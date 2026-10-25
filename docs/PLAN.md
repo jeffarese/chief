@@ -76,3 +76,24 @@ I review and test each milestone before the next starts. Local git only; nothing
 - Relies on recent Claude Code features; `projd` checks for 2.1.310 or later at start.
 - Each thread is a full session on your plan; default threads to a smaller model in `project.toml`.
 - A thread's process is ended after about an hour unattached once finished; `wake_thread` respawns it.
+
+## Milestone 2b results (live, Claude Code 2.1.310, Haiku sessions, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| Start: coordinator calls start_thread, subscribes, thread works in its own worktree, report stored, idle notice back | Pass |
+| Context: every coordinator turn carries `<chief-board>` and `<chief-memory>` | Pass |
+| Follow-up routed to the existing thread by SendMessage, same branch | Pass |
+| Permission prompt: board shows Waiting on you (permission); approving returns it to Working | Pass |
+| Respawn: stopped thread shows asleep; coordinator calls wake_thread, then messages it | Pass |
+| Guard: coordinator → outside session denied and recorded; thread ListAgents and thread → outside session denied | Pass |
+| Thread killed mid-turn leaves Working (shows Idle, asleep) | Pass after fix |
+| Hook error log | Empty over 125 events |
+
+Fixed during the run: trust inherits from trusted parents but stops at a git root (chief refused
+valid folders); "working" now means a busy process (a finished thread stayed in Working because
+`claude agents` kept `state: working`); threads get their own ListAgents refusal.
+
+For prompt tuning (M5): the coordinator offers to remove worktrees (it can't; cleanup is the
+user's); a coordinator brief said "the branch this thread was created with", which confused the
+thread; the coordinator correctly refused to relay a request that would route around its own guard.

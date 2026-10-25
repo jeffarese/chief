@@ -44,6 +44,16 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
 - The supervisor ends a finished, unattached session's process after about an hour.
 - `claude attach <short-id>` shows the real session UI. Ctrl+Z detaches and exits the attach
   process; the session keeps running.
+- `claude rm <id>` (verified live in M2b) stops the session **even when it then refuses**, and
+  refuses (exit 1, "kept <id> — …") while the worktree has unpushed commits or uncommitted changes
+  (untracked files count; git-ignored files don't). An unpushed refusal prints
+  `claude rm <id> --discard-unpushed <head sha>@<worktree-id>`; a dirty refusal offers no flag in
+  its message, though usage lists `--force-remove-worktree <worktree-id>` (untested). On success it
+  deletes the worktree and the local branch, keeps any remote branch, and the session disappears
+  from `claude agents --all` (a stopped session stays listed as `stopped`).
+- Threads name their own worktree (`EnterWorktree`), e.g. `.claude/worktrees/add-hello-txt` on
+  `worktree-add-hello-txt`, not after the thread; use the cwd and branch hooks report.
+- A thread killed mid-turn stays `state: working` with no status and no pid in `claude agents`.
 
 Minimum Claude Code version: 2.1.310. `chief` checks `claude --version` on `init` and `up`.
 
