@@ -463,6 +463,8 @@ mod tests {
             r.short_id = Some("x".into());
             r.pr_state = pr.map(str::to_string);
             r.cc_state = Some(cc.to_string());
+            // Only a busy process counts as working (§5 rule 5).
+            r.cc_status = Some(if cc == "working" { "busy" } else { "idle" }.to_string());
             r.cc_fresh = true;
             r
         };

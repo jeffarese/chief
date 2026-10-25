@@ -268,17 +268,25 @@ Derivation, first match wins (inputs: the row plus the latest `claude agents` sn
 
 1. `resolved = 1` → **resolved**
 2. `cc_state = failed` → **failed**
-3. `pending_permission = 1` → **waiting**, reason `permission`, unless the process is gone (below)
+3. `pending_permission = 1` → **waiting**, reason `permission`; else `cc_status = waiting` →
+   **waiting**, reason `question`; both unless the process is gone (below)
 4. `cc_state = blocked` → **waiting**, reason `question`
-5. `cc_state = working` or `cc_status = busy` → **working**, unless the process is gone (below)
+5. `cc_status = busy` → **working**, unless the process is gone (below)
+
+`cc_state` is Claude Code's judgment of the task (working, blocked, done), not of the process: in M2b
+a thread that had finished its turn stayed `working` / `idle` indefinitely (its job record never
+reached a terminal state). So only `cc_status` (busy, waiting, idle) says whether something runs;
+`cc_state` still drives rules 2 and 4. A live permission prompt showed as `blocked` / `waiting` in
+the spike, which is why a `waiting` status counts even before the Notification hook lands.
 6. `pr_state = OPEN` and `pr_review = APPROVED` → **landing**
 7. `pr_state = OPEN` and not draft → **review**
 8. anything else → **idle** (the board marks it "asleep" when `pid` is NULL)
 
 Without a `claude agents` row (not listed yet, or no poll since the hook: `cc_fresh = 0`), use the
 provisional group from the last hook: UserPromptSubmit/PreToolUse/PostToolUse → working; pending
-permission → waiting; Stop or Notification `idle_prompt` → idle. Concretely, rules 2, 4 and 5 read
-`cc_state` as absent and rule 5 matches when the last hook is one of the three working hooks; a
+permission → waiting; Stop or Notification `idle_prompt` → idle. Concretely, rules 2–5 read
+`cc_state` and `cc_status` as absent and rule 5 matches when the last hook is one of the three
+working hooks; a
 provisional idle still falls through rules 6 and 7, so a stopped thread with an open PR shows in
 review.
 

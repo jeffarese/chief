@@ -197,17 +197,26 @@ pub fn derive(facts: &Facts) -> Derived {
         return Derived::group(Group::Failed);
     }
     // A permission prompt dies with its process and doesn't come back on respawn.
-    if facts.pending_permission && !facts.process_gone {
-        return Derived::waiting(WaitingReason::Permission);
+    if !facts.process_gone {
+        if facts.pending_permission {
+            return Derived::waiting(WaitingReason::Permission);
+        }
+        // A live process waiting on the user that no hook told us about.
+        if facts.cc_status == Some("waiting") {
+            return Derived::waiting(WaitingReason::Question);
+        }
     }
     if facts.cc_state == Some("blocked") {
         return Derived::waiting(WaitingReason::Question);
     }
-    let working = match facts.cc_state {
-        Some(state) => state == "working",
-        None => facts.last_hook.is_some_and(HookKind::means_working),
+    // `cc_state` judges the task, not the process: a finished turn can stay "working" while the
+    // process idles. Only the status says something runs.
+    let working = match (facts.cc_status, facts.cc_state) {
+        (Some(status), _) => status == "busy",
+        (None, Some(_)) => false,
+        (None, None) => facts.last_hook.is_some_and(HookKind::means_working),
     };
-    if !facts.process_gone && (working || facts.cc_status == Some("busy")) {
+    if !facts.process_gone && working {
         return Derived::group(Group::Working);
     }
     if facts.pr_state == Some("OPEN") {
@@ -299,12 +308,34 @@ mod tests {
             ),
             // 5. working
             (
-                "working state",
+                "working state on a busy process",
                 Facts {
                     cc_state: Some("working"),
+                    cc_status: Some("busy"),
                     ..base()
                 },
                 Working,
+                None,
+            ),
+            (
+                "working state on an idle process is idle (seen live in M2b)",
+                Facts {
+                    cc_state: Some("working"),
+                    cc_status: Some("idle"),
+                    last_hook: Some(Stop),
+                    ..base()
+                },
+                Idle,
+                None,
+            ),
+            (
+                "working state without a status: no process",
+                Facts {
+                    cc_state: Some("working"),
+                    last_hook: Some(PostToolUse),
+                    ..base()
+                },
+                Idle,
                 None,
             ),
             (
@@ -331,6 +362,7 @@ mod tests {
                 "working beats approved PR",
                 Facts {
                     cc_state: Some("working"),
+                    cc_status: Some("busy"),
                     pr_state: Some("OPEN"),
                     pr_review: Some("APPROVED"),
                     ..base()
@@ -418,11 +450,32 @@ mod tests {
                 "unknown state counts as idle",
                 Facts {
                     cc_state: Some("hibernating"),
-                    cc_status: Some("waiting"),
+                    cc_status: Some("idle"),
                     ..base()
                 },
                 Idle,
                 None,
+            ),
+            (
+                "waiting status before any permission hook",
+                Facts {
+                    cc_state: Some("blocked"),
+                    cc_status: Some("waiting"),
+                    ..base()
+                },
+                Waiting,
+                Some(Question),
+            ),
+            (
+                "waiting status with the permission hook",
+                Facts {
+                    cc_state: Some("blocked"),
+                    cc_status: Some("waiting"),
+                    pending_permission: true,
+                    ..base()
+                },
+                Waiting,
+                Some(Permission),
             ),
             (
                 "stopped and idle states",
