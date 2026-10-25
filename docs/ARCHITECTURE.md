@@ -13,8 +13,9 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
 - `claude --bg [flags] "<prompt>"` starts a background session under Claude Code's supervisor and
   prints `backgrounded · <short-id> · <name>`. `--session-id` is **ignored** with `--bg`: look the
   full id up in `claude agents --json --all` by short id (`id`) → `sessionId`.
-- Background sessions refuse untrusted folders ("Workspace not trusted…"). Trust is per exact path in
-  `~/.claude.json` → `projects[<path>].hasTrustDialogAccepted`; parents do not cover children.
+- Background sessions refuse untrusted folders ("Workspace not trusted…"). Trust lives in
+  `~/.claude.json` → `projects[<path>].hasTrustDialogAccepted`, and a trusted folder covers every
+  folder under it, even one whose own entry is false (verified live in M2b with `/` trusted).
 - Before editing, a background thread moves into `<repo>/.claude/worktrees/<name>` on branch
   `worktree-<name>`. `worktree.bgIsolation: "none"` in its settings turns that off.
 - `claude agents --json --all` rows: `id`, `sessionId`, `name`, `cwd`, `kind`, `startedAt`, `state`
@@ -380,8 +381,9 @@ Parse `backgrounded · <short-id>` from stdout (error if missing, include stderr
 with stdin closed; "Workspace not trusted" in its output becomes `ClaudeError::NotTrusted(cwd)`,
 whose message says to run `claude` in that folder once and accept the trust prompt.
 
-Trust (`claude::is_trusted`) checks both the path as given and its canonical form (macOS `/tmp` is
-`/private/tmp`), reading `$CHIEF_CLAUDE_CONFIG` instead of `~/.claude.json` when set.
+Trust (`claude::is_trusted`) walks up both the path as given and its canonical form (macOS `/tmp`
+is `/private/tmp`): any trusted ancestor counts. It reads `$CHIEF_CLAUDE_CONFIG` instead of
+`~/.claude.json` when set.
 
 ### Coordinator spawn (`chief up`)
 

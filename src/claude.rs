@@ -301,9 +301,10 @@ pub fn is_trusted(path: &Path) -> Result<bool> {
     is_trusted_in(&claude_config_path(), path)
 }
 
-/// `is_trusted` against an explicit config file. A missing file trusts nothing. Trust is per
-/// exact path, so both the path as given and its canonical form (macOS `/tmp` is
-/// `/private/tmp`) are checked.
+/// `is_trusted` against an explicit config file. A missing file trusts nothing. Like Claude Code,
+/// a trusted folder covers everything under it (verified live: with `/` trusted, a background
+/// session starts in a folder whose own entry says false). Both the path as given and its
+/// canonical form (macOS `/tmp` is `/private/tmp`) are walked up.
 pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
@@ -316,8 +317,8 @@ pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     if let Ok(canon) = path.canonicalize() {
         keys.push(canon);
     }
-    Ok(keys.iter().any(|key| {
-        let key = key.to_string_lossy();
+    Ok(keys.iter().flat_map(|key| key.ancestors()).any(|dir| {
+        let key = dir.to_string_lossy();
         let key = if key.len() > 1 {
             key.trim_end_matches('/')
         } else {
@@ -515,6 +516,7 @@ mod tests {
                 canon.to_string_lossy(): {"hasTrustDialogAccepted": true},
                 "/untrusted": {"hasTrustDialogAccepted": false},
                 "/parent": {"hasTrustDialogAccepted": true},
+                "/parent/declined": {"hasTrustDialogAccepted": false},
             }
         });
         std::fs::write(&config, json.to_string()).unwrap();
@@ -522,8 +524,12 @@ mod tests {
 
         assert!(is_trusted_in(&config, &repo).unwrap());
         assert!(is_trusted_in(&config, &canon).unwrap());
+        assert!(is_trusted_in(&config, &canon.join("sub/dir")).unwrap());
         assert!(!is_trusted_in(&config, Path::new("/untrusted")).unwrap());
-        assert!(!is_trusted_in(&config, Path::new("/parent/child")).unwrap());
+        assert!(!is_trusted_in(&config, Path::new("/untrusted/child")).unwrap());
+        assert!(is_trusted_in(&config, Path::new("/parent/child")).unwrap());
+        // The child's own false entry doesn't override a trusted parent.
+        assert!(is_trusted_in(&config, Path::new("/parent/declined")).unwrap());
         assert!(!is_trusted_in(&config, Path::new("/nowhere")).unwrap());
         assert!(!is_trusted_in(&dir.path().join("missing.json"), &repo).unwrap());
         assert_eq!(std::fs::read(&config).unwrap(), before, "must never write");
