@@ -301,10 +301,12 @@ pub fn is_trusted(path: &Path) -> Result<bool> {
     is_trusted_in(&claude_config_path(), path)
 }
 
-/// `is_trusted` against an explicit config file. A missing file trusts nothing. Like Claude Code,
-/// a trusted folder covers everything under it (verified live: with `/` trusted, a background
-/// session starts in a folder whose own entry says false). Both the path as given and its
-/// canonical form (macOS `/tmp` is `/private/tmp`) are walked up.
+/// `is_trusted` against an explicit config file. A missing file trusts nothing. Matches what
+/// Claude Code 2.1.310 did live: a trusted folder covers the folders under it (with `/` trusted, a
+/// background session started in a folder whose own entry said false), but not past a git
+/// repository's root (the same `/` didn't cover a fresh repo; Claude asked to trust it). So the
+/// walk up stops at the first folder holding `.git`. Both the path as given and its canonical
+/// form (macOS `/tmp` is `/private/tmp`) are checked.
 pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
@@ -317,7 +319,7 @@ pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     if let Ok(canon) = path.canonicalize() {
         keys.push(canon);
     }
-    Ok(keys.iter().flat_map(|key| key.ancestors()).any(|dir| {
+    Ok(keys.iter().flat_map(|key| trust_scope(key)).any(|dir| {
         let key = dir.to_string_lossy();
         let key = if key.len() > 1 {
             key.trim_end_matches('/')
@@ -326,6 +328,19 @@ pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
         };
         json["projects"][key]["hasTrustDialogAccepted"].as_bool() == Some(true)
     }))
+}
+
+/// `path` and its ancestors up to and including the git repository root, or up to `/` outside a
+/// repository.
+fn trust_scope(path: &Path) -> Vec<&Path> {
+    let mut scope = Vec::new();
+    for dir in path.ancestors() {
+        scope.push(dir);
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    scope
 }
 
 #[cfg(test)]
@@ -531,6 +546,28 @@ mod tests {
         // The child's own false entry doesn't override a trusted parent.
         assert!(is_trusted_in(&config, Path::new("/parent/declined")).unwrap());
         assert!(!is_trusted_in(&config, Path::new("/nowhere")).unwrap());
+
+        // A trusted parent stops covering at a git repository's root.
+        let outer = dir.path().join("outer");
+        let git_repo = outer.join("project");
+        std::fs::create_dir_all(git_repo.join(".git")).unwrap();
+        std::fs::create_dir_all(git_repo.join("pkg")).unwrap();
+        std::fs::create_dir_all(outer.join("plain/sub")).unwrap();
+        let outer = outer.canonicalize().unwrap();
+        let git_repo = git_repo.canonicalize().unwrap();
+        let json = serde_json::json!({
+            "projects": { outer.to_string_lossy(): {"hasTrustDialogAccepted": true} }
+        });
+        let scoped = dir.path().join("scoped.json");
+        std::fs::write(&scoped, json.to_string()).unwrap();
+        assert!(is_trusted_in(&scoped, &outer.join("plain/sub")).unwrap());
+        assert!(!is_trusted_in(&scoped, &git_repo).unwrap());
+        assert!(!is_trusted_in(&scoped, &git_repo.join("pkg")).unwrap());
+        let json = serde_json::json!({
+            "projects": { git_repo.to_string_lossy(): {"hasTrustDialogAccepted": true} }
+        });
+        std::fs::write(&scoped, json.to_string()).unwrap();
+        assert!(is_trusted_in(&scoped, &git_repo.join("pkg")).unwrap());
         assert!(!is_trusted_in(&dir.path().join("missing.json"), &repo).unwrap());
         assert_eq!(std::fs::read(&config).unwrap(), before, "must never write");
 
