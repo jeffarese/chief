@@ -11,5 +11,7 @@ pub mod mux;
 pub mod names;
 pub mod pane;
 pub mod paths;
+pub mod proc;
 pub mod project;
+pub mod registry;
 pub mod state;

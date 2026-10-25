@@ -1,8 +1,11 @@
 //! Wrapper around the `claude` CLI (ARCHITECTURE §1, §7). `CHIEF_CLAUDE_BIN` overrides the binary.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 pub const MIN_VERSION: (u32, u32, u32) = (2, 1, 310);
@@ -41,6 +44,23 @@ pub struct BgSpawn {
     pub prompt: Option<String>,
 }
 
+/// Errors callers act on; everything else is a plain `anyhow` error.
+#[derive(Debug, thiserror::Error)]
+pub enum ClaudeError {
+    #[error(
+        "Claude Code doesn't trust {0} yet, and background sessions refuse untrusted folders. \
+         Run `claude` in that folder once (cd {0} && claude), accept the trust prompt, then try again."
+    )]
+    NotTrusted(PathBuf),
+}
+
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const AGENTS_TIMEOUT: Duration = Duration::from_secs(15);
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a freshly spawned session may take to show up in `claude agents` (§7).
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Claude {
     pub bin: PathBuf,
 }
@@ -55,45 +75,447 @@ impl Claude {
 
     /// Fails when `claude --version` is older than MIN_VERSION.
     pub fn check_version(&self) -> Result<()> {
-        todo!("M1")
+        let out = self.run_ok(&["--version".into()], None, VERSION_TIMEOUT)?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some(version) = parse_version(&text) else {
+            bail!(
+                "could not read the Claude Code version from {:?}",
+                text.trim()
+            );
+        };
+        if version < MIN_VERSION {
+            let (a, b, c) = version;
+            let (x, y, z) = MIN_VERSION;
+            bail!("Claude Code {a}.{b}.{c} is older than {x}.{y}.{z}; run `claude update`");
+        }
+        Ok(())
     }
 
     /// `claude agents --json --all`.
     pub fn agents(&self) -> Result<Vec<AgentRow>> {
-        todo!("M1")
+        let args: Vec<OsString> = vec!["agents".into(), "--json".into(), "--all".into()];
+        let out = self.run_ok(&args, None, AGENTS_TIMEOUT)?;
+        parse_agents(&String::from_utf8_lossy(&out.stdout))
     }
 
     /// Starts a background session and returns its short id.
     pub fn spawn_bg(&self, spec: &BgSpawn) -> Result<String> {
-        let _ = spec;
-        todo!("M1")
+        let out = self.run(&bg_args(spec), Some(&spec.cwd), SPAWN_TIMEOUT)?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("Workspace not trusted") || stderr.contains("Workspace not trusted") {
+            return Err(ClaudeError::NotTrusted(spec.cwd.clone()).into());
+        }
+        match parse_bg_short_id(&stdout) {
+            Some(id) => Ok(id),
+            None => bail!(
+                "`claude --bg` for {} printed no session id ({}).\nstdout: {}\nstderr: {}",
+                spec.name,
+                out.status,
+                stdout.trim(),
+                stderr.trim()
+            ),
+        }
     }
 
     pub fn respawn(&self, short_id: &str) -> Result<()> {
-        let _ = short_id;
-        todo!("M1")
+        self.run_ok(&["respawn".into(), short_id.into()], None, CONTROL_TIMEOUT)?;
+        Ok(())
     }
 
     pub fn stop(&self, short_id: &str) -> Result<()> {
-        let _ = short_id;
-        todo!("M1")
+        self.run_ok(&["stop".into(), short_id.into()], None, CONTROL_TIMEOUT)?;
+        Ok(())
     }
+
+    /// Finds a freshly spawned session in `claude agents` by its short id, retrying until
+    /// `timeout`: `--session-id` is ignored with `--bg`, so this is the only way to learn the
+    /// full id (§1).
+    pub fn resolve_session(&self, short_id: &str, timeout: Duration) -> Result<AgentRow> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last_err = match self.agents() {
+                Ok(rows) => {
+                    if let Some(row) = rows.into_iter().find(|r| r.id.as_deref() == Some(short_id))
+                    {
+                        return Ok(row);
+                    }
+                    None
+                }
+                Err(e) => Some(e),
+            };
+            if Instant::now() >= deadline {
+                let why = last_err.map(|e| format!(": {e:#}")).unwrap_or_default();
+                bail!(
+                    "session {short_id} did not appear in `claude agents` within {}s{why}",
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Runs the binary; fails only if it can't start or outlives `timeout`.
+    fn run(&self, args: &[OsString], cwd: Option<&Path>, timeout: Duration) -> Result<Output> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(args);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        let shown = format!(
+            "{} {}",
+            self.bin.display(),
+            args.first()
+                .map(|a| a.to_string_lossy())
+                .unwrap_or_default()
+        );
+        crate::proc::output_with_timeout(&mut cmd, timeout)
+            .with_context(|| format!("running `{shown}`"))?
+            .with_context(|| format!("`{shown}` took longer than {}s", timeout.as_secs()))
+    }
+
+    /// Like `run`, but a non-zero exit is an error carrying stderr.
+    fn run_ok(&self, args: &[OsString], cwd: Option<&Path>, timeout: Duration) -> Result<Output> {
+        let out = self.run(args, cwd, timeout)?;
+        if !out.status.success() {
+            let joined: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+            bail!(
+                "`claude {}` failed ({}): {}",
+                joined.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// The `claude --bg` argument list from §7, skipping empty optionals. Repeated flags rather than
+/// variadic lists, and the prompt last after a single-valued flag, so no list can swallow it.
+pub fn bg_args(spec: &BgSpawn) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "--bg".into(),
+        "--name".into(),
+        spec.name.clone().into(),
+        "--model".into(),
+        spec.model.clone().into(),
+        "--effort".into(),
+        spec.effort.clone().into(),
+        "--permission-mode".into(),
+        spec.permission_mode.clone().into(),
+        "--settings".into(),
+        spec.settings.clone().into(),
+    ];
+    if let Some(mcp) = &spec.mcp_config {
+        args.push("--mcp-config".into());
+        args.push(mcp.clone().into());
+    }
+    for tool in &spec.disallowed_tools {
+        args.push("--disallowedTools".into());
+        args.push(tool.into());
+    }
+    for dir in &spec.add_dirs {
+        args.push("--add-dir".into());
+        args.push(dir.clone().into());
+    }
+    if !spec.append_system_prompt.is_empty() {
+        args.push("--append-system-prompt".into());
+        args.push(spec.append_system_prompt.clone().into());
+    }
+    if let Some(prompt) = spec.prompt.as_ref().filter(|p| !p.is_empty()) {
+        args.push(prompt.into());
+    }
+    args
+}
+
+/// Parses `2.1.310 (Claude Code)`.
+pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let token = s.split_whitespace().next()?;
+    let mut parts = token.split('.').map(|p| p.parse::<u32>().ok());
+    let v = (parts.next()??, parts.next()??, parts.next()??);
+    Some(v)
 }
 
 /// Parses `claude agents --json` output.
 pub fn parse_agents(json: &str) -> Result<Vec<AgentRow>> {
-    let _ = json;
-    todo!("M1")
+    serde_json::from_str(json).context("parsing `claude agents --json` output")
 }
 
 /// Extracts the short id from `backgrounded · <short-id> · <name>`.
 pub fn parse_bg_short_id(stdout: &str) -> Option<String> {
-    let _ = stdout;
-    todo!("M1")
+    let clean = strip_ansi(stdout);
+    clean.lines().find_map(|line| {
+        let rest = &line[line.find("backgrounded")? + "backgrounded".len()..];
+        let id = rest.split('·').nth(1)?.trim();
+        let ok = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        ok.then(|| id.to_string())
+    })
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `$CHIEF_CLAUDE_CONFIG`, else `~/.claude.json`.
+pub fn claude_config_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("CHIEF_CLAUDE_CONFIG") {
+        return PathBuf::from(p);
+    }
+    dirs::home_dir().unwrap_or_default().join(".claude.json")
 }
 
 /// Reads `~/.claude.json` → `projects[<path>].hasTrustDialogAccepted`. Read-only, never writes.
 pub fn is_trusted(path: &Path) -> Result<bool> {
-    let _ = path;
-    todo!("M1")
+    is_trusted_in(&claude_config_path(), path)
+}
+
+/// `is_trusted` against an explicit config file. A missing file trusts nothing. Trust is per
+/// exact path, so both the path as given and its canonical form (macOS `/tmp` is
+/// `/private/tmp`) are checked.
+pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
+    let text = match std::fs::read_to_string(config) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", config.display())),
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", config.display()))?;
+    let mut keys = vec![path.to_path_buf()];
+    if let Ok(canon) = path.canonicalize() {
+        keys.push(canon);
+    }
+    Ok(keys.iter().any(|key| {
+        let key = key.to_string_lossy();
+        let key = if key.len() > 1 {
+            key.trim_end_matches('/')
+        } else {
+            &key
+        };
+        json["projects"][key]["hasTrustDialogAccepted"].as_bool() == Some(true)
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> BgSpawn {
+        BgSpawn {
+            cwd: "/work/repo".into(),
+            name: "p-fix-1a2b".into(),
+            model: "sonnet".into(),
+            effort: "high".into(),
+            permission_mode: "auto".into(),
+            settings: "/root/projects/p/generated/thread-settings.json".into(),
+            mcp_config: None,
+            add_dirs: vec!["/root/projects/p/memory".into()],
+            disallowed_tools: vec![],
+            append_system_prompt: "brief\nline two".into(),
+            prompt: Some("Fix the bug".into()),
+        }
+    }
+
+    fn strs(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn thread_args_match_the_contract() {
+        assert_eq!(
+            strs(&bg_args(&spec())),
+            [
+                "--bg",
+                "--name",
+                "p-fix-1a2b",
+                "--model",
+                "sonnet",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "auto",
+                "--settings",
+                "/root/projects/p/generated/thread-settings.json",
+                "--add-dir",
+                "/root/projects/p/memory",
+                "--append-system-prompt",
+                "brief\nline two",
+                "Fix the bug",
+            ]
+        );
+    }
+
+    #[test]
+    fn coordinator_args_match_the_contract() {
+        let s = BgSpawn {
+            name: "chief-p".into(),
+            model: "opus".into(),
+            effort: "low".into(),
+            settings: "/d/generated/coordinator-settings.json".into(),
+            mcp_config: Some("/d/generated/mcp.json".into()),
+            add_dirs: vec!["/r1".into(), "/r2".into()],
+            disallowed_tools: vec!["Bash".into()],
+            append_system_prompt: "coord".into(),
+            prompt: None,
+            ..spec()
+        };
+        assert_eq!(
+            strs(&bg_args(&s)),
+            [
+                "--bg",
+                "--name",
+                "chief-p",
+                "--model",
+                "opus",
+                "--effort",
+                "low",
+                "--permission-mode",
+                "auto",
+                "--settings",
+                "/d/generated/coordinator-settings.json",
+                "--mcp-config",
+                "/d/generated/mcp.json",
+                "--disallowedTools",
+                "Bash",
+                "--add-dir",
+                "/r1",
+                "--add-dir",
+                "/r2",
+                "--append-system-prompt",
+                "coord",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_optionals_are_skipped() {
+        let s = BgSpawn {
+            add_dirs: vec![],
+            append_system_prompt: String::new(),
+            prompt: Some(String::new()),
+            ..spec()
+        };
+        let args = strs(&bg_args(&s));
+        assert_eq!(args.len(), 11);
+        assert_eq!(
+            args.last().unwrap(),
+            "/root/projects/p/generated/thread-settings.json"
+        );
+    }
+
+    #[test]
+    fn short_id_parsing() {
+        let cases = [
+            (
+                "backgrounded · f8627ea8 · spike-thread-a\n",
+                Some("f8627ea8"),
+            ),
+            ("noise\n  backgrounded · a1b2c3d4 · x\n", Some("a1b2c3d4")),
+            (
+                "\u{1b}[2mbackgrounded\u{1b}[0m · \u{1b}[1mabc123\u{1b}[0m · n",
+                Some("abc123"),
+            ),
+            ("backgrounded · abc123", Some("abc123")),
+            ("Workspace not trusted", None),
+            ("backgrounded ·  · name", None),
+            ("backgrounded", None),
+            ("", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_bg_short_id(input).as_deref(), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn version_parsing() {
+        assert_eq!(parse_version("2.1.310 (Claude Code)\n"), Some((2, 1, 310)));
+        assert_eq!(parse_version("10.0.1"), Some((10, 0, 1)));
+        assert_eq!(parse_version("2.1 (Claude Code)"), None);
+        assert_eq!(parse_version("Claude Code"), None);
+        assert!((2, 1, 309) < MIN_VERSION);
+        assert!((2, 2, 0) > MIN_VERSION);
+    }
+
+    #[test]
+    fn parses_the_agents_fixture() {
+        let json = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agents/agents-sample.json"
+        ))
+        .unwrap();
+        let rows = parse_agents(&json).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0],
+            AgentRow {
+                id: Some("f8627ea8".into()),
+                session_id: "f8627ea8-50af-4cce-b12d-936669f85ed0".into(),
+                name: Some("demo-hello-txt-1a2b".into()),
+                cwd: Some("/tmp/chief-fixture/repo".into()),
+                kind: Some("background".into()),
+                started_at: Some(1792940000000),
+                state: Some("working".into()),
+                status: Some("busy".into()),
+                pid: Some(93669),
+            }
+        );
+        let asleep = &rows[3];
+        assert_eq!(asleep.state.as_deref(), Some("done"));
+        assert_eq!((asleep.status.as_deref(), asleep.pid), (None, None));
+        let interactive = &rows[4];
+        assert_eq!(
+            (interactive.id.as_deref(), interactive.state.as_deref()),
+            (None, None)
+        );
+        assert!(parse_agents("not json").is_err());
+    }
+
+    #[test]
+    fn trust_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let canon = repo.canonicalize().unwrap();
+        let config = dir.path().join("claude.json");
+        let json = serde_json::json!({
+            "projects": {
+                canon.to_string_lossy(): {"hasTrustDialogAccepted": true},
+                "/untrusted": {"hasTrustDialogAccepted": false},
+                "/parent": {"hasTrustDialogAccepted": true},
+            }
+        });
+        std::fs::write(&config, json.to_string()).unwrap();
+        let before = std::fs::read(&config).unwrap();
+
+        assert!(is_trusted_in(&config, &repo).unwrap());
+        assert!(is_trusted_in(&config, &canon).unwrap());
+        assert!(!is_trusted_in(&config, Path::new("/untrusted")).unwrap());
+        assert!(!is_trusted_in(&config, Path::new("/parent/child")).unwrap());
+        assert!(!is_trusted_in(&config, Path::new("/nowhere")).unwrap());
+        assert!(!is_trusted_in(&dir.path().join("missing.json"), &repo).unwrap());
+        assert_eq!(std::fs::read(&config).unwrap(), before, "must never write");
+
+        std::fs::write(&config, "{").unwrap();
+        assert!(is_trusted_in(&config, &repo).is_err());
+    }
 }

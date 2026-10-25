@@ -135,8 +135,9 @@ CREATE TABLE sessions (                   -- coordinator and threads
   effort          TEXT,
   cc_state        TEXT,                   -- last `claude agents` state
   cc_status       TEXT,                   -- last `claude agents` status
+  cc_fresh        INTEGER NOT NULL DEFAULT 0, -- 1 = cc_state/cc_status come from a poll newer than the last hook
   pid             INTEGER,                -- NULL = process gone (asleep)
-  last_hook       TEXT,                   -- last hook event name
+  last_hook       TEXT,                   -- last hook event name; Notification keeps its type: `Notification:permission_prompt`
   pending_permission INTEGER NOT NULL DEFAULT 0,
   group_name      TEXT NOT NULL DEFAULT 'working',   -- derived board group, see §5
   waiting_reason  TEXT,                   -- 'permission' | 'question' | NULL
@@ -190,9 +191,14 @@ Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
 
 ### Matching a hook to a session
 
-1. `session_id` matches `sessions.session_id` → that row.
-2. Else `session_title` matches `sessions.name` within the project → that row; store `session_id`.
+1. `session_id` matches `sessions.session_id` → that row, if it belongs to the hook's project.
+2. Else `session_title` matches `sessions.name` within the project and that row has no
+   `session_id` yet → that row; store `session_id`. (A row with another `session_id` is not
+   matched: the hook comes from a copy of the session.)
 3. Else record the event with `session_name = NULL` and stop.
+
+Matching, the event row and the session update run in one `BEGIN IMMEDIATE` transaction; the git
+branch lookup runs before it so the write lock is never held for the 2 s timeout.
 
 ## 5. Thread state and board groups
 
@@ -208,7 +214,15 @@ Hook updates (per matched session):
 | PostToolUse | `pending_permission = 0`; update `cwd`; provisional `working` |
 | Notification `permission_prompt` | `pending_permission = 1` |
 | Notification `idle_prompt` | nothing beyond `last_hook` |
-| Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports`; update `cwd` and `branch` (`git -C <cwd> branch --show-current`, 2 s timeout) |
+| Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` and `branch` (`git -C <cwd> branch --show-current`, 2 s timeout, threads only, kept on a detached HEAD or error) |
+
+Every hook above also sets `last_hook`, `updated_at` and `cc_fresh = 0`, re-derives the group, and
+(except Notification `idle_prompt`) sets `last_activity_at`. Other events (SubagentStop,
+SessionEnd, other notification types) are only recorded in `events`. Coordinator Stops store
+reports too.
+
+When `[ui] notify` is true, a thread's `permission_prompt` and a thread's Stop send a macOS
+notification (`osascript`, spawned without waiting; skipped if missing or `CHIEF_NO_NOTIFY=1`).
 
 Derivation, first match wins (inputs: the row plus the latest `claude agents` snapshot if fresh):
 
@@ -221,12 +235,23 @@ Derivation, first match wins (inputs: the row plus the latest `claude agents` sn
 7. `pr_state = OPEN` and not draft → **review**
 8. anything else → **idle** (the board marks it "asleep" when `pid` is NULL)
 
-Without a `claude agents` row (not listed yet, or no poll since the hook), use the provisional group
-from the last hook: UserPromptSubmit/PreToolUse/PostToolUse → working; pending permission → waiting;
-Stop or Notification `idle_prompt` → idle.
+Without a `claude agents` row (not listed yet, or no poll since the hook: `cc_fresh = 0`), use the
+provisional group from the last hook: UserPromptSubmit/PreToolUse/PostToolUse → working; pending
+permission → waiting; Stop or Notification `idle_prompt` → idle. Concretely, rules 2, 4 and 5 read
+`cc_state` as absent and rule 5 matches when the last hook is one of the three working hooks; a
+provisional idle still falls through rules 6 and 7, so a stopped thread with an open PR shows in
+review.
 
-Unknown `cc_state` values count as idle. Auto-resolve: `pr_state = MERGED` → resolved (`merged`);
-no activity for 7 days and not working or waiting → resolved (`inactive`).
+Unknown `cc_state` values count as idle. Auto-resolve (threads only, and only if the thread was
+never resolved before: reopening keeps `resolved_reason`, so a reopened thread is not resolved
+again automatically; reopening also sets `last_activity_at`): `pr_state = MERGED` → resolved
+(`merged`); no activity for 7 days and not working or waiting → resolved (`inactive`).
+
+Sync (`src/registry.rs`, run with each `claude agents` snapshot): match each project session by
+`session_id`, or by `short_id` = row `id` while `session_id` is NULL (then store it). Matched rows
+get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows get `pid = NULL` and
+`cc_fresh = 0` and keep their last `cc_state`. Rows with neither id (not spawned yet) are left
+alone. Then re-derive and apply auto-resolve.
 
 Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Failed, Resolved.
 
@@ -271,7 +296,13 @@ claude --bg --name <name> --model <m> --effort <e> --permission-mode <threads.pe
 ```
 
 Parse `backgrounded · <short-id>` from stdout (error if missing, include stderr). Resolve
-`sessionId` from `claude agents --json --all` (retry up to 5 s).
+`sessionId` from `claude agents --json --all` (retry up to 5 s). List flags (`--add-dir`,
+`--disallowedTools`) are repeated once per value, and empty optionals are left out. The command runs
+with stdin closed; "Workspace not trusted" in its output becomes `ClaudeError::NotTrusted(cwd)`,
+whose message says to run `claude` in that folder once and accept the trust prompt.
+
+Trust (`claude::is_trusted`) checks both the path as given and its canonical form (macOS `/tmp` is
+`/private/tmp`), reading `$CHIEF_CLAUDE_CONFIG` instead of `~/.claude.json` when set.
 
 ### Coordinator spawn (`chief up`)
 
@@ -347,6 +378,8 @@ Board switching: write `pane_target`, then `send_key(main, "ctrl+z")`.
 - Unit tests: §5 derivation (table-driven), §6 guard (table-driven), hook payload parsing against
   `tests/fixtures/hooks/spike-events.jsonl`, `claude agents` parsing against
   `tests/fixtures/agents/agents-sample.json`, config round trip, migrations on a fresh DB.
-- `CHIEF_CLAUDE_BIN` overrides the `claude` binary; integration tests use a fake script that records
-  its arguments and prints canned output. `CHIEF_HOME` points tests at a temp dir.
+- `CHIEF_CLAUDE_BIN` overrides the `claude` binary; integration tests use a fake script
+  (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_HOME` points
+  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_NO_NOTIFY=1` turns off
+  notifications.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).

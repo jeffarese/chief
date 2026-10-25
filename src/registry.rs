@@ -1,0 +1,418 @@
+//! Keeps `sessions` in step with `claude agents` and PR status (ARCHITECTURE §5): stores the
+//! snapshot, re-derives groups and applies auto-resolve. Callers fetch the inputs; this module
+//! only touches the database.
+
+use anyhow::{Context, Result};
+use rusqlite::Connection;
+
+use crate::claude::AgentRow;
+use crate::db::{self, SessionRow};
+use crate::state::{self, Facts, Group, HookKind, Role};
+
+const INACTIVE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The derivation inputs a row carries. The stored `claude agents` state only counts while it is
+/// newer than the last hook; otherwise the last hook gives the provisional group.
+pub fn facts(row: &SessionRow) -> Facts<'_> {
+    let (cc_state, cc_status) = if row.cc_fresh {
+        (row.cc_state.as_deref(), row.cc_status.as_deref())
+    } else {
+        (None, None)
+    };
+    Facts {
+        resolved: row.resolved,
+        pending_permission: row.pending_permission,
+        cc_state,
+        cc_status,
+        last_hook: row.last_hook.as_deref().and_then(HookKind::from_stored),
+        pr_state: row.pr_state.as_deref(),
+        pr_draft: row.pr_draft.unwrap_or(false),
+        pr_review: row.pr_review.as_deref(),
+    }
+}
+
+/// Recomputes `group_name` and `waiting_reason` from the row.
+pub fn rederive(row: &mut SessionRow) {
+    let d = state::derive(&facts(row));
+    row.group_name = d.group.as_str().to_string();
+    row.waiting_reason = d.reason.map(|r| {
+        match r {
+            state::WaitingReason::Permission => "permission",
+            state::WaitingReason::Question => "question",
+        }
+        .to_string()
+    });
+}
+
+/// §5 auto-resolve for threads: a merged PR, or 7 days without activity while not working or
+/// waiting. A thread that was ever resolved keeps its `resolved_reason` when reopened, and is
+/// never auto-resolved again: the user reopened it on purpose.
+pub fn auto_resolve(row: &mut SessionRow, now: i64) {
+    if row.role != Role::Thread.as_str() || row.resolved || row.resolved_reason.is_some() {
+        return;
+    }
+    let reason = if row.pr_state.as_deref() == Some("MERGED") {
+        "merged"
+    } else if now - row.last_activity_at >= INACTIVE_MS
+        && !matches!(
+            Group::parse(&row.group_name),
+            Some(Group::Working | Group::Waiting)
+        )
+    {
+        "inactive"
+    } else {
+        return;
+    };
+    row.resolved = true;
+    row.resolved_reason = Some(reason.to_string());
+    rederive(row);
+}
+
+/// Applies one `claude agents` snapshot to a row. Returns whether the row changed.
+pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], now: i64) -> bool {
+    // Not spawned yet: nothing in the snapshot can be this session.
+    if row.short_id.is_none() && row.session_id.is_none() {
+        return false;
+    }
+    let before = row.clone();
+    let found = match (&row.session_id, &row.short_id) {
+        (Some(sid), _) => snapshot.iter().find(|a| &a.session_id == sid),
+        (None, Some(short)) => snapshot.iter().find(|a| a.id.as_ref() == Some(short)),
+        (None, None) => None,
+    };
+    match found {
+        Some(a) => {
+            if row.session_id.is_none() {
+                row.session_id = Some(a.session_id.clone());
+            }
+            if row.short_id.is_none() {
+                row.short_id = a.id.clone();
+            }
+            row.cc_state = a.state.clone();
+            row.cc_status = a.status.clone();
+            row.pid = a.pid;
+            row.cc_fresh = true;
+        }
+        None => {
+            // Gone from the supervisor: asleep, last cc_state kept for display.
+            row.pid = None;
+            row.cc_fresh = false;
+        }
+    }
+    rederive(row);
+    auto_resolve(row, now);
+    let changed = *row != before;
+    if changed {
+        row.updated_at = now;
+    }
+    changed
+}
+
+/// Writes a `claude agents` snapshot into every session of the project (one transaction).
+pub fn sync(conn: &Connection, project_slug: &str, snapshot: &[AgentRow], now: i64) -> Result<()> {
+    db::immediate(conn, |conn| {
+        for mut row in db::list_sessions(conn, project_slug, None)? {
+            if sync_row(&mut row, snapshot, now) {
+                db::update_session(conn, &row)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Resolves (`reason` = user | coordinator) or reopens a session. Reopening counts as activity so
+/// the inactivity rule doesn't fire again right away.
+pub fn set_resolved(
+    conn: &Connection,
+    name: &str,
+    resolved: bool,
+    reason: &str,
+    now: i64,
+) -> Result<SessionRow> {
+    db::immediate(conn, |conn| {
+        let mut row = db::get_session(conn, name)?.with_context(|| format!("no session {name}"))?;
+        row.resolved = resolved;
+        if resolved {
+            row.resolved_reason = Some(reason.to_string());
+        } else {
+            row.last_activity_at = now;
+        }
+        row.updated_at = now;
+        rederive(&mut row);
+        db::update_session(conn, &row)?;
+        Ok(row)
+    })
+}
+
+/// A PR as `gh pr list --json url,state,isDraft,reviewDecision` reports it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrInfo {
+    pub url: String,
+    pub state: String,
+    pub draft: bool,
+    /// Empty `reviewDecision` from gh is None.
+    pub review: Option<String>,
+}
+
+/// Stores a session's PR status (None: no PR for its branch) and applies auto-resolve.
+pub fn set_pr(conn: &Connection, name: &str, pr: Option<&PrInfo>, now: i64) -> Result<SessionRow> {
+    db::immediate(conn, |conn| {
+        let mut row = db::get_session(conn, name)?.with_context(|| format!("no session {name}"))?;
+        let before = row.clone();
+        row.pr_url = pr.map(|p| p.url.clone());
+        row.pr_state = pr.map(|p| p.state.clone());
+        row.pr_draft = pr.map(|p| p.draft);
+        row.pr_review = pr.and_then(|p| p.review.clone()).filter(|r| !r.is_empty());
+        rederive(&mut row);
+        auto_resolve(&mut row, now);
+        if row != before {
+            row.updated_at = now;
+            db::update_session(conn, &row)?;
+        }
+        Ok(row)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+
+    fn setup() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("chief.db")).unwrap();
+        db::register_project(&conn, "demo", dir.path(), 0).unwrap();
+        (dir, conn)
+    }
+
+    fn snapshot() -> Vec<AgentRow> {
+        let json = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agents/agents-sample.json"
+        ))
+        .unwrap();
+        crate::claude::parse_agents(&json).unwrap()
+    }
+
+    fn thread(name: &str, short: Option<&str>, sid: Option<&str>, now: i64) -> SessionRow {
+        let mut r = SessionRow::new(name, "demo", Role::Thread, now);
+        r.short_id = short.map(str::to_string);
+        r.session_id = sid.map(str::to_string);
+        r
+    }
+
+    #[test]
+    fn sync_matches_by_session_id_and_short_id() {
+        let (_dir, conn) = setup();
+        let now = 1_792_940_700_000;
+        let rows = [
+            // matched by full session id
+            thread(
+                "demo-hello-txt-1a2b",
+                Some("f8627ea8"),
+                Some("f8627ea8-50af-4cce-b12d-936669f85ed0"),
+                now,
+            ),
+            // session id not resolved yet: matched by short id
+            thread("demo-curl-check-9f8e", Some("bf6db904"), None, now),
+            // listed without a pid: asleep
+            thread(
+                "demo-asleep-thread-77aa",
+                Some("0a1b2c3d"),
+                Some("0a1b2c3d-1111-4222-8333-944455556666"),
+                now,
+            ),
+            // not in the snapshot at all
+            thread("demo-vanished-0000", Some("deadbeef"), Some("gone"), now),
+            // not spawned yet
+            thread("demo-pending-1111", None, None, now),
+        ];
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, now);
+        coord.short_id = Some("20dc103a".into());
+        db::insert_session(&conn, &coord).unwrap();
+        for r in &rows {
+            db::insert_session(&conn, r).unwrap();
+        }
+        let mut vanished = db::get_session(&conn, "demo-vanished-0000")
+            .unwrap()
+            .unwrap();
+        vanished.pid = Some(1);
+        vanished.cc_state = Some("working".into());
+        vanished.last_hook = Some("Stop".into());
+        db::update_session(&conn, &vanished).unwrap();
+
+        sync(&conn, "demo", &snapshot(), now + 1).unwrap();
+        let get = |n: &str| db::get_session(&conn, n).unwrap().unwrap();
+
+        let a = get("demo-hello-txt-1a2b");
+        assert_eq!(
+            (a.cc_state.as_deref(), a.cc_status.as_deref()),
+            (Some("working"), Some("busy"))
+        );
+        assert_eq!(
+            (a.pid, a.cc_fresh, a.group_name.as_str()),
+            (Some(93669), true, "working")
+        );
+        assert_eq!(a.updated_at, now + 1);
+
+        let b = get("demo-curl-check-9f8e");
+        assert_eq!(
+            b.session_id.as_deref(),
+            Some("bf6db904-3919-4adc-956d-c30266432600")
+        );
+        assert_eq!(
+            (b.group_name.as_str(), b.waiting_reason.as_deref()),
+            ("waiting", Some("question"))
+        );
+
+        let c = get("chief-demo");
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("20dc103a-4f18-4895-8bae-4454c193c7e6")
+        );
+        assert_eq!((c.group_name.as_str(), c.pid), ("idle", Some(74112)));
+
+        let d = get("demo-asleep-thread-77aa");
+        assert_eq!(
+            (d.group_name.as_str(), d.pid, d.cc_state.as_deref()),
+            ("idle", None, Some("done"))
+        );
+
+        let v = get("demo-vanished-0000");
+        assert_eq!((v.pid, v.cc_fresh), (None, false));
+        assert_eq!(v.cc_state.as_deref(), Some("working"), "last cc_state kept");
+        assert_eq!(v.group_name, "idle", "provisional from the Stop hook");
+
+        let p = get("demo-pending-1111");
+        assert_eq!(p, rows[4], "unspawned rows are untouched");
+
+        // A second identical sync changes nothing.
+        let before = db::list_sessions(&conn, "demo", None).unwrap();
+        sync(&conn, "demo", &snapshot(), now + 2).unwrap();
+        assert_eq!(db::list_sessions(&conn, "demo", None).unwrap(), before);
+    }
+
+    #[test]
+    fn auto_resolve_rules() {
+        let now = 100 * DAY;
+        let mk = |pr: Option<&str>, idle_days: i64, cc: &str, role: Role| {
+            let mut r = SessionRow::new("t", "demo", role, now - idle_days * DAY);
+            r.short_id = Some("x".into());
+            r.pr_state = pr.map(str::to_string);
+            r.cc_state = Some(cc.to_string());
+            r.cc_fresh = true;
+            r
+        };
+        let cases = [
+            (
+                "merged",
+                mk(Some("MERGED"), 0, "done", Role::Thread),
+                Some("merged"),
+            ),
+            (
+                "merged while working",
+                mk(Some("MERGED"), 0, "working", Role::Thread),
+                Some("merged"),
+            ),
+            (
+                "idle 7 days",
+                mk(None, 7, "done", Role::Thread),
+                Some("inactive"),
+            ),
+            ("idle 6 days", mk(None, 6, "done", Role::Thread), None),
+            ("working 8 days", mk(None, 8, "working", Role::Thread), None),
+            ("blocked 8 days", mk(None, 8, "blocked", Role::Thread), None),
+            (
+                "open PR 8 days",
+                mk(Some("OPEN"), 8, "done", Role::Thread),
+                Some("inactive"),
+            ),
+            (
+                "coordinator",
+                mk(Some("MERGED"), 30, "done", Role::Coordinator),
+                None,
+            ),
+        ];
+        for (name, mut row, want) in cases {
+            rederive(&mut row);
+            auto_resolve(&mut row, now);
+            assert_eq!(row.resolved_reason.as_deref(), want, "{name}");
+            assert_eq!(row.resolved, want.is_some(), "{name}");
+            if want.is_some() {
+                assert_eq!(row.group_name, "resolved", "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn reopened_threads_stay_open() {
+        let (_dir, conn) = setup();
+        let now = 100 * DAY;
+        let mut r = thread("t", Some("x"), None, now - 30 * DAY);
+        r.pr_state = Some("MERGED".into());
+        db::insert_session(&conn, &r).unwrap();
+
+        sync(&conn, "demo", &[], now).unwrap();
+        let row = db::get_session(&conn, "t").unwrap().unwrap();
+        assert_eq!(
+            (row.resolved, row.resolved_reason.as_deref()),
+            (true, Some("merged"))
+        );
+
+        let row = set_resolved(&conn, "t", false, "user", now).unwrap();
+        assert!(!row.resolved);
+        assert_eq!(row.last_activity_at, now);
+        assert_eq!(row.group_name, "idle");
+
+        sync(&conn, "demo", &[], now + 30 * DAY).unwrap();
+        assert!(!db::get_session(&conn, "t").unwrap().unwrap().resolved);
+
+        let row = set_resolved(&conn, "t", true, "coordinator", now).unwrap();
+        assert_eq!(
+            (row.group_name.as_str(), row.resolved_reason.as_deref()),
+            ("resolved", Some("coordinator"))
+        );
+        assert!(set_resolved(&conn, "nope", true, "user", now).is_err());
+    }
+
+    #[test]
+    fn pr_status_drives_groups() {
+        let (_dir, conn) = setup();
+        let now = DAY;
+        let mut r = thread("t", Some("x"), None, now);
+        r.cc_state = Some("done".into());
+        r.cc_fresh = true;
+        db::insert_session(&conn, &r).unwrap();
+
+        let mut pr = PrInfo {
+            url: "https://github.com/o/r/pull/1".into(),
+            state: "OPEN".into(),
+            draft: true,
+            review: Some(String::new()),
+        };
+        let row = set_pr(&conn, "t", Some(&pr), now).unwrap();
+        assert_eq!(
+            (row.group_name.as_str(), row.pr_review.as_deref()),
+            ("idle", None)
+        );
+        pr.draft = false;
+        assert_eq!(
+            set_pr(&conn, "t", Some(&pr), now).unwrap().group_name,
+            "review"
+        );
+        pr.review = Some("APPROVED".into());
+        assert_eq!(
+            set_pr(&conn, "t", Some(&pr), now).unwrap().group_name,
+            "landing"
+        );
+        pr.state = "MERGED".into();
+        let row = set_pr(&conn, "t", Some(&pr), now).unwrap();
+        assert_eq!(
+            (row.group_name.as_str(), row.resolved_reason.as_deref()),
+            ("resolved", Some("merged"))
+        );
+        let row = set_pr(&conn, "t", None, now).unwrap();
+        assert_eq!((row.pr_url, row.pr_draft), (None, None));
+    }
+}
