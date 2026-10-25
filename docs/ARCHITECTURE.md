@@ -325,7 +325,7 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 
 | Caller | Tool | Rule |
 | --- | --- | --- |
-| any | `ListAgents` | deny: "Use the chief list_threads tool; it lists only this project's threads." |
+| any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
 | coordinator | `SendMessage` | allow only if `to` (with any trailing ` [ref]` removed) is the name of a thread in this project, not resolved, and alive (pid in a fresh `claude agents` snapshot). Asleep → deny: "Thread is asleep: call wake_thread first." Resolved → deny: "Thread is resolved; reopen it first." Also allow `to = uds:…/<pid>.sock` when `<pid>` is a live thread of this project (a reply). Everything else → deny |
 | thread | `SendMessage` | deny if `to` starts with `uds:` and the pid is not this project's coordinator; deny if `to` (ref removed) equals the name of any live session in `claude agents` other than this project's coordinator; allow otherwise (the thread's own subagents) |
 

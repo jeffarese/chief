@@ -38,6 +38,9 @@ pub enum Decision {
 
 pub const LIST_AGENTS_DENIED: &str =
     "Use the chief list_threads tool; it lists only this project's threads.";
+/// Threads have no list_threads tool, so they get a different pointer.
+pub const THREAD_LIST_AGENTS_DENIED: &str =
+    "ListAgents is blocked in chief threads: you can message only your coordinator.";
 pub const ASLEEP: &str = "Thread is asleep: call wake_thread first.";
 pub const RESOLVED: &str = "Thread is resolved; reopen it first.";
 
@@ -45,7 +48,13 @@ pub const RESOLVED: &str = "Thread is resolved; reopen it first.";
 /// matcher never sends them here.
 pub fn evaluate(input: &GuardInput) -> Decision {
     match input.tool {
-        "ListAgents" => return Decision::Deny(LIST_AGENTS_DENIED.to_string()),
+        "ListAgents" => {
+            let reason = match input.role {
+                Role::Coordinator => LIST_AGENTS_DENIED,
+                Role::Thread => THREAD_LIST_AGENTS_DENIED,
+            };
+            return Decision::Deny(reason.to_string());
+        }
         "SendMessage" => {}
         _ => return Decision::Allow,
     }
@@ -257,7 +266,7 @@ mod tests {
         let cases: Vec<Case> = vec![
             // ListAgents: denied for everyone.
             (C, "ListAgents", None, cp, Deny("list_threads")),
-            (T, "ListAgents", None, cp, Deny("list_threads")),
+            (T, "ListAgents", None, cp, Deny("only your coordinator")),
             // Other tools never reach the guard; allow them.
             (C, "Read", None, cp, Allow),
             // Missing `to`.
