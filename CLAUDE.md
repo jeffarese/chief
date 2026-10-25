@@ -1,0 +1,28 @@
+# chief
+
+Local Claude Projects: a coordinator Claude session, background Claude Code threads, and a ratatui
+board. Read `docs/ARCHITECTURE.md` before changing anything; it is the contract. `docs/PLAN.md` has
+the milestones.
+
+## Rules
+
+- `docs/ARCHITECTURE.md` wins over code. If the code must differ, update the doc in the same commit.
+- Hook commands (`chief hook …`) must never block or fail a Claude session: exit 0, keep stdout empty
+  except the guard decision and the coordinator's context, log errors to `<root>/logs/hook-errors.log`.
+- Never call `claude --bg --resume <id>` with extra arguments; revive with `claude respawn <id>`.
+- Never start real Claude sessions from unit or integration tests. Use `CHIEF_CLAUDE_BIN` with a fake
+  script and `CHIEF_HOME` with a temp dir. Only `scripts/e2e.sh` starts real sessions.
+- Use `ratatui::crossterm`, not a separate crossterm dependency.
+- Match the surrounding code: small modules, plain functions, `anyhow::Result` at the edges,
+  `thiserror` only where callers match on errors. Comments explain why, not what.
+
+## Commands
+
+Before `cargo`, run `. ~/.cargo/env` if `cargo` isn't on PATH.
+
+- `cargo build`
+- `cargo test` (run targeted tests first: `cargo test state::`)
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo fmt`
+
+A milestone is done when build, tests, clippy and fmt are clean.

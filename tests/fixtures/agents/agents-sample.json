@@ -1,0 +1,53 @@
+[
+  {
+    "id": "f8627ea8",
+    "cwd": "/tmp/chief-fixture/repo",
+    "kind": "background",
+    "startedAt": 1792940000000,
+    "sessionId": "f8627ea8-50af-4cce-b12d-936669f85ed0",
+    "name": "demo-hello-txt-1a2b",
+    "state": "working",
+    "status": "busy",
+    "pid": 93669
+  },
+  {
+    "id": "bf6db904",
+    "cwd": "/tmp/chief-fixture/repo",
+    "kind": "background",
+    "startedAt": 1792940100000,
+    "sessionId": "bf6db904-3919-4adc-956d-c30266432600",
+    "name": "demo-curl-check-9f8e",
+    "state": "blocked",
+    "status": "waiting",
+    "pid": 80760
+  },
+  {
+    "id": "20dc103a",
+    "cwd": "/tmp/chief-fixture/project",
+    "kind": "background",
+    "startedAt": 1792939900000,
+    "sessionId": "20dc103a-4f18-4895-8bae-4454c193c7e6",
+    "name": "chief-demo",
+    "state": "done",
+    "status": "idle",
+    "pid": 74112
+  },
+  {
+    "id": "0a1b2c3d",
+    "cwd": "/tmp/chief-fixture/repo",
+    "kind": "background",
+    "startedAt": 1792930000000,
+    "sessionId": "0a1b2c3d-1111-4222-8333-944455556666",
+    "name": "demo-asleep-thread-77aa",
+    "state": "done"
+  },
+  {
+    "pid": 70003,
+    "cwd": "/tmp/chief-fixture/elsewhere",
+    "kind": "interactive",
+    "startedAt": 1792940667303,
+    "sessionId": "2f947ae1-32e1-414f-bafc-4e275206adde",
+    "name": "some-other-project",
+    "status": "busy"
+  }
+]
