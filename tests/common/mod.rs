@@ -95,9 +95,10 @@ pub fn agent(
         "startedAt": 1,
         "state": state,
     });
+    // A live process reports busy while it works (ARCHITECTURE §5 rule 5).
     if let Some(pid) = pid {
         v["pid"] = pid.into();
-        v["status"] = "idle".into();
+        v["status"] = if state == "working" { "busy" } else { "idle" }.into();
     }
     v
 }
