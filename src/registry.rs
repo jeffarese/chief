@@ -25,10 +25,20 @@ pub fn facts(row: &SessionRow) -> Facts<'_> {
         cc_state,
         cc_status,
         last_hook: row.last_hook.as_deref().and_then(HookKind::from_stored),
+        process_gone: process_gone(row),
         pr_state: row.pr_state.as_deref(),
         pr_draft: row.pr_draft.unwrap_or(false),
         pr_review: row.pr_review.as_deref(),
     }
+}
+
+/// No pid, and a snapshot taken at or after the last hook said so. A newer hook (a respawn
+/// starting a turn) makes the row count as running again until the next poll.
+pub fn process_gone(row: &SessionRow) -> bool {
+    row.pid.is_none()
+        && row
+            .gone_at
+            .is_some_and(|gone| row.last_hook_at.is_none_or(|hook| hook <= gone))
 }
 
 /// Recomputes `group_name` and `waiting_reason` from the row.
@@ -106,6 +116,10 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now:
             row.pid = None;
             row.cc_fresh = false;
         }
+    }
+    // Only when the verdict flips, so repeated polls of an asleep row don't rewrite it.
+    if !stale && row.pid.is_none() && !process_gone(row) {
+        row.gone_at = Some(taken_at);
     }
     rederive(row);
     auto_resolve(row, now);
@@ -360,6 +374,64 @@ mod tests {
         let mut done = row.clone();
         sync_row(&mut done, &snap, 101, 110);
         assert_eq!((done.cc_fresh, done.group_name.as_str()), (true, "idle"));
+    }
+
+    #[test]
+    fn a_thread_that_died_mid_turn_is_not_working() {
+        let (_dir, conn) = setup();
+        let mut row = thread("t", Some("x"), Some("sid-x"), 0);
+        row.pid = Some(7);
+        row.last_hook = Some("PreToolUse".into());
+        row.last_hook_at = Some(100);
+        rederive(&mut row);
+        assert_eq!(row.group_name, "working");
+        db::insert_session(&conn, &row).unwrap();
+        let get = || db::get_session(&conn, "t").unwrap().unwrap();
+
+        // A snapshot from before the hook proves nothing.
+        sync(&conn, "demo", &[], 90, 110).unwrap();
+        assert_eq!((get().group_name.as_str(), get().pid), ("working", Some(7)));
+
+        // A later snapshot without it: the process is gone.
+        sync(&conn, "demo", &[], 150, 160).unwrap();
+        let r = get();
+        assert_eq!(
+            (r.group_name.as_str(), r.pid, r.gone_at),
+            ("idle", None, Some(150))
+        );
+        let before = get();
+        sync(&conn, "demo", &[], 170, 180).unwrap();
+        assert_eq!(get(), before, "repeated polls change nothing");
+
+        // Listed without a pid while its stale state still says working: also gone.
+        let mut listed = snapshot()[3].clone();
+        listed.session_id = "sid-x".into();
+        listed.state = Some("working".into());
+        sync(&conn, "demo", &[listed], 190, 200).unwrap();
+        assert_eq!(get().group_name, "idle");
+
+        // A respawn starts a turn: the newer hook counts as working until the next poll.
+        let mut r = get();
+        r.last_hook_at = Some(300);
+        r.cc_fresh = false;
+        rederive(&mut r);
+        assert_eq!(r.group_name, "working");
+        db::update_session(&conn, &r).unwrap();
+        sync(&conn, "demo", &[], 250, 310).unwrap();
+        assert_eq!(get().group_name, "working", "stale snapshot");
+        sync(&conn, "demo", &[], 320, 330).unwrap();
+        assert_eq!(get().group_name, "idle");
+
+        // Pending permission and an open PR still win over "gone".
+        let mut r = get();
+        r.pending_permission = true;
+        rederive(&mut r);
+        assert_eq!(r.group_name, "waiting");
+        r.pending_permission = false;
+        r.pr_state = Some("OPEN".into());
+        r.pr_draft = Some(false);
+        rederive(&mut r);
+        assert_eq!(r.group_name, "review");
     }
 
     #[test]

@@ -188,7 +188,8 @@ CREATE TABLE sessions (                   -- coordinator and threads
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL,
   last_activity_at INTEGER NOT NULL,
-  last_hook_at    INTEGER                 -- when last_hook ran (migration 2); see §5 sync
+  last_hook_at    INTEGER,                -- when last_hook ran (migration 2); see §5 sync
+  gone_at         INTEGER                 -- when a snapshot no older than the last hook showed no process (migration 3)
 );
 
 CREATE TABLE events (
@@ -267,7 +268,7 @@ Derivation, first match wins (inputs: the row plus the latest `claude agents` sn
 2. `cc_state = failed` → **failed**
 3. `pending_permission = 1` → **waiting**, reason `permission`
 4. `cc_state = blocked` → **waiting**, reason `question`
-5. `cc_state = working` or `cc_status = busy` → **working**
+5. `cc_state = working` or `cc_status = busy` → **working**, unless the process is gone (below)
 6. `pr_state = OPEN` and `pr_review = APPROVED` → **landing**
 7. `pr_state = OPEN` and not draft → **review**
 8. anything else → **idle** (the board marks it "asleep" when `pid` is NULL)
@@ -294,6 +295,15 @@ A snapshot taken before a row's last hook (`last_hook_at` > taken-at) is stale f
 `cc_fresh = 0` and its `cc_state`/`cc_status`, so the hook's provisional group stands. Ids are still
 learned, a matched row still takes the snapshot's `pid`, and an unmatched row keeps its `pid` (the
 newer hook proves the process ran). Every hook in the table above sets `last_hook_at`.
+
+A thread whose process died mid-turn drops out of `claude agents` (or stays listed without a pid),
+and its last hook would keep it provisionally working forever. So a non-stale snapshot that shows
+no process sets `gone_at` = taken-at (only when the verdict changes, so repeated polls don't rewrite
+the row), and the row counts as **process gone** while `pid` is NULL and `gone_at` ≥
+`last_hook_at`. A process-gone row never matches rule 5, neither from `cc_state`/`cc_status` nor
+from the provisional working hooks; rules 1–4 and 6–8 still apply, so it shows as waiting
+(pending permission), review/landing (open PR), resolved, or idle/asleep. A newer hook (e.g. a
+respawn starting a turn) makes it count as running again until the next non-stale poll.
 
 Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Failed, Resolved.
 

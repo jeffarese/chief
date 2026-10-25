@@ -157,6 +157,9 @@ pub struct Facts<'a> {
     pub cc_state: Option<&'a str>,
     pub cc_status: Option<&'a str>,
     pub last_hook: Option<HookKind>,
+    /// A snapshot no older than the last hook showed no process: nothing can be running, so
+    /// rule 5 can't match (a thread that died mid-turn isn't "working" forever).
+    pub process_gone: bool,
     pub pr_state: Option<&'a str>,
     pub pr_draft: bool,
     pub pr_review: Option<&'a str>,
@@ -203,7 +206,7 @@ pub fn derive(facts: &Facts) -> Derived {
         Some(state) => state == "working",
         None => facts.last_hook.is_some_and(HookKind::means_working),
     };
-    if working || facts.cc_status == Some("busy") {
+    if !facts.process_gone && (working || facts.cc_status == Some("busy")) {
         return Derived::group(Group::Working);
     }
     if facts.pr_state == Some("OPEN") {
@@ -427,6 +430,48 @@ mod tests {
                     ..base()
                 },
                 Idle,
+                None,
+            ),
+            (
+                "no process: a working hook doesn't count",
+                Facts {
+                    last_hook: Some(PreToolUse),
+                    process_gone: true,
+                    ..base()
+                },
+                Idle,
+                None,
+            ),
+            (
+                "no process: a stale working state doesn't count",
+                Facts {
+                    cc_state: Some("working"),
+                    process_gone: true,
+                    ..base()
+                },
+                Idle,
+                None,
+            ),
+            (
+                "no process: permission still waits",
+                Facts {
+                    last_hook: Some(PreToolUse),
+                    pending_permission: true,
+                    process_gone: true,
+                    ..base()
+                },
+                Waiting,
+                Some(Permission),
+            ),
+            (
+                "no process: an open PR shows in review",
+                Facts {
+                    last_hook: Some(PostToolUse),
+                    pr_state: Some("OPEN"),
+                    process_gone: true,
+                    ..base()
+                },
+                Review,
                 None,
             ),
             (

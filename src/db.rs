@@ -87,6 +87,9 @@ CREATE TABLE ui_state (
     // When the last state-changing hook ran, so an older `claude agents` snapshot can't
     // overwrite it (§5).
     "ALTER TABLE sessions ADD COLUMN last_hook_at INTEGER;",
+    // When a snapshot no older than the last hook showed no process, so a thread that died
+    // mid-turn stops counting as working (§5).
+    "ALTER TABLE sessions ADD COLUMN gone_at INTEGER;",
 ];
 
 /// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
@@ -164,6 +167,8 @@ pub struct SessionRow {
     pub last_hook: Option<String>,
     /// When `last_hook` ran (unix ms).
     pub last_hook_at: Option<i64>,
+    /// When a `claude agents` snapshot taken at or after `last_hook_at` showed no process.
+    pub gone_at: Option<i64>,
     pub pending_permission: bool,
     pub group_name: String,
     pub waiting_reason: Option<String>,
@@ -200,7 +205,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     repo_name, repo_path, cwd, branch, model, effort, cc_state, cc_status, cc_fresh, pid, \
     last_hook, pending_permission, group_name, waiting_reason, resolved, resolved_reason, pr_url, \
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
-    last_activity_at, last_hook_at";
+    last_activity_at, last_hook_at, gone_at";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -237,6 +242,7 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         updated_at: r.get(30)?,
         last_activity_at: r.get(31)?,
         last_hook_at: r.get(32)?,
+        gone_at: r.get(33)?,
     })
 }
 
@@ -271,7 +277,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32, ?33)"
+         ?29, ?30, ?31, ?32, ?33, ?34)"
     );
     conn.execute(
         &sql,
@@ -309,6 +315,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.updated_at,
             s.last_activity_at,
             s.last_hook_at,
+            s.gone_at,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -326,7 +333,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            last_hook = ?18, pending_permission = ?19, group_name = ?20, waiting_reason = ?21,
            resolved = ?22, resolved_reason = ?23, pr_url = ?24, pr_state = ?25, pr_draft = ?26,
            pr_review = ?27, last_report = ?28, last_report_at = ?29, created_at = ?30,
-           updated_at = ?31, last_activity_at = ?32, last_hook_at = ?33
+           updated_at = ?31, last_activity_at = ?32, last_hook_at = ?33,
+           gone_at = ?34
          WHERE name = ?1",
             params![
                 s.name,
@@ -362,6 +370,7 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.updated_at,
                 s.last_activity_at,
                 s.last_hook_at,
+                s.gone_at,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
