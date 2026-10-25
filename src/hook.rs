@@ -10,32 +10,40 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 
+use crate::claude::{AgentRow, Claude};
 use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::state::{HookKind, Role};
-use crate::{paths, registry};
+use crate::text::{local_hhmm, one_line};
+use crate::{context, guard, names, paths, registry, tools};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The guard holds up a tool call and the context a turn; neither may hang on the supervisor.
+const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTEXT_AGENTS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUMMARY_CHARS: usize = 120;
 
 /// Entry point. Reads the payload from stdin, never panics, never returns an error: failures are
 /// appended to the hook error log. Prints only the guard decision or the coordinator's
-/// UserPromptSubmit context.
+/// UserPromptSubmit context. The guard fails closed: any error or panic in it denies.
 pub fn run(event: &str, project: &str, role: Role) {
     // The default panic hook writes to stderr, which Claude Code may show in the session.
     std::panic::set_hook(Box::new(|_| {}));
-    let error = match std::panic::catch_unwind(AssertUnwindSafe(|| dispatch(event, project, role)))
-    {
-        Ok(Ok(Some(out))) => {
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(out.as_bytes());
-            let _ = stdout.flush();
-            None
-        }
-        Ok(Ok(None)) => None,
-        Ok(Err(e)) => Some(format!("{e:#}")),
-        Err(panic) => Some(format!("panic: {}", panic_message(&*panic))),
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| dispatch(event, project, role)));
+    let (out, error) = match result {
+        Ok(Ok(out)) => (out, None),
+        Ok(Err(e)) => (None, Some(format!("{e:#}"))),
+        Err(panic) => (None, Some(format!("panic: {}", panic_message(&*panic)))),
     };
+    let out = match (&error, event) {
+        (Some(error), "guard") => Some(guard_failed(project, error)),
+        _ => out,
+    };
+    if let Some(out) = out {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(out.as_bytes());
+        let _ = stdout.flush();
+    }
     if let Some(error) = error {
         log_error(&paths::hook_error_log(), event, project, &error);
     }
@@ -64,12 +72,148 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
             send_notice(notice);
         }
     }
-    Ok(outcome.stdout)
+    if role == Role::Coordinator && event == "UserPromptSubmit" {
+        return coordinator_context(&conn, project).map(Some);
+    }
+    Ok(None)
 }
 
+/// §6: gathers the registry rows and a fresh `claude agents` snapshot, decides, and records a
+/// denial. Returns the deny JSON, or None to allow.
 fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
-    let _ = (project, role, input);
-    todo!("M2: §6 message guard")
+    let payload: Value = serde_json::from_str(input).context("parsing the hook payload")?;
+    let tool = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .context("the payload has no tool_name")?;
+    let to = payload
+        .get("tool_input")
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("to"))
+        .and_then(Value::as_str);
+    let conn = db::open(&paths::db())?;
+    let rows = db::list_sessions(&conn, project, None)?;
+    // Only a SendMessage with an address needs to know who is alive.
+    let snapshot = if tool == "SendMessage" && to.is_some() {
+        Claude::from_env().agents_within(GUARD_AGENTS_TIMEOUT)?
+    } else {
+        Vec::new()
+    };
+    let decision = guard_decision(project, role, tool, to, &rows, &snapshot);
+    let guard::Decision::Deny(reason) = decision else {
+        return Ok(None);
+    };
+    let caller = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
+        .map(|r| r.name.clone());
+    db::insert_guard_denial(
+        &conn,
+        &db::GuardDenial {
+            project_slug: project.to_string(),
+            session_name: caller,
+            tool: tool.to_string(),
+            target: to.map(str::to_string),
+            reason: reason.clone(),
+            ts: db::now_ms(),
+        },
+    )?;
+    Ok(Some(guard::deny_json(&reason)))
+}
+
+/// The §6 decision from the project's registry rows and a `claude agents` snapshot. A row is
+/// alive when the snapshot lists it with a pid.
+pub fn guard_decision(
+    project: &str,
+    role: Role,
+    tool: &str,
+    to: Option<&str>,
+    rows: &[SessionRow],
+    snapshot: &[AgentRow],
+) -> guard::Decision {
+    let pid_of = |row: &SessionRow| {
+        snapshot
+            .iter()
+            .find(|a| match (&row.session_id, &row.short_id) {
+                (Some(sid), _) => &a.session_id == sid,
+                (None, Some(short)) => a.id.as_ref() == Some(short),
+                (None, None) => false,
+            })
+            .and_then(|a| a.pid)
+    };
+    let threads: Vec<_> = rows
+        .iter()
+        .filter(|r| r.role == Role::Thread.as_str())
+        .map(|r| guard::ProjectThread {
+            name: r.name.clone(),
+            resolved: r.resolved,
+            pid: pid_of(r),
+        })
+        .collect();
+    let coordinator_pid = rows
+        .iter()
+        .find(|r| r.role == Role::Coordinator.as_str())
+        .and_then(pid_of);
+    let live: Vec<_> = snapshot
+        .iter()
+        .map(|a| guard::LiveSession {
+            name: a.name.clone(),
+            pid: a.pid,
+        })
+        .collect();
+    let coordinator_name = names::coordinator_name(project);
+    guard::evaluate(&guard::GuardInput {
+        role,
+        tool,
+        to,
+        coordinator_name: &coordinator_name,
+        coordinator_pid,
+        threads: &threads,
+        live: &live,
+    })
+}
+
+/// The deny JSON for a guard that couldn't decide, recorded if the database still opens.
+fn guard_failed(project: &str, error: &str) -> String {
+    let reason = format!("chief's message guard failed, so the message is blocked: {error}");
+    if let Ok(conn) = db::open(&paths::db()) {
+        let _ = db::insert_guard_denial(
+            &conn,
+            &db::GuardDenial {
+                project_slug: project.to_string(),
+                session_name: None,
+                tool: "unknown".to_string(),
+                target: None,
+                reason: reason.clone(),
+                ts: db::now_ms(),
+            },
+        );
+    }
+    guard::deny_json(&reason)
+}
+
+/// §8: refreshes the board from `claude agents` (bounded; stored rows if it fails) and returns
+/// the UserPromptSubmit output with the board snapshot and MEMORY.md.
+fn coordinator_context(conn: &Connection, project: &str) -> Result<String> {
+    let taken_at = db::now_ms();
+    let refreshed = Claude::from_env()
+        .agents_within(CONTEXT_AGENTS_TIMEOUT)
+        .and_then(|snapshot| registry::sync(conn, project, &snapshot, taken_at, db::now_ms()));
+    if let Err(e) = refreshed {
+        log_error(
+            &paths::hook_error_log(),
+            "UserPromptSubmit",
+            project,
+            &format!("board refresh failed, using stored rows: {e:#}"),
+        );
+    }
+    let mut threads = db::list_sessions(conn, project, Some(Role::Thread))?;
+    tools::board_order(&mut threads);
+    let memory = std::fs::read_to_string(paths::project_dir(project).join("memory/MEMORY.md"))
+        .unwrap_or_default();
+    let text = context::coordinator_context(&threads, &memory, &local_hhmm(db::now_ms()));
+    Ok(context::hook_output(&text))
 }
 
 /// What `handle` needs from the outside world, passed in so tests can replay fixtures.
@@ -87,8 +231,6 @@ pub struct Outcome {
     /// The matched session, if any.
     pub session: Option<String>,
     pub notices: Vec<Notice>,
-    /// Text for stdout (M2: the coordinator's UserPromptSubmit context).
-    pub stdout: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +324,7 @@ fn apply(
 ) -> Option<String> {
     let str_field = |k: &str| payload.get(k).and_then(Value::as_str);
     row.last_hook = Some(kind.as_str().to_string());
+    row.last_hook_at = Some(now);
     row.cc_fresh = false;
     row.updated_at = now;
     if kind != HookKind::IdleNotification {
@@ -251,17 +394,6 @@ pub fn summary(event: &str, payload: &Value) -> String {
         _ => String::new(),
     };
     one_line(&text, SUMMARY_CHARS)
-}
-
-/// Collapses whitespace and cuts to `max` chars with an ellipsis.
-fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        return flat;
-    }
-    let mut cut: String = flat.chars().take(max.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
 }
 
 /// `git -C <cwd> branch --show-current`; None on error, timeout, or a detached HEAD.
@@ -442,7 +574,6 @@ mod tests {
                 out.session.is_some(),
                 "every fixture hook matches a session"
             );
-            assert!(out.stdout.is_none(), "hooks print nothing in M1");
             notices.extend(out.notices);
             let sid = line.payload["session_id"].as_str().unwrap();
             let ntype = line.payload["notification_type"].as_str();
@@ -736,10 +867,51 @@ mod tests {
     }
 
     #[test]
-    fn one_line_cuts_and_flattens() {
-        assert_eq!(one_line("a\n  b\tc", 10), "a b c");
-        assert_eq!(one_line("abcdef", 4), "abc…");
-        assert_eq!(one_line("ééééé", 5), "ééééé");
+    fn guard_decision_uses_the_registry_and_the_snapshot() {
+        let snapshot = crate::claude::parse_agents(include_str!(
+            "../tests/fixtures/agents/agents-sample.json"
+        ))
+        .unwrap();
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.session_id = Some("20dc103a-4f18-4895-8bae-4454c193c7e6".into());
+        let mut live = SessionRow::new("demo-hello-txt-1a2b", "demo", Role::Thread, 0);
+        live.short_id = Some("f8627ea8".into()); // session id not resolved yet
+        let mut asleep = SessionRow::new("demo-asleep-thread-77aa", "demo", Role::Thread, 0);
+        asleep.session_id = Some("0a1b2c3d-1111-4222-8333-944455556666".into());
+        // Registered here but its pid in the snapshot belongs to another session id: a copy.
+        let mut copy = SessionRow::new("demo-curl-check-9f8e", "demo", Role::Thread, 0);
+        copy.session_id = Some("not-the-listed-one".into());
+        let rows = [coord, live, asleep, copy];
+        let decide = |role, to: &str| {
+            guard_decision("demo", role, "SendMessage", Some(to), &rows, &snapshot)
+        };
+        use guard::Decision::{Allow, Deny};
+        assert_eq!(decide(Role::Coordinator, "demo-hello-txt-1a2b"), Allow);
+        assert_eq!(
+            decide(Role::Coordinator, "uds:/tmp/cc-socks/93669.sock"),
+            Allow
+        );
+        assert_eq!(
+            decide(Role::Coordinator, "demo-asleep-thread-77aa"),
+            Deny(guard::ASLEEP.into())
+        );
+        assert_eq!(
+            decide(Role::Coordinator, "demo-curl-check-9f8e"),
+            Deny(guard::ASLEEP.into())
+        );
+        assert!(
+            matches!(decide(Role::Coordinator, "some-other-project"), Deny(r) if r.contains("not a thread of this project"))
+        );
+        assert_eq!(decide(Role::Thread, "chief-demo"), Allow);
+        assert_eq!(decide(Role::Thread, "uds:/tmp/cc-socks/74112.sock"), Allow);
+        assert!(matches!(
+            decide(Role::Thread, "some-other-project"),
+            Deny(_)
+        ));
+        assert!(matches!(
+            decide(Role::Thread, "uds:/tmp/cc-socks/70003.sock"),
+            Deny(_)
+        ));
     }
 
     #[test]

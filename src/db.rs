@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::state::Role;
 
 /// One entry per schema version; never edit a shipped entry, append a new one.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE projects (
   slug        TEXT PRIMARY KEY,
   dir         TEXT NOT NULL,
@@ -82,7 +83,11 @@ CREATE TABLE ui_state (
   project_slug TEXT PRIMARY KEY,
   pane_target  TEXT
 );
-"#];
+"#,
+    // When the last state-changing hook ran, so an older `claude agents` snapshot can't
+    // overwrite it (§5).
+    "ALTER TABLE sessions ADD COLUMN last_hook_at INTEGER;",
+];
 
 /// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
 /// migrates it to the latest schema.
@@ -157,6 +162,8 @@ pub struct SessionRow {
     pub cc_fresh: bool,
     pub pid: Option<u32>,
     pub last_hook: Option<String>,
+    /// When `last_hook` ran (unix ms).
+    pub last_hook_at: Option<i64>,
     pub pending_permission: bool,
     pub group_name: String,
     pub waiting_reason: Option<String>,
@@ -193,7 +200,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     repo_name, repo_path, cwd, branch, model, effort, cc_state, cc_status, cc_fresh, pid, \
     last_hook, pending_permission, group_name, waiting_reason, resolved, resolved_reason, pr_url, \
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
-    last_activity_at";
+    last_activity_at, last_hook_at";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -229,6 +236,7 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         created_at: r.get(29)?,
         updated_at: r.get(30)?,
         last_activity_at: r.get(31)?,
+        last_hook_at: r.get(32)?,
     })
 }
 
@@ -239,6 +247,15 @@ pub fn register_project(conn: &Connection, slug: &str, dir: &Path, now: i64) -> 
         params![slug, dir.to_string_lossy(), now],
     )?;
     Ok(())
+}
+
+/// Every registered project as (slug, dir), by slug.
+pub fn list_projects(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT slug, dir FROM projects ORDER BY slug")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// The project's folder, if registered.
@@ -254,7 +271,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32)"
+         ?29, ?30, ?31, ?32, ?33)"
     );
     conn.execute(
         &sql,
@@ -291,6 +308,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.created_at,
             s.updated_at,
             s.last_activity_at,
+            s.last_hook_at,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -308,7 +326,7 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            last_hook = ?18, pending_permission = ?19, group_name = ?20, waiting_reason = ?21,
            resolved = ?22, resolved_reason = ?23, pr_url = ?24, pr_state = ?25, pr_draft = ?26,
            pr_review = ?27, last_report = ?28, last_report_at = ?29, created_at = ?30,
-           updated_at = ?31, last_activity_at = ?32
+           updated_at = ?31, last_activity_at = ?32, last_hook_at = ?33
          WHERE name = ?1",
             params![
                 s.name,
@@ -343,10 +361,19 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.created_at,
                 s.updated_at,
                 s.last_activity_at,
+                s.last_hook_at,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
     anyhow::ensure!(n == 1, "no session named {}", s.name);
+    Ok(())
+}
+
+/// Removes a session that never started (a failed spawn), with its events and reports.
+pub fn delete_session(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("DELETE FROM events WHERE session_name = ?1", [name])?;
+    conn.execute("DELETE FROM reports WHERE session_name = ?1", [name])?;
+    conn.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
     Ok(())
 }
 

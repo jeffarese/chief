@@ -93,9 +93,22 @@ impl Claude {
 
     /// `claude agents --json --all`.
     pub fn agents(&self) -> Result<Vec<AgentRow>> {
+        self.agents_within(AGENTS_TIMEOUT)
+    }
+
+    /// `agents` with a shorter deadline, for hooks that hold up a session turn.
+    pub fn agents_within(&self, timeout: Duration) -> Result<Vec<AgentRow>> {
         let args: Vec<OsString> = vec!["agents".into(), "--json".into(), "--all".into()];
-        let out = self.run_ok(&args, None, AGENTS_TIMEOUT)?;
+        let out = self.run_ok(&args, None, timeout)?;
         parse_agents(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Runs `claude` in `cwd` on this terminal and waits for it to exit (for the trust prompt).
+    pub fn run_interactive(&self, cwd: &Path) -> Result<std::process::ExitStatus> {
+        Command::new(&self.bin)
+            .current_dir(cwd)
+            .status()
+            .with_context(|| format!("running {} in {}", self.bin.display(), cwd.display()))
     }
 
     /// Starts a background session and returns its short id.

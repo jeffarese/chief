@@ -51,7 +51,7 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 
 | Command | Started by | Job |
 | --- | --- | --- |
-| `chief init <name> [--goal …] [--repo PATH…]` | you | Create project files, check trust, register the project |
+| `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
 | `chief up <slug>` | you | Start or revive the coordinator, open the Rex layout |
 | `chief down <slug> [--stop-threads]` | you | Close the layout; threads keep running unless asked |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
@@ -63,7 +63,22 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision and the coordinator's
-UserPromptSubmit context.
+UserPromptSubmit context. The `claude agents` call inside the guard is bounded at 10 s, inside the
+coordinator's context at 5 s.
+
+`chief init` validates first (Claude Code version, name → slug with ≥1 letter or digit, slug not
+taken, every `--repo` an existing folder, stored canonical and named after its folder with `-2`, `-3`
+… on a clash) and leaves nothing behind on failure. It then lists every folder Claude Code doesn't
+trust yet: the project folder always, plus untrusted repos. When stdin and stdout are terminals
+(and without `--no-trust-prompt`) it asks for each "Open Claude there now to trust it? [Y/n]" and
+runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twice), then re-checks;
+otherwise it prints `cd <folder> && claude` for each.
+
+`chief up` checks the version, rewrites `generated/*`, then runs the coordinator step (§7). Until
+the layout lands (§9) it prints the coordinator's name and `claude attach <short_id>`.
+
+`chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
+each project's coordinator and threads grouped in board order.
 
 ## 3. Files
 
@@ -82,7 +97,28 @@ UserPromptSubmit context.
 ```
 
 `generated/*` is rewritten by `init`, `up` and whenever settings change. Commands inside them use the
-absolute path of the `chief` binary (`std::env::current_exe()`), so install with `cargo install --path .`.
+canonical absolute path of the `chief` binary (`std::env::current_exe()`), so install with
+`cargo install --path .`. Every word of a hook command is shell-quoted.
+
+Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so the
+variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY`, when set at
+generation time, are written into the files: as `K='v'` prefixes on every hook command and in the
+MCP server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN` without a slash is
+kept for PATH lookup).
+
+- `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
+  SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
+  `SendMessage|ListAgents`, `chief hook guard`), PostToolUse (matcher `*`), Notification, Stop,
+  SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`.
+  The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and
+  `"permissions": {"allow": ["mcp__chief"]}` (nobody watches its background session for prompts
+  on its own tools).
+- `mcp.json`: `{"mcpServers": {"chief": {"type": "stdio", "command": <chief>, "args": ["mcp",
+  "--project", <slug>], "env": {...}}}}`.
+
+`instructions.md` starts as an HTML comment explaining its use; comments are stripped before it is
+appended to prompts, and an otherwise empty file is not appended. `memory/MEMORY.md` starts with a
+one-line header.
 
 ### project.toml
 
@@ -151,7 +187,8 @@ CREATE TABLE sessions (                   -- coordinator and threads
   last_report_at  INTEGER,
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL,
-  last_activity_at INTEGER NOT NULL
+  last_activity_at INTEGER NOT NULL,
+  last_hook_at    INTEGER                 -- when last_hook ran (migration 2); see §5 sync
 );
 
 CREATE TABLE events (
@@ -247,11 +284,16 @@ never resolved before: reopening keeps `resolved_reason`, so a reopened thread i
 again automatically; reopening also sets `last_activity_at`): `pr_state = MERGED` → resolved
 (`merged`); no activity for 7 days and not working or waiting → resolved (`inactive`).
 
-Sync (`src/registry.rs`, run with each `claude agents` snapshot): match each project session by
-`session_id`, or by `short_id` = row `id` while `session_id` is NULL (then store it). Matched rows
-get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows get `pid = NULL` and
-`cc_fresh = 0` and keep their last `cc_state`. Rows with neither id (not spawned yet) are left
-alone. Then re-derive and apply auto-resolve.
+Sync (`src/registry.rs`, run with each `claude agents` snapshot and the time it was taken, read just
+before running the command): match each project session by `session_id`, or by `short_id` = row
+`id` while `session_id` is NULL (then store it). Matched rows get `cc_state`, `cc_status`, `pid` and
+`cc_fresh = 1`; unmatched rows get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`.
+Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve.
+
+A snapshot taken before a row's last hook (`last_hook_at` > taken-at) is stale for that row: it keeps
+`cc_fresh = 0` and its `cc_state`/`cc_status`, so the hook's provisional group stands. Ids are still
+learned, a matched row still takes the snapshot's `pid`, and an unmatched row keeps its `pid` (the
+newer hook proves the process ran). Every hook in the table above sets `last_hook_at`.
 
 Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Failed, Resolved.
 
@@ -265,8 +307,16 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 | coordinator | `SendMessage` | allow only if `to` (with any trailing ` [ref]` removed) is the name of a thread in this project, not resolved, and alive (pid in a fresh `claude agents` snapshot). Asleep → deny: "Thread is asleep: call wake_thread first." Resolved → deny: "Thread is resolved; reopen it first." Also allow `to = uds:…/<pid>.sock` when `<pid>` is a live thread of this project (a reply). Everything else → deny |
 | thread | `SendMessage` | deny if `to` starts with `uds:` and the pid is not this project's coordinator; deny if `to` (ref removed) equals the name of any live session in `claude agents` other than this project's coordinator; allow otherwise (the thread's own subagents) |
 
-Every deny writes a `guard_denials` row and returns the PreToolUse deny JSON above. If the guard
-itself fails (DB or `claude agents` error), deny with the error as the reason (fail closed).
+`to` is read from `tool_input.to`; a SendMessage whose `tool_input` isn't an object or has no string
+`to` is denied. A thread's pid is the pid that the snapshot lists for its `session_id` (or
+`short_id` while unresolved); the coordinator's pid likewise. The coordinator is also denied when
+more than one live session carries the thread's name (never deliver to an ambiguous name). Other
+tools are allowed. `claude agents` is only run for a SendMessage with a `to`.
+
+Every deny writes a `guard_denials` row (caller matched by `session_id`, `target` = raw `to`) and
+returns the PreToolUse deny JSON above; an allow prints nothing. If the guard itself fails (bad
+payload, DB or `claude agents` error, or a panic), it denies with the error as the reason (fail
+closed), logs the error, and records the denial if the DB opens.
 
 ## 7. Coordinator MCP tools (`chief mcp --project <slug>`)
 
@@ -274,14 +324,31 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 
 | Tool | Input | Does |
 | --- | --- | --- |
-| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort}` |
-| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents`, returns rows: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` |
-| `read_report` | `name`, `history?` (int, default 1) | Last `history` reports, full text |
-| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, wait up to 20 s for a pid. Returns `{name, alive}` |
-| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`) |
+| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}` |
+| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago") |
+| `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text |
+| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}` |
+| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}` |
+
+Names may carry a trailing ` [ref]`; it is ignored. Only this project's threads are accepted.
+
+`start_thread` details: `repo` falls back to `threads.default_repo` (error if neither); an absolute
+path must be a folder and maps back to a repos[] name when it is one. Trust is checked before
+anything else and an untrusted repo returns the `NotTrusted` message. The name must not be in the
+registry nor among `claude agents` names (a few suffixes are tried; if `claude agents` fails,
+nothing starts). A task that starts with `-` is sent as `Task: <task>` so the CLI can't read it as
+a flag. If the spawn fails, the inserted row is deleted and the error returned. Failing to resolve
+the session id is not an error (hooks match by title, sync by short id). `next` is
+`Subscribe now: SendMessage(to="<name>", notify_when_idle=true) with no message.`: the coordinator
+subscribes right after starting a thread, which is how it hears the thread finished.
 
 The coordinator sends work to existing threads itself with `SendMessage` (`to` = name,
 `notify_when_idle: true`); the guard enforces scope.
+
+The tool logic lives in `src/tools.rs` as plain functions over a context (connection, config,
+`Claude`, project dir, trust file, clock, timeouts); `src/mcp.rs` adapts them to `rmcp` and runs
+each call on the blocking pool with a freshly loaded `project.toml`. stdout is the protocol; logs go
+to stderr.
 
 ### Thread spawn
 
@@ -317,7 +384,10 @@ claude --bg --name chief-<slug> --model <m> --effort <e> --permission-mode auto
        --append-system-prompt <coordinator prompt, §8>
 ```
 
-No prompt: it waits for you. If the coordinator exists but has no pid, `claude respawn` it.
+No prompt: it waits for you. Started when it has no row or no `short_id` (the project folder must be
+trusted, and no other live session may already use the name; a failed spawn removes a row it
+inserted). If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
+a pid. Otherwise it is left alone.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)
 
@@ -330,8 +400,27 @@ No prompt: it waits for you. If the coordinator exists but has no pid, `claude r
   instructions follow; work on your own branch; end every turn with a short report (what changed,
   branch, PR URL if any, what you need); if something is missing, say exactly what and stop.
 
-Both get `instructions.md` appended. The coordinator's UserPromptSubmit hook adds a board snapshot
-(the `list_threads` rows, compact) and the current `MEMORY.md` as `additionalContext`.
+Placeholders (`{{name}}` replaced verbatim): coordinator `name`, `goal_line` (` Goal: …` or empty),
+`project_dir`, `max_parallel`; thread `name`, `coordinator_name`, `project_dir`. Both get
+`instructions.md` appended under `## Project instructions` when it isn't empty.
+
+The coordinator's UserPromptSubmit hook runs `claude agents` (≤5 s; stored rows if it fails, logged),
+syncs, and returns as `additionalContext`:
+
+```
+<chief-board as-of="HH:MM">
+Waiting on you:
+- <name> "<title>" · waiting: permission · asleep · branch <b> · PR <url>
+  report: <≤200-char one-line preview>
+…groups in board order; resolved threads left out; "No open threads." when empty
+</chief-board>
+<chief-memory>
+<MEMORY.md, or (empty)>
+</chief-memory>
+```
+
+The whole context stays under 8 KB: previews shrink first (200, 100, 40, none), then memory is cut
+with a marker, then the board itself.
 
 ## 9. Layout (`chief up`, Rex first, tmux later)
 

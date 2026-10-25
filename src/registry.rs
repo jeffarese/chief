@@ -68,13 +68,17 @@ pub fn auto_resolve(row: &mut SessionRow, now: i64) {
     rederive(row);
 }
 
-/// Applies one `claude agents` snapshot to a row. Returns whether the row changed.
-pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], now: i64) -> bool {
+/// Applies one `claude agents` snapshot, taken at `taken_at`, to a row. Returns whether the row
+/// changed. A hook that ran after the snapshot was taken knows better than the snapshot, so the
+/// row keeps that hook's provisional state (`cc_fresh = 0`, `cc_state`/`cc_status` untouched);
+/// only the ids and a listed pid are taken from it.
+pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now: i64) -> bool {
     // Not spawned yet: nothing in the snapshot can be this session.
     if row.short_id.is_none() && row.session_id.is_none() {
         return false;
     }
     let before = row.clone();
+    let stale = row.last_hook_at.is_some_and(|at| at > taken_at);
     let found = match (&row.session_id, &row.short_id) {
         (Some(sid), _) => snapshot.iter().find(|a| &a.session_id == sid),
         (None, Some(short)) => snapshot.iter().find(|a| a.id.as_ref() == Some(short)),
@@ -88,11 +92,15 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], now: i64) -> bool {
             if row.short_id.is_none() {
                 row.short_id = a.id.clone();
             }
-            row.cc_state = a.state.clone();
-            row.cc_status = a.status.clone();
             row.pid = a.pid;
-            row.cc_fresh = true;
+            if !stale {
+                row.cc_state = a.state.clone();
+                row.cc_status = a.status.clone();
+                row.cc_fresh = true;
+            }
         }
+        // A newer hook proves the process ran after the snapshot; keep its pid.
+        None if stale => {}
         None => {
             // Gone from the supervisor: asleep, last cc_state kept for display.
             row.pid = None;
@@ -108,11 +116,18 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], now: i64) -> bool {
     changed
 }
 
-/// Writes a `claude agents` snapshot into every session of the project (one transaction).
-pub fn sync(conn: &Connection, project_slug: &str, snapshot: &[AgentRow], now: i64) -> Result<()> {
+/// Writes a `claude agents` snapshot taken at `taken_at` into every session of the project (one
+/// transaction). Take `taken_at` just before running `claude agents`.
+pub fn sync(
+    conn: &Connection,
+    project_slug: &str,
+    snapshot: &[AgentRow],
+    taken_at: i64,
+    now: i64,
+) -> Result<()> {
     db::immediate(conn, |conn| {
         for mut row in db::list_sessions(conn, project_slug, None)? {
-            if sync_row(&mut row, snapshot, now) {
+            if sync_row(&mut row, snapshot, taken_at, now) {
                 db::update_session(conn, &row)?;
             }
         }
@@ -242,7 +257,7 @@ mod tests {
         vanished.last_hook = Some("Stop".into());
         db::update_session(&conn, &vanished).unwrap();
 
-        sync(&conn, "demo", &snapshot(), now + 1).unwrap();
+        sync(&conn, "demo", &snapshot(), now + 1, now + 1).unwrap();
         let get = |n: &str| db::get_session(&conn, n).unwrap().unwrap();
 
         let a = get("demo-hello-txt-1a2b");
@@ -289,8 +304,62 @@ mod tests {
 
         // A second identical sync changes nothing.
         let before = db::list_sessions(&conn, "demo", None).unwrap();
-        sync(&conn, "demo", &snapshot(), now + 2).unwrap();
+        sync(&conn, "demo", &snapshot(), now + 2, now + 2).unwrap();
         assert_eq!(db::list_sessions(&conn, "demo", None).unwrap(), before);
+    }
+
+    #[test]
+    fn a_snapshot_older_than_the_last_hook_keeps_the_hook_state() {
+        let snap = snapshot();
+        let mut row = thread(
+            "demo-asleep-thread-77aa",
+            Some("0a1b2c3d"),
+            Some("0a1b2c3d-1111-4222-8333-944455556666"),
+            0,
+        );
+        // A UserPromptSubmit at t=100 woke it; the snapshot (state done, no pid) was taken at 90.
+        row.last_hook = Some("UserPromptSubmit".into());
+        row.last_hook_at = Some(100);
+        row.pid = Some(4242);
+        row.cc_state = Some("done".into());
+        rederive(&mut row);
+        assert_eq!(row.group_name, "working");
+
+        let mut stale = row.clone();
+        sync_row(&mut stale, &snap, 90, 110);
+        assert_eq!(
+            (stale.cc_fresh, stale.group_name.as_str()),
+            (false, "working")
+        );
+        assert_eq!(stale.pid, None, "a listed row still updates the pid");
+        assert_eq!(stale.cc_state.as_deref(), Some("done"));
+
+        // Not listed at all: the newer hook proves the process ran, so the pid stays.
+        let mut unlisted = row.clone();
+        sync_row(&mut unlisted, &[], 90, 110);
+        assert_eq!(
+            (
+                unlisted.pid,
+                unlisted.cc_fresh,
+                unlisted.group_name.as_str()
+            ),
+            (Some(4242), false, "working")
+        );
+
+        // The same snapshot taken after the hook wins.
+        let mut fresh = row.clone();
+        let mut busy = snap.clone();
+        busy[3].state = Some("working".into());
+        busy[3].status = Some("busy".into());
+        busy[3].pid = Some(5);
+        sync_row(&mut fresh, &busy, 100, 110);
+        assert_eq!(
+            (fresh.cc_fresh, fresh.cc_state.as_deref(), fresh.pid),
+            (true, Some("working"), Some(5))
+        );
+        let mut done = row.clone();
+        sync_row(&mut done, &snap, 101, 110);
+        assert_eq!((done.cc_fresh, done.group_name.as_str()), (true, "idle"));
     }
 
     #[test]
@@ -353,7 +422,7 @@ mod tests {
         r.pr_state = Some("MERGED".into());
         db::insert_session(&conn, &r).unwrap();
 
-        sync(&conn, "demo", &[], now).unwrap();
+        sync(&conn, "demo", &[], now, now).unwrap();
         let row = db::get_session(&conn, "t").unwrap().unwrap();
         assert_eq!(
             (row.resolved, row.resolved_reason.as_deref()),
@@ -365,7 +434,7 @@ mod tests {
         assert_eq!(row.last_activity_at, now);
         assert_eq!(row.group_name, "idle");
 
-        sync(&conn, "demo", &[], now + 30 * DAY).unwrap();
+        sync(&conn, "demo", &[], now + 30 * DAY, now + 30 * DAY).unwrap();
         assert!(!db::get_session(&conn, "t").unwrap().unwrap().resolved);
 
         let row = set_resolved(&conn, "t", true, "coordinator", now).unwrap();

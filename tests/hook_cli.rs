@@ -1,4 +1,7 @@
-//! `chief hook` as Claude Code runs it: payload on stdin, exit 0, empty stdout, errors logged.
+//! `chief hook` as Claude Code runs it: payload on stdin, exit 0, errors logged; stdout only for
+//! the guard's decision and the coordinator's context.
+
+mod common;
 
 use std::io::Write;
 use std::path::Path;
@@ -6,6 +9,8 @@ use std::process::{Command, Output, Stdio};
 
 use chief::db::{self, SessionRow};
 use chief::state::Role;
+use common::{Home, agent, stderr};
+use serde_json::Value;
 
 fn hook(home: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_chief"))
@@ -105,15 +110,293 @@ fn bad_payload_exits_zero_and_logs() {
 }
 
 #[test]
-fn panics_are_caught_and_logged() {
-    // The guard is still a todo!() until M2: a panic must not reach the session.
-    let home = tempfile::tempdir().unwrap();
-    let out = hook(
-        home.path(),
-        &["guard", "--project", "demo", "--role", "coordinator"],
+fn guard_fails_closed() {
+    // No tool_name: the guard can't decide, so it denies, logs, and records the denial.
+    let home = Home::new();
+    let out = home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
         "{}",
     );
-    assert_silent_success(&out);
-    let log = error_log(home.path());
-    assert!(log.contains("hook guard --project demo: panic:"), "{log}");
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{}", stderr(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason.contains("guard failed") && reason.contains("tool_name"),
+        "{reason}"
+    );
+    assert!(error_log(home.path()).contains("hook guard --project demo"));
+    assert_eq!(db::count_guard_denials(&home.db(), "demo").unwrap(), 1);
+
+    // `claude agents` failing is an error too.
+    home.fake
+        .set("agents.exit", "1")
+        .set("agents.stderr", "supervisor down");
+    let out = home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        &send("demo-a-1111"),
+    );
+    let reason = deny_reason(&out).unwrap();
+    assert!(reason.contains("supervisor down"), "{reason}");
+
+    // Not JSON at all.
+    let out = home.run(
+        &["hook", "guard", "--project", "demo", "--role", "thread"],
+        "{not json",
+    );
+    assert!(
+        deny_reason(&out)
+            .unwrap()
+            .contains("parsing the hook payload")
+    );
+}
+
+fn send(to: &str) -> String {
+    serde_json::json!({
+        "session_id": "coord-sid",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage",
+        "tool_input": {"to": to, "message": "hi"},
+        "cwd": "/x",
+    })
+    .to_string()
+}
+
+fn deny_reason(out: &Output) -> Option<String> {
+    assert!(out.status.success(), "{out:?}");
+    if out.stdout.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    Some(
+        v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+/// A project with a live coordinator, a live thread and an asleep one.
+fn guarded_home() -> Home {
+    let home = Home::new();
+    {
+        let conn = home.db();
+        db::register_project(&conn, "demo", &home.path().join("projects/demo"), 0).unwrap();
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.session_id = Some("coord-sid".into());
+        db::insert_session(&conn, &coord).unwrap();
+        for (name, sid) in [("demo-a-1111", "a-sid"), ("demo-b-2222", "b-sid")] {
+            // Recent, or the inactivity rule would resolve the asleep one.
+            let mut t = SessionRow::new(name, "demo", Role::Thread, db::now_ms());
+            t.session_id = Some(sid.into());
+            db::insert_session(&conn, &t).unwrap();
+        }
+    }
+    home.fake.set(
+        "agents.stdout",
+        &serde_json::json!([
+            agent("c1", "coord-sid", "chief-demo", "done", Some(100)),
+            agent("a1", "a-sid", "demo-a-1111", "working", Some(201)),
+            agent("b1", "b-sid", "demo-b-2222", "done", None),
+            agent("x1", "x-sid", "other-project-thread", "working", Some(300)),
+        ])
+        .to_string(),
+    );
+    home
+}
+
+#[test]
+fn guard_scopes_the_coordinator_to_its_threads() {
+    let home = guarded_home();
+    let guard = |to: &str| {
+        home.run(
+            &[
+                "hook",
+                "guard",
+                "--project",
+                "demo",
+                "--role",
+                "coordinator",
+            ],
+            &send(to),
+        )
+    };
+    let ok = guard("demo-a-1111 [a1]");
+    assert!(ok.stdout.is_empty() && ok.stderr.is_empty(), "{ok:?}");
+
+    let reason = deny_reason(&guard("other-project-thread")).unwrap();
+    assert!(reason.contains("not a thread of this project"), "{reason}");
+    assert_eq!(
+        deny_reason(&guard("demo-b-2222")).unwrap(),
+        "Thread is asleep: call wake_thread first."
+    );
+    assert_eq!(
+        error_log(home.path()),
+        "",
+        "denials are decisions, not errors"
+    );
+
+    let list =
+        serde_json::json!({"session_id": "coord-sid", "tool_name": "ListAgents", "tool_input": {}});
+    let reason = deny_reason(&home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        &list.to_string(),
+    ))
+    .unwrap();
+    assert!(reason.contains("list_threads"));
+
+    let no_to = serde_json::json!({"tool_name": "SendMessage", "tool_input": "demo-a-1111"});
+    assert!(
+        deny_reason(&home.run(
+            &[
+                "hook",
+                "guard",
+                "--project",
+                "demo",
+                "--role",
+                "coordinator"
+            ],
+            &no_to.to_string(),
+        ))
+        .is_some()
+    );
+
+    let conn = home.db();
+    assert_eq!(db::count_guard_denials(&conn, "demo").unwrap(), 4);
+    let (who, target, tool): (Option<String>, Option<String>, String) = conn
+        .query_row(
+            "SELECT session_name, target, tool FROM guard_denials ORDER BY id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (who.as_deref(), target.as_deref(), tool.as_str()),
+        (
+            Some("chief-demo"),
+            Some("other-project-thread"),
+            "SendMessage"
+        )
+    );
+}
+
+#[test]
+fn guard_keeps_threads_to_their_coordinator() {
+    let home = guarded_home();
+    let guard = |to: &str| {
+        home.run(
+            &["hook", "guard", "--project", "demo", "--role", "thread"],
+            &send(to),
+        )
+    };
+    assert_eq!(deny_reason(&guard("chief-demo")), None);
+    assert_eq!(deny_reason(&guard("uds:/tmp/cc-socks/100.sock")), None);
+    assert_eq!(deny_reason(&guard("my-subagent")), None);
+    assert!(deny_reason(&guard("other-project-thread")).is_some());
+    assert!(deny_reason(&guard("demo-a-1111")).is_some());
+    assert!(deny_reason(&guard("uds:/tmp/cc-socks/300.sock")).is_some());
+}
+
+#[test]
+fn coordinator_prompts_get_the_board_and_memory() {
+    let home = guarded_home();
+    std::fs::create_dir_all(home.path().join("projects/demo/memory")).unwrap();
+    std::fs::write(
+        home.path().join("projects/demo/memory/MEMORY.md"),
+        "# Memory\n- [Style](style.md)\n",
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "session_id": "coord-sid",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "status?",
+        "cwd": "/x",
+    });
+    let out = home.run(
+        &[
+            "hook",
+            "UserPromptSubmit",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        &payload.to_string(),
+    );
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.starts_with("<chief-board as-of=\""), "{ctx}");
+    assert!(ctx.contains("Working:\n- demo-a-1111"), "{ctx}");
+    assert!(ctx.contains("- demo-b-2222 · asleep"), "{ctx}");
+    assert!(!ctx.contains("other-project-thread"));
+    assert!(
+        ctx.ends_with("<chief-memory>\n# Memory\n- [Style](style.md)\n</chief-memory>"),
+        "{ctx}"
+    );
+    assert_eq!(error_log(home.path()), "");
+
+    // The board refresh failing still yields the stored board, and is logged.
+    home.fake.set("agents.exit", "1");
+    let out = home.run(
+        &[
+            "hook",
+            "UserPromptSubmit",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        &payload.to_string(),
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("demo-a-1111")
+    );
+    assert!(error_log(home.path()).contains("board refresh failed"));
+
+    // Threads print nothing.
+    let thread = home.run(
+        &[
+            "hook",
+            "UserPromptSubmit",
+            "--project",
+            "demo",
+            "--role",
+            "thread",
+        ],
+        &payload.to_string(),
+    );
+    assert!(thread.stdout.is_empty());
 }

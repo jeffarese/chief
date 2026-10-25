@@ -26,6 +26,9 @@ enum Command {
         /// Repository folders threads work in (repeatable)
         #[arg(long = "repo")]
         repos: Vec<PathBuf>,
+        /// Don't offer to open Claude in untrusted folders; print the commands instead
+        #[arg(long)]
+        no_trust_prompt: bool,
     },
     /// Start or revive the coordinator and open the layout
     Up { slug: String },
@@ -81,7 +84,12 @@ impl From<RoleArg> for Role {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { name, goal, repos } => chief::project::init(&name, goal.as_deref(), &repos),
+        Command::Init {
+            name,
+            goal,
+            repos,
+            no_trust_prompt,
+        } => chief::project::init(&name, goal.as_deref(), &repos, !no_trust_prompt),
         Command::Up { slug } => chief::project::up(&slug),
         Command::Down { slug, stop_threads } => chief::project::down(&slug, stop_threads),
         Command::Board { project } => chief::board::run(&project),

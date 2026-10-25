@@ -1,54 +1,12 @@
 //! `chief::claude` against `tests/fake-claude.sh`; no real Claude session is started.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::time::Duration;
 
 use chief::claude::{BgSpawn, Claude, ClaudeError};
-
-/// A temp dir with a `claude` link to the fake script; canned outputs go beside it.
-struct Fake {
-    dir: tempfile::TempDir,
-}
-
-impl Fake {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-claude.sh");
-        std::os::unix::fs::symlink(script, dir.path().join("claude")).unwrap();
-        Fake { dir }
-    }
-
-    fn claude(&self) -> Claude {
-        Claude {
-            bin: self.dir.path().join("claude"),
-        }
-    }
-
-    fn set(&self, file: &str, text: &str) -> &Self {
-        std::fs::write(self.dir.path().join(file), text).unwrap();
-        self
-    }
-
-    /// Arguments of every call so far.
-    fn calls(&self) -> Vec<Vec<String>> {
-        (0..)
-            .map(|n| self.dir.path().join(format!("calls/{n}")))
-            .take_while(|p| p.exists())
-            .map(|p| {
-                let raw = std::fs::read(p).unwrap();
-                raw.split(|b| *b == 0)
-                    .filter(|a| !a.is_empty())
-                    .map(|a| String::from_utf8(a.to_vec()).unwrap())
-                    .collect()
-            })
-            .collect()
-    }
-
-    fn cwd(&self, n: usize) -> PathBuf {
-        let text = std::fs::read_to_string(self.dir.path().join(format!("calls/{n}.cwd"))).unwrap();
-        PathBuf::from(text.trim())
-    }
-}
+use common::Fake;
 
 fn spec(cwd: &Path) -> BgSpawn {
     BgSpawn {
