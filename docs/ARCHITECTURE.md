@@ -266,7 +266,7 @@ Derivation, first match wins (inputs: the row plus the latest `claude agents` sn
 
 1. `resolved = 1` → **resolved**
 2. `cc_state = failed` → **failed**
-3. `pending_permission = 1` → **waiting**, reason `permission`
+3. `pending_permission = 1` → **waiting**, reason `permission`, unless the process is gone (below)
 4. `cc_state = blocked` → **waiting**, reason `question`
 5. `cc_state = working` or `cc_status = busy` → **working**, unless the process is gone (below)
 6. `pr_state = OPEN` and `pr_review = APPROVED` → **landing**
@@ -301,8 +301,10 @@ and its last hook would keep it provisionally working forever. So a non-stale sn
 no process sets `gone_at` = taken-at (only when the verdict changes, so repeated polls don't rewrite
 the row), and the row counts as **process gone** while `pid` is NULL and `gone_at` ≥
 `last_hook_at`. A process-gone row never matches rule 5, neither from `cc_state`/`cc_status` nor
-from the provisional working hooks; rules 1–4 and 6–8 still apply, so it shows as waiting
-(pending permission), review/landing (open PR), resolved, or idle/asleep. A newer hook (e.g. a
+from the provisional working hooks. A permission prompt dies with its process and a respawn doesn't
+bring it back, so the sync that sets `gone_at` also clears `pending_permission`, and rule 3 doesn't
+match a process-gone row either. Rules 1, 2, 4 and 6–8 still apply, so it shows as waiting (a
+blocked question), review/landing (open PR), resolved, failed, or idle/asleep. A newer hook (e.g. a
 respawn starting a turn) makes it count as running again until the next non-stale poll.
 
 Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Failed, Resolved.

@@ -196,7 +196,8 @@ pub fn derive(facts: &Facts) -> Derived {
     if facts.cc_state == Some("failed") {
         return Derived::group(Group::Failed);
     }
-    if facts.pending_permission {
+    // A permission prompt dies with its process and doesn't come back on respawn.
+    if facts.pending_permission && !facts.process_gone {
         return Derived::waiting(WaitingReason::Permission);
     }
     if facts.cc_state == Some("blocked") {
@@ -453,15 +454,25 @@ mod tests {
                 None,
             ),
             (
-                "no process: permission still waits",
+                "no process: a pending permission prompt is gone too",
                 Facts {
-                    last_hook: Some(PreToolUse),
+                    last_hook: Some(PermissionNotification),
                     pending_permission: true,
                     process_gone: true,
                     ..base()
                 },
+                Idle,
+                None,
+            ),
+            (
+                "no process: a blocked question still waits",
+                Facts {
+                    cc_state: Some("blocked"),
+                    process_gone: true,
+                    ..base()
+                },
                 Waiting,
-                Some(Permission),
+                Some(Question),
             ),
             (
                 "no process: an open PR shows in review",

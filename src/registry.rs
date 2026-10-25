@@ -117,9 +117,11 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now:
             row.cc_fresh = false;
         }
     }
-    // Only when the verdict flips, so repeated polls of an asleep row don't rewrite it.
+    // Only when the verdict flips, so repeated polls of an asleep row don't rewrite it. A
+    // permission prompt dies with the process and a respawn doesn't bring it back.
     if !stale && row.pid.is_none() && !process_gone(row) {
         row.gone_at = Some(taken_at);
+        row.pending_permission = false;
     }
     rederive(row);
     auto_resolve(row, now);
@@ -422,12 +424,31 @@ mod tests {
         sync(&conn, "demo", &[], 320, 330).unwrap();
         assert_eq!(get().group_name, "idle");
 
-        // Pending permission and an open PR still win over "gone".
+        // A permission prompt waits on the user until the process is known gone; then it is
+        // cleared, since a respawn doesn't bring it back.
         let mut r = get();
+        r.last_hook = Some("Notification:permission_prompt".into());
+        r.last_hook_at = Some(400);
         r.pending_permission = true;
+        r.pid = Some(8);
         rederive(&mut r);
-        assert_eq!(r.group_name, "waiting");
-        r.pending_permission = false;
+        assert_eq!(r.waiting_reason.as_deref(), Some("permission"));
+        db::update_session(&conn, &r).unwrap();
+        sync(&conn, "demo", &[], 390, 395).unwrap();
+        assert_eq!(get().waiting_reason.as_deref(), Some("permission"), "stale");
+        sync(&conn, "demo", &[], 410, 415).unwrap();
+        let r = get();
+        assert!(!r.pending_permission);
+        assert_eq!((r.group_name.as_str(), r.waiting_reason), ("idle", None));
+
+        // A blocked question still waits, and an open PR still shows in review.
+        let mut blocked = snapshot()[3].clone();
+        blocked.session_id = "sid-x".into();
+        blocked.state = Some("blocked".into());
+        sync(&conn, "demo", &[blocked], 420, 425).unwrap();
+        assert_eq!(get().waiting_reason.as_deref(), Some("question"));
+        let mut r = get();
+        r.cc_state = Some("done".into());
         r.pr_state = Some("OPEN".into());
         r.pr_draft = Some(false);
         rederive(&mut r);
