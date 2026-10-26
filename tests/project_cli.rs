@@ -405,6 +405,40 @@ fn up_starts_then_leaves_then_respawns_the_coordinator() {
     assert!(!home.run(&["status", "nope"], "").status.success());
 }
 
+/// §2: the cleanup state comes after the PR, and every thread line ends with how long ago it was
+/// active.
+#[test]
+fn status_lines_show_cleanup_then_end_with_the_age() {
+    use chief::state::Role;
+    let now = 10 * 60 * 1000;
+    let thread = |name: &str| {
+        let mut t = db::SessionRow::new(name, SLUG, Role::Thread, 0);
+        t.resolved = true;
+        t.group_name = "resolved".into();
+        t.branch = Some("worktree-x".into());
+        t.pr_url = Some("https://github.com/o/r/pull/3".into());
+        t.last_activity_at = now - 5 * 60 * 1000;
+        t
+    };
+    let mut cleaned = thread("payments-latency-a-1111");
+    cleaned.cleaned_at = Some(1);
+    let mut blocked = thread("payments-latency-b-2222");
+    blocked.cleanup_blocked = Some("2 unpushed commits".into());
+    let text = chief::project::render_status(SLUG, &[cleaned, blocked], now);
+    let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("    ")).collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for (line, state) in lines
+        .iter()
+        .zip(["cleaned up", "cleanup blocked: 2 unpushed commits"])
+    {
+        assert!(
+            line.contains(&format!("PR https://github.com/o/r/pull/3 · {state} · ")),
+            "{line}"
+        );
+        assert!(line.ends_with(" ago"), "{line}");
+    }
+}
+
 /// A project whose coordinator runs (started by a first `up` that found no Rex).
 fn running_project(home: &Home) -> PathBuf {
     version_ok(home);

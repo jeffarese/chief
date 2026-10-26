@@ -103,8 +103,10 @@ uncleaned thread with a process. Without it, it says how many threads keep runni
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
 `chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
-each project's coordinator and threads grouped in board order. A thread's line ends with
-`cleaned up` or `cleanup blocked: <reason>` when §12 applies.
+each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
+its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>` (each when there is
+one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
+it was last active (`5m ago`, `just now`).
 
 ## 3. Files
 
@@ -589,8 +591,13 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
    (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1.
 
-`q` while chief has the terminal ends the loop; so does the session being killed (the pty hangs
-up). On exit `pane_showing` is cleared.
+`q` while chief has the terminal ends the loop; so does the block being closed or the session
+killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
+`claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
+`SA_RESTART`, so the default action can't end it before cleanup: the interrupted wait passes
+SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either way; the loop
+then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
+thread).
 
 Ctrl+Z: the board switches by sending Ctrl+Z to `main`. Inside `claude attach` it detaches. While
 chief itself has the terminal, the terminal is in raw mode (ISIG off), so Ctrl+Z, Ctrl+C and

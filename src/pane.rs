@@ -10,6 +10,7 @@
 use std::io::Write;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,34 @@ const WAKE_WAIT: Duration = Duration::from_secs(20);
 /// An attach that ends sooner than this counts as a failed start: wait before the next try so a
 /// session that keeps refusing doesn't spin.
 const SHORT_ATTACH: Duration = Duration::from_secs(1);
+/// How long attach gets to exit after a hangup before it is killed.
+const HANGUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Set by SIGHUP or SIGTERM.
+static HUNG_UP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_hangup(_: libc::c_int) {
+    HUNG_UP.store(true, Ordering::SeqCst);
+}
+
+/// Rex closing the block or killing the session hangs up the pty, and the kernel sends SIGHUP to
+/// the session leader: this process, not `claude attach`. Its default action would end chief at
+/// once, leaving `pane_showing` set (which also keeps cleanup away from that thread, §12) and
+/// attach unreaped. The handler only records it; without `SA_RESTART` the blocking `waitpid` is
+/// interrupted, and the loop winds down. SIGTERM (`kill <pid>`) is handled the same way. A caught
+/// signal reverts to the default across exec, so attach keeps the usual behaviour.
+fn catch_hangup() {
+    // SAFETY: installing a handler that only stores to an atomic (async-signal-safe).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_hangup as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        for sig in [libc::SIGHUP, libc::SIGTERM] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
 
 pub fn run(project: &str) -> Result<()> {
     let conn = db::open(&paths::db())?;
@@ -39,6 +68,7 @@ pub fn run(project: &str) -> Result<()> {
         bail!("no chief project {project:?}");
     }
     let claude = Claude::from_env();
+    catch_hangup();
     let tty = Tty::take()?;
     let result = pane_loop(&conn, &claude, project, &tty);
     let _ = db::set_pane_showing(&conn, project, None);
@@ -67,6 +97,9 @@ pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<Session
 
 fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Result<()> {
     loop {
+        if HUNG_UP.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let Some(row) = resolve_target(conn, project)? else {
             tty.say(&format!(
                 "chief · no coordinator yet: run chief up {project} · q quits"
@@ -102,6 +135,10 @@ fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Re
         tty.release();
         let started = Instant::now();
         let attached = attach(claude, &short_id);
+        if HUNG_UP.load(Ordering::SeqCst) {
+            // Nothing left to draw on; `run` clears `pane_showing`.
+            return Ok(());
+        }
         tty.retake()?;
         db::set_pane_showing(conn, project, None)?;
 
@@ -155,7 +192,7 @@ fn attach(claude: &Claude, short_id: &str) -> Result<ExitStatus> {
     let child = cmd
         .spawn()
         .with_context(|| format!("running {} attach {short_id}", claude.bin.display()))?;
-    Ok(wait_continuing(child)?.0)
+    Ok(wait_continuing(child, &HUNG_UP)?.0)
 }
 
 /// This process ignores SIGTSTP, and an ignored signal stays ignored across exec; the child
@@ -172,12 +209,18 @@ fn with_default_tstp(cmd: &mut Command) {
 
 /// Waits for `pid` to exit; returns its status and how many times it was stopped. A child
 /// stopped before it took the terminal (a Ctrl+Z during attach start-up) is continued: nothing
-/// else would, and the pane would hang.
-fn wait_continuing(child: Child) -> std::io::Result<(ExitStatus, usize)> {
+/// else would, and the pane would hang. Once `hung_up` is set (seen when a signal interrupts the
+/// wait, or between waits), the child gets SIGHUP, `HANGUP_GRACE` to exit, then SIGKILL, and is
+/// reaped either way. A hangup that lands just before `waitpid` blocks is only seen when attach
+/// exits, which it does on the dead terminal.
+fn wait_continuing(child: Child, hung_up: &AtomicBool) -> std::io::Result<(ExitStatus, usize)> {
     // Reaped here rather than by `Child::wait`, which can't see a stop.
     let pid = child.id() as libc::pid_t;
     let mut stops = 0;
     loop {
+        if hung_up.load(Ordering::SeqCst) {
+            return Ok((reap_after_hangup(pid), stops));
+        }
         let mut status = 0;
         // SAFETY: plain syscalls on our own child.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
@@ -194,6 +237,46 @@ fn wait_continuing(child: Child) -> std::io::Result<(ExitStatus, usize)> {
             continue;
         }
         return Ok((ExitStatus::from_raw(status), stops));
+    }
+}
+
+/// Passes the hangup on to `pid`, waits up to `HANGUP_GRACE` for it to exit, then kills it, and
+/// reaps it.
+fn reap_after_hangup(pid: libc::pid_t) -> ExitStatus {
+    // SAFETY: signals and waits on our own, not yet reaped, child.
+    unsafe {
+        libc::kill(pid, libc::SIGHUP);
+        libc::kill(pid, libc::SIGCONT);
+    }
+    let deadline = Instant::now() + HANGUP_GRACE;
+    loop {
+        let mut status = 0;
+        // SAFETY: as above.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid && !libc::WIFSTOPPED(status) {
+            return ExitStatus::from_raw(status);
+        }
+        if r == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            // Already reaped elsewhere: nothing left to wait for.
+            return ExitStatus::from_raw(0);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    loop {
+        let mut status = 0;
+        // SAFETY: as above.
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r == pid {
+            return ExitStatus::from_raw(status);
+        }
+        if r == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return ExitStatus::from_raw(0);
+        }
     }
 }
 
@@ -252,6 +335,9 @@ impl Tty {
     fn quit_pressed(&self, wait: Duration) -> Result<bool> {
         let deadline = Instant::now() + wait;
         loop {
+            if HUNG_UP.load(Ordering::SeqCst) {
+                return Ok(true);
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if !event::poll(left)? {
                 return Ok(false);
@@ -272,7 +358,8 @@ impl Drop for Tty {
         let _ = disable_raw_mode();
         // SAFETY: as in `release`.
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.cooked) };
-        println!();
+        // Not `println!`: it panics when the terminal has hung up.
+        let _ = writeln!(std::io::stdout());
     }
 }
 
@@ -415,7 +502,8 @@ mod tests {
         cmd.args(["-c", "kill -TSTP $$; exit 3"]).process_group(0);
         with_default_tstp(&mut cmd);
         let child = cmd.spawn().unwrap();
-        let (status, stops) = wait_continuing(child).unwrap();
+        let calm = AtomicBool::new(false);
+        let (status, stops) = wait_continuing(child, &calm).unwrap();
         assert_eq!((status.code(), stops), (Some(3), 1));
 
         // Without the reset the child inherits the ignore and never stops.
@@ -424,7 +512,33 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let (status, stops) = wait_continuing(child).unwrap();
+        let (status, stops) = wait_continuing(child, &calm).unwrap();
         assert_eq!((status.code(), stops), (Some(4), 0));
+    }
+
+    /// Rex closing the block hangs up the pty, and only the session leader (chief) gets SIGHUP.
+    /// chief must live on to reap attach (here one that ignores SIGHUP, so it gets SIGKILL after
+    /// the grace period) and then clear `pane_showing`.
+    #[test]
+    fn a_hangup_reaps_the_attach_child() {
+        use std::os::unix::thread::JoinHandleExt;
+        catch_hangup();
+        let child = Command::new("sh")
+            .args(["-c", "trap '' HUP; exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let waiter = std::thread::spawn(move || wait_continuing(child, &HUNG_UP));
+        // Let it block in waitpid, then hang up on that thread.
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        // SAFETY: signalling a live thread of this process; the handler only stores a flag.
+        unsafe { libc::pthread_kill(waiter.as_pthread_t(), libc::SIGHUP) };
+        let (status, _) = waiter.join().unwrap().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() < HANGUP_GRACE + Duration::from_secs(2));
+        // SAFETY: probing a pid; it is reaped, so nothing has it.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "reaped");
+        assert!(HUNG_UP.load(Ordering::SeqCst));
     }
 }
