@@ -160,7 +160,8 @@ uncleaned thread with a process. Without it, it says how many threads keep runni
 accounts and their threads', §3; stored rows if it fails), syncs each project with those
 snapshots (§5), and prints
 each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
-its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>` (each when there is
+its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>`, `account <label>` (the
+agp account it runs in, §7 "Thread account") (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
 it was last active (`5m ago`, `just now`).
 
@@ -959,8 +960,10 @@ are tested without a terminal (`TestBackend`).
   the bottom). A row is `<target mark><glyph> <title or name>  <tags>`, cut to the
   width with an ellipsis and never wrapped; the title gives way first so tags stay readable. Tags:
   waiting reason, `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`),
-  `cleanup blocked`, `cleaned up`. Detail panel for the selection (title, name, group and reason or
-  resolved reason, asleep, branch, PR URL, model · effort, last activity, cleanup state, the last
+  `cleanup blocked`, `cleaned up`, then the agp label of the account it runs in (`PB2`; none for a
+  thread in the project's account without agp, §7 "Thread account"). Detail panel for the
+  selection (title, name, group and reason or resolved reason, asleep, branch, PR URL, model ·
+  effort, `account <label>`, last activity, cleanup state, the last
   report wrapped): below the list when the body has ≥ 16 lines (the list takes what it needs up to
   3/5), otherwise Tab swaps the list for it. One status line: a running worker, else the last
   action's result (cleared by the next key), else refresh errors, else the PR hint, else key help.

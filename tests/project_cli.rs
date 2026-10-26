@@ -498,6 +498,9 @@ fn status_takes_one_snapshot_per_account() {
         let row = db::get_session(&home.db(), name).unwrap().unwrap();
         assert_eq!(row.pid, Some(pid), "{name}");
     }
+    // Each thread line names the agp account it runs in.
+    let far = text.lines().find(|l| l.contains("gamma-far-2222")).unwrap();
+    assert!(far.contains("gamma-far-2222 · account cpb · "), "{far}");
 }
 
 #[test]

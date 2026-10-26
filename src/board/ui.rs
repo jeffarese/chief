@@ -137,6 +137,10 @@ pub fn tags(row: &SessionRow) -> Vec<String> {
     } else if row.cleanup_blocked.is_some() {
         tags.push("cleanup blocked".to_string());
     }
+    // The agp account it runs in (§3), last: the least urgent.
+    if let Some(account) = row.account_shown() {
+        tags.push(account.to_string());
+    }
     tags
 }
 
@@ -333,6 +337,9 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
     };
     if let Some(m) = model {
         lines.push(field("model", m));
+    }
+    if let Some(account) = row.account_shown() {
+        lines.push(field("account", account.to_string()));
     }
     lines.push(field("active", ago(app.now, row.last_activity_at)));
     if row.cleaned_at.is_some() {
@@ -698,6 +705,8 @@ mod tests {
         review.last_report = Some("Opened PR 42.\nAll tests pass.".into());
         review.model = Some("sonnet".into());
         review.effort = Some("high".into());
+        review.account_id = Some("cpb".into());
+        review.account_label = Some("PB2".into());
         let mut done = thread("demo-old-7a8b", Group::Resolved, 1);
         done.title = Some("Old work".into());
         done.cleanup_blocked = Some("2 unpushed commits".into());
@@ -720,11 +729,12 @@ mod tests {
             "Approve the migration  permission",
             "Working 1",
             "Ready for review 1",
-            "Speed up checkout  asleep · PR open",
+            "Speed up che…  asleep · PR open · PB2",
             "Resolved 1 · R shows",
             "branch",
             "https://github.com/o/r/pull/42",
             "sonnet · high",
+            "account PB2",
             "All tests pass.",
         ] {
             assert!(out.contains(want), "missing {want:?} in\n{out}");

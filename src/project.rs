@@ -870,6 +870,9 @@ pub fn render_status(slug: &str, rows: &[SessionRow], prefix: &str, now: i64) ->
             if let Some(pr) = &t.pr_url {
                 parts.push(format!("PR {pr}"));
             }
+            if let Some(account) = t.account_shown() {
+                parts.push(format!("account {account}"));
+            }
             if t.cleaned_at.is_some() {
                 parts.push("cleaned up".to_string());
             } else if let Some(why) = &t.cleanup_blocked {
