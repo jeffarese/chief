@@ -7,6 +7,8 @@
 #   <key>.stdout.<k>   canned stdout for the k-th call of that subcommand (1-based), if present
 #   <key>.stderr       canned stderr
 #   <key>.exit         exit code (default 0)
+#   <key>.exit.<k>     exit code for the k-th call of that subcommand, if present
+# The same script stands in for `gh` (tests link it as `gh`; `pr list` has key `pr`).
 dir=$(dirname "$0")
 mkdir -p "$dir/calls"
 n=$(ls "$dir/calls" | grep -cv '\.cwd$')
@@ -24,4 +26,7 @@ elif [ -f "$dir/$key.stdout" ]; then
   cat "$dir/$key.stdout"
 fi
 [ -f "$dir/$key.stderr" ] && cat "$dir/$key.stderr" >&2
+if [ -f "$dir/$key.exit.$k" ]; then
+  exit "$(cat "$dir/$key.exit.$k")"
+fi
 exit "$(cat "$dir/$key.exit" 2>/dev/null || echo 0)"

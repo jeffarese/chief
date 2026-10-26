@@ -115,6 +115,14 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now:
             // Gone from the supervisor: asleep, last cc_state kept for display.
             row.pid = None;
             row.cc_fresh = false;
+            if removed_outside(row, snapshot) {
+                row.cleaned_at = Some(taken_at);
+                row.cleanup_blocked = None;
+                if !row.resolved {
+                    row.resolved = true;
+                    row.resolved_reason = Some("removed".to_string());
+                }
+            }
         }
     }
     // Only when the verdict flips, so repeated polls of an asleep row don't rewrite it. A
@@ -130,6 +138,19 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now:
         row.updated_at = now;
     }
     changed
+}
+
+/// A stopped session stays listed in `claude agents --all`; only `claude rm` (here, or from
+/// `claude agents` itself) takes it off. So a thread whose session id was seen once and that a
+/// non-stale snapshot no longer lists has been removed. An empty snapshot proves nothing: chief
+/// can't tell "every session was removed" from a supervisor that lists nothing for a moment, and
+/// a wrong verdict would block the thread for good. Its coordinator is normally listed, so this
+/// only delays the verdict until some session shows up again.
+fn removed_outside(row: &SessionRow, snapshot: &[AgentRow]) -> bool {
+    row.role == Role::Thread.as_str()
+        && row.session_id.is_some()
+        && row.cleaned_at.is_none()
+        && !snapshot.is_empty()
 }
 
 /// Writes a `claude agents` snapshot taken at `taken_at` into every session of the project (one
@@ -162,6 +183,9 @@ pub fn set_resolved(
 ) -> Result<SessionRow> {
     db::immediate(conn, |conn| {
         let mut row = db::get_session(conn, name)?.with_context(|| format!("no session {name}"))?;
+        if !resolved && row.cleaned_at.is_some() {
+            anyhow::bail!(crate::guard::cleaned_message(name));
+        }
         row.resolved = resolved;
         if resolved {
             row.resolved_reason = Some(reason.to_string());
@@ -310,10 +334,18 @@ mod tests {
             ("idle", None, Some("done"))
         );
 
+        // Seen before (it has a session id) and now unlisted: removed with `claude rm`.
         let v = get("demo-vanished-0000");
         assert_eq!((v.pid, v.cc_fresh), (None, false));
         assert_eq!(v.cc_state.as_deref(), Some("working"), "last cc_state kept");
-        assert_eq!(v.group_name, "idle", "provisional from the Stop hook");
+        assert_eq!(
+            (
+                v.cleaned_at,
+                v.resolved_reason.as_deref(),
+                v.group_name.as_str()
+            ),
+            (Some(now + 1), Some("removed"), "resolved")
+        );
 
         let p = get("demo-pending-1111");
         assert_eq!(p, rows[4], "unspawned rows are untouched");
@@ -456,6 +488,73 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_missing_from_a_snapshot_was_removed() {
+        let snap = snapshot();
+        let mut row = thread("demo-gone-1111", Some("g1"), Some("sid-g1"), 0);
+        row.pid = Some(3);
+        row.last_hook = Some("Stop".into());
+        row.last_hook_at = Some(100);
+        rederive(&mut row);
+
+        // An empty list proves nothing, nor does a snapshot older than the last hook.
+        let mut empty = row.clone();
+        sync_row(&mut empty, &[], 200, 210);
+        assert_eq!((empty.cleaned_at, empty.resolved), (None, false));
+        let mut stale = row.clone();
+        sync_row(&mut stale, &snap, 90, 210);
+        assert_eq!(stale.cleaned_at, None);
+
+        let mut gone = row.clone();
+        assert!(sync_row(&mut gone, &snap, 200, 210));
+        assert_eq!(
+            (
+                gone.cleaned_at,
+                gone.resolved,
+                gone.resolved_reason.as_deref(),
+                gone.group_name.as_str()
+            ),
+            (Some(200), true, Some("removed"), "resolved")
+        );
+        let before = gone.clone();
+        sync_row(&mut gone, &snap, 300, 310);
+        assert_eq!(gone, before, "the verdict is kept, not rewritten");
+
+        // An already resolved thread keeps its reason; a blocked cleanup is cleared.
+        let mut resolved = row.clone();
+        resolved.resolved = true;
+        resolved.resolved_reason = Some("user".into());
+        resolved.cleanup_blocked = Some("2 unpushed commits".into());
+        sync_row(&mut resolved, &snap, 200, 210);
+        assert_eq!(
+            (
+                resolved.cleaned_at,
+                resolved.resolved_reason.as_deref(),
+                resolved.cleanup_blocked
+            ),
+            (Some(200), Some("user"), None)
+        );
+
+        // Never seen in `claude agents` (just spawned), or the coordinator: not removed.
+        let mut fresh = thread("demo-new-2222", Some("n2"), None, 0);
+        sync_row(&mut fresh, &snap, 200, 210);
+        assert_eq!(fresh.cleaned_at, None);
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.session_id = Some("coord-gone".into());
+        sync_row(&mut coord, &snap, 200, 210);
+        assert_eq!((coord.cleaned_at, coord.resolved), (None, false));
+
+        // Listed without a pid (stopped): asleep, not removed.
+        let mut stopped = thread(
+            "demo-asleep-thread-77aa",
+            Some("0a1b2c3d"),
+            Some("0a1b2c3d-1111-4222-8333-944455556666"),
+            0,
+        );
+        sync_row(&mut stopped, &snap, 200, 210);
+        assert_eq!((stopped.cleaned_at, stopped.pid), (None, None));
+    }
+
+    #[test]
     fn auto_resolve_rules() {
         let now = 100 * DAY;
         let mk = |pr: Option<&str>, idle_days: i64, cc: &str, role: Role| {
@@ -538,6 +637,14 @@ mod tests {
             ("resolved", Some("coordinator"))
         );
         assert!(set_resolved(&conn, "nope", true, "user", now).is_err());
+
+        // A cleaned thread has no session left to reopen.
+        let mut row = db::get_session(&conn, "t").unwrap().unwrap();
+        row.cleaned_at = Some(now);
+        db::update_session(&conn, &row).unwrap();
+        let err = set_resolved(&conn, "t", false, "user", now).unwrap_err();
+        assert!(err.to_string().contains("t was cleaned up"), "{err}");
+        assert!(set_resolved(&conn, "t", true, "user", now).is_ok());
     }
 
     #[test]

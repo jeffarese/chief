@@ -44,6 +44,20 @@ pub struct BgSpawn {
     pub prompt: Option<String>,
 }
 
+/// What `claude rm <id>` did. It stops the session even when it refuses (§1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RmOutcome {
+    /// Session, worktree and local branch are gone.
+    Removed,
+    /// Kept: commits exist on no remote. `commits` are the summary lines Claude Code printed;
+    /// `token` is the `<head sha>@<worktree-id>` value `--discard-unpushed` takes.
+    Unpushed { commits: Vec<String>, token: String },
+    /// Kept: the worktree has uncommitted changes (untracked files count, ignored ones don't).
+    Dirty,
+    /// Anything else, with the output.
+    Other(String),
+}
+
 /// Errors callers act on; everything else is a plain `anyhow` error.
 #[derive(Debug, thiserror::Error)]
 pub enum ClaudeError {
@@ -139,6 +153,23 @@ impl Claude {
     pub fn stop(&self, short_id: &str) -> Result<()> {
         self.run_ok(&["stop".into(), short_id.into()], None, CONTROL_TIMEOUT)?;
         Ok(())
+    }
+
+    /// `claude rm <id> [--discard-unpushed <token>]`. A refusal is an outcome, not an error;
+    /// only a failure to run the command is.
+    pub fn rm(&self, short_id: &str, discard: Option<&str>) -> Result<RmOutcome> {
+        let mut args: Vec<OsString> = vec!["rm".into(), short_id.into()];
+        if let Some(token) = discard {
+            args.push("--discard-unpushed".into());
+            args.push(token.into());
+        }
+        let out = self.run(&args, None, CONTROL_TIMEOUT)?;
+        Ok(parse_rm(
+            short_id,
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ))
     }
 
     /// Finds a freshly spawned session in `claude agents` by its short id, retrying until
@@ -266,6 +297,55 @@ pub fn parse_bg_short_id(stdout: &str) -> Option<String> {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         ok.then(|| id.to_string())
     })
+}
+
+/// Reads `claude rm` output (texts in `tests/fixtures/rm/`). Only a `removed <id>` line counts
+/// as removed: a stale `--discard-unpushed` token printed usage and exited 0 in the M2b probe.
+pub fn parse_rm(short_id: &str, success: bool, stdout: &str, stderr: &str) -> RmOutcome {
+    let text = strip_ansi(&format!("{stdout}\n{stderr}"));
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let removed = format!("removed {short_id}");
+    if lines
+        .iter()
+        .any(|l| *l == removed || l.starts_with(&format!("{removed} ")))
+    {
+        return RmOutcome::Removed;
+    }
+    let kept = lines.iter().any(|l| l.starts_with("kept "));
+    if kept && let Some(token) = lines.iter().find_map(|l| discard_token(l)) {
+        let commits = lines
+            .iter()
+            .filter(|l| l.contains("unpushed commit"))
+            .map(|l| l.to_string())
+            .collect();
+        return RmOutcome::Unpushed { commits, token };
+    }
+    if kept && text.contains("uncommitted changes") {
+        return RmOutcome::Dirty;
+    }
+    let shown = lines.join("\n");
+    RmOutcome::Other(if shown.is_empty() {
+        format!(
+            "`claude rm` exited {} with no output",
+            if success { "0" } else { "non-zero" }
+        )
+    } else {
+        shown
+    })
+}
+
+/// The `<sha>@<worktree-id>` after `--discard-unpushed` on a line, if it looks like one (the
+/// usage line shows a `<commit>@<worktree-id>` placeholder).
+fn discard_token(line: &str) -> Option<String> {
+    let rest = &line[line.find("--discard-unpushed ")? + "--discard-unpushed ".len()..];
+    let token = rest.split_whitespace().next()?;
+    let (sha, worktree) = token.split_once('@')?;
+    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+    (hex(sha) && hex(worktree)).then(|| token.to_string())
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -517,6 +597,78 @@ mod tests {
             (None, None)
         );
         assert!(parse_agents("not json").is_err());
+    }
+
+    fn rm_fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/rm/{name}.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn rm_output_parsing() {
+        assert_eq!(
+            parse_rm("58534bf3", true, &rm_fixture("removed"), ""),
+            RmOutcome::Removed
+        );
+        assert_eq!(
+            parse_rm("b65c3d73", false, &rm_fixture("unpushed-one"), ""),
+            RmOutcome::Unpushed {
+                commits: vec![
+                    "1 unpushed commit on “worktree-e2e-add-notes-txt”: a2a6266 “Add notes.txt”. \
+                     It exists on no remote, so deleting the worktree would lose it."
+                        .into()
+                ],
+                token: "a2a6266abcfc311c36e618d6f2c556188b528181@03abe83c324a9c3e9a0db4020ffa195d"
+                    .into(),
+            }
+        );
+        let RmOutcome::Unpushed { commits, token } =
+            parse_rm("58534bf3", false, &rm_fixture("unpushed-many"), "")
+        else {
+            panic!("want unpushed");
+        };
+        assert_eq!(
+            token,
+            "2eb2c0406cd37c70c23cd34e3469a5f4796e3756@bce72e14d86c9546d5f9872220affd57"
+        );
+        assert!(
+            commits[0].starts_with("3 unpushed commits on"),
+            "{commits:?}"
+        );
+        assert_eq!(
+            parse_rm("b65c3d73", false, &rm_fixture("dirty"), ""),
+            RmOutcome::Dirty
+        );
+        // Usage on a stale token, even with exit 0, isn't a removal; nor is another id's line.
+        let stale = parse_rm("58534bf3", true, "", &rm_fixture("stale-token"));
+        assert!(
+            matches!(&stale, RmOutcome::Other(t) if t.contains("--discard-unpushed")),
+            "{stale:?}"
+        );
+        assert!(matches!(
+            parse_rm("58534bf3", true, "removed 58534bf3x\n", ""),
+            RmOutcome::Other(_)
+        ));
+        assert_eq!(
+            parse_rm(
+                "abc",
+                true,
+                "\u{1b}[32mremoved abc\u{1b}[0m\n  worktree: x\n",
+                ""
+            ),
+            RmOutcome::Removed
+        );
+        assert!(matches!(
+            parse_rm("abc", false, "", ""),
+            RmOutcome::Other(t) if t.contains("no output")
+        ));
+        assert!(matches!(
+            parse_rm("abc", false, "", "error: no session abc\n"),
+            RmOutcome::Other(t) if t == "error: no session abc"
+        ));
     }
 
     #[test]

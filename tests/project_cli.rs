@@ -176,6 +176,7 @@ fn generated_hook_commands_reach_this_home() {
     let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
+    assert!(command.contains("CHIEF_GH_BIN="), "{command}");
     {
         let conn = home.db();
         let row = db::SessionRow::new("demo-x-1111", "demo", chief::state::Role::Thread, 0);
@@ -187,6 +188,7 @@ fn generated_hook_commands_reach_this_home() {
         .current_dir("/")
         .env_remove("CHIEF_HOME")
         .env_remove("CHIEF_CLAUDE_BIN")
+        .env_remove("CHIEF_GH_BIN")
         .env_remove("CHIEF_CLAUDE_CONFIG")
         .env_remove("CHIEF_NO_NOTIFY")
         .stdin(std::process::Stdio::piped())

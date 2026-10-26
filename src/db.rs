@@ -90,6 +90,10 @@ CREATE TABLE ui_state (
     // When a snapshot no older than the last hook showed no process, so a thread that died
     // mid-turn stops counting as working (§5).
     "ALTER TABLE sessions ADD COLUMN gone_at INTEGER;",
+    // Thread cleanup (§12): when `claude rm` removed the session and its worktree, and why the
+    // last attempt didn't.
+    "ALTER TABLE sessions ADD COLUMN cleaned_at INTEGER;
+     ALTER TABLE sessions ADD COLUMN cleanup_blocked TEXT;",
 ];
 
 /// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
@@ -169,6 +173,10 @@ pub struct SessionRow {
     pub last_hook_at: Option<i64>,
     /// When a `claude agents` snapshot taken at or after `last_hook_at` showed no process.
     pub gone_at: Option<i64>,
+    /// When the session, its worktree and its local branch were removed (unix ms).
+    pub cleaned_at: Option<i64>,
+    /// Why the last cleanup attempt left it in place, e.g. "2 unpushed commits".
+    pub cleanup_blocked: Option<String>,
     pub pending_permission: bool,
     pub group_name: String,
     pub waiting_reason: Option<String>,
@@ -205,7 +213,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     repo_name, repo_path, cwd, branch, model, effort, cc_state, cc_status, cc_fresh, pid, \
     last_hook, pending_permission, group_name, waiting_reason, resolved, resolved_reason, pr_url, \
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
-    last_activity_at, last_hook_at, gone_at";
+    last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -243,6 +251,8 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         last_activity_at: r.get(31)?,
         last_hook_at: r.get(32)?,
         gone_at: r.get(33)?,
+        cleaned_at: r.get(34)?,
+        cleanup_blocked: r.get(35)?,
     })
 }
 
@@ -277,7 +287,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32, ?33, ?34)"
+         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)"
     );
     conn.execute(
         &sql,
@@ -316,6 +326,8 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.last_activity_at,
             s.last_hook_at,
             s.gone_at,
+            s.cleaned_at,
+            s.cleanup_blocked,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -334,7 +346,7 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            resolved = ?22, resolved_reason = ?23, pr_url = ?24, pr_state = ?25, pr_draft = ?26,
            pr_review = ?27, last_report = ?28, last_report_at = ?29, created_at = ?30,
            updated_at = ?31, last_activity_at = ?32, last_hook_at = ?33,
-           gone_at = ?34
+           gone_at = ?34, cleaned_at = ?35, cleanup_blocked = ?36
          WHERE name = ?1",
             params![
                 s.name,
@@ -371,6 +383,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.last_activity_at,
                 s.last_hook_at,
                 s.gone_at,
+                s.cleaned_at,
+                s.cleanup_blocked,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -648,6 +662,8 @@ mod tests {
         t.pending_permission = true;
         t.cc_fresh = true;
         t.last_report = Some("done".into());
+        t.cleaned_at = Some(20);
+        t.cleanup_blocked = Some("2 unpushed commits".into());
         update_session(&conn, &t).unwrap();
         assert_eq!(
             get_session_by_session_id(&conn, "uuid-1").unwrap().unwrap(),

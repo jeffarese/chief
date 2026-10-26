@@ -1,0 +1,3 @@
+kept b65c3d73 — its worktree is still at “/private/tmp/chief-e2e/repo/.claude/worktrees/e2e-add-notes-txt”
+  1 unpushed commit on “worktree-e2e-add-notes-txt”: a2a6266 “Add notes.txt”. It exists on no remote, so deleting the worktree would lose it.
+  push it and run 'claude rm b65c3d73' again, or discard the worktree and its commits: claude rm b65c3d73 --discard-unpushed a2a6266abcfc311c36e618d6f2c556188b528181@03abe83c324a9c3e9a0db4020ffa195d

@@ -14,6 +14,8 @@ pub struct LiveSession {
 pub struct ProjectThread {
     pub name: String,
     pub resolved: bool,
+    /// Its session, worktree and branch were removed (§12).
+    pub cleaned: bool,
     /// Its pid in the fresh `claude agents` snapshot; None when it isn't running (asleep).
     pub pid: Option<u32>,
 }
@@ -43,6 +45,14 @@ pub const THREAD_LIST_AGENTS_DENIED: &str =
     "ListAgents is blocked in chief threads: you can message only your coordinator.";
 pub const ASLEEP: &str = "Thread is asleep: call wake_thread first.";
 pub const RESOLVED: &str = "Thread is resolved; reopen it first.";
+
+/// Shared by the guard, `wake_thread` and reopening: a cleaned thread has no session left.
+pub fn cleaned_message(name: &str) -> String {
+    format!(
+        "{name} was cleaned up; start a new thread (its reports are still readable with \
+         read_report)"
+    )
+}
 
 /// ARCHITECTURE §6. Tools other than `SendMessage` and `ListAgents` are allowed: the hook's
 /// matcher never sends them here.
@@ -74,7 +84,7 @@ fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
             input
                 .threads
                 .iter()
-                .find(|t| t.pid == Some(pid) && !t.resolved)
+                .find(|t| t.pid == Some(pid) && !t.resolved && !t.cleaned)
         });
         return match live {
             Some(_) => Decision::Allow,
@@ -89,6 +99,9 @@ fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
              thread with start_thread."
         ));
     };
+    if thread.cleaned {
+        return Decision::Deny(cleaned_message(&thread.name));
+    }
     if thread.resolved {
         return Decision::Deny(RESOLVED.to_string());
     }
@@ -169,21 +182,31 @@ mod tests {
             ProjectThread {
                 name: "p-live-1a2b".into(),
                 resolved: false,
+                cleaned: false,
                 pid: Some(201),
             },
             ProjectThread {
                 name: "p-asleep-3c4d".into(),
                 resolved: false,
+                cleaned: false,
                 pid: None,
             },
             ProjectThread {
                 name: "p-done-5e6f".into(),
                 resolved: true,
+                cleaned: false,
                 pid: Some(203),
             },
             ProjectThread {
                 name: "p-done-asleep-7a8b".into(),
                 resolved: true,
+                cleaned: false,
+                pid: None,
+            },
+            ProjectThread {
+                name: "p-cleaned-9c0d".into(),
+                resolved: true,
+                cleaned: true,
                 pid: None,
             },
         ]
@@ -234,6 +257,7 @@ mod tests {
         all.push(ProjectThread {
             name: "p-dup-9999".into(),
             resolved: false,
+            cleaned: false,
             pid: Some(601),
         });
         let input = GuardInput {
@@ -286,6 +310,13 @@ mod tests {
                 Deny(RESOLVED),
             ),
             (C, "SendMessage", Some("p-dup-9999"), cp, Deny("ambiguous")),
+            (
+                C,
+                "SendMessage",
+                Some("p-cleaned-9c0d [r]"),
+                cp,
+                Deny("p-cleaned-9c0d was cleaned up; start a new thread"),
+            ),
             // Coordinator outside the project, or to itself.
             (
                 C,

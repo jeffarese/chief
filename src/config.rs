@@ -33,6 +33,19 @@ pub struct ThreadSettings {
     pub max_parallel: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_repo: Option<String>,
+    /// When chief removes a resolved thread's worktree and branch on its own (§12).
+    #[serde(default)]
+    pub cleanup: Cleanup,
+}
+
+/// `threads.cleanup`: `merged` cleans a thread once its PR merged (never discarding work);
+/// `manual` leaves it to `chief clean`, `chief gc` and the board.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Cleanup {
+    #[default]
+    Merged,
+    Manual,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +87,7 @@ impl ProjectConfig {
                 permission_mode: "auto".to_string(),
                 max_parallel: 3,
                 default_repo,
+                cleanup: Cleanup::Merged,
             },
             repos,
             ui: UiSettings::default(),
@@ -198,6 +212,7 @@ mod tests {
         assert_eq!(c.threads.effort, "high");
         assert_eq!(c.threads.permission_mode, "auto");
         assert_eq!(c.threads.max_parallel, 3);
+        assert_eq!(c.threads.cleanup, Cleanup::Merged);
         assert_eq!(c.threads.default_repo.as_deref(), Some("payments-api"));
         assert!(
             ProjectConfig::new("x", "x", None, vec![])
@@ -259,6 +274,25 @@ notify = true
             PathBuf::from("/Users/me/workspace/payments-api")
         );
         assert!(c.ui.notify);
+        // Files from before `cleanup` existed get the default.
+        assert_eq!(c.threads.cleanup, Cleanup::Merged);
+
+        let manual = text.replace(
+            "max_parallel = 3\n",
+            "max_parallel = 3\ncleanup = \"manual\"\n",
+        );
+        std::fs::write(&path, manual).unwrap();
+        assert_eq!(
+            ProjectConfig::load(&path).unwrap().threads.cleanup,
+            Cleanup::Manual
+        );
+        let bad = text.replace(
+            "max_parallel = 3\n",
+            "max_parallel = 3\ncleanup = \"always\"\n",
+        );
+        std::fs::write(&path, bad).unwrap();
+        let err = format!("{:#}", ProjectConfig::load(&path).unwrap_err());
+        assert!(err.contains("always"), "{err}");
     }
 
     #[test]

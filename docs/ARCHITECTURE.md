@@ -72,6 +72,8 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief hook guard --project <slug> --role …` | PreToolUse hook | Message guard |
 | `chief mcp --project <slug>` | Claude Code (coordinator's MCP config) | Coordinator tools over stdio |
 | `chief status [<slug>]` | you | Print the board as text (debugging, scripting) |
+| `chief gc [<slug>] [--dry-run]` | you | Refresh PRs, then clean up every resolved thread that loses nothing (§12) |
+| `chief clean <slug> <thread> [--discard] [--yes]` | you | Clean up one resolved thread; `--discard` throws away unsaved work after confirming (§12) |
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision and the coordinator's
@@ -90,7 +92,8 @@ otherwise it prints `cd <folder> && claude` for each.
 the layout lands (§9) it prints the coordinator's name and `claude attach <short_id>`.
 
 `chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
-each project's coordinator and threads grouped in board order.
+each project's coordinator and threads grouped in board order. A thread's line ends with
+`cleaned up` or `cleanup blocked: <reason>` when §12 applies.
 
 ## 3. Files
 
@@ -113,10 +116,10 @@ canonical absolute path of the `chief` binary (`std::env::current_exe()`), so in
 `cargo install --path .`. Every word of a hook command is shell-quoted.
 
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so the
-variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY`, when set at
-generation time, are written into the files: as `K='v'` prefixes on every hook command and in the
-MCP server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN` without a slash is
-kept for PATH lookup).
+variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_CLAUDE_CONFIG` and
+`CHIEF_NO_NOTIFY`, when set at generation time, are written into the files: as `K='v'` prefixes on
+every hook command and in the MCP server's `env`. Paths among them are made absolute (a bare
+`CHIEF_CLAUDE_BIN` or `CHIEF_GH_BIN` without a slash is kept for PATH lookup).
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -149,6 +152,7 @@ effort = "high"
 permission_mode = "auto"           # must not be bypassPermissions (messages would be held)
 max_parallel = 3                   # soft; told to the coordinator, not enforced
 default_repo = "payments-api"      # a repos[].name
+cleanup = "merged"                 # merged | manual (default merged), see §12
 
 [[repos]]
 name = "payments-api"
@@ -190,7 +194,7 @@ CREATE TABLE sessions (                   -- coordinator and threads
   group_name      TEXT NOT NULL DEFAULT 'working',   -- derived board group, see §5
   waiting_reason  TEXT,                   -- 'permission' | 'question' | NULL
   resolved        INTEGER NOT NULL DEFAULT 0,
-  resolved_reason TEXT,                   -- 'user' | 'coordinator' | 'merged' | 'inactive'
+  resolved_reason TEXT,                   -- 'user' | 'coordinator' | 'merged' | 'inactive' | 'removed'
   pr_url          TEXT,
   pr_state        TEXT,                   -- OPEN | MERGED | CLOSED
   pr_draft        INTEGER,
@@ -201,7 +205,9 @@ CREATE TABLE sessions (                   -- coordinator and threads
   updated_at      INTEGER NOT NULL,
   last_activity_at INTEGER NOT NULL,
   last_hook_at    INTEGER,                -- when last_hook ran (migration 2); see §5 sync
-  gone_at         INTEGER                 -- when a snapshot no older than the last hook showed no process (migration 3)
+  gone_at         INTEGER,                -- when a snapshot no older than the last hook showed no process (migration 3)
+  cleaned_at      INTEGER,                -- when the session, worktree and local branch were removed, §12 (migration 4)
+  cleanup_blocked TEXT                    -- why the last cleanup kept it, e.g. '2 unpushed commits' (migration 4)
 );
 
 CREATE TABLE events (
@@ -311,6 +317,15 @@ before running the command): match each project session by `session_id`, or by `
 `cc_fresh = 1`; unmatched rows get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`.
 Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve.
 
+Removed outside chief: a stopped session stays listed in `claude agents --all`, and only
+`claude rm` takes one off. So a thread row that has a `session_id`, isn't cleaned, and is missing
+from a non-stale snapshot that lists at least one session was removed: it gets `cleaned_at` =
+taken-at, `cleanup_blocked = NULL`, and, if it wasn't resolved, `resolved = 1` with
+`resolved_reason = 'removed'`. An empty list never counts: chief can't tell "every session was
+removed" from a supervisor that lists nothing for a moment, and a wrong verdict would lock the
+thread out for good (§12). The coordinator is normally listed, so this only delays the verdict.
+The coordinator row is never marked.
+
 A snapshot taken before a row's last hook (`last_hook_at` > taken-at) is stale for that row: it keeps
 `cc_fresh = 0` and its `cc_state`/`cc_status`, so the hook's provisional group stands. Ids are still
 learned, a matched row still takes the snapshot's `pid`, and an unmatched row keeps its `pid` (the
@@ -336,7 +351,7 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 | Caller | Tool | Rule |
 | --- | --- | --- |
 | any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
-| coordinator | `SendMessage` | allow only if `to` (with any trailing ` [ref]` removed) is the name of a thread in this project, not resolved, and alive (pid in a fresh `claude agents` snapshot). Asleep → deny: "Thread is asleep: call wake_thread first." Resolved → deny: "Thread is resolved; reopen it first." Also allow `to = uds:…/<pid>.sock` when `<pid>` is a live thread of this project (a reply). Everything else → deny |
+| coordinator | `SendMessage` | allow only if `to` (with any trailing ` [ref]` removed) is the name of a thread in this project, not cleaned, not resolved, and alive (pid in a fresh `claude agents` snapshot). Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Asleep → deny: "Thread is asleep: call wake_thread first." Resolved → deny: "Thread is resolved; reopen it first." Also allow `to = uds:…/<pid>.sock` when `<pid>` is a live, uncleaned, unresolved thread of this project (a reply). Everything else → deny |
 | thread | `SendMessage` | deny if `to` starts with `uds:` and the pid is not this project's coordinator; deny if `to` (ref removed) equals the name of any live session in `claude agents` other than this project's coordinator; allow otherwise (the thread's own subagents) |
 
 `to` is read from `tool_input.to`; a SendMessage whose `tool_input` isn't an object or has no string
@@ -357,10 +372,12 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | Tool | Input | Does |
 | --- | --- | --- |
 | `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}` |
-| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago") |
+| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text |
-| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}` |
-| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}` |
+| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)" |
+| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
+
+There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
 Names may carry a trailing ` [ref]`; it is ignored. Only this project's threads are accepted.
 
@@ -428,7 +445,9 @@ a pid. Otherwise it is left alone.
   new work → `start_thread`; follow-up → `SendMessage` to the matching thread with
   `notify_when_idle`, waking it first if asleep; several tasks → several threads), say which thread
   got what, keep `max_parallel`, save preferences and decisions to `memory/` and update
-  `memory/MEMORY.md`, read full reports with `read_report` when an idle notice arrives.
+  `memory/MEMORY.md`, read full reports with `read_report` when an idle notice arrives. Removing
+  worktrees and branches is the user's call (board `x`, `chief clean`, `chief gc`), so it never
+  offers to; it names no branch in a thread's brief unless the user did (threads create their own).
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch; end every turn with a short report (what changed,
   branch, PR URL if any, what you need); if something is missing, say exactly what and stop.
@@ -484,13 +503,18 @@ Board switching: write `pane_target`, then `send_key(main, "ctrl+z")`.
 ## 10. Board
 
 - Refresh every 2 s from SQLite and `claude agents --json --all` (filtered to the project's session
-  ids, written back through §5). PR status every 30 s:
+  ids, written back through §5). PR status every 30 s with `pr::refresh_project` (§12), which runs
   `gh pr list --head <branch> --state all --json url,state,isDraft,reviewDecision --limit 1`
-  run in `repo_path`.
+  in `repo_path` and, with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
+  (no `gh`, not logged in, no GitHub remote) goes in the status line.
 - Layout: header (project, goal, coordinator state, denials count); groups in §5 order with counts;
   detail panel for the selection (title, name, group, reason, branch, PR, model, last report).
 - Keys: ↑/↓ or j/k move; Enter view thread in the main pane; Esc or c view coordinator; w wake;
-  r resolve or reopen; o open PR; s settings; ? help; q quit the board only.
+  r resolve or reopen; o open PR; x clean up the selected resolved thread (`cleanup::clean`, Safe;
+  when blocked, show what would be lost and offer Discard after typing the thread's name);
+  s settings; ? help; q quit the board only.
+- A thread with `cleanup_blocked` shows a "cleanup blocked: <reason>" badge; a cleaned thread
+  shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread.
 - Settings screen edits `project.toml` (goal, models, efforts, permission mode, max_parallel,
   default repo, repos) and opens `instructions.md` or `memory/` in `$EDITOR`. Saving regenerates
   `generated/*`. Changes reach new threads; coordinator model and effort apply on its next start.
@@ -501,7 +525,76 @@ Board switching: write `pane_target`, then `send_key(main, "ctrl+z")`.
   `tests/fixtures/hooks/spike-events.jsonl`, `claude agents` parsing against
   `tests/fixtures/agents/agents-sample.json`, config round trip, migrations on a fresh DB.
 - `CHIEF_CLAUDE_BIN` overrides the `claude` binary; integration tests use a fake script
-  (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_HOME` points
+  (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_GH_BIN`
+  overrides `gh` the same way (the same script, linked as `gh`). `claude rm` outputs from the live
+  M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
+  remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
   tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_NO_NOTIFY=1` turns off
   notifications.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
+
+## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)
+
+Resolving a thread keeps its session, worktree and branch. Cleanup removes them with
+`claude rm <short_id>` (§1), which deletes the worktree and the local branch and keeps any remote
+branch. The row stays, with its reports: `cleaned_at` is set and `cleanup_blocked` cleared.
+
+The worktree is the stored `cwd` (hooks report the latest; the worktree once the thread moved):
+`<repo>/.claude/worktrees/<name>` at or above it, confirmed with
+`git -C <cwd> rev-parse --show-toplevel` while it exists. Never a name derived from the thread's.
+A thread whose `cwd` never entered `.claude/worktrees/` has nothing of its own to lose.
+
+`inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s): whether the worktree
+exists, its branch (`git branch --show-current`, else `sessions.branch`),
+`git status --porcelain --untracked-files=normal` lines (ignored files aren't listed, as Claude
+Code ignores them), and unpushed commits as Claude Code means them:
+`git rev-list --count HEAD refs/heads/<branch> --not --remotes`, listed with
+`git log --format='%h %s' -n20 …`. When the worktree is gone, commits are checked in `repo_path`
+if the branch still exists there.
+
+`clean(ctx, name, mode)`:
+
+1. Refresh from `claude agents` and sync (§5); if that finds the session removed, it is already
+   clean.
+2. Refuse (error, nothing run) unless the thread is resolved and, derived as if it weren't
+   resolved, neither working nor waiting: `claude rm` stops the session even when it refuses.
+3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
+4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
+   in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
+   `, `) and stop without calling `claude rm`.
+   `Discard` (the user confirmed): in a dirty worktree run `git -C <wt> reset --hard -q` and
+   `git -C <wt> clean -fdq` (never `-x`: ignored files stay).
+5. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
+   `--discard-unpushed <token>` from the refusal. Removed → cleaned. Unpushed → `N unpushed
+   commits`; dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in
+   `cleanup_blocked`.
+
+`claude rm` output (`claude::parse_rm`): a `removed <id>` line is removed (exit status alone isn't:
+a stale token printed usage and exited 0); `kept <id> — …` with a `--discard-unpushed <hex>@<hex>`
+line is unpushed (its `unpushed commit` summary lines kept); `kept` with "uncommitted changes" is
+dirty; anything else is `Other` with the text.
+
+PR status (`pr.rs`): `Gh::poll(repo_path, branch)` runs the §10 `gh pr list` (10 s). A missing `gh`,
+a `gh` that isn't logged in, or a repository without a GitHub remote is no PR plus a hint returned
+once per `Gh`; other failures are errors. `poll_project` polls threads that work in a worktree,
+have a branch and aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
+closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
+auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
+`cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is
+neither working nor waiting and has no `cleanup_blocked`: a blocked thread waits for the user, a
+working one is tried again on the next refresh. `cleanup = "manual"` never cleans on its own.
+
+`chief gc [<slug>] [--dry-run]` per project: `poll_project`, sync `claude agents`, then
+`clean(Safe)` on every resolved, uncleaned thread (dry: what it would do, from `inspect`). It prints
+`cleaned` / `would clean` / `blocked <reason>` / `skipped <why>` (working or waiting, or an error)
+per thread, or `nothing to clean`; warnings go to stderr. `--dry-run` still stores PR status, as
+the board would.
+
+`chief clean <slug> <thread>` runs `clean(Safe)` and fails with the reason and the `--discard`
+command when blocked. With `--discard` it checks step 2 first, prints what would be deleted and
+lost (`git status --short` lines, the unpushed commits), and, when something would be lost, asks
+`Type the thread name to confirm:` on a terminal; without one it refuses unless `--yes`.
+
+A cleaned thread can't be woken, reopened or messaged (§6, §7) and is hidden from `list_threads`
+unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
+user's call (§8).

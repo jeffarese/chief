@@ -1,5 +1,5 @@
-//! Shared test helpers: the fake `claude` and a temp chief home. Nothing here starts a real
-//! Claude session.
+//! Shared test helpers: the fake `claude` and `gh`, a temp chief home and real temporary git
+//! repositories. Nothing here starts a real Claude session or calls GitHub.
 #![allow(dead_code)]
 
 use std::io::Write;
@@ -7,22 +7,34 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use chief::claude::Claude;
+use chief::pr::Gh;
 
-/// A temp dir with a `claude` link to the fake script; canned outputs go beside it.
+/// A temp dir with a `claude` (or `gh`) link to the fake script; canned outputs go beside it.
 pub struct Fake {
     pub dir: tempfile::TempDir,
+    name: &'static str,
 }
 
 impl Fake {
     pub fn new() -> Self {
+        Fake::named("claude")
+    }
+
+    /// The fake under another binary name; `Fake::named("gh")` with `pr.stdout` for
+    /// `gh pr list`.
+    pub fn named(name: &'static str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-claude.sh");
-        std::os::unix::fs::symlink(script, dir.path().join("claude")).unwrap();
-        Fake { dir }
+        std::os::unix::fs::symlink(script, dir.path().join(name)).unwrap();
+        Fake { dir, name }
     }
 
     pub fn bin(&self) -> PathBuf {
-        self.dir.path().join("claude")
+        self.dir.path().join(self.name)
+    }
+
+    pub fn gh(&self) -> Gh {
+        Gh::new(self.bin())
     }
 
     pub fn claude(&self) -> Claude {
@@ -107,6 +119,8 @@ pub fn agent(
 pub struct Home {
     pub home: tempfile::TempDir,
     pub fake: Fake,
+    /// `gh`; lists no PRs unless told otherwise.
+    pub gh: Fake,
     pub trust: PathBuf,
 }
 
@@ -115,9 +129,12 @@ impl Home {
         let home = tempfile::tempdir().unwrap();
         let trust = home.path().join("claude.json");
         std::fs::write(&trust, "{}").unwrap();
+        let gh = Fake::named("gh");
+        gh.set("pr.stdout", "[]");
         Home {
             home,
             fake: Fake::new(),
+            gh,
             trust,
         }
     }
@@ -131,6 +148,7 @@ impl Home {
         cmd.args(args)
             .env("CHIEF_HOME", self.home.path())
             .env("CHIEF_CLAUDE_BIN", self.fake.bin())
+            .env("CHIEF_GH_BIN", self.gh.bin())
             .env("CHIEF_CLAUDE_CONFIG", &self.trust)
             .env("CHIEF_NO_NOTIFY", "1")
             .stdin(Stdio::piped())
@@ -161,4 +179,91 @@ pub fn stdout(out: &Output) -> String {
 
 pub fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Runs git in `dir` without the user's config getting in the way (signing, hooks); panics on
+/// failure. Returns stdout.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=chief test",
+            "-c",
+            "user.email=chief@test.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A bare remote and a clone of it with `main` pushed; threads' worktrees go under
+/// `<repo>/.claude/worktrees/`, as Claude Code puts them.
+pub struct GitRepo {
+    pub root: tempfile::TempDir,
+    pub remote: PathBuf,
+    pub repo: PathBuf,
+}
+
+impl GitRepo {
+    pub fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let remote = base.join("remote.git");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&base, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "Initial"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "-u", "origin", "main"]);
+        GitRepo { root, remote, repo }
+    }
+
+    /// `<repo>/.claude/worktrees/<name>` on a new branch `worktree-<name>`.
+    pub fn worktree(&self, name: &str) -> PathBuf {
+        let path = self.repo.join(".claude/worktrees").join(name);
+        git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("worktree-{name}"),
+                path.to_str().unwrap(),
+            ],
+        );
+        path
+    }
+
+    /// Writes `file` and commits it in `dir`.
+    pub fn commit(&self, dir: &Path, file: &str, message: &str) {
+        std::fs::write(dir.join(file), format!("{message}\n")).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-q", "-m", message]);
+    }
+
+    pub fn push(&self, dir: &Path) {
+        git(dir, &["push", "-q", "-u", "origin", "HEAD"]);
+    }
 }

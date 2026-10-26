@@ -459,6 +459,11 @@ pub fn render_status(slug: &str, rows: &[SessionRow], now: i64) -> String {
             if let Some(pr) = &t.pr_url {
                 parts.push(format!("PR {pr}"));
             }
+            if t.cleaned_at.is_some() {
+                parts.push("cleaned up".to_string());
+            } else if let Some(why) = &t.cleanup_blocked {
+                parts.push(format!("cleanup blocked: {why}"));
+            }
             parts.push(ago(now, t.last_activity_at));
             out.push_str(&format!("    {}\n", parts.join(" · ")));
             if let Some(report) = t.last_report.as_deref().filter(|r| !r.trim().is_empty()) {

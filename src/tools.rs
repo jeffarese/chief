@@ -107,6 +107,8 @@ pub struct ThreadView {
     pub pr_url: Option<String>,
     pub last_report_preview: Option<String>,
     pub last_activity: String,
+    /// Its session, worktree and branch were removed; only its reports remain.
+    pub cleaned: bool,
 }
 
 pub fn thread_view(row: &SessionRow, preview_chars: usize, now: i64) -> ThreadView {
@@ -123,6 +125,7 @@ pub fn thread_view(row: &SessionRow, preview_chars: usize, now: i64) -> ThreadVi
             .as_deref()
             .map(|r| one_line(r, preview_chars)),
         last_activity: ago(now, row.last_activity_at),
+        cleaned: row.cleaned_at.is_some(),
     }
 }
 
@@ -317,7 +320,7 @@ pub fn list_threads(ctx: &ToolCtx, args: &ListThreadsArgs) -> Result<Value> {
     let include_resolved = args.include_resolved.unwrap_or(false);
     let mut rows: Vec<_> = db::list_sessions(ctx.conn, ctx.slug(), Some(Role::Thread))?
         .into_iter()
-        .filter(|r| include_resolved || !r.resolved)
+        .filter(|r| include_resolved || (!r.resolved && r.cleaned_at.is_none()))
         .collect();
     board_order(&mut rows);
     let now = (ctx.now)();
@@ -364,6 +367,9 @@ pub fn read_report(ctx: &ToolCtx, args: &ReadReportArgs) -> Result<Value> {
 pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     let row = project_thread(ctx, &args.name)?;
     let name = row.name.clone();
+    if row.cleaned_at.is_some() {
+        bail!(crate::guard::cleaned_message(&name));
+    }
     let alive = |ctx: &ToolCtx| -> Result<bool> {
         refresh(ctx)?;
         Ok(db::get_session(ctx.conn, &name)?.is_some_and(|r| r.pid.is_some()))

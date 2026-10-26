@@ -64,6 +64,25 @@ enum Command {
     },
     /// Print a project's board as text
     Status { slug: Option<String> },
+    /// Refresh PRs, then clean up every resolved thread that loses nothing (worktree, branch,
+    /// session)
+    Gc {
+        slug: Option<String>,
+        /// Show what would be cleaned without removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Clean up one resolved thread: remove its session, worktree and local branch
+    Clean {
+        slug: String,
+        thread: String,
+        /// Also throw away uncommitted changes and unpushed commits (asks first)
+        #[arg(long)]
+        discard: bool,
+        /// Don't ask before discarding
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -105,5 +124,12 @@ fn main() -> Result<()> {
         }
         Command::Mcp { project } => chief::mcp::run(&project),
         Command::Status { slug } => chief::project::status(slug.as_deref()),
+        Command::Gc { slug, dry_run } => chief::cleanup::run_gc(slug.as_deref(), dry_run),
+        Command::Clean {
+            slug,
+            thread,
+            discard,
+            yes,
+        } => chief::cleanup::run_clean(&slug, &thread, discard, yes),
     }
 }

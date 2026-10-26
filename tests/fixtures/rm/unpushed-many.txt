@@ -1,0 +1,3 @@
+kept 58534bf3 — its worktree is still at “/private/tmp/chief-e2e/repo/.claude/worktrees/add-hello-txt”
+  3 unpushed commits on “worktree-add-hello-txt”: 2eb2c04 “Update bye.txt” and 2 more. They exist on no remote, so deleting the worktree would lose them.
+  push them and run 'claude rm 58534bf3' again, or discard the worktree and its commits: claude rm 58534bf3 --discard-unpushed 2eb2c0406cd37c70c23cd34e3469a5f4796e3756@bce72e14d86c9546d5f9872220affd57

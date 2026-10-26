@@ -148,6 +148,7 @@ pub fn guard_decision(
         .map(|r| guard::ProjectThread {
             name: r.name.clone(),
             resolved: r.resolved,
+            cleaned: r.cleaned_at.is_some(),
             pid: pid_of(r),
         })
         .collect();

@@ -494,3 +494,75 @@ fn resolve_and_reopen() {
     assert_eq!(out["resolved"], false);
     assert_ne!(out["group"], "resolved");
 }
+
+#[test]
+fn cleaned_threads_keep_their_reports_but_nothing_else() {
+    let env = Env::new();
+    env.insert("demo-gone-1111", |r| {
+        r.short_id = Some("g1".into());
+        r.session_id = Some("sid-g1".into());
+        r.resolved = true;
+        r.resolved_reason = Some("merged".into());
+        r.group_name = "resolved".into();
+        r.cleaned_at = Some(NOW - 1000);
+    });
+    db::insert_report(&env.conn, "demo-gone-1111", NOW - 2000, "merged it").unwrap();
+    env.agents(&[]);
+    let want = "demo-gone-1111 was cleaned up; start a new thread (its reports are still \
+                readable with read_report)";
+
+    let err = env
+        .with(|ctx| {
+            tools::wake_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-gone-1111".into(),
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(err.to_string(), want);
+    assert!(env.fake.calls_of("respawn").is_empty());
+
+    let reopen = |reopen| {
+        env.with(|ctx| {
+            tools::resolve_thread(
+                ctx,
+                &ResolveThreadArgs {
+                    name: "demo-gone-1111 [ref]".into(),
+                    reopen: Some(reopen),
+                },
+            )
+        })
+    };
+    assert_eq!(reopen(true).unwrap_err().to_string(), want);
+    assert_eq!(reopen(false).unwrap()["resolved"], true);
+
+    let listed = |include_resolved| {
+        env.with(|ctx| {
+            tools::list_threads(
+                ctx,
+                &ListThreadsArgs {
+                    include_resolved: Some(include_resolved),
+                },
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(listed(false)["threads"], json!([]));
+    let all = listed(true);
+    assert_eq!(all["threads"][0]["cleaned"], true);
+
+    let out = env
+        .with(|ctx| {
+            tools::read_report(
+                ctx,
+                &ReadReportArgs {
+                    name: "demo-gone-1111".into(),
+                    history: None,
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(out["reports"][0]["text"], "merged it");
+}

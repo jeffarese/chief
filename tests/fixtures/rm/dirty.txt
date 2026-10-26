@@ -1,0 +1,3 @@
+kept b65c3d73 — its worktree is still at “/private/tmp/chief-e2e/repo/.claude/worktrees/e2e-add-notes-txt”
+  The worktree has uncommitted changes. Deleting it would lose them.
+  commit or stash them and run 'claude rm b65c3d73' again, or delete the session from 'claude agents' (ctrl+x twice) to discard them

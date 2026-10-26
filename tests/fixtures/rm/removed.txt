@@ -1,0 +1,2 @@
+removed 58534bf3
+  worktree: “/private/tmp/chief-e2e/repo/.claude/worktrees/add-hello-txt”

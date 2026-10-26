@@ -2,6 +2,7 @@
 
 pub mod board;
 pub mod claude;
+pub mod cleanup;
 pub mod config;
 pub mod context;
 pub mod db;
@@ -13,6 +14,7 @@ pub mod mux;
 pub mod names;
 pub mod pane;
 pub mod paths;
+pub mod pr;
 pub mod proc;
 pub mod project;
 pub mod prompts;
