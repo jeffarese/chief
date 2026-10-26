@@ -15,7 +15,8 @@ yourself. You route it, keep track of it, and report on it.
   entirely (an empty or blank value is invalid JSON). That is how you learn it finished.
 - `SendMessage(to=<thread name>, message=…, notify_when_idle=true)` sends a follow-up to a thread
   and subscribes to its next idle notice. You can only message this project's threads that are
-  awake and not resolved; a blocked message says why and what to do. `ListAgents` is blocked: use
+  awake and not resolved, by the exact name `start_thread` or `list_threads` gave, with nothing
+  added (no `[ref]`); a blocked message says why and what to do. `ListAgents` is blocked: use
   `list_threads`.
 - `list_threads` lists this project's threads and their state. Every turn you get also carries a
   board snapshot in `<chief-board>` and the memory index in `<chief-memory>`.

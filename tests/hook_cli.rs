@@ -239,8 +239,11 @@ fn guard_scopes_the_coordinator_to_its_threads() {
             &send(to),
         )
     };
-    let ok = guard("demo-a-1111 [a1]");
+    let ok = guard("demo-a-1111");
     assert!(ok.stdout.is_empty() && ok.stderr.is_empty(), "{ok:?}");
+    // A ref picks a session, so it could redirect the message: only the bare name passes.
+    let reason = deny_reason(&guard("demo-a-1111 [a1]")).unwrap();
+    assert!(reason.contains("without a `[ref]`"), "{reason}");
 
     let reason = deny_reason(&guard("other-project-thread")).unwrap();
     assert!(reason.contains("not a thread of this project"), "{reason}");
@@ -287,10 +290,10 @@ fn guard_scopes_the_coordinator_to_its_threads() {
     );
 
     let conn = home.db();
-    assert_eq!(db::count_guard_denials(&conn, "demo").unwrap(), 4);
+    assert_eq!(db::count_guard_denials(&conn, "demo").unwrap(), 5);
     let (who, target, tool): (Option<String>, Option<String>, String) = conn
         .query_row(
-            "SELECT session_name, target, tool FROM guard_denials ORDER BY id LIMIT 1",
+            "SELECT session_name, target, tool FROM guard_denials ORDER BY id LIMIT 1 OFFSET 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -316,7 +319,10 @@ fn guard_keeps_threads_to_their_coordinator() {
     };
     assert_eq!(deny_reason(&guard("chief-demo")), None);
     assert_eq!(deny_reason(&guard("uds:/tmp/cc-socks/100.sock")), None);
-    assert_eq!(deny_reason(&guard("my-subagent")), None);
+    // Only the coordinator: not even the thread's own subagents or a ref'd coordinator name.
+    assert!(deny_reason(&guard("my-subagent")).is_some());
+    assert!(deny_reason(&guard("chief-demo [c1]")).is_some());
+    assert!(deny_reason(&guard("uds:100.sock")).is_some());
     assert!(deny_reason(&guard("other-project-thread")).is_some());
     assert!(deny_reason(&guard("demo-a-1111")).is_some());
     assert!(deny_reason(&guard("uds:/tmp/cc-socks/300.sock")).is_some());

@@ -1,23 +1,23 @@
 //! Message guard (ARCHITECTURE §6). `evaluate` is pure; `hook::guard` gathers its inputs.
+//!
+//! An allow-list by byte-exact equality: `to` is never trimmed or parsed. A `[ref]` after a name
+//! picks one session in Claude Code, so it could redirect a message that the name alone would
+//! allow; lookalike names (case, zero-width characters) and sessions the local `claude agents`
+//! doesn't list (other machines, the cloud, teammates, subagents) match nothing and are denied.
 
+use crate::claude::AgentRow;
 use crate::state::Role;
 
-/// A live session from a fresh `claude agents` snapshot.
+/// A registry row of this project, as the guard needs it.
 #[derive(Debug, Clone)]
-pub struct LiveSession {
-    pub name: Option<String>,
-    pub pid: Option<u32>,
-}
-
-/// One of this project's threads, from the registry.
-#[derive(Debug, Clone)]
-pub struct ProjectThread {
+pub struct Member {
     pub name: String,
+    pub session_id: Option<String>,
+    /// Used to find the row in the snapshot while `session_id` is unresolved.
+    pub short_id: Option<String>,
     pub resolved: bool,
     /// Its session, worktree and branch were removed (§12).
     pub cleaned: bool,
-    /// Its pid in the fresh `claude agents` snapshot; None when it isn't running (asleep).
-    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,10 +26,13 @@ pub struct GuardInput<'a> {
     pub tool: &'a str,
     /// `SendMessage.to`, verbatim.
     pub to: Option<&'a str>,
+    /// `chief-<slug>`.
     pub coordinator_name: &'a str,
-    pub coordinator_pid: Option<u32>,
-    pub threads: &'a [ProjectThread],
-    pub live: &'a [LiveSession],
+    /// The coordinator's row; None before `chief up` first started it.
+    pub coordinator: Option<&'a Member>,
+    pub threads: &'a [Member],
+    /// A fresh `claude agents --json --all` snapshot (every state).
+    pub snapshot: &'a [AgentRow],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,12 @@ pub const THREAD_LIST_AGENTS_DENIED: &str =
     "ListAgents is blocked in chief threads: you can message only your coordinator.";
 pub const ASLEEP: &str = "Thread is asleep: call wake_thread first.";
 pub const RESOLVED: &str = "Thread is resolved; reopen it first.";
+/// Prefixed to a denial whose `to` contains `[`.
+pub const BARE_NAME: &str = "Use the bare name, without a `[ref]`: chief matches names exactly, and a ref can pick \
+     another session.";
+/// What a thread can do instead of messaging its coordinator.
+const REPORT_INSTEAD: &str = "Just finish your turn: your final message is recorded as your \
+                              report when you stop anyway, and the coordinator reads it there.";
 
 /// Shared by the guard, `wake_thread` and reopening: a cleaned thread has no session left.
 pub fn cleaned_message(name: &str) -> String {
@@ -68,95 +77,173 @@ pub fn evaluate(input: &GuardInput) -> Decision {
         "SendMessage" => {}
         _ => return Decision::Allow,
     }
-    let Some(raw) = input.to.map(str::trim).filter(|t| !t.is_empty()) else {
+    // Blank only picks the message; the comparisons below use `to` as given.
+    let Some(to) = input.to.filter(|t| !t.trim().is_empty()) else {
         return Decision::Deny("SendMessage has no `to`; chief can't check where it goes.".into());
     };
-    let to = strip_ref(raw);
-    match input.role {
+    let decision = match input.role {
         Role::Coordinator => coordinator_send(input, to),
         Role::Thread => thread_send(input, to),
+    };
+    match decision {
+        Decision::Deny(reason) if to.contains('[') => {
+            Decision::Deny(format!("{BARE_NAME} {reason}"))
+        }
+        d => d,
     }
 }
 
+/// Allowed: the exact name of one of this project's threads, or the exact socket address of
+/// one, when that thread can be reached (`reach_thread`).
 fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
-    if let Some(addr) = to.strip_prefix("uds:") {
-        let live = uds_pid(addr).and_then(|pid| {
-            input
-                .threads
-                .iter()
-                .find(|t| t.pid == Some(pid) && !t.resolved && !t.cleaned)
-        });
-        return match live {
-            Some(_) => Decision::Allow,
-            None => Decision::Deny(format!(
-                "{to} is not a live thread of this project; message threads by name."
+    if let Some(thread) = input.threads.iter().find(|t| t.name == to) {
+        return match reach_thread(input, thread) {
+            Ok(_) => Decision::Allow,
+            Err(reason) => Decision::Deny(reason),
+        };
+    }
+    if to.starts_with("uds:") {
+        let reply = input
+            .threads
+            .iter()
+            .any(|t| reach_thread(input, t).is_ok_and(|pid| uds_address(pid) == to));
+        return if reply {
+            Decision::Allow
+        } else {
+            Decision::Deny(format!(
+                "{to} is not the address of a live thread of this project; message threads by \
+                 name."
+            ))
+        };
+    }
+    Decision::Deny(format!(
+        "{to} is not a thread of this project. Call list_threads for the names; start a thread \
+         with start_thread."
+    ))
+}
+
+/// Allowed: exactly `chief-<slug>`, or exactly the coordinator's socket address, while the
+/// coordinator's own session is live under that name.
+fn thread_send(input: &GuardInput, to: &str) -> Decision {
+    let coordinator = input.coordinator_name;
+    let only = || {
+        Decision::Deny(format!(
+            "Threads may message only their coordinator, by its exact name {coordinator}."
+        ))
+    };
+    let reached = match input.coordinator {
+        Some(row) => reach(row, coordinator, input.snapshot),
+        None => Reach::Asleep,
+    };
+    if to == coordinator {
+        return match reached {
+            Reach::Live(_) => Decision::Allow,
+            Reach::Asleep => Decision::Deny(format!(
+                "Your coordinator {coordinator} isn't running, so the message can't be \
+                 delivered. {REPORT_INSTEAD}"
+            )),
+            Reach::Renamed(now) => Decision::Deny(format!(
+                "Your coordinator's session was renamed ({}), so {coordinator} may name another \
+                 session; message not sent. {REPORT_INSTEAD}",
+                shown(now.as_deref())
+            )),
+            Reach::Ambiguous => Decision::Deny(format!(
+                "More than one Claude session is named {coordinator}; chief won't send to an \
+                 ambiguous name. {REPORT_INSTEAD}"
             )),
         };
     }
-    let Some(thread) = input.threads.iter().find(|t| t.name == to) else {
-        return Decision::Deny(format!(
-            "{to} is not a thread of this project. Call list_threads for the names; start a \
-             thread with start_thread."
-        ));
-    };
+    match reached {
+        Reach::Live(pid) if to == uds_address(pid) => Decision::Allow,
+        _ => only(),
+    }
+}
+
+/// Whether a message to one of this project's threads would reach its own session; the
+/// thread's pid if so, else the denial.
+fn reach_thread(input: &GuardInput, thread: &Member) -> Result<u32, String> {
     if thread.cleaned {
-        return Decision::Deny(cleaned_message(&thread.name));
+        return Err(cleaned_message(&thread.name));
     }
     if thread.resolved {
-        return Decision::Deny(RESOLVED.to_string());
+        return Err(RESOLVED.to_string());
     }
-    if thread.pid.is_none() {
-        return Decision::Deny(ASLEEP.to_string());
+    let name = &thread.name;
+    match reach(thread, name, input.snapshot) {
+        Reach::Live(pid) => Ok(pid),
+        Reach::Asleep => Err(ASLEEP.to_string()),
+        Reach::Renamed(now) => Err(format!(
+            "{name}'s session was renamed ({}), so the name {name} may reach another session; \
+             chief won't send it.",
+            shown(now.as_deref())
+        )),
+        Reach::Ambiguous => Err(format!(
+            "More than one Claude session is named {name}; chief won't send to an ambiguous \
+             name."
+        )),
     }
-    // Names are unique by construction, but a message must never reach two sessions.
-    if live_named(input, to) > 1 {
-        return Decision::Deny(format!(
-            "More than one live session is named {to}; chief won't send to an ambiguous name."
-        ));
-    }
-    Decision::Allow
 }
 
-fn thread_send(input: &GuardInput, to: &str) -> Decision {
-    if let Some(addr) = to.strip_prefix("uds:") {
-        return match (uds_pid(addr), input.coordinator_pid) {
-            (Some(pid), Some(coord)) if pid == coord => Decision::Allow,
-            _ => Decision::Deny(format!(
-                "Threads may message only their coordinator ({}).",
-                input.coordinator_name
-            )),
-        };
-    }
-    if to != input.coordinator_name && live_named(input, to) > 0 {
-        return Decision::Deny(format!(
-            "{to} is another Claude session; threads may message only their coordinator ({}).",
-            input.coordinator_name
-        ));
-    }
-    Decision::Allow
+/// What a message addressed to `name` would reach, for the registry row `member`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reach {
+    /// The row's own session is live, carries `name`, and is the only session that does.
+    Live(u32),
+    /// The row's session isn't listed, or has no process.
+    Asleep,
+    /// The row's session is live under another name (or none).
+    Renamed(Option<String>),
+    /// Some other session, in any state, carries `name` too.
+    Ambiguous,
 }
 
-fn live_named(input: &GuardInput, name: &str) -> usize {
-    input
-        .live
+/// §6 identity check. The row's session is the snapshot entry with its `session_id` (its
+/// `short_id` while unresolved), never one found by name.
+fn reach(member: &Member, name: &str, snapshot: &[AgentRow]) -> Reach {
+    let own = snapshot
         .iter()
-        .filter(|s| s.pid.is_some() && s.name.as_deref() == Some(name))
-        .count()
+        .find(|a| match (&member.session_id, &member.short_id) {
+            (Some(sid), _) => &a.session_id == sid,
+            (None, Some(short)) => a.id.as_ref() == Some(short),
+            (None, None) => false,
+        });
+    let Some((own, pid)) = own.and_then(|a| a.pid.map(|pid| (a, pid))) else {
+        return Reach::Asleep;
+    };
+    if own.name.as_deref() != Some(name) {
+        return Reach::Renamed(own.name.clone());
+    }
+    let named = snapshot
+        .iter()
+        .filter(|a| a.name.as_deref() == Some(name))
+        .count();
+    if named > 1 {
+        return Reach::Ambiguous;
+    }
+    Reach::Live(pid)
 }
 
-/// `name [ref]` → `name`: ListAgents shows a ref after the name, and models copy it.
+fn shown(name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("now {n}"),
+        None => "it has no name now".to_string(),
+    }
+}
+
+/// The address a live session's messages come from (§1): `uds:/tmp/cc-socks/<pid>.sock`, the
+/// pid in decimal. The guard accepts a `uds:` target only in exactly this form.
+pub fn uds_address(pid: u32) -> String {
+    format!("uds:/tmp/cc-socks/{pid}.sock")
+}
+
+/// `name [ref]` → `name`, for the MCP tools' `name` arguments (§7), which look rows up in the
+/// registry: there a ref can't redirect anything. The guard never strips refs.
 pub fn strip_ref(to: &str) -> &str {
     let to = to.trim();
     match to.rfind(" [") {
         Some(i) if to.ends_with(']') => to[..i].trim_end(),
         _ => to,
     }
-}
-
-/// `/tmp/cc-socks/<pid>.sock` → pid.
-pub fn uds_pid(addr: &str) -> Option<u32> {
-    let file = addr.rsplit('/').next()?;
-    file.strip_suffix(".sock")?.parse().ok()
 }
 
 /// The PreToolUse deny JSON Claude Code expects on stdout.
@@ -177,57 +264,75 @@ mod tests {
 
     const COORD_PID: u32 = 100;
 
-    fn threads() -> Vec<ProjectThread> {
+    fn member(name: &str, sid: &str) -> Member {
+        Member {
+            name: name.into(),
+            session_id: Some(sid.into()),
+            short_id: None,
+            resolved: false,
+            cleaned: false,
+        }
+    }
+
+    fn threads() -> Vec<Member> {
         vec![
-            ProjectThread {
-                name: "p-live-1a2b".into(),
-                resolved: false,
-                cleaned: false,
-                pid: Some(201),
-            },
-            ProjectThread {
-                name: "p-asleep-3c4d".into(),
-                resolved: false,
-                cleaned: false,
-                pid: None,
-            },
-            ProjectThread {
-                name: "p-done-5e6f".into(),
+            member("p-live-1a2b", "live"),
+            member("p-asleep-3c4d", "asleep"),
+            Member {
                 resolved: true,
-                cleaned: false,
-                pid: Some(203),
+                ..member("p-done-5e6f", "done")
             },
-            ProjectThread {
-                name: "p-done-asleep-7a8b".into(),
+            Member {
                 resolved: true,
-                cleaned: false,
-                pid: None,
+                ..member("p-done-asleep-7a8b", "done-asleep")
             },
-            ProjectThread {
-                name: "p-cleaned-9c0d".into(),
+            Member {
                 resolved: true,
                 cleaned: true,
-                pid: None,
+                ..member("p-cleaned-9c0d", "cleaned")
             },
+            // Not resolved yet: found in the snapshot by short id.
+            Member {
+                session_id: None,
+                short_id: Some("u1".into()),
+                ..member("p-unresolved-1111", "")
+            },
+            member("p-dup-9999", "dup"),
+            member("p-renamed-2222", "renamed"),
         ]
     }
 
-    fn live() -> Vec<LiveSession> {
-        let s = |name: &str, pid: Option<u32>| LiveSession {
-            name: Some(name.into()),
+    fn row(sid: &str, name: Option<&str>, pid: Option<u32>) -> AgentRow {
+        AgentRow {
+            id: None,
+            session_id: sid.into(),
+            name: name.map(String::from),
+            cwd: None,
+            kind: None,
+            started_at: None,
+            state: None,
+            status: None,
             pid,
-        };
+        }
+    }
+
+    fn snapshot(coord_pid: Option<u32>) -> Vec<AgentRow> {
         vec![
-            s("chief-p", Some(COORD_PID)),
-            s("p-live-1a2b", Some(201)),
-            s("p-done-5e6f", Some(203)),
-            s("other-project-thread", Some(300)),
-            s("someone-asleep", None),
-            s("dup", Some(401)),
-            LiveSession {
-                name: None,
-                pid: Some(500),
+            row("coord", Some("chief-p"), coord_pid),
+            row("live", Some("p-live-1a2b"), Some(201)),
+            row("asleep", Some("p-asleep-3c4d"), None),
+            row("done", Some("p-done-5e6f"), Some(203)),
+            AgentRow {
+                id: Some("u1".into()),
+                ..row("u1-sid", Some("p-unresolved-1111"), Some(204))
             },
+            row("dup", Some("p-dup-9999"), Some(205)),
+            // Another session, asleep, with a project thread's name.
+            row("other-dup", Some("p-dup-9999"), None),
+            row("renamed", Some("p-renamed-now"), Some(206)),
+            row("x", Some("other-project-thread"), Some(300)),
+            row("y", Some("p-renamed-2222"), Some(301)),
+            row("z", None, Some(500)),
         ]
     }
 
@@ -241,33 +346,16 @@ mod tests {
 
     fn check(role: Role, tool: &str, to: Option<&str>, coord_pid: Option<u32>, want: Want) {
         let threads = threads();
-        let mut live = live();
-        // A second live session with a project thread's name, for the ambiguity case.
-        if to == Some("p-dup-9999") {
-            live.push(LiveSession {
-                name: Some("p-dup-9999".into()),
-                pid: Some(601),
-            });
-            live.push(LiveSession {
-                name: Some("p-dup-9999".into()),
-                pid: Some(602),
-            });
-        }
-        let mut all = threads.clone();
-        all.push(ProjectThread {
-            name: "p-dup-9999".into(),
-            resolved: false,
-            cleaned: false,
-            pid: Some(601),
-        });
+        let snapshot = snapshot(coord_pid);
+        let coordinator = member("chief-p", "coord");
         let input = GuardInput {
             role,
             tool,
             to,
             coordinator_name: "chief-p",
-            coordinator_pid: coord_pid,
-            threads: &all,
-            live: &live,
+            coordinator: Some(&coordinator),
+            threads: &threads,
+            snapshot: &snapshot,
         };
         let got = evaluate(&input);
         let case = format!("{role:?} {tool} {to:?}");
@@ -293,13 +381,41 @@ mod tests {
             (T, "ListAgents", None, cp, Deny("only your coordinator")),
             // Other tools never reach the guard; allow them.
             (C, "Read", None, cp, Allow),
-            // Missing `to`.
+            // Missing or blank `to`.
             (C, "SendMessage", None, cp, Deny("no `to`")),
             (T, "SendMessage", Some("  "), cp, Deny("no `to`")),
-            // Coordinator to its threads.
+            (C, "SendMessage", Some(""), cp, Deny("no `to`")),
+            // Coordinator to its threads, by exact name.
             (C, "SendMessage", Some("p-live-1a2b"), cp, Allow),
-            (C, "SendMessage", Some("p-live-1a2b [a1b2c3]"), cp, Allow),
-            (C, "SendMessage", Some(" p-live-1a2b  [ref] "), cp, Allow),
+            (C, "SendMessage", Some("p-unresolved-1111"), cp, Allow),
+            (
+                C,
+                "SendMessage",
+                Some("p-live-1a2b [a1b2c3]"),
+                cp,
+                Deny(BARE_NAME),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some(" p-live-1a2b"),
+                cp,
+                Deny("not a thread"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("p-live-1a2b\u{200b}"),
+                cp,
+                Deny("not a thread"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("P-Live-1a2b"),
+                cp,
+                Deny("not a thread"),
+            ),
             (C, "SendMessage", Some("p-asleep-3c4d"), cp, Deny(ASLEEP)),
             (C, "SendMessage", Some("p-done-5e6f"), cp, Deny(RESOLVED)),
             (
@@ -313,7 +429,14 @@ mod tests {
             (
                 C,
                 "SendMessage",
-                Some("p-cleaned-9c0d [r]"),
+                Some("p-renamed-2222"),
+                cp,
+                Deny("renamed (now p-renamed-now)"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("p-cleaned-9c0d"),
                 cp,
                 Deny("p-cleaned-9c0d was cleaned up; start a new thread"),
             ),
@@ -325,13 +448,6 @@ mod tests {
                 cp,
                 Deny("not a thread of this project"),
             ),
-            (
-                C,
-                "SendMessage",
-                Some("other-project-thread [x1]"),
-                cp,
-                Deny("not a thread"),
-            ),
             (C, "SendMessage", Some("chief-p"), cp, Deny("not a thread")),
             (
                 C,
@@ -340,7 +456,7 @@ mod tests {
                 cp,
                 Deny("not a thread"),
             ),
-            // Coordinator replying to a uds address.
+            // Coordinator replying to a thread's socket address, exactly.
             (
                 C,
                 "SendMessage",
@@ -351,48 +467,97 @@ mod tests {
             (
                 C,
                 "SendMessage",
-                Some("uds:/tmp/cc-socks/201.sock [r]"),
+                Some("uds:/tmp/cc-socks/204.sock"),
                 cp,
                 Allow,
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("uds:/tmp/cc-socks/201.sock [r]"),
+                cp,
+                Deny(BARE_NAME),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("uds:201.sock"),
+                cp,
+                Deny("not the address"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("uds:/x/201.sock"),
+                cp,
+                Deny("not the address"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("uds:/tmp/cc-socks/0201.sock"),
+                cp,
+                Deny("not the address"),
             ),
             (
                 C,
                 "SendMessage",
                 Some("uds:/tmp/cc-socks/300.sock"),
                 cp,
-                Deny("not a live thread"),
+                Deny("not the address"),
             ),
+            // Resolved, renamed and ambiguous threads aren't reachable by address either.
             (
                 C,
                 "SendMessage",
                 Some("uds:/tmp/cc-socks/203.sock"),
                 cp,
-                Deny("not a live thread"),
+                Deny("not the address"),
             ),
             (
                 C,
                 "SendMessage",
-                Some("uds:/tmp/cc-socks/nope.sock"),
+                Some("uds:/tmp/cc-socks/205.sock"),
                 cp,
-                Deny("not a live thread"),
+                Deny("not the address"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("uds:/tmp/cc-socks/206.sock"),
+                cp,
+                Deny("not the address"),
             ),
             (
                 C,
                 "SendMessage",
                 Some("uds:garbage"),
                 cp,
-                Deny("not a live thread"),
+                Deny("not the address"),
             ),
-            // Thread to its coordinator.
+            // Thread to its coordinator, exactly.
             (T, "SendMessage", Some("chief-p"), cp, Allow),
-            (T, "SendMessage", Some("chief-p [ref]"), cp, Allow),
-            (T, "SendMessage", Some("chief-p"), None, Allow),
             (
                 T,
                 "SendMessage",
                 Some("uds:/tmp/cc-socks/100.sock"),
                 cp,
                 Allow,
+            ),
+            (T, "SendMessage", Some("chief-p [ref]"), cp, Deny(BARE_NAME)),
+            (
+                T,
+                "SendMessage",
+                Some("chief-p"),
+                None,
+                Deny("isn't running"),
+            ),
+            (
+                T,
+                "SendMessage",
+                Some("chief-p"),
+                None,
+                Deny("recorded as your report"),
             ),
             (
                 T,
@@ -411,40 +576,74 @@ mod tests {
             (
                 T,
                 "SendMessage",
-                Some("uds:/tmp/cc-socks/300.sock"),
+                Some("uds:100.sock"),
                 cp,
                 Deny("only their coordinator"),
             ),
-            // Thread to other live sessions: siblings and other projects.
+            // Thread to anything else: siblings, other projects, its own subagents, sessions
+            // the local `claude agents` doesn't list.
             (
                 T,
                 "SendMessage",
                 Some("p-live-1a2b"),
                 cp,
-                Deny("another Claude session"),
+                Deny("only their coordinator"),
             ),
             (
                 T,
                 "SendMessage",
                 Some("other-project-thread"),
                 cp,
-                Deny("another Claude session"),
+                Deny("only their coordinator"),
             ),
             (
                 T,
                 "SendMessage",
                 Some("other-project-thread [abc]"),
                 cp,
-                Deny("another Claude session"),
+                Deny(BARE_NAME),
             ),
-            // Thread to its own subagents (not in `claude agents`), or a listed session with
-            // no process.
-            (T, "SendMessage", Some("researcher"), cp, Allow),
-            (T, "SendMessage", Some("someone-asleep"), cp, Allow),
+            (
+                T,
+                "SendMessage",
+                Some("researcher"),
+                cp,
+                Deny("only their coordinator"),
+            ),
+            (
+                T,
+                "SendMessage",
+                Some("Chief-P"),
+                cp,
+                Deny("only their coordinator"),
+            ),
         ];
         for (role, tool, to, coord_pid, want) in cases {
             check(role, tool, to, coord_pid, want);
         }
+    }
+
+    #[test]
+    fn identity() {
+        let snap = snapshot(Some(COORD_PID));
+        let m = member("p-live-1a2b", "live");
+        assert_eq!(reach(&m, "p-live-1a2b", &snap), Reach::Live(201));
+        assert_eq!(
+            reach(&m, "other", &snap),
+            Reach::Renamed(Some("p-live-1a2b".into()))
+        );
+        let nobody = Member {
+            session_id: None,
+            short_id: None,
+            ..m.clone()
+        };
+        assert_eq!(
+            reach(&nobody, "p-live-1a2b", &snap),
+            Reach::Asleep,
+            "never by name"
+        );
+        let unnamed = member("x", "z");
+        assert_eq!(reach(&unnamed, "x", &snap), Reach::Renamed(None));
     }
 
     #[test]
@@ -453,10 +652,7 @@ mod tests {
         assert_eq!(strip_ref("a"), "a");
         assert_eq!(strip_ref("a [b"), "a [b");
         assert_eq!(strip_ref("[b]"), "[b]");
-        assert_eq!(uds_pid("/tmp/cc-socks/123.sock"), Some(123));
-        assert_eq!(uds_pid("123.sock"), Some(123));
-        assert_eq!(uds_pid("/tmp/cc-socks/123"), None);
-        assert_eq!(uds_pid(""), None);
+        assert_eq!(uds_address(123), "uds:/tmp/cc-socks/123.sock");
     }
 
     #[test]

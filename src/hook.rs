@@ -122,8 +122,7 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     Ok(Some(guard::deny_json(&reason)))
 }
 
-/// The §6 decision from the project's registry rows and a `claude agents` snapshot. A row is
-/// alive when the snapshot lists it with a pid.
+/// The §6 decision from the project's registry rows and a `claude agents` snapshot.
 pub fn guard_decision(
     project: &str,
     role: Role,
@@ -132,46 +131,31 @@ pub fn guard_decision(
     rows: &[SessionRow],
     snapshot: &[AgentRow],
 ) -> guard::Decision {
-    let pid_of = |row: &SessionRow| {
-        snapshot
-            .iter()
-            .find(|a| match (&row.session_id, &row.short_id) {
-                (Some(sid), _) => &a.session_id == sid,
-                (None, Some(short)) => a.id.as_ref() == Some(short),
-                (None, None) => false,
-            })
-            .and_then(|a| a.pid)
+    let member = |r: &SessionRow| guard::Member {
+        name: r.name.clone(),
+        session_id: r.session_id.clone(),
+        short_id: r.short_id.clone(),
+        resolved: r.resolved,
+        cleaned: r.cleaned_at.is_some(),
     };
     let threads: Vec<_> = rows
         .iter()
         .filter(|r| r.role == Role::Thread.as_str())
-        .map(|r| guard::ProjectThread {
-            name: r.name.clone(),
-            resolved: r.resolved,
-            cleaned: r.cleaned_at.is_some(),
-            pid: pid_of(r),
-        })
+        .map(member)
         .collect();
-    let coordinator_pid = rows
+    let coordinator = rows
         .iter()
         .find(|r| r.role == Role::Coordinator.as_str())
-        .and_then(pid_of);
-    let live: Vec<_> = snapshot
-        .iter()
-        .map(|a| guard::LiveSession {
-            name: a.name.clone(),
-            pid: a.pid,
-        })
-        .collect();
+        .map(member);
     let coordinator_name = names::coordinator_name(project);
     guard::evaluate(&guard::GuardInput {
         role,
         tool,
         to,
         coordinator_name: &coordinator_name,
-        coordinator_pid,
+        coordinator: coordinator.as_ref(),
         threads: &threads,
-        live: &live,
+        snapshot,
     })
 }
 
@@ -913,6 +897,224 @@ mod tests {
             decide(Role::Thread, "uds:/tmp/cc-socks/70003.sock"),
             Deny(_)
         ));
+    }
+
+    fn agent_row(id: &str, sid: &str, name: &str, pid: Option<u32>) -> AgentRow {
+        AgentRow {
+            id: Some(id.into()),
+            session_id: sid.into(),
+            name: Some(name.into()),
+            cwd: None,
+            kind: Some("background".into()),
+            started_at: None,
+            state: Some("done".into()),
+            status: pid.map(|_| "idle".into()),
+            pid,
+        }
+    }
+
+    /// The coordinator `chief-demo` (c-sid) and one thread `demo-fix-1a2b` (t-sid).
+    fn guard_rows() -> Vec<SessionRow> {
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.session_id = Some("c-sid".into());
+        coord.short_id = Some("c1".into());
+        let mut t = SessionRow::new("demo-fix-1a2b", "demo", Role::Thread, 0);
+        t.session_id = Some("t-sid".into());
+        t.short_id = Some("t1".into());
+        vec![coord, t]
+    }
+
+    fn denied(d: &guard::Decision, part: &str) -> bool {
+        matches!(d, guard::Decision::Deny(r) if r.contains(part))
+    }
+
+    #[test]
+    fn guard_checks_that_the_name_still_belongs_to_the_thread() {
+        // Our thread (t-sid, pid 201) now carries another name, and an outside session carries
+        // its old one: a message by name would reach the outsider.
+        let snap = [
+            agent_row("c1", "c-sid", "chief-demo", Some(100)),
+            agent_row("t1", "t-sid", "renamed", Some(201)),
+            agent_row("o1", "o-sid", "demo-fix-1a2b", Some(300)),
+        ];
+        let decide = |to: &str| {
+            guard_decision(
+                "demo",
+                Role::Coordinator,
+                "SendMessage",
+                Some(to),
+                &guard_rows(),
+                &snap,
+            )
+        };
+        assert!(
+            denied(&decide("demo-fix-1a2b"), "renamed"),
+            "{:?}",
+            decide("demo-fix-1a2b")
+        );
+        assert!(denied(
+            &decide("uds:/tmp/cc-socks/300.sock"),
+            "not the address"
+        ));
+
+        // Another session, asleep, carries the thread's name too: ambiguous.
+        let snap = [
+            agent_row("t1", "t-sid", "demo-fix-1a2b", Some(201)),
+            agent_row("o1", "o-sid", "demo-fix-1a2b", None),
+        ];
+        let d = guard_decision(
+            "demo",
+            Role::Coordinator,
+            "SendMessage",
+            Some("demo-fix-1a2b"),
+            &guard_rows(),
+            &snap,
+        );
+        assert!(denied(&d, "ambiguous"), "{d:?}");
+    }
+
+    #[test]
+    fn guard_checks_the_threads_coordinator() {
+        let thread = |to: &str, snap: &[AgentRow]| {
+            guard_decision(
+                "demo",
+                Role::Thread,
+                "SendMessage",
+                Some(to),
+                &guard_rows(),
+                snap,
+            )
+        };
+        // Coordinator asleep; an unrelated live session is named chief-demo.
+        let snap = [
+            agent_row("c1", "c-sid", "chief-demo", None),
+            agent_row("o1", "o-sid", "chief-demo", Some(300)),
+        ];
+        let d = thread("chief-demo", &snap);
+        assert!(denied(&d, "recorded"), "the report is kept anyway: {d:?}");
+        assert!(denied(
+            &thread("uds:/tmp/cc-socks/300.sock", &snap),
+            "only their coordinator"
+        ));
+        // Two live sessions with the coordinator's name.
+        let snap = [
+            agent_row("c1", "c-sid", "chief-demo", Some(100)),
+            agent_row("o1", "o-sid", "chief-demo", Some(300)),
+        ];
+        assert!(denied(&thread("chief-demo", &snap), "ambiguous"));
+        // The coordinator's session renamed.
+        let snap = [agent_row("c1", "c-sid", "something-else", Some(100))];
+        assert!(denied(&thread("chief-demo", &snap), "renamed"));
+        // No coordinator row at all.
+        let rows: Vec<_> = guard_rows().into_iter().skip(1).collect();
+        let snap = [agent_row("o1", "o-sid", "chief-demo", Some(300))];
+        let d = guard_decision(
+            "demo",
+            Role::Thread,
+            "SendMessage",
+            Some("chief-demo"),
+            &rows,
+            &snap,
+        );
+        assert!(denied(&d, "recorded"), "{d:?}");
+    }
+
+    #[test]
+    fn guard_allows_threads_only_their_coordinators_exact_name() {
+        let snap = [
+            agent_row("c1", "c-sid", "chief-demo", Some(100)),
+            agent_row("o1", "o-sid", "other-thread", Some(300)),
+        ];
+        let thread = |to: &str| {
+            guard_decision(
+                "demo",
+                Role::Thread,
+                "SendMessage",
+                Some(to),
+                &guard_rows(),
+                &snap,
+            )
+        };
+        assert_eq!(thread("chief-demo"), guard::Decision::Allow);
+        assert_eq!(thread("uds:/tmp/cc-socks/100.sock"), guard::Decision::Allow);
+        for to in [
+            "other-thread",
+            "other-thread [x]",
+            "other-thread\u{feff}",
+            "\u{feff}other-thread",
+            "other-thread\u{200b}",
+            "Other-Thread",
+            "other-thread\t[x]",
+            "other-thread[x]",
+            "other-thread [x] [y]",
+            "chief-demo [2c7859]",
+            "chief-demo ",
+            " chief-demo",
+            "chief-demo\u{feff}",
+            "Chief-Demo",
+            // Not in the local `claude agents`: another machine, the cloud, a teammate, a
+            // subagent.
+            "researcher",
+            "demo-fix-1a2b",
+            // Addresses other than the coordinator's socket in exactly Claude Code's form.
+            "uds:100.sock",
+            "uds:/elsewhere/100.sock",
+            "uds:/tmp/cc-socks/0100.sock",
+            "uds:/tmp/cc-socks/+100.sock",
+            "uds:/tmp/cc-socks//100.sock",
+            "uds:/tmp/cc-socks/100.sock [r]",
+            "uds:/tmp/cc-socks/100.sock\n",
+            "uds:/tmp/cc-socks/300.sock",
+        ] {
+            assert!(
+                matches!(thread(to), guard::Decision::Deny(_)),
+                "{to:?} allowed"
+            );
+        }
+        assert!(denied(&thread("chief-demo [2c7859]"), "without a"));
+        assert!(denied(&thread("other-thread[x]"), "without a"));
+    }
+
+    #[test]
+    fn guard_allows_the_coordinator_only_exact_thread_names() {
+        let snap = [
+            agent_row("c1", "c-sid", "chief-demo", Some(100)),
+            agent_row("t1", "t-sid", "demo-fix-1a2b", Some(201)),
+            agent_row("o1", "o-sid", "other-thread", Some(300)),
+        ];
+        let coord = |to: &str| {
+            guard_decision(
+                "demo",
+                Role::Coordinator,
+                "SendMessage",
+                Some(to),
+                &guard_rows(),
+                &snap,
+            )
+        };
+        assert_eq!(coord("demo-fix-1a2b"), guard::Decision::Allow);
+        assert_eq!(coord("uds:/tmp/cc-socks/201.sock"), guard::Decision::Allow);
+        for to in [
+            "demo-fix-1a2b [2c7859]",
+            "demo-fix-1a2b [ref-of-other-thread]",
+            " demo-fix-1a2b",
+            "demo-fix-1a2b ",
+            "demo-fix-1a2b\u{feff}",
+            "Demo-Fix-1a2b",
+            "demo-fix-1a2b[x]",
+            "uds:201.sock",
+            "uds:/elsewhere/201.sock",
+            "uds:/tmp/cc-socks/0201.sock",
+            "uds:/tmp/cc-socks/201.sock [r]",
+            "uds:/tmp/cc-socks/201.sock ",
+            "uds:/tmp/cc-socks/100.sock",
+        ] {
+            assert!(
+                matches!(coord(to), guard::Decision::Deny(_)),
+                "{to:?} allowed"
+            );
+        }
+        assert!(denied(&coord("demo-fix-1a2b [2c7859]"), "without a"));
     }
 
     #[test]

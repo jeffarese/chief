@@ -369,14 +369,34 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 | Caller | Tool | Rule |
 | --- | --- | --- |
 | any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
-| coordinator | `SendMessage` | allow only if `to` (with any trailing ` [ref]` removed) is the name of a thread in this project, not cleaned, not resolved, and alive (pid in a fresh `claude agents` snapshot). Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Asleep → deny: "Thread is asleep: call wake_thread first." Resolved → deny: "Thread is resolved; reopen it first." Also allow `to = uds:…/<pid>.sock` when `<pid>` is a live, uncleaned, unresolved thread of this project (a reply). Everything else → deny |
-| thread | `SendMessage` | deny if `to` starts with `uds:` and the pid is not this project's coordinator; deny if `to` (ref removed) equals the name of any live session in `claude agents` other than this project's coordinator; allow otherwise (the thread's own subagents) |
+| coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not cleaned, not resolved, and reachable (below). Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
+| thread | `SendMessage` | allow only if `to` is exactly `chief-<slug>` or exactly the coordinator's socket address, and the coordinator is reachable. Coordinator not running (or never started) → deny: "Your coordinator chief-<slug> isn't running, so the message can't be delivered. Just finish your turn: your final message is recorded as your report when you stop anyway, and the coordinator reads it there." Renamed or ambiguous → deny with the same advice. Everything else → deny ("Threads may message only their coordinator, by its exact name chief-<slug>."): siblings, other projects, the thread's own subagents, and any session the local `claude agents` doesn't list |
 
-`to` is read from `tool_input.to`; a SendMessage whose `tool_input` isn't an object or has no string
-`to` is denied. A thread's pid is the pid that the snapshot lists for its `session_id` (or
-`short_id` while unresolved); the coordinator's pid likewise. The coordinator is also denied when
-more than one live session carries the thread's name (never deliver to an ambiguous name). Other
-tools are allowed. `claude agents` is only run for a SendMessage with a `to`.
+An allow-list by byte-exact equality. `to` is never trimmed, case-folded or parsed, and a trailing
+` [ref]` is not removed: Claude Code's refs (`[2c7859]`, a short hex id) pick one session, so a
+ref could deliver a message that the bare name would allow to another session. A denied `to` that
+contains `[` gets "Use the bare name, without a `[ref]`: chief matches names exactly, and a ref can
+pick another session." before the reason. Lookalikes (another case, U+FEFF, U+200B, a tab before
+the ref) and sessions the local `claude agents` doesn't list (other machines, cloud sessions,
+Remote Control, teammates, subagents) match nothing and are denied.
+
+Reachable (the identity check, for a thread under its name and for the coordinator under
+`chief-<slug>`): the snapshot entry for the row's `session_id` (its `short_id` while the
+`session_id` is unresolved; never an entry found by name) has a pid and carries exactly that name,
+and no other snapshot entry, in any state, carries that name. Otherwise it is asleep (no entry, or
+no pid), renamed (the entry carries another name, so the name may reach someone else), or
+ambiguous (another entry carries the name too). A coordinator with no row counts as not running.
+
+Socket addresses are accepted only in the exact form Claude Code gives a session's socket (§1, the
+`from` of every cross-session message): `uds:/tmp/cc-socks/<pid>.sock`, the pid in decimal with no
+sign or leading zeros, nothing before or after. The guard builds that string from the reachable
+session's pid and compares bytes, so another folder, a bare `uds:<pid>.sock`, `0201` or a ref
+after it is denied. If Claude Code ever moves its sockets, replies by address are denied (fail
+closed) and the sessions fall back to names.
+
+`to` is read from `tool_input.to`; a SendMessage whose `tool_input` isn't an object, or has no
+string `to` or a blank one, is denied. Other tools are allowed. `claude agents` is only run for a
+SendMessage with a `to`.
 
 The guard process itself always exits 0 (deny JSON or empty stdout); its generated command turns
 any other exit, including a chief binary that can't start, into exit 2 (§3), which blocks the call.
@@ -472,14 +492,16 @@ a pid. Otherwise it is left alone.
 
 - `coordinator.md`: role (route, never do the work), routing rules (quick question → answer;
   new work → `start_thread`; follow-up → `SendMessage` to the matching thread with
-  `notify_when_idle`, waking it first if asleep; several tasks → several threads), say which thread
-  got what, keep `max_parallel`, save preferences and decisions to `memory/` and update
-  `memory/MEMORY.md`, read full reports with `read_report` when an idle notice arrives. Removing
-  worktrees and branches is the user's call (board `x`, `chief clean`, `chief gc`), so it never
-  offers to; it names no branch in a thread's brief unless the user did (threads create their own).
+  `notify_when_idle`, waking it first if asleep, by its exact name with no `[ref]`; several tasks →
+  several threads), say which thread got what, keep `max_parallel`, save preferences and decisions
+  to `memory/` and update `memory/MEMORY.md`, read full reports with `read_report` when an idle
+  notice arrives. Removing worktrees and branches is the user's call (board `x`, `chief clean`,
+  `chief gc`), so it never offers to; it names no branch in a thread's brief unless the user did
+  (threads create their own).
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
-  instructions follow; work on your own branch; end every turn with a short report (what changed,
-  branch, PR URL if any, what you need); if something is missing, say exactly what and stop.
+  instructions follow; work on your own branch; message only the coordinator, by its exact name
+  (the report needs no message); end every turn with a short report (what changed, branch, PR URL
+  if any, what you need); if something is missing, say exactly what and stop.
 
 Placeholders (`{{name}}` replaced verbatim): coordinator `name`, `goal_line` (` Goal: …` or empty),
 `project_dir`, `max_parallel`; thread `name`, `coordinator_name`, `project_dir`. Both get
