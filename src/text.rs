@@ -22,6 +22,24 @@ pub fn ago(now: i64, ts: i64) -> String {
     }
 }
 
+/// What runs beside a session's own turn (§5 "Background work"): `2 subagents, 1 background
+/// command`; None when nothing does.
+pub fn background_work(subagents: u32, commands: u32) -> Option<String> {
+    let count = |n: u32, one: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {one}s")),
+    };
+    let parts: Vec<String> = [
+        count(subagents, "subagent"),
+        count(commands, "background command"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 /// Local wall-clock `HH:MM` for a unix ms timestamp.
 pub fn local_hhmm(ts: i64) -> String {
     use chrono::{Local, TimeZone};
@@ -47,6 +65,20 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_work_counts() {
+        assert_eq!(background_work(0, 0), None);
+        assert_eq!(background_work(1, 0).as_deref(), Some("1 subagent"));
+        assert_eq!(
+            background_work(2, 1).as_deref(),
+            Some("2 subagents, 1 background command")
+        );
+        assert_eq!(
+            background_work(0, 3).as_deref(),
+            Some("3 background commands")
+        );
+    }
 
     #[test]
     fn one_line_cuts_and_flattens() {

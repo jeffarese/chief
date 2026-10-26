@@ -169,7 +169,7 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | Guard: an Agent named like the coordinator or a project thread denied at spawn; a free name allowed; a thread messaging the coordinator's subagent, the coordinator messaging a thread's subagent, a lead messaging `team-lead` all denied; the thread's own subagent allowed by name and by agent id | Pass (the thread's catch-all denial reworded: it now names subagents, and the reply address for a thread in another account) |
 | `claude respawn` of the thread: SessionStart `resume` forgets its subagents; the old name is denied | Pass |
 
-## Next: threads that wait on subagents or background commands (designed, not built)
+## Threads that wait on subagents or background commands (built)
 
 Problem (side-agent note after the subagents run): a thread that hands work to a subagent ends its
 turn while it waits. Claude Code then reports it idle, the coordinator's idle notice fires, and
@@ -219,8 +219,7 @@ idle subagent with a Stop-hook block, a `TaskStop`, and background commands).
    compact). Subagent hooks still don't change the lead's `last_hook` handling.
 2. **State (§5 rule 5).** Working when the process isn't gone and (`cc_status` busy, or the
    provisional working hook, or `subagents_busy > 0`, or `background_running > 0`). Waiting rules
-   still come first. A subagent stalled on a background command keeps its thread Working rather
-   than finished.
+   still come first.
 3. **The final report.** A thread's Stop with work still running sets `stopped_early_at`. Its
    Stop with nothing running clears it, and, unless `stop_hook_active`, prints
    `{"decision":"block","reason":…}` asking it to send its final report to the coordinator at the
@@ -232,10 +231,17 @@ idle subagent with a Stop-hook block, a `TaskStop`, and background commands).
    `N background commands`. Prompt: an idle notice from a thread the board shows working isn't
    a finish: say nothing, don't subscribe again (the notice would come straight back); its final
    report arrives as a message.
-5. **Thread prompt.** When it ends a turn while subagents or background commands run, it says
-   what it waits for; chief asks for the final report once they're done. Tell subagents to run
-   long commands (tests, builds) in the foreground: a subagent isn't woken when its background
-   command ends.
+5. **No background commands in subagents.** A second side-agent note found the gap in a
+   prompt-only rule: a subagent stalled on its background command is between turns, so nothing
+   counts it, and as soon as anything wakes its lead (the lead's own command ending, a message),
+   the lead's Stop finds nothing running and asks for the final report on half-done work. When
+   nothing wakes the lead, no hook fires at all, so detecting the stall at the lead's next Stop
+   can't cover the common case either. So the regular PreToolUse hook (matcher `*`, fails open,
+   unlike the guard) denies a Bash call from a subagent with `run_in_background: true`: run it in
+   the foreground with a long enough timeout, or leave anything over 10 minutes to the lead.
+   Thread prompt: say what it waits for when it ends a turn early (chief asks for the final
+   report once everything is done), and tell subagents to run tests and builds in the
+   foreground.
 6. **Board.** Tags `N subagents` / `N bg commands` on Working rows; detail line.
 7. **Contract.** ARCHITECTURE §1 (the facts above), §5 (hook table, rule 5, the final report),
    §7 `list_threads`, §8 prompts, the board section; `CLAUDE.md`: hooks print only the guard

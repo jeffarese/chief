@@ -8,7 +8,9 @@ the milestones.
 
 - `docs/ARCHITECTURE.md` wins over code. If the code must differ, update the doc in the same commit.
 - Hook commands (`chief hook …`) must never block or fail a Claude session: exit 0, keep stdout empty
-  except the guard decision and the coordinator's context, log errors to `<root>/logs/hook-errors.log`.
+  except the guard decision, the coordinator's context, and the two background-work outputs
+  (ARCHITECTURE §5): the denial of a subagent's background command and the Stop decision that asks
+  a thread for its final report. Log errors to `<root>/logs/hook-errors.log`.
 - Never call `claude --bg --resume <id>` with extra arguments; revive with `claude respawn <id>`.
 - Never start real Claude sessions from unit or integration tests. Use `CHIEF_CLAUDE_BIN` with a fake
   script and `CHIEF_HOME` with a temp dir. Only `scripts/e2e.sh` starts real sessions.

@@ -113,6 +113,9 @@ pub struct ThreadView {
     pub waiting_reason: Option<String>,
     /// No process: `wake_thread` before messaging it.
     pub asleep: bool,
+    /// Its subagents mid-turn and its background commands running (§5 "Background work"),
+    /// e.g. `1 subagent`; null when none. Its own turn may have ended: it isn't done yet.
+    pub running: Option<String>,
     pub branch: Option<String>,
     pub pr_url: Option<String>,
     pub last_report_preview: Option<String>,
@@ -140,6 +143,7 @@ pub fn thread_view(
         group: row.group_name.clone(),
         waiting_reason: row.waiting_reason.clone(),
         asleep: row.pid.is_none(),
+        running: registry::background_work(row),
         branch: row.branch.clone(),
         pr_url: row.pr_url.clone(),
         last_report_preview: row
@@ -532,6 +536,14 @@ pub fn read_report(ctx: &ToolCtx, args: &ReadReportArgs) -> Result<Value> {
     });
     if reports.is_empty() {
         out["note"] = json!("No report yet: the thread hasn't finished a turn.");
+    }
+    // §5 "Background work": its idle notice came from a turn that ended while these run.
+    if let Some(work) = registry::background_work(&row) {
+        out["note"] = json!(format!(
+            "Not finished: {work} still running. The thread ended its own turn while they run, \
+             and it sends you its final report when they finish."
+        ));
+        out["running"] = json!(work);
     }
     Ok(out)
 }

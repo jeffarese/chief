@@ -50,7 +50,9 @@ board on the right (or tells you how to open it yourself). Then just talk: ask q
 tasks, send follow-ups. The coordinator
 answers quick questions itself, starts a thread per piece of work, sends follow-ups to the thread
 that owns the work (waking it first if it's asleep), and posts a short update when a thread
-finishes.
+finishes. A thread that ends its turn while its subagents or background commands still run isn't
+finished: the board keeps it in Working and shows what runs (`1 subagent`), and once they finish
+chief has the thread send the coordinator its final report.
 
 `chief down <slug>` closes the layout `up` opened and stops the coordinator; threads keep running
 unless you add `--stop-threads`.
@@ -145,6 +147,10 @@ readable.
   Blocked attempts are counted on the board. Each session may also use its own subagents: it
   messages them by the name or agent id the Agent tool gave them, they report back to it, and a
   subagent can't take the name of another session (it would get that session's messages).
+- **Subagents run commands in the foreground.** Claude Code doesn't wake a subagent when its
+  background command ends, so its work would stop half done. chief denies a subagent's background
+  commands and tells it to run them in the foreground (up to 10 minutes); longer ones are left to
+  the thread itself.
 - **Trust.** chief never edits Claude Code's trust settings; it only reads them.
 - Threads run with the permission mode you choose (default `auto`); permission prompts show as
   Waiting on you, and you answer them by opening the thread.

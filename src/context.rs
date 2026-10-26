@@ -4,6 +4,7 @@
 use serde_json::json;
 
 use crate::db::SessionRow;
+use crate::registry;
 use crate::state::Group;
 use crate::text::one_line;
 
@@ -76,7 +77,8 @@ fn board(threads: &[SessionRow], preview: usize, as_of: &str) -> String {
     out
 }
 
-/// `- name "title" · waiting: permission · asleep · branch b · PR url` and an indented preview.
+/// `- name "title" · waiting: permission · 1 subagent running · asleep · branch b · PR url` and
+/// an indented preview.
 fn line(t: &SessionRow, preview: usize) -> String {
     let mut parts = vec![match t.title.as_deref() {
         Some(title) => format!("- {} \"{}\"", t.name, one_line(title, 80)),
@@ -84,6 +86,9 @@ fn line(t: &SessionRow, preview: usize) -> String {
     }];
     if let Some(reason) = &t.waiting_reason {
         parts.push(format!("waiting: {reason}"));
+    }
+    if let Some(work) = registry::background_work(t) {
+        parts.push(format!("{work} running"));
     }
     if t.pid.is_none() {
         parts.push("asleep".to_string());
@@ -158,6 +163,22 @@ mod tests {
         assert!(text.ends_with(
             "</chief-board>\n<chief-memory>\n# Memory\n- [Prefs](prefs.md)\n</chief-memory>"
         ));
+    }
+
+    /// §5 "Background work": a thread idle in its own turn still has work running, unless its
+    /// process is gone with it.
+    #[test]
+    fn background_work_is_on_the_line() {
+        let mut t = row("p-a-1111", "working");
+        t.subagents_busy = 1;
+        t.background_running = 2;
+        assert_eq!(
+            line(&t, 0),
+            "- p-a-1111 \"Title of p-a-1111\" · 1 subagent, 2 background commands running\n"
+        );
+        t.pid = None;
+        t.gone_at = Some(5);
+        assert_eq!(line(&t, 0), "- p-a-1111 \"Title of p-a-1111\" · asleep\n");
     }
 
     #[test]

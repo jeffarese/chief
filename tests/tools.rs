@@ -911,6 +911,20 @@ fn read_report_returns_full_text() {
 
     env.insert("demo-new-2222", |_| {});
     assert!(read("demo-new-2222", None).unwrap()["note"].is_string());
+    // §5 "Background work": an idle notice from a turn that ended while its subagent works.
+    env.insert("demo-wait-3333", |r| {
+        r.pid = Some(42);
+        r.subagents_busy = 1;
+    });
+    let out = read("demo-wait-3333", None).unwrap();
+    assert_eq!(out["running"], "1 subagent");
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("Not finished: 1 subagent still running.")
+    );
+    assert!(read("demo-a-1111", None).unwrap().get("running").is_none());
     assert!(read("nope", None).is_err());
     let coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
     db::insert_session(&env.conn, &coord).unwrap();

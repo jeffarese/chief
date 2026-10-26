@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::db::SessionRow;
+use crate::registry;
 use crate::state::Group;
 use crate::text::ago;
 
@@ -116,6 +117,12 @@ pub fn tags(row: &SessionRow) -> Vec<String> {
     let mut tags = Vec::new();
     if let Some(reason) = &row.waiting_reason {
         tags.push(reason.clone());
+    }
+    // Its own turn may have ended while these run (§5 "Background work").
+    if !row.resolved
+        && let Some(work) = registry::background_work(row)
+    {
+        tags.push(work);
     }
     if row.pid.is_none() && !row.resolved && row.short_id.is_some() {
         tags.push("asleep".to_string());
@@ -312,6 +319,11 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     if let (Group::Resolved, Some(r)) = (group, &row.resolved_reason) {
         state.push_str(&format!(" ({r})"));
+    }
+    if !row.resolved
+        && let Some(work) = registry::background_work(row)
+    {
+        state.push_str(&format!(" · {work} running"));
     }
     if row.pid.is_none() && row.short_id.is_some() && row.cleaned_at.is_none() {
         state.push_str(" · asleep");
@@ -867,6 +879,20 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         let out = render(&app, 40, 24);
         assert!(out.contains("Ship it▏"), "{out}");
+    }
+
+    /// §5 "Background work": its own turn may have ended, so the tag says what still runs.
+    #[test]
+    fn background_work_is_a_tag() {
+        let mut row = thread("demo-wait-1a2b", Group::Working, 10);
+        row.subagents_busy = 2;
+        assert!(
+            tags(&row).contains(&"2 subagents".to_string()),
+            "{:?}",
+            tags(&row)
+        );
+        row.resolved = true;
+        assert!(!tags(&row).iter().any(|t| t.contains("subagent")));
     }
 
     #[test]

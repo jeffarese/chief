@@ -160,6 +160,9 @@ pub struct Facts<'a> {
     /// A snapshot no older than the last hook showed no process: nothing can be running, so
     /// rule 5 can't match (a thread that died mid-turn isn't "working" forever).
     pub process_gone: bool,
+    /// Its subagents or background commands still run (§5 "Background work"), which its own
+    /// turn may have ended without.
+    pub background_work: bool,
     pub pr_state: Option<&'a str>,
     pub pr_draft: bool,
     pub pr_review: Option<&'a str>,
@@ -216,7 +219,9 @@ pub fn derive(facts: &Facts) -> Derived {
         (None, Some(_)) => false,
         (None, None) => facts.last_hook.is_some_and(HookKind::means_working),
     };
-    if !facts.process_gone && working {
+    // Subagents and background commands run inside the session's process, so it works on
+    // after its own turn ends, until they finish.
+    if !facts.process_gone && (working || facts.background_work) {
         return Derived::group(Group::Working);
     }
     if facts.pr_state == Some("OPEN") {
@@ -536,6 +541,51 @@ mod tests {
                     ..base()
                 },
                 Review,
+                None,
+            ),
+            // 5. background work (§5 "Background work")
+            (
+                "subagents at work on an idle process",
+                Facts {
+                    cc_state: Some("working"),
+                    cc_status: Some("idle"),
+                    last_hook: Some(Stop),
+                    background_work: true,
+                    ..base()
+                },
+                Working,
+                None,
+            ),
+            (
+                "background work without a snapshot",
+                Facts {
+                    last_hook: Some(Stop),
+                    background_work: true,
+                    pr_state: Some("OPEN"),
+                    ..base()
+                },
+                Working,
+                None,
+            ),
+            (
+                "a question beats background work",
+                Facts {
+                    cc_status: Some("waiting"),
+                    background_work: true,
+                    ..base()
+                },
+                Waiting,
+                Some(Question),
+            ),
+            (
+                "background work dies with the process",
+                Facts {
+                    last_hook: Some(Stop),
+                    background_work: true,
+                    process_gone: true,
+                    ..base()
+                },
+                Idle,
                 None,
             ),
             (

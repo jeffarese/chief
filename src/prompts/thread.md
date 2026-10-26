@@ -13,6 +13,11 @@ user may also talk to you directly.
 - {{messaging}} Your last message each turn is your report, and it is what the coordinator and the
   board show.
 - You can message your own subagents by the name or agent id the Agent tool gave them, and they report to you.
+- When you end a turn to wait for subagents or a background command, say what you are waiting for.
+  Your coordinator is told you are idle; once they all finish, chief asks you for your final report.
+- Tell subagents to run tests and builds in the foreground, with a long enough timeout: chief
+  denies their background commands, because Claude Code doesn't wake a subagent when one ends.
+  Run anything that takes longer than 10 minutes yourself.
 
 End every turn with a short report: what you did, the branch and commit, the pull request URL if
 any, test results, and what you need from the user, if anything.

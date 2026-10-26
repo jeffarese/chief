@@ -422,6 +422,22 @@ pub fn uds_address(pid: u32) -> String {
     format!("uds:/tmp/cc-socks/{pid}.sock")
 }
 
+/// Where a thread's message reaches its coordinator, as `thread_send` allows it: the name, or
+/// for a thread in another account (`by_socket`) the socket address. None unless the
+/// coordinator's own session is live under that name, and alone with it.
+pub fn coordinator_address(
+    coordinator: &Member,
+    name: &str,
+    snapshot: &[AgentRow],
+    by_socket: bool,
+) -> Option<String> {
+    match reach(coordinator, name, snapshot) {
+        Reach::Live(pid) if by_socket => Some(uds_address(pid)),
+        Reach::Live(_) => Some(name.to_string()),
+        _ => None,
+    }
+}
+
 /// `name [ref]` → `name`, for the MCP tools' `name` arguments (§7), which look rows up in the
 /// registry: there a ref can't redirect anything. The guard never strips refs.
 pub fn strip_ref(to: &str) -> &str {
@@ -1247,6 +1263,41 @@ mod tests {
         assert_eq!(strip_ref("a [b"), "a [b");
         assert_eq!(strip_ref("[b]"), "[b]");
         assert_eq!(uds_address(123), "uds:/tmp/cc-socks/123.sock");
+    }
+
+    /// The address a thread's final report goes to (§5 "Background work"): one `thread_send`
+    /// allows, so only a live coordinator alone with its name.
+    #[test]
+    fn coordinator_addresses() {
+        let coordinator = member("chief-p", "coord");
+        let address = |pid, extra: Option<AgentRow>, by_socket| {
+            let mut snapshot = snapshot(pid);
+            snapshot.extend(extra);
+            coordinator_address(&coordinator, "chief-p", &snapshot, by_socket)
+        };
+        assert_eq!(
+            address(Some(COORD_PID), None, false).as_deref(),
+            Some("chief-p")
+        );
+        assert_eq!(
+            address(Some(COORD_PID), None, true),
+            Some(uds_address(COORD_PID))
+        );
+        assert_eq!(address(None, None, false), None, "asleep");
+        let twin = row("twin", Some("chief-p"), Some(900));
+        assert_eq!(
+            address(Some(COORD_PID), Some(twin), true),
+            None,
+            "ambiguous"
+        );
+        let renamed = Member {
+            session_id: Some("renamed".into()),
+            ..coordinator.clone()
+        };
+        assert_eq!(
+            coordinator_address(&renamed, "chief-p", &snapshot(Some(COORD_PID)), false),
+            None
+        );
     }
 
     #[test]

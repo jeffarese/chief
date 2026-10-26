@@ -42,6 +42,7 @@ pub fn facts(row: &SessionRow) -> Facts<'_> {
         cc_status,
         last_hook: row.last_hook.as_deref().and_then(HookKind::from_stored),
         process_gone: process_gone(row),
+        background_work: row.subagents_busy > 0 || row.background_running > 0,
         pr_state: row.pr_state.as_deref(),
         pr_draft: row.pr_draft.unwrap_or(false),
         pr_review: row.pr_review.as_deref(),
@@ -55,6 +56,15 @@ pub fn process_gone(row: &SessionRow) -> bool {
         && row
             .gone_at
             .is_some_and(|gone| row.last_hook_at.is_none_or(|hook| hook <= gone))
+}
+
+/// What runs beside the session's own turn, `2 subagents, 1 background command` (§5
+/// "Background work"); None when nothing does, or its process is gone with all of it.
+pub fn background_work(row: &SessionRow) -> Option<String> {
+    if process_gone(row) {
+        return None;
+    }
+    crate::text::background_work(row.subagents_busy, row.background_running)
 }
 
 /// Recomputes `group_name` and `waiting_reason` from the row.

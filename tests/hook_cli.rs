@@ -1,5 +1,6 @@
 //! `chief hook` as Claude Code runs it: payload on stdin, exit 0, errors logged; stdout only for
-//! the guard's decision and the coordinator's context.
+//! the guard's decision, the coordinator's context, the denial of a subagent's background command
+//! and the Stop decision that asks a thread for its final report.
 
 mod common;
 
@@ -776,4 +777,103 @@ fn coordinator_prompts_get_the_board_and_memory() {
         &payload.to_string(),
     );
     assert!(thread.stdout.is_empty());
+}
+
+/// §5 "Background work": a subagent's command in the background is denied, as Claude Code
+/// wouldn't wake the subagent when it ends; its lead's own isn't.
+#[test]
+fn subagent_background_commands_are_denied() {
+    let home = guarded_home();
+    let bash = |agent_id: Option<&str>| {
+        let mut payload = serde_json::json!({
+            "session_id": "a-sid",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test", "run_in_background": true},
+            "cwd": "/x",
+        });
+        if let Some(a) = agent_id {
+            payload["agent_id"] = a.into();
+        }
+        home.run(
+            &[
+                "hook",
+                "PreToolUse",
+                "--project",
+                "demo",
+                "--role",
+                "thread",
+            ],
+            &payload.to_string(),
+        )
+    };
+    let reason = deny_reason(&bash(Some("aworker-1"))).unwrap();
+    assert!(
+        reason.contains("Run the command in the foreground"),
+        "{reason}"
+    );
+    assert_silent_success(&bash(None));
+    assert_eq!(error_log(home.path()), "");
+}
+
+/// §5 "Background work" end to end: a thread that ended a turn while its subagent worked is
+/// asked for its final report at its first Stop after, addressed as its coordinator can be
+/// reached: by name, or for a thread in another account at the coordinator's socket.
+#[test]
+fn a_thread_that_stopped_early_is_asked_for_its_final_report() {
+    let home = guarded_home();
+    let cpb = common::account(home.path(), "claude-cpb");
+    {
+        let mut t = SessionRow::new("demo-far-3333", "demo", Role::Thread, db::now_ms());
+        t.session_id = Some("far-sid".into());
+        common::in_account(&mut t, "cpb", "PB2", Some(&cpb));
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    for (sid, address) in [
+        ("a-sid", "chief-demo"),
+        ("far-sid", "uds:/tmp/cc-socks/100.sock"),
+    ] {
+        let event = |name: &str, extra: Value| {
+            let mut payload = serde_json::json!({
+                "session_id": sid,
+                "hook_event_name": name,
+                "cwd": "/x",
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            home.run(
+                &["hook", name, "--project", "demo", "--role", "thread"],
+                &payload.to_string(),
+            )
+        };
+        let teammate = serde_json::json!([{"id": "t1", "type": "teammate", "status": "running"}]);
+        let stop = |active: bool| {
+            event(
+                "Stop",
+                serde_json::json!({
+                    "stop_hook_active": active,
+                    "last_assistant_message": "done",
+                    "background_tasks": teammate,
+                }),
+            )
+        };
+        let subagent =
+            serde_json::json!({"agent_id": "aworker-1", "agent_type": "general-purpose"});
+        assert_silent_success(&event("SubagentStart", subagent.clone()));
+        assert_silent_success(&stop(false));
+        assert_silent_success(&event("SubagentStop", subagent));
+        let out = stop(false);
+        assert!(out.status.success(), "{out:?}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["decision"], "block");
+        let reason = v["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!("SendMessage (to: \"{address}\")")),
+            "{reason}"
+        );
+        assert_silent_success(&stop(true));
+    }
+    assert_eq!(error_log(home.path()), "");
 }

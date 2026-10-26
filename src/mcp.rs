@@ -62,14 +62,14 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "List this project's threads with their board group, waiting reason, whether asleep, branch, PR, account, the address to message them at, and a preview of the last report."
+        description = "List this project's threads with their board group, waiting reason, the subagents and background commands still running, whether asleep, branch, PR, account, the address to message them at, and a preview of the last report."
     )]
     async fn list_threads(&self, Parameters(args): Parameters<ListThreadsArgs>) -> CallToolResult {
         self.call(move |ctx| tools::list_threads(ctx, &args)).await
     }
 
     #[tool(
-        description = "Read a thread's full latest report (idle notices are cut short). history returns more reports, newest first."
+        description = "Read a thread's full latest report (idle notices are cut short), and what it still runs: a thread with subagents or background commands running isn't finished. history returns more reports, newest first."
     )]
     async fn read_report(&self, Parameters(args): Parameters<ReadReportArgs>) -> CallToolResult {
         self.call(move |ctx| tools::read_report(ctx, &args)).await

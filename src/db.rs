@@ -136,6 +136,13 @@ CREATE TABLE ui_state (
        recorded_at  INTEGER NOT NULL,
        PRIMARY KEY (session_name, agent_id)
      );",
+    // Background work, which a session's own turn doesn't show (§5 "Background work"): which
+    // subagents are mid-turn and how many, how many background commands its last Stop listed as
+    // running, and when a thread last ended a turn while any of that still ran.
+    "ALTER TABLE teammates ADD COLUMN busy INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE sessions ADD COLUMN subagents_busy INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE sessions ADD COLUMN background_running INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE sessions ADD COLUMN stopped_early_at INTEGER;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -252,6 +259,14 @@ pub struct SessionRow {
     pub account_label: Option<String>,
     /// That account's config folder; None with an `account_id` is the default account.
     pub account_dir: Option<String>,
+    /// How many of its subagents are mid-turn, from SubagentStart to SubagentStop (§5
+    /// "Background work").
+    pub subagents_busy: u32,
+    /// How many background commands its last Stop listed as running (§5 "Background work").
+    pub background_running: u32,
+    /// When a thread last ended a turn while background work still ran: its coordinator was told
+    /// it was idle, so the Stop that finds nothing running asks it to report (§5).
+    pub stopped_early_at: Option<i64>,
 }
 
 impl SessionRow {
@@ -293,7 +308,8 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     last_hook, pending_permission, group_name, waiting_reason, resolved, resolved_reason, pr_url, \
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
     last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked, synced_at, ids_at, \
-    removed_at, account_id, account_label, account_dir";
+    removed_at, account_id, account_label, account_dir, subagents_busy, background_running, \
+    stopped_early_at";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -339,6 +355,9 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         account_id: r.get(39)?,
         account_label: r.get(40)?,
         account_dir: r.get(41)?,
+        subagents_busy: r.get(42)?,
+        background_running: r.get(43)?,
+        stopped_early_at: r.get(44)?,
     })
 }
 
@@ -373,7 +392,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)"
+         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)"
     );
     let has_ids = s.short_id.is_some() || s.session_id.is_some();
     let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
@@ -422,6 +441,9 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.account_id,
             s.account_label,
             s.account_dir,
+            s.subagents_busy,
+            s.background_running,
+            s.stopped_early_at,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -445,7 +467,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            gone_at = ?34, cleaned_at = ?35, cleanup_blocked = ?36, synced_at = ?37,
            ids_at = CASE WHEN short_id IS ?4 AND session_id IS ?5 THEN coalesce(?38, ids_at)
                          ELSE ?31 END,
-           removed_at = ?39, account_id = ?40, account_label = ?41, account_dir = ?42
+           removed_at = ?39, account_id = ?40, account_label = ?41, account_dir = ?42,
+           subagents_busy = ?43, background_running = ?44, stopped_early_at = ?45
          WHERE name = ?1",
             params![
                 s.name,
@@ -490,6 +513,9 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.account_id,
                 s.account_label,
                 s.account_dir,
+                s.subagents_busy,
+                s.background_running,
+                s.stopped_early_at,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -734,6 +760,38 @@ pub fn record_teammate(
         params![session_name, session_id, agent_id, name, now],
     )?;
     Ok(())
+}
+
+/// Marks a recorded subagent mid-turn (SubagentStart) or done with its turn (SubagentStop).
+pub fn set_teammate_busy(
+    conn: &Connection,
+    session_name: &str,
+    agent_id: &str,
+    busy: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE teammates SET busy = ?3 WHERE session_name = ?1 AND agent_id = ?2",
+        params![session_name, agent_id, busy],
+    )?;
+    Ok(())
+}
+
+/// Marks every subagent of `session_name` done with its turn: its Stop listed none running.
+pub fn idle_teammates(conn: &Connection, session_name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE teammates SET busy = 0 WHERE session_name = ?1",
+        [session_name],
+    )?;
+    Ok(())
+}
+
+/// How many subagents `session_name` recorded under `session_id` are mid-turn.
+pub fn busy_teammates(conn: &Connection, session_name: &str, session_id: &str) -> Result<u32> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM teammates WHERE session_name = ?1 AND session_id = ?2 AND busy = 1",
+        params![session_name, session_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Forgets every subagent of `session_name`, whose process started again; returns how many.
@@ -981,7 +1039,7 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 11);
+        assert_eq!(MIGRATIONS.len(), 12);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
@@ -1021,6 +1079,9 @@ mod tests {
         t.account_id = Some("cpb".into());
         t.account_label = Some("PB2".into());
         t.account_dir = Some("/Users/me/.claude-cpb".into());
+        t.subagents_busy = 2;
+        t.background_running = 1;
+        t.stopped_early_at = Some(25);
         t.updated_at = 30;
         update_session(&conn, &t).unwrap();
         t.ids_at = Some(30);
@@ -1137,6 +1198,23 @@ mod tests {
         assert_eq!(of("u", "sid-u"), [mate("ahelper-9", Some("helper"))]);
         assert!(of("t", "sid-u").is_empty());
         assert_eq!(of("t", "sid-t").len(), 3);
+
+        // Mid-turn from SubagentStart to SubagentStop (§5 "Background work"), counted per
+        // session id; recording again keeps it.
+        let busy = |name: &str, sid: &str| busy_teammates(&conn, name, sid).unwrap();
+        assert_eq!(busy("t", "sid-t"), 0);
+        set_teammate_busy(&conn, "t", "ahelper-1", true).unwrap();
+        set_teammate_busy(&conn, "t", "aother-2", true).unwrap();
+        set_teammate_busy(&conn, "u", "ahelper-9", true).unwrap();
+        record_teammate(&conn, "t", "sid-t", "ahelper-1", None, 21).unwrap();
+        assert_eq!(busy("t", "sid-t"), 2);
+        assert_eq!(busy("t", "sid-u"), 0);
+        set_teammate_busy(&conn, "t", "aother-2", false).unwrap();
+        set_teammate_busy(&conn, "t", "unknown-agent", false).unwrap();
+        assert_eq!(busy("t", "sid-t"), 1);
+        idle_teammates(&conn, "t").unwrap();
+        assert_eq!(busy("t", "sid-t"), 0);
+        assert_eq!(busy("u", "sid-u"), 1, "only that session's");
 
         assert_eq!(forget_teammates(&conn, "t").unwrap(), 3);
         assert!(of("t", "sid-t").is_empty());
