@@ -747,6 +747,44 @@ fn a_reused_branch_name_ignores_older_and_cross_repository_prs() {
     assert!(env.rm_calls().is_empty());
 }
 
+/// The reviewer's probe: PRs are matched on what the job state names, never the hooks' cwd or
+/// branch. A thread whose shell sits in the checkout on `main` is polled for its worktree's
+/// branch; one whose job never entered a worktree isn't polled, wherever its hooks say it is.
+#[test]
+fn prs_are_polled_for_the_branch_the_job_state_names() {
+    let env = Env::new();
+    let open = |r: &mut SessionRow| {
+        r.resolved = false;
+        r.resolved_reason = None;
+        r.group_name = "idle".into();
+    };
+    env.insert(|r| {
+        open(r);
+        r.cwd = r.repo_path.clone();
+        r.branch = Some("main".into());
+    });
+    env.gh.set("pr.stdout", "[]");
+    let polled = || {
+        let refresh = env.with(|ctx| pr::poll_project(ctx, "demo")).unwrap();
+        assert!(refresh.errors.is_empty(), "{:?}", refresh.errors);
+        refresh.polled
+    };
+    assert_eq!(polled(), 1);
+    assert_eq!(env.gh.calls()[0][3], "worktree-add-notes");
+
+    // Its hooks say it works in a worktree on a branch; its job never entered one.
+    env.insert(|r| {
+        open(r);
+        r.cwd = Some(env.worktree.join("src").to_string_lossy().into_owned());
+    });
+    env.claude.job(SHORT, None);
+    assert_eq!(polled(), 0);
+    // A worktree, but no branch recorded: nothing to match a PR on.
+    env.claude.job_on(SHORT, Some(&env.worktree), None);
+    assert_eq!(polled(), 0);
+    assert_eq!(env.gh.calls().len(), 1);
+}
+
 #[test]
 fn a_merged_pr_resolves_and_cleans_the_thread() {
     let env = Env::new();

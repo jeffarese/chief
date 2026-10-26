@@ -17,7 +17,6 @@ use crate::state::{HookKind, Role};
 use crate::text::{local_hhmm, one_line};
 use crate::{context, guard, names, paths, registry, tools};
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The guard holds up a tool call and the context a turn; neither may hang on the supervisor.
 pub const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTEXT_AGENTS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -117,7 +116,6 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
         project,
         role,
         now: db::now_ms(),
-        branch_of: git_branch,
     };
     let outcome = handle(&conn, &ctx, event, &payload)?;
     if !outcome.notices.is_empty() && notify_enabled(project) {
@@ -261,8 +259,6 @@ pub struct Ctx<'a> {
     /// The `--role` the hook was installed with.
     pub role: Role,
     pub now: i64,
-    /// Current branch of a folder; `git_branch` outside tests.
-    pub branch_of: fn(&Path) -> Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -283,12 +279,6 @@ pub fn handle(conn: &Connection, ctx: &Ctx, event: &str, payload: &Value) -> Res
     let str_field = |k: &str| payload.get(k).and_then(Value::as_str);
     let session_id = str_field("session_id");
     let kind = HookKind::parse(event, str_field("notification_type"));
-    // Outside the write transaction: git may take up to GIT_TIMEOUT.
-    let branch = match (kind, ctx.role, str_field("cwd")) {
-        (Some(HookKind::Stop), Role::Thread, Some(cwd)) => (ctx.branch_of)(Path::new(cwd)),
-        _ => None,
-    };
-
     let row = db::immediate(conn, |conn| {
         let mut row = match_session(conn, ctx.project, session_id, str_field("session_title"))?;
         db::insert_event(
@@ -306,7 +296,7 @@ pub fn handle(conn: &Connection, ctx: &Ctx, event: &str, payload: &Value) -> Res
             return Ok(None);
         };
         if let Some(kind) = kind
-            && let Some(report) = apply(r, kind, payload, branch, ctx.now)
+            && let Some(report) = apply(r, kind, payload, ctx.now)
         {
             db::insert_report(conn, &r.name, ctx.now, &report)?;
         }
@@ -353,14 +343,9 @@ fn match_session(
 }
 
 /// §5 "Hook updates". The hook is newer than any `claude agents` poll, so the stored snapshot
-/// stops counting until the next poll. Returns the new report, if the hook carried one.
-fn apply(
-    row: &mut SessionRow,
-    kind: HookKind,
-    payload: &Value,
-    branch: Option<String>,
-    now: i64,
-) -> Option<String> {
+/// stops counting until the next poll. Returns the new report, if the hook carried one. The cwd
+/// is kept for display only: the thread's worktree and branch come from its job state (sync).
+fn apply(row: &mut SessionRow, kind: HookKind, payload: &Value, now: i64) -> Option<String> {
     let str_field = |k: &str| payload.get(k).and_then(Value::as_str);
     row.last_hook = Some(kind.as_str().to_string());
     row.last_hook_at = Some(now);
@@ -384,9 +369,6 @@ fn apply(
             row.pending_permission = false;
             if let Some(cwd) = str_field("cwd") {
                 row.cwd = Some(cwd.to_string());
-            }
-            if branch.is_some() {
-                row.branch = branch;
             }
             if let Some(text) = str_field("last_assistant_message").filter(|r| !r.trim().is_empty())
             {
@@ -433,18 +415,6 @@ pub fn summary(event: &str, payload: &Value) -> String {
         _ => String::new(),
     };
     one_line(&text, SUMMARY_CHARS)
-}
-
-/// `git -C <cwd> branch --show-current`; None on error, timeout, or a detached HEAD.
-pub fn git_branch(cwd: &Path) -> Option<String> {
-    if !cwd.is_dir() {
-        return None;
-    }
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(cwd).args(["branch", "--show-current"]);
-    let out = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT).ok()??;
-    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !branch.is_empty()).then_some(branch)
 }
 
 /// `ui.notify` from project.toml. A missing file means no notifications; a broken one is logged.
@@ -554,11 +524,6 @@ mod tests {
             .collect()
     }
 
-    fn fake_branch(cwd: &Path) -> Option<String> {
-        let name = cwd.file_name()?.to_str()?;
-        Some(format!("worktree-{name}"))
-    }
-
     fn setup() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let conn = db::open(&dir.path().join("chief.db")).unwrap();
@@ -589,7 +554,6 @@ mod tests {
             project: "demo",
             role: role_of(sid),
             now: line.ts * 1000,
-            branch_of: fake_branch,
         };
         handle(conn, &ctx, &line.hook, &line.payload).unwrap()
     }
@@ -692,7 +656,10 @@ mod tests {
             a.cwd.as_deref(),
             Some("/tmp/chief-fixture/repo/.claude/worktrees/hello-txt")
         );
-        assert_eq!(a.branch.as_deref(), Some("worktree-hello-txt"));
+        assert_eq!(
+            a.branch, None,
+            "the branch comes from the job state on sync, never from the hooks' cwd"
+        );
         assert!(!a.pending_permission);
 
         let c = get(&conn, "spike-coord");
@@ -786,7 +753,6 @@ mod tests {
             project: "demo",
             role: Role::Thread,
             now: 5,
-            branch_of: fake_branch,
         };
         let out = handle(&conn, &ctx, "UserPromptSubmit", &payload).unwrap();
         assert_eq!(out.session, None);
@@ -808,7 +774,6 @@ mod tests {
             project: "demo",
             role: Role::Thread,
             now: 5,
-            branch_of: fake_branch,
         };
         let start = |sid: &str| {
             serde_json::json!({
@@ -864,7 +829,6 @@ mod tests {
             project: "demo",
             role: Role::Thread,
             now: 10,
-            branch_of: fake_branch,
         };
         let payload = serde_json::json!({"session_id": THREAD_A, "tool_name": "Bash", "cwd": "/x"});
         handle(&conn, &ctx, "PreToolUse", &payload).unwrap();
@@ -880,7 +844,6 @@ mod tests {
             project: "demo",
             role: Role::Thread,
             now: 10,
-            branch_of: fake_branch,
         };
         let stop = |msg: Option<&str>| {
             serde_json::json!({
@@ -1169,25 +1132,6 @@ mod tests {
             );
         }
         assert!(denied(&coord("demo-fix-1a2b [2c7859]"), "without a"));
-    }
-
-    #[test]
-    fn git_branch_reads_the_current_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let ok = Command::new("git")
-            .args(["init", "-q", "-b", "worktree-demo"])
-            .arg(dir.path())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("git unavailable; skipping");
-            return;
-        }
-        assert_eq!(git_branch(dir.path()).as_deref(), Some("worktree-demo"));
-        assert_eq!(git_branch(&dir.path().join("missing")), None);
-        let plain = tempfile::tempdir().unwrap();
-        assert_eq!(git_branch(plain.path()), None);
     }
 
     #[test]

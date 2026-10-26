@@ -103,6 +103,11 @@ impl Claude {
         job_worktree(&self.config_dir, short_id)
     }
 
+    /// A background session's job state (`job_state`).
+    pub fn job_state(&self, short_id: &str) -> Option<JobState> {
+        job_state(&self.config_dir, short_id)
+    }
+
     /// Fails when `claude --version` is older than MIN_VERSION.
     pub fn check_version(&self) -> Result<()> {
         let out = self.run_ok(&["--version".into()], None, VERSION_TIMEOUT)?;
@@ -455,9 +460,19 @@ pub fn claude_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".claude")
 }
 
-/// `<config_dir>/jobs/<short_id>/state.json` → `worktreePath`. A missing or unreadable file, or
-/// a short id that isn't a plain name, is None: no worktree chief may touch.
-pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
+/// What the supervisor records about a background session's worktree (§1): the source of truth
+/// for a thread's worktree and branch, unlike the hooks' cwd.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobState {
+    /// `worktreePath`; None for a session that never left its folder.
+    pub worktree: Option<PathBuf>,
+    /// `worktreeBranch`.
+    pub branch: Option<String>,
+}
+
+/// `<config_dir>/jobs/<short_id>/state.json`. A missing or unreadable file, or a short id that
+/// isn't a plain name, is None.
+pub fn job_state(config_dir: &Path, short_id: &str) -> Option<JobState> {
     let plain = !short_id.is_empty()
         && short_id
             .chars()
@@ -468,10 +483,21 @@ pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
     let state = config_dir.join("jobs").join(short_id).join("state.json");
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()?;
-    json["worktreePath"]
-        .as_str()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
+    let text = |key: &str| {
+        json[key]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    };
+    Some(JobState {
+        worktree: text("worktreePath").map(PathBuf::from),
+        branch: text("worktreeBranch"),
+    })
+}
+
+/// `job_state` → `worktreePath`: None is no worktree chief may touch.
+pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
+    job_state(config_dir, short_id)?.worktree
 }
 
 /// `$CHIEF_CLAUDE_CONFIG`, else `$CLAUDE_CONFIG_DIR/.claude.json` (where Claude Code keeps it
@@ -791,7 +817,7 @@ mod tests {
         };
         write(
             "a1b2c3d4",
-            r#"{"state":"done","daemonShort":"a1b2c3d4","worktreePath":"/r/.claude/worktrees/fix"}"#,
+            r#"{"state":"done","daemonShort":"a1b2c3d4","worktreePath":"/r/.claude/worktrees/fix","worktreeBranch":"worktree-fix"}"#,
         );
         write("e5f6", r#"{"state":"done","bgIsolation":"none"}"#);
         write("bad", "{");
@@ -806,6 +832,12 @@ mod tests {
         for short in ["e5f6", "bad", "missing", "", "../a1b2c3d4", "a1b2c3d4/x"] {
             assert_eq!(claude.job_worktree(short), None, "{short:?}");
         }
+        assert_eq!(
+            claude.job_state("a1b2c3d4").unwrap().branch.as_deref(),
+            Some("worktree-fix")
+        );
+        assert_eq!(claude.job_state("e5f6"), Some(JobState::default()));
+        assert_eq!(claude.job_state("bad"), None);
     }
 
     #[test]

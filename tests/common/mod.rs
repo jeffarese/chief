@@ -49,13 +49,28 @@ impl Fake {
         self.dir.path().join("claude-dir")
     }
 
-    /// Writes the job state of background session `short`, with `worktreePath` when given.
+    /// Writes the job state of background session `short`, with `worktreePath` when given and
+    /// the `worktreeBranch` Claude Code gives it (`worktree-<folder name>`).
     pub fn job(&self, short: &str, worktree: Option<&Path>) -> &Self {
+        let branch = worktree.map(|wt| {
+            format!(
+                "worktree-{}",
+                wt.file_name().unwrap_or_default().to_string_lossy()
+            )
+        });
+        self.job_on(short, worktree, branch.as_deref())
+    }
+
+    /// `job` with the branch given.
+    pub fn job_on(&self, short: &str, worktree: Option<&Path>, branch: Option<&str>) -> &Self {
         let dir = self.config_dir().join("jobs").join(short);
         std::fs::create_dir_all(&dir).unwrap();
         let mut state = serde_json::json!({"daemonShort": short, "state": "done"});
         if let Some(wt) = worktree {
             state["worktreePath"] = wt.to_string_lossy().into_owned().into();
+        }
+        if let Some(branch) = branch {
+            state["worktreeBranch"] = branch.into();
         }
         std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
         self

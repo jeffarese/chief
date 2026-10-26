@@ -169,20 +169,11 @@ pub fn parse_pr_list(json: &str, since: i64) -> Result<Option<PrInfo>> {
     }))
 }
 
-/// Threads whose PR is worth asking about: they work in their own worktree (a thread still in
-/// the repository checkout reports that checkout's branch, often `main`) and aren't cleaned.
-/// Resolved ones only while their PR can still change and they were active lately.
+/// Threads whose PR is worth asking about, once their job state names a worktree and branch
+/// (`cleanup::branch_of`): not cleaned; resolved ones only while their PR can still change and
+/// they were active lately.
 fn wants_poll(row: &SessionRow, now: i64) -> bool {
-    let in_worktree = row
-        .cwd
-        .as_deref()
-        .is_some_and(|c| cleanup::worktree_root(Path::new(c)).is_some());
-    if row.role != Role::Thread.as_str()
-        || row.cleaned_at.is_some()
-        || row.branch.is_none()
-        || row.repo_path.is_none()
-        || !in_worktree
-    {
+    if row.role != Role::Thread.as_str() || row.cleaned_at.is_some() || row.repo_path.is_none() {
         return false;
     }
     !row.resolved
@@ -211,13 +202,18 @@ pub fn poll_project(ctx: &Ctx, slug: &str) -> Result<Refresh> {
         if !wants_poll(&row, now) {
             continue;
         }
-        let (Some(repo), Some(branch)) = (row.repo_path.as_deref(), row.branch.as_deref()) else {
+        // The job state's, not the hooks': a thread whose shell sits in the checkout reports
+        // that checkout's branch, often `main`.
+        let (Some(repo), Some(branch)) = (
+            row.repo_path.as_deref(),
+            cleanup::branch_of(ctx.claude, &row),
+        ) else {
             continue;
         };
         refresh.polled += 1;
         let stored = ctx
             .gh
-            .poll(Path::new(repo), branch, row.created_at)
+            .poll(Path::new(repo), &branch, row.created_at)
             .and_then(|pr| registry::set_pr(ctx.conn, &row.name, pr.as_ref(), (ctx.now)()));
         if let Err(e) = stored {
             refresh.errors.push(format!("{}: {e:#}", row.name));
@@ -350,15 +346,12 @@ mod tests {
         let base = || {
             let mut r = SessionRow::new("t", "p", Role::Thread, now);
             r.repo_path = Some("/w/r".into());
-            r.cwd = Some("/w/r/.claude/worktrees/fix/src".into());
-            r.branch = Some("worktree-fix".into());
             r
         };
         assert!(wants_poll(&base(), now));
         type Edit = fn(&mut SessionRow);
-        let skipped: [(&str, Edit); 6] = [
-            ("no branch", |r| r.branch = None),
-            ("still in the checkout", |r| r.cwd = Some("/w/r".into())),
+        let skipped: [(&str, Edit); 5] = [
+            ("no repo", |r| r.repo_path = None),
             ("cleaned", |r| r.cleaned_at = Some(1)),
             ("coordinator", |r| r.role = "coordinator".into()),
             ("resolved and merged", |r| {

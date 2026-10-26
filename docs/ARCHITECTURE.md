@@ -59,7 +59,8 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   deletes the worktree and the local branch, keeps any remote branch, and the session disappears
   from `claude agents --all` (a stopped session stays listed as `stopped`).
 - Threads name their own worktree (`EnterWorktree`), e.g. `.claude/worktrees/add-hello-txt` on
-  `worktree-add-hello-txt`, not after the thread; use the cwd and branch hooks report.
+  `worktree-add-hello-txt`, not after the thread; use the worktree and branch its job state
+  records.
 - A thread killed mid-turn stays `state: working` with no status and no pid in `claude agents`.
 - A `permissions.deny` rule `Edit(//<absolute canonical path>/**)` in `--settings` (a leading `//`
   means an absolute path) blocks both the Edit and the Write tool for every file under that folder
@@ -311,8 +312,7 @@ Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
    matched: the hook comes from a copy of the session.)
 3. Else record the event with `session_name = NULL` and stop.
 
-Matching, the event row and the session update run in one `BEGIN IMMEDIATE` transaction; the git
-branch lookup runs before it so the write lock is never held for the 2 s timeout.
+Matching, the event row and the session update run in one `BEGIN IMMEDIATE` transaction.
 
 ## 5. Thread state and board groups
 
@@ -328,7 +328,7 @@ Hook updates (per matched session):
 | PostToolUse | `pending_permission = 0`; update `cwd`; provisional `working` |
 | Notification `permission_prompt` | `pending_permission = 1` |
 | Notification `idle_prompt` | nothing beyond `last_hook` |
-| Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` and `branch` (`git -C <cwd> branch --show-current`, 2 s timeout, threads only, kept on a detached HEAD or error) |
+| Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` (shown only; a thread's branch comes from its job state on sync, below) |
 
 Every hook above also sets `last_hook`, `updated_at` and `cc_fresh = 0`, re-derives the group, and
 (except Notification `idle_prompt`) sets `last_activity_at`. Other events (SubagentStop,
@@ -374,8 +374,11 @@ before running the command): match each project session by `session_id`, else by
 `id`. A row matched by short id under another session id (after `/clear`) takes the new
 `session_id`, unless another registered row already has it; a row without a `session_id` stores
 the listed one. Matched rows get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows
-get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. Rows with neither id (not
-spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
+get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. A thread's `branch` is its job
+state's `worktreeBranch` (§1) when that names a `worktreePath`, NULL when the job state names no
+worktree (the checkout's branch isn't the thread's), and kept when there is no job state to read;
+never anything read at the hooks' `cwd`, which follows the thread's shell into the checkout or
+another thread's worktree. Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
 `synced_at` = taken-at of the newest snapshot applied to it: a snapshot older than that is ignored
 for the row (polls from the board, hooks and the CLI run in separate processes and may commit out
 of order). A poll that changes nothing else moves only the watermark (`updated_at` stays).
@@ -826,7 +829,7 @@ file or no `worktreePath` means the thread has no worktree of its own: nothing t
 is reset or cleaned.
 
 `inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s): whether the worktree
-exists, its branch (`git branch --show-current`, else `sessions.branch`),
+exists, its branch (`git branch --show-current`, else the job state's `worktreeBranch`),
 `git status --porcelain --untracked-files=normal` lines (ignored files aren't listed, as Claude
 Code ignores them), and unpushed commits as Claude Code means them:
 `git rev-list --count HEAD refs/heads/<branch> --not --remotes`, listed with
@@ -890,8 +893,9 @@ clock skew. Worktree branches are named after threads, so a new thread can reuse
 old one whose PR merged long ago; that PR must not resolve and clean the new thread. A PR without a
 readable `createdAt` is ignored. A missing `gh`,
 a `gh` that isn't logged in, or a repository without a GitHub remote is no PR plus a hint returned
-once per `Gh`; other failures are errors. `poll_project` polls threads that work in a worktree,
-have a branch and aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
+once per `Gh`; other failures are errors. `poll_project` polls, on that branch, threads whose job
+state names their own worktree and a `worktreeBranch` (`cleanup::branch_of`; never the hooks'
+`cwd` or `sessions.branch`) and that aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
 closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
 auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
 `cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is

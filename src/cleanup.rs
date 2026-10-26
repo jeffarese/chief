@@ -117,20 +117,31 @@ pub fn active(row: &SessionRow) -> bool {
 /// `claude rm` deletes, and only when that is a `<repo>/.claude/worktrees/<name>` folder. Never
 /// the hooks' cwd: it follows the thread's shell anywhere, into another thread's worktree too.
 pub fn worktree_of(claude: &Claude, row: &SessionRow) -> Option<PathBuf> {
-    let path = claude.job_worktree(row.short_id.as_deref()?)?;
-    (worktree_root(&path).as_deref() == Some(path.as_path())).then_some(path)
+    own_job(claude, row).map(|(wt, _)| wt)
+}
+
+/// The branch the job state names with the thread's own worktree (`worktree_of`): what its PR is
+/// matched on. Never the hooks' cwd, which may sit in the checkout on `main`.
+pub fn branch_of(claude: &Claude, row: &SessionRow) -> Option<String> {
+    own_job(claude, row)?.1
+}
+
+fn own_job(claude: &Claude, row: &SessionRow) -> Option<(PathBuf, Option<String>)> {
+    let job = claude.job_state(row.short_id.as_deref()?)?;
+    let path = job.worktree?;
+    (worktree_root(&path).as_deref() == Some(path.as_path())).then_some((path, job.branch))
 }
 
 /// Reads the thread's worktree (`worktree_of`). A thread without one has nothing of its own to
 /// lose.
 pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
-    let Some(root) = worktree_of(claude, row) else {
+    let Some((root, branch)) = own_job(claude, row) else {
         return Ok(Inspection::default());
     };
     let mut ins = Inspection {
         exists: root.is_dir(),
         worktree: Some(root.clone()),
-        branch: row.branch.clone(),
+        branch,
         ..Default::default()
     };
     // Where to ask about commits: the worktree, or the repository if the worktree is gone.
