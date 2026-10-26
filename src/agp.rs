@@ -198,15 +198,8 @@ impl Agp {
     /// The Claude Code config folder of account `id`, as `agp exec` sets `CLAUDE_CONFIG_DIR`,
     /// made absolute; None is the default account (`~/.claude`).
     pub fn config_dir(&self, id: &str) -> Result<Option<PathBuf>> {
-        let mut cmd = Command::new(&self.bin);
-        cmd.args([
-            "exec",
-            id,
-            "--",
-            "sh",
-            "-c",
-            "printf %s \"${CLAUDE_CONFIG_DIR-}\"",
-        ]);
+        let mut cmd = self.exec(id);
+        cmd.args(["sh", "-c", "printf %s \"${CLAUDE_CONFIG_DIR-}\""]);
         let shown = format!("exec {id}");
         let Some(out) = self.run(&mut cmd, &shown)? else {
             bail!("agp isn't installed");
@@ -223,8 +216,17 @@ impl Agp {
 
     /// The command `run_interactive` runs, for a caller that hands over the terminal itself.
     pub fn interactive(&self, id: &str, claude: &Path, cwd: &Path) -> Command {
+        let mut cmd = self.exec(id);
+        cmd.arg(claude).current_dir(cwd);
+        cmd
+    }
+
+    /// `agp exec <id> --`, without this process's `CLAUDE_CONFIG_DIR`: agp leaves it unset for
+    /// the default account (§1), so one inherited from the shell (a project on another account)
+    /// would pass for the default account's folder.
+    fn exec(&self, id: &str) -> Command {
         let mut cmd = Command::new(&self.bin);
-        cmd.args(["exec", id, "--"]).arg(claude).current_dir(cwd);
+        cmd.args(["exec", id, "--"]).env_remove("CLAUDE_CONFIG_DIR");
         cmd
     }
 

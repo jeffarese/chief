@@ -658,7 +658,9 @@ own account needn't be in it. No pool account allowed: the project's account, si
 pool, the usable accounts are those not `limited`, with 5-hour and weekly utilization below
 `max_usage` when it is set, best agp `score` first (`agp pick` ignores `--accounts`/`--exclude`,
 §1, so chief never asks it). For each in turn chief asks agp for its folder (`agp exec <id> --
-sh -c 'printf %s "${CLAUDE_CONFIG_DIR-}"'`; empty = the default account) and checks the repo's
+sh -c 'printf %s "${CLAUDE_CONFIG_DIR-}"'`; empty = the default account; every `agp exec` runs
+with chief's own `CLAUDE_CONFIG_DIR` removed, since agp leaves it unset for the default account
+and the MCP server inherits the project's) and checks the repo's
 trust in that account's `.claude.json`; the first that trusts it gets the thread, and the ones
 skipped (untrusted, with the `cd <repo> && agp exec <id> -- claude` that fixes it; agp failing)
 are listed in `account_note`. When none is usable or none trusts the repo, or `agp status`

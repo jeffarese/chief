@@ -220,6 +220,52 @@ fn init_checks_trust_in_every_pool_account() {
         "{text}"
     );
 
+    // A project on an agp account: agp runs without this shell's CLAUDE_CONFIG_DIR, so the
+    // default account's folder is never taken for the project's.
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    let cpe = common::account(home.path(), "claude-cpe");
+    trust_file(&cpe.join(".claude.json"), &[&a, &b]);
+    let agp = home.install_agp();
+    common::agp_accounts(
+        agp,
+        &[
+            common::agp_view("default", "Main", true, 0.9),
+            common::agp_view("cpe", "PB3", true, 0.7),
+        ],
+        &[("default", None), ("cpe", Some(&cpe))],
+    );
+    let out = home
+        .command(&[
+            "init",
+            "Payments Latency",
+            "--repo",
+            a.to_str().unwrap(),
+            "--repo",
+            b.to_str().unwrap(),
+        ])
+        .env("CLAUDE_CONFIG_DIR", &cpe)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!("Main doesn't trust {}", a.display())),
+        "{text}"
+    );
+    assert!(
+        !text.contains("PB3 doesn't trust"),
+        "the project's own account: {text}"
+    );
+    let execs: Vec<_> = agp
+        .accounts()
+        .into_iter()
+        .filter(|(first, _)| first == "exec")
+        .collect();
+    assert_eq!(execs.len(), 2, "{execs:?}");
+    assert!(execs.iter().all(|(_, env)| env == "unset"), "{execs:?}");
+
     // Without agp, nothing changes.
     let home = Home::new();
     version_ok(&home);
