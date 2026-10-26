@@ -183,15 +183,65 @@ fn generated_hook_commands_reach_this_home() {
         db::insert_session(&conn, &row).unwrap();
     }
     let payload = json!({"session_id": "s", "session_title": "demo-x-1111", "cwd": "/", "last_assistant_message": "hi"});
+    assert!(run_hook(command, &payload).status.success());
+    let row = db::get_session(&home.db(), "demo-x-1111").unwrap().unwrap();
+    assert_eq!(row.last_report.as_deref(), Some("hi"));
+
+    // The guard exits 0 whether it allows (no output) or denies (the deny JSON).
+    let guard = settings["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let out = run_hook(
+        guard,
+        &json!({"session_id": "s", "tool_name": "Read", "tool_input": {}}),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let out = run_hook(
+        guard,
+        &json!({"session_id": "s", "tool_name": "ListAgents", "tool_input": {}}),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let decision: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+
+    // A guard whose chief is gone blocks the call (exit 2) and says why; the state hooks don't.
+    let exe = Path::new(env!("CARGO_BIN_EXE_chief"))
+        .canonicalize()
+        .unwrap();
+    let missing = guard.replace(exe.to_str().unwrap(), "/nonexistent/chief");
+    let out = run_hook(&missing, &json!({"tool_name": "SendMessage"}));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).ends_with(
+            "chief's message guard could not run (/nonexistent/chief); message blocked. Run chief \
+             up again.\n"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_hook(
+        &command.replace(exe.to_str().unwrap(), "/nonexistent/chief"),
+        &payload,
+    );
+    assert_eq!(out.status.code(), Some(127), "fails open: {}", stderr(&out));
+}
+
+/// Runs a generated hook command through `sh` from `/`, without chief's variables in the
+/// environment, as Claude Code would.
+fn run_hook(command: &str, payload: &Value) -> std::process::Output {
     let mut child = Command::new("sh")
         .args(["-c", command])
         .current_dir("/")
         .env_remove("CHIEF_HOME")
         .env_remove("CHIEF_CLAUDE_BIN")
         .env_remove("CHIEF_GH_BIN")
+        .env_remove("CHIEF_REX_BIN")
         .env_remove("CHIEF_CLAUDE_CONFIG")
         .env_remove("CHIEF_NO_NOTIFY")
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     use std::io::Write;
@@ -201,9 +251,7 @@ fn generated_hook_commands_reach_this_home() {
         .unwrap()
         .write_all(payload.to_string().as_bytes())
         .unwrap();
-    assert!(child.wait().unwrap().success());
-    let row = db::get_session(&home.db(), "demo-x-1111").unwrap().unwrap();
-    assert_eq!(row.last_report.as_deref(), Some("hi"));
+    child.wait_with_output().unwrap()
 }
 
 /// The fake's next `agents` call number.

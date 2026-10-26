@@ -237,6 +237,13 @@ pub fn up(slug: &str) -> Result<()> {
     let config = ProjectConfig::load(&dir.join("project.toml"))
         .with_context(|| format!("no usable chief project {slug:?}; create it with chief init"))?;
     let exe = generated::chief_exe()?;
+    if generated::in_cargo_target(&exe) {
+        eprintln!(
+            "warning: chief runs from {}, inside a cargo target/ folder: `cargo clean` would \
+             disable chief's hooks and message guard. Install with `cargo install --path .`.",
+            exe.display()
+        );
+    }
     let env = generated::passthrough_env();
     generated::write_all(&dir, slug, &exe, &env)?;
     let conn = db::open(&paths::db())?;

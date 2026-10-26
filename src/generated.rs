@@ -110,7 +110,11 @@ pub fn hook_settings(exe: &Path, slug: &str, role: Role, env: &[(String, String)
         }
         let mut entries = vec![entry];
         if event == "PreToolUse" {
-            entries.push(json!({"matcher": GUARD_MATCHER, "hooks": [command("guard")]}));
+            let guard = json!({
+                "type": "command",
+                "command": guard_command(exe, slug, role, env),
+            });
+            entries.push(json!({"matcher": GUARD_MATCHER, "hooks": [guard]}));
         }
         hooks.insert(event.to_string(), Value::Array(entries));
     }
@@ -148,6 +152,31 @@ pub fn hook_command(
         words.push(shell_quote(arg));
     }
     words.join(" ")
+}
+
+/// The guard's hook command, which fails closed even when chief can't start (a missing binary
+/// exits 127, which Claude Code treats as a non-blocking error): any non-zero exit becomes exit 2,
+/// which blocks the tool call and shows the message to the model. chief itself always exits 0,
+/// with the deny JSON or nothing.
+pub fn guard_command(exe: &Path, slug: &str, role: Role, env: &[(String, String)]) -> String {
+    let message = format!(
+        "chief's message guard could not run ({}); message blocked. Run chief up again.",
+        exe.display()
+    );
+    format!(
+        "{} || {{ echo {} >&2; exit 2; }}",
+        hook_command(exe, slug, role, "guard", env),
+        shell_quote(&message)
+    )
+}
+
+/// Whether `exe` sits in a cargo `target/` folder (an ancestor named `target` beside a
+/// `Cargo.toml`), where `cargo clean` would delete it from under every hook.
+pub fn in_cargo_target(exe: &Path) -> bool {
+    exe.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|n| n == "target")
+            && dir.parent().is_some_and(|p| p.join("Cargo.toml").is_file())
+    })
 }
 
 /// `--mcp-config` JSON that starts `chief mcp --project <slug>`.
@@ -213,7 +242,9 @@ mod tests {
         assert_eq!(pre[1]["matcher"], "SendMessage|ListAgents");
         assert_eq!(
             pre[1]["hooks"][0]["command"],
-            "'/opt/my tools/chief' hook guard --project demo --role thread"
+            "'/opt/my tools/chief' hook guard --project demo --role thread || { echo \
+             'chief'\\''s message guard could not run (/opt/my tools/chief); message blocked. Run \
+             chief up again.' >&2; exit 2; }"
         );
         assert_eq!(hooks["PostToolUse"][0]["matcher"], "*");
         assert!(hooks["Notification"][0].get("matcher").is_none());
@@ -257,6 +288,17 @@ mod tests {
             String::from_utf8(out.stdout).unwrap(),
             "/x/it's here|hook Stop --project demo --role thread\n"
         );
+    }
+
+    #[test]
+    fn cargo_target_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let exe = dir.path().join("target/release/chief");
+        assert!(in_cargo_target(&exe));
+        assert!(!in_cargo_target(&dir.path().join("bin/chief")));
+        // A folder named target without a Cargo.toml beside it is just a folder.
+        assert!(!in_cargo_target(Path::new("/nowhere/target/chief")));
     }
 
     #[test]

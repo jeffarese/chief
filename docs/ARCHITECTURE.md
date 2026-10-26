@@ -121,7 +121,9 @@ each project's coordinator and threads grouped in board order. A thread's line e
 
 `generated/*` is rewritten by `init`, `up` and whenever settings change. Commands inside them use the
 canonical absolute path of the `chief` binary (`std::env::current_exe()`), so install with
-`cargo install --path .`. Every word of a hook command is shell-quoted.
+`cargo install --path .`: `chief up` prints a one-line warning when that path is inside a cargo
+`target/` folder (an ancestor named `target` beside a `Cargo.toml`), since `cargo clean` would
+disable chief's hooks and guard. Every word of a hook command is shell-quoted.
 
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so the
 variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG`
@@ -134,7 +136,12 @@ variables (§9).
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
   `SendMessage|ListAgents`, `chief hook guard`), PostToolUse (matcher `*`), Notification, Stop,
-  SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`.
+  SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`. The
+  state and context hooks fail open (a missing binary is a non-blocking hook error). The guard's
+  command fails closed: `<chief> hook guard --project <slug> --role <role> || { echo "chief's
+  message guard could not run (<chief path>); message blocked. Run chief up again." >&2; exit 2; }`
+  (the message is one shell-quoted word), so a missing or broken binary (exit 127 or any non-zero
+  exit) blocks the call with exit 2, which Claude Code treats as a block and shows to the model.
   The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and
   `"permissions": {"allow": ["mcp__chief"]}` (nobody watches its background session for prompts
   on its own tools).
@@ -370,6 +377,9 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 `short_id` while unresolved); the coordinator's pid likewise. The coordinator is also denied when
 more than one live session carries the thread's name (never deliver to an ambiguous name). Other
 tools are allowed. `claude agents` is only run for a SendMessage with a `to`.
+
+The guard process itself always exits 0 (deny JSON or empty stdout); its generated command turns
+any other exit, including a chief binary that can't start, into exit 2 (§3), which blocks the call.
 
 Every deny writes a `guard_denials` row (caller matched by `session_id`, `target` = raw `to`) and
 returns the PreToolUse deny JSON above; an allow prints nothing. If the guard itself fails (bad
