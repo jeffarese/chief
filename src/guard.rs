@@ -18,6 +18,8 @@ pub struct Member {
     pub resolved: bool,
     /// Its session, worktree and branch were removed (§12).
     pub cleaned: bool,
+    /// A sync found its session removed outside chief (§5); its worktree may remain.
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +62,15 @@ pub fn cleaned_message(name: &str) -> String {
     format!(
         "{name} was cleaned up; start a new thread (its reports are still readable with \
          read_report)"
+    )
+}
+
+/// Shared by the guard, `wake_thread` and reopening: a sync found the session removed outside
+/// chief (§5), so `claude respawn` has nothing to bring back, even while its worktree remains.
+pub fn removed_message(name: &str) -> String {
+    format!(
+        "{name}'s session was removed outside chief, so it can't be woken, reopened or \
+         messaged; start a new thread (its reports are still readable with read_report)"
     )
 }
 
@@ -162,6 +173,9 @@ fn thread_send(input: &GuardInput, to: &str) -> Decision {
 /// Whether a message to one of this project's threads would reach its own session; the
 /// thread's pid if so, else the denial.
 fn reach_thread(input: &GuardInput, thread: &Member) -> Result<u32, String> {
+    if thread.removed {
+        return Err(removed_message(&thread.name));
+    }
     if thread.cleaned {
         return Err(cleaned_message(&thread.name));
     }
@@ -271,6 +285,7 @@ mod tests {
             short_id: None,
             resolved: false,
             cleaned: false,
+            removed: false,
         }
     }
 
@@ -290,6 +305,12 @@ mod tests {
                 resolved: true,
                 cleaned: true,
                 ..member("p-cleaned-9c0d", "cleaned")
+            },
+            // Removed outside chief, its worktree still there: resolved, not cleaned.
+            Member {
+                resolved: true,
+                removed: true,
+                ..member("p-removed-3a3a", "removed")
             },
             // Not resolved yet: found in the snapshot by short id.
             Member {
@@ -439,6 +460,13 @@ mod tests {
                 Some("p-cleaned-9c0d"),
                 cp,
                 Deny("p-cleaned-9c0d was cleaned up; start a new thread"),
+            ),
+            (
+                C,
+                "SendMessage",
+                Some("p-removed-3a3a"),
+                cp,
+                Deny("p-removed-3a3a's session was removed outside chief"),
             ),
             // Coordinator outside the project, or to itself.
             (

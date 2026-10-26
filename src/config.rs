@@ -11,6 +11,11 @@ pub struct ProjectConfig {
     pub slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// The Claude Code account the project belongs to (§1, §3): the `CLAUDE_CONFIG_DIR` in
+    /// effect at `chief init`, absolute. None (no key) is the default account, `~/.claude`. Every
+    /// Claude Code call for the project runs in it; it is never changed afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<PathBuf>,
     pub coordinator: ModelSettings,
     pub threads: ThreadSettings,
     #[serde(default)]
@@ -66,6 +71,9 @@ impl Default for UiSettings {
 }
 
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// Characters a permission rule reads as glob or syntax: a repo path holding one would widen or
+/// break the coordinator's deny rule for it.
+const RULE_GLOB_CHARS: [char; 9] = ['(', ')', '*', '?', '[', ']', '{', '}', '\\'];
 /// `bypassPermissions` is excluded: messages to such a session are held for approval.
 pub const THREAD_PERMISSION_MODES: [&str; 4] = ["auto", "acceptEdits", "manual", "plan"];
 
@@ -77,6 +85,7 @@ impl ProjectConfig {
             name: name.to_string(),
             slug: slug.to_string(),
             goal: goal.map(str::to_string),
+            claude_config_dir: None,
             coordinator: ModelSettings {
                 model: "opus".to_string(),
                 effort: "low".to_string(),
@@ -119,6 +128,25 @@ impl ProjectConfig {
         Ok(())
     }
 
+    /// Only `claude_config_dir` from a project.toml: hooks and cross-project commands find the
+    /// project's account even when another key doesn't validate.
+    pub fn read_account(path: &Path) -> Result<Option<PathBuf>> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        match table.get("claude_config_dir") {
+            None => Ok(None),
+            Some(toml::Value::String(dir)) if Path::new(dir).is_absolute() => {
+                Ok(Some(PathBuf::from(dir)))
+            }
+            Some(other) => bail!(
+                "claude_config_dir in {} must be an absolute path, not {other}",
+                path.display()
+            ),
+        }
+    }
+
     /// Rejects unknown efforts and permission modes, duplicate repo names, a default_repo
     /// that names no repo, and max_parallel = 0.
     pub fn validate(&self) -> Result<()> {
@@ -129,6 +157,14 @@ impl ProjectConfig {
             bail!(
                 "slug {:?} must be lowercase letters, digits and single hyphens",
                 self.slug
+            );
+        }
+        if let Some(dir) = &self.claude_config_dir
+            && !dir.is_absolute()
+        {
+            bail!(
+                "claude_config_dir {} must be an absolute path",
+                dir.display()
             );
         }
         for (what, m) in [
@@ -156,6 +192,21 @@ impl ProjectConfig {
         }
         if self.threads.max_parallel == 0 {
             bail!("threads.max_parallel must be at least 1");
+        }
+        for repo in &self.repos {
+            // Each repo becomes a permission-rule glob for the coordinator (§3).
+            if let Some(c) = repo
+                .path
+                .to_string_lossy()
+                .chars()
+                .find(|c| RULE_GLOB_CHARS.contains(c))
+            {
+                bail!(
+                    "the repo path {} contains {c:?}, which chief can't put in a permission rule \
+                     safely; rename or move the folder",
+                    repo.path.display()
+                );
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for repo in &self.repos {
@@ -326,6 +377,48 @@ notify = true
         let mut c = sample();
         c.threads.default_repo = None;
         c.validate().unwrap();
+    }
+
+    /// A repo path becomes a permission-rule glob (§3): these characters would widen or break the
+    /// coordinator's deny rule for it.
+    #[test]
+    fn validate_rejects_repo_paths_a_rule_cant_hold() {
+        for c in ['(', ')', '*', '?', '[', ']', '{', '}', '\\'] {
+            let mut config = sample();
+            config.repos[0].path = PathBuf::from(format!("/Users/me/work{c}space/api"));
+            let err = format!("{:#}", config.validate().unwrap_err());
+            assert!(err.contains("rename or move"), "{c}: {err}");
+            assert!(err.contains(&format!("{c:?}")), "{c}: {err}");
+        }
+        let mut config = sample();
+        config.repos[0].path = PathBuf::from("/Users/me/work space/api-2.0_x");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn claude_config_dir_must_be_absolute_and_reads_alone() {
+        let mut config = sample();
+        config.claude_config_dir = Some("relative/.claude".into());
+        assert!(config.validate().is_err());
+        config.claude_config_dir = Some("/Users/me/.claude-carlos".into());
+        config.validate().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.toml");
+        config.save(&path).unwrap();
+        assert_eq!(
+            ProjectConfig::read_account(&path).unwrap().as_deref(),
+            Some(Path::new("/Users/me/.claude-carlos"))
+        );
+        // Another key broken: the account still reads.
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("effort = \"high\"", "effort = \"ultra\"");
+        std::fs::write(&path, text).unwrap();
+        assert!(ProjectConfig::load(&path).is_err());
+        assert!(ProjectConfig::read_account(&path).unwrap().is_some());
+        std::fs::write(&path, "name = \"x\"\n").unwrap();
+        assert_eq!(ProjectConfig::read_account(&path).unwrap(), None);
     }
 
     #[test]

@@ -274,6 +274,26 @@ fn discard_resets_only_the_threads_own_worktree() {
     assert_eq!(env.rm_calls().len(), rm_before);
 }
 
+/// The reviewer's probe: two registered sessions whose job state names one worktree. `claude rm`
+/// would delete it and its branch under the other session, so a safe cleanup refuses too, before
+/// `claude rm`, even with nothing unsaved.
+#[test]
+fn safe_clean_refuses_a_worktree_another_session_names() {
+    let env = Env::new();
+    let mut other = SessionRow::new("demo-b-2222", "demo", Role::Thread, NOW);
+    other.short_id = Some("bb22".into());
+    other.session_id = Some("sid-bb22".into());
+    db::insert_session(&env.conn, &other).unwrap();
+    env.claude.job("bb22", Some(&env.worktree));
+    let Outcome::Blocked(why) = env.clean(Mode::Safe).unwrap() else {
+        panic!("want blocked");
+    };
+    assert!(why.contains("also the worktree of demo-b-2222"), "{why}");
+    assert_eq!(env.row().cleanup_blocked.as_deref(), Some(why.as_str()));
+    assert!(env.rm_calls().is_empty());
+    assert!(env.worktree.is_dir());
+}
+
 #[test]
 fn safe_clean_removes_a_thread_with_nothing_to_lose() {
     let env = Env::new();
@@ -571,7 +591,7 @@ fn cli_discard_keeps_commits_it_did_not_show() {
     let home = Home::new();
     {
         let conn = home.db();
-        db::register_project(&conn, "demo", home.path(), 0).unwrap();
+        home.register("demo");
         let mut row = SessionRow::new("demo-x-1111", "demo", Role::Thread, NOW);
         row.short_id = Some(SHORT.into());
         row.session_id = Some("t-sid".into());
@@ -725,6 +745,44 @@ fn a_reused_branch_name_ignores_older_and_cross_repository_prs() {
         (None, false, None, None)
     );
     assert!(env.rm_calls().is_empty());
+}
+
+/// The reviewer's probe: PRs are matched on what the job state names, never the hooks' cwd or
+/// branch. A thread whose shell sits in the checkout on `main` is polled for its worktree's
+/// branch; one whose job never entered a worktree isn't polled, wherever its hooks say it is.
+#[test]
+fn prs_are_polled_for_the_branch_the_job_state_names() {
+    let env = Env::new();
+    let open = |r: &mut SessionRow| {
+        r.resolved = false;
+        r.resolved_reason = None;
+        r.group_name = "idle".into();
+    };
+    env.insert(|r| {
+        open(r);
+        r.cwd = r.repo_path.clone();
+        r.branch = Some("main".into());
+    });
+    env.gh.set("pr.stdout", "[]");
+    let polled = || {
+        let refresh = env.with(|ctx| pr::poll_project(ctx, "demo")).unwrap();
+        assert!(refresh.errors.is_empty(), "{:?}", refresh.errors);
+        refresh.polled
+    };
+    assert_eq!(polled(), 1);
+    assert_eq!(env.gh.calls()[0][3], "worktree-add-notes");
+
+    // Its hooks say it works in a worktree on a branch; its job never entered one.
+    env.insert(|r| {
+        open(r);
+        r.cwd = Some(env.worktree.join("src").to_string_lossy().into_owned());
+    });
+    env.claude.job(SHORT, None);
+    assert_eq!(polled(), 0);
+    // A worktree, but no branch recorded: nothing to match a PR on.
+    env.claude.job_on(SHORT, Some(&env.worktree), None);
+    assert_eq!(polled(), 0);
+    assert_eq!(env.gh.calls().len(), 1);
 }
 
 #[test]
@@ -938,7 +996,7 @@ fn cli_gc_and_clean() {
     std::fs::write(wt.join("dirty.txt"), "x").unwrap();
     {
         let conn = home.db();
-        db::register_project(&conn, "demo", home.path(), 0).unwrap();
+        home.register("demo");
         let mut row = SessionRow::new("demo-cli-1111", "demo", Role::Thread, NOW);
         row.short_id = Some("cli1".into());
         row.session_id = Some("sid-cli1".into());

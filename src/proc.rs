@@ -17,6 +17,22 @@ pub fn output_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<Option<Output>> {
+    run_bounded(cmd, timeout, &|group| {
+        // SAFETY: a plain syscall; `run_bounded` calls it only while the group's leader is
+        // unreaped, so the id is still this command's group.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    })
+}
+
+/// `output_with_timeout` with the group kill passed in (tests watch when it runs). Pipes are
+/// awaited before the child is reaped: an unreaped child, even a zombie, keeps its pid, which is
+/// the group's id, so `kill_group` can only reach this command's processes. Once `try_wait` has
+/// reaped it, the id may be reused, and the group is never signalled after that.
+fn run_bounded(
+    cmd: &mut Command,
+    timeout: Duration,
+    kill_group: &dyn Fn(libc::pid_t),
+) -> std::io::Result<Option<Output>> {
     let deadline = Instant::now() + timeout;
     let mut child = cmd
         .stdin(Stdio::null())
@@ -26,11 +42,6 @@ pub fn output_with_timeout(
         .spawn()?;
     // The child's pid is its process group id (process_group(0)).
     let group = child.id() as libc::pid_t;
-    let kill_group = || {
-        // SAFETY: a plain syscall. The id stays this group's while our unreaped child or any
-        // process left in the group exists, which is when it is called.
-        unsafe { libc::kill(-group, libc::SIGKILL) };
-    };
     let (tx, rx) = mpsc::channel();
     let streams: [(bool, Box<dyn Read + Send>); 2] = [
         (true, Box::new(child.stdout.take().expect("piped stdout"))),
@@ -46,17 +57,7 @@ pub fn output_with_timeout(
     }
     drop(tx);
 
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            kill_group();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    // Both pipes closed first, while the child is unreaped (exited or not).
     let (mut stdout, mut stderr) = (None, None);
     while stdout.is_none() || stderr.is_none() {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -64,13 +65,26 @@ pub fn output_with_timeout(
             Ok((true, buf)) => stdout = Some(buf),
             Ok((false, buf)) => stderr = Some(buf),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Something left in the group still holds a pipe.
-                kill_group();
+                // The child, or something left in its group, still holds a pipe.
+                kill_group(group);
+                let _ = child.wait();
                 return Ok(None);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    // Then its exit. `try_wait` reaps it, so the group is signalled only before that.
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_group(group);
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     Ok(Some(Output {
         status,
         stdout: stdout.unwrap_or_default(),
@@ -228,6 +242,39 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(start_time(pid), None, "gone");
+    }
+
+    /// The group is signalled only while its leader, the child, is still unreaped: once reaped,
+    /// its pid (the group's id) may belong to an unrelated process group.
+    #[test]
+    fn the_group_is_signalled_only_before_the_child_is_reaped() {
+        let leader_there = std::sync::Mutex::new(Vec::new());
+        let kill = |group: libc::pid_t| {
+            // SAFETY: signal 0 only checks that the pid exists (an unreaped zombie still does).
+            leader_there
+                .lock()
+                .unwrap()
+                .push(unsafe { libc::kill(group, 0) } == 0);
+            // SAFETY: the group of the command this test started.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        };
+        // The child exits at once; a grandchild holds the pipes past the deadline.
+        let out = run_bounded(
+            Command::new("sh").args(["-c", "sleep 30 & exit 0"]),
+            Duration::from_millis(500),
+            &kill,
+        )
+        .unwrap();
+        assert!(out.is_none());
+        // And a child that outlives the deadline itself.
+        let out = run_bounded(
+            Command::new("sh").args(["-c", "exec sleep 30"]),
+            Duration::from_millis(300),
+            &kill,
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(*leader_there.lock().unwrap(), [true, true]);
     }
 
     /// Output that a grandchild finishes writing before the deadline is kept.

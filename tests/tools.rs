@@ -336,14 +336,24 @@ fn spawns_and_respawns_rewrite_the_generated_files_first() {
 }
 
 /// A `claude` whose `--bg` prints no id (`bg_exit` as its exit code) and whose `agents` lists the
-/// session that `--bg` named, as if it had started anyway.
+/// session that `--bg` named, as if it had started anyway, in the folder `--bg` ran in (or
+/// `cwd` when given).
 fn started_anyway(dir: &Path, bg_exit: u8) -> chief::claude::Claude {
+    started_anyway_in(dir, bg_exit, None)
+}
+
+fn started_anyway_in(dir: &Path, bg_exit: u8, cwd: Option<&Path>) -> chief::claude::Claude {
     let bin = dir.join("claude-started-anyway");
+    let listed_cwd = match cwd {
+        Some(p) => format!("'{}'", p.display()),
+        None => "\"$(cat \"$dir/started-cwd\")\"".to_string(),
+    };
     let script = format!(
         r#"#!/bin/sh
 dir=$(dirname "$0")
 case "$1" in
   --bg)
+    pwd -P > "$dir/started-cwd"
     while [ $# -gt 1 ]; do
       [ "$1" = "--name" ] && printf '%s' "$2" > "$dir/started-name"
       shift
@@ -352,7 +362,7 @@ case "$1" in
     exit {bg_exit} ;;
   agents)
     if [ -f "$dir/started-name" ]; then
-      printf '[{{"id":"ad0pt","sessionId":"sid-adopt","name":"%s","state":"working","status":"busy","pid":42}}]' "$(cat "$dir/started-name")"
+      printf '[{{"id":"ad0pt","sessionId":"sid-adopt","name":"%s","cwd":"%s","state":"working","status":"busy","pid":42}}]' "$(cat "$dir/started-name")" {listed_cwd}
     else
       echo '[]'
     fi ;;
@@ -364,7 +374,11 @@ esac
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     // No job state: these threads never entered a worktree.
     let config_dir = dir.join("claude-config");
-    chief::claude::Claude { bin, config_dir }
+    chief::claude::Claude {
+        bin,
+        account: None,
+        config_dir,
+    }
 }
 
 /// A `claude --bg` that timed out or printed no id may still have started the session: chief
@@ -400,6 +414,39 @@ fn start_thread_adopts_a_session_that_started_anyway() {
             (Some("ad0pt"), Some("sid-adopt"), Some(42))
         );
     }
+}
+
+/// A session with the new name in another folder isn't the one this spawn started (another chief
+/// home's thread, say): not adopted, and the row goes.
+#[test]
+fn start_thread_adopts_only_a_session_in_the_repo() {
+    let env = Env::new();
+    let elsewhere = env.root.path().canonicalize().unwrap();
+    let claude = started_anyway_in(env.fake.dir.path(), 1, Some(&elsewhere));
+    let err = tools::start_thread(
+        &ToolCtx {
+            conn: &env.conn,
+            config: &env.config,
+            claude: &claude,
+            project_dir: &env.dir,
+            trust_config: &env.trust,
+            now,
+            resolve_timeout: Duration::from_millis(300),
+            wake_timeout: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(10),
+        },
+        &start_args("Fix login bug", "Fix it"),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("printed no session id"),
+        "{err:#}"
+    );
+    assert!(
+        db::list_sessions(&env.conn, "demo", None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// When `claude agents` can't say whether the session started, the row stays: hooks match it by
@@ -641,6 +688,48 @@ fn resolve_and_reopen() {
     let out = call(Some(true));
     assert_eq!(out["resolved"], false);
     assert_ne!(out["group"], "resolved");
+}
+
+/// Removed outside chief while its worktree remains: resolved, not cleaned. Its session is gone,
+/// so it can't be reopened or woken (`claude respawn` would fail), with a message that says so.
+#[test]
+fn removed_threads_cannot_be_reopened_or_woken() {
+    let env = Env::new();
+    env.insert("demo-gone-1111", |r| {
+        r.short_id = Some("g1".into());
+        r.session_id = Some("sid-g1".into());
+        r.resolved = true;
+        r.resolved_reason = Some("removed".into());
+        r.group_name = "resolved".into();
+        r.removed_at = Some(NOW - 1000);
+        r.cleanup_blocked = Some("session removed outside chief; worktree remains at /r".into());
+    });
+    // The coordinator is listed; the thread isn't.
+    env.agents(&[agent("c1", "sid-c1", "chief-demo", "done", Some(1))]);
+    let want = "demo-gone-1111's session was removed outside chief, so it can't be woken, \
+                reopened or messaged; start a new thread (its reports are still readable with \
+                read_report)";
+    let reopen = env.with(|ctx| {
+        tools::resolve_thread(
+            ctx,
+            &ResolveThreadArgs {
+                name: "demo-gone-1111".into(),
+                reopen: Some(true),
+            },
+        )
+    });
+    assert_eq!(reopen.unwrap_err().to_string(), want);
+    assert!(env.row("demo-gone-1111").unwrap().resolved);
+    let wake = env.with(|ctx| {
+        tools::wake_thread(
+            ctx,
+            &NameArgs {
+                name: "demo-gone-1111".into(),
+            },
+        )
+    });
+    assert_eq!(wake.unwrap_err().to_string(), want);
+    assert!(env.fake.calls_of("respawn").is_empty());
 }
 
 #[test]

@@ -13,6 +13,7 @@
 
 use std::io::Write;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -46,6 +47,8 @@ const WAIT_TICK: Duration = Duration::from_millis(50);
 /// clear.
 const TERMINAL_RESET: &str = "\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
                               \x1b[?2004l\x1b[?1004l\x1b[0m\x1b[2J\x1b[H";
+/// How often an unusable project.toml is read again.
+const CONFIG_RETRY: Duration = Duration::from_secs(5);
 
 /// Set by SIGHUP or SIGTERM.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
@@ -95,7 +98,6 @@ pub fn run(project: &str) -> Result<()> {
     if db::project_dir(&conn, project)?.is_none() {
         bail!("no chief project {project:?}");
     }
-    let claude = Claude::from_env();
     catch_hangup();
     catch_switch();
     let tty = Tty::take()?;
@@ -105,7 +107,7 @@ pub fn run(project: &str) -> Result<()> {
     if let Some(started) = proc::start_time(me) {
         db::set_pane_process(&conn, project, me, &started)?;
     }
-    let result = pane_loop(&conn, &claude, project, &tty);
+    let result = pane_loop(&conn, project, &tty);
     let _ = db::set_pane_showing(&conn, project, None);
     let _ = db::clear_pane_process_if(&conn, project, me);
     drop(tty);
@@ -113,14 +115,16 @@ pub fn run(project: &str) -> Result<()> {
 }
 
 /// The session the pane should show: `pane_target`, or the coordinator when it is NULL or names
-/// a session that is unknown, of another project, cleaned or removed, or never started (the
-/// stale target is cleared). None when the coordinator hasn't been started either.
+/// a session that is unknown, of another project, cleaned, removed outside chief (its worktree
+/// may remain, its session doesn't), or never started (the stale target is cleared). None when
+/// the coordinator hasn't been started either.
 pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<SessionRow>> {
     if let Some(name) = db::get_pane_target(conn, project)? {
         match db::get_session(conn, &name)? {
             Some(row)
                 if row.project_slug == project
                     && row.cleaned_at.is_none()
+                    && row.removed_at.is_none()
                     && row.short_id.is_some() =>
             {
                 return Ok(Some(row));
@@ -131,11 +135,41 @@ pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<Session
     Ok(db::get_coordinator(conn, project)?.filter(|r| r.short_id.is_some()))
 }
 
-fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Result<()> {
+/// project.toml as it is now, or the lines the pane shows while it can't be read or doesn't
+/// validate: the pane then neither attaches nor rewrites or respawns from stale files.
+fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
+    ProjectConfig::load(&dir.join("project.toml")).map_err(|e| {
+        let mut lines = vec!["chief · project.toml can't be used:".to_string()];
+        lines.extend(format!("{e:#}").lines().map(|l| format!("  {l}")));
+        lines.push(format!(
+            "Fix project.toml; retrying every {} s · q quits",
+            CONFIG_RETRY.as_secs()
+        ));
+        lines
+    })
+}
+
+fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
+    let dir = project::project_dir(project);
     loop {
         if HUNG_UP.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let config = match project_config(&dir) {
+            Ok(config) => config,
+            Err(lines) => {
+                tty.say(&lines[0])?;
+                for line in &lines[1..] {
+                    tty.note(line)?;
+                }
+                if tty.quit_pressed(CONFIG_RETRY)? {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        // The project's account, whatever the block's shell names (§3).
+        let claude = &Claude::for_account(config.claude_config_dir.clone());
         let Some(row) = resolve_target(conn, project)? else {
             tty.say(&format!(
                 "chief · no coordinator yet: run chief up {project} · q quits"
@@ -148,7 +182,7 @@ fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Re
         let name = row.name.clone();
         let short_id = row.short_id.clone().context("target has no short id")?;
         tty.say(&format!("chief · {name} …"))?;
-        if let Err(e) = wake(conn, claude, project, &row, tty) {
+        if let Err(e) = wake(conn, claude, project, (&dir, &config), &row, tty) {
             tty.say(&format!("chief · {name}: {e:#} · retrying · q quits"))?;
             if tty.quit_pressed(RETRY)? {
                 return Ok(());
@@ -209,12 +243,13 @@ fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Re
     }
 }
 
-/// Respawns `row` when `claude agents` shows no process for it and waits for one. A failing
-/// `claude agents` is no reason not to try attaching.
+/// Respawns `row` when `claude agents` shows no process for it and waits for one, from the
+/// project.toml just read. A failing `claude agents` is no reason not to try attaching.
 fn wake(
     conn: &Connection,
     claude: &Claude,
     project: &str,
+    (dir, config): (&Path, &ProjectConfig),
     row: &SessionRow,
     tty: &Tty,
 ) -> Result<()> {
@@ -222,23 +257,28 @@ fn wake(
     let Ok(snapshot) = claude.agents() else {
         return Ok(());
     };
-    registry::sync(conn, project, &snapshot, taken_at, db::now_ms())?;
+    registry::sync_in(
+        conn,
+        project,
+        &snapshot,
+        taken_at,
+        db::now_ms(),
+        &claude.config_dir,
+    )?;
     let row =
         db::get_session(conn, &row.name)?.with_context(|| format!("{} vanished", row.name))?;
     if row.pid.is_some() {
         return Ok(());
     }
     tty.say(&format!("chief · waking {} …", row.name))?;
-    let dir = project::project_dir(project);
-    let config = ProjectConfig::load(&dir.join("project.toml"))?;
-    project::respawn(conn, claude, &dir, &config, &row, WAKE_WAIT)?;
+    project::respawn(conn, claude, dir, config, &row, WAKE_WAIT)?;
     Ok(())
 }
 
 /// Runs `claude attach <short_id>` on this terminal and waits for it, or until `switch` says the
 /// board wants another target.
 fn attach(claude: &Claude, short_id: &str, switch: &dyn Fn() -> bool) -> Result<Waited> {
-    let mut cmd = Command::new(&claude.bin);
+    let mut cmd = claude.command();
     cmd.args(["attach", short_id]);
     with_default_tstp(&mut cmd);
     let child = cmd
@@ -513,6 +553,34 @@ mod tests {
         resolve_target(conn, "demo").unwrap().map(|r| r.name)
     }
 
+    /// The reviewer's probe: a malformed project.toml made every wake fail, and the error flashed
+    /// between retries. The pane says what is wrong and what to do, and uses nothing else.
+    #[test]
+    fn an_unusable_project_toml_is_shown_with_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("project.toml");
+        std::fs::write(&toml, "name = \"Demo\"\nslug = [\n").unwrap();
+        let lines = project_config(dir.path()).unwrap_err();
+        assert_eq!(lines[0], "chief · project.toml can't be used:");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("parsing") && l.contains("project.toml")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "Fix project.toml; retrying every 5 s · q quits"
+        );
+        assert!(lines.iter().all(|l| !l.contains('\n')), "{lines:?}");
+
+        // A valid one is used as it is now.
+        crate::config::ProjectConfig::new("Demo", "demo", None, vec![])
+            .save(&toml)
+            .unwrap();
+        assert_eq!(project_config(dir.path()).unwrap().slug, "demo");
+    }
+
     #[test]
     fn target_resolution() {
         let (_dir, conn) = fresh();
@@ -534,6 +602,16 @@ mod tests {
         db::update_session(&conn, &row).unwrap();
         assert_eq!(target(&conn).as_deref(), Some("chief-demo"));
         assert_eq!(db::get_pane_target(&conn, "demo").unwrap(), None, "cleared");
+
+        // Removed outside chief, its worktree still there: no session to attach to either.
+        insert(&conn, "demo-r-4444", "demo", Role::Thread, Some("t4"));
+        let mut removed = db::get_session(&conn, "demo-r-4444").unwrap().unwrap();
+        removed.removed_at = Some(5);
+        removed.resolved = true;
+        db::update_session(&conn, &removed).unwrap();
+        db::set_pane_target(&conn, "demo", Some("demo-r-4444")).unwrap();
+        assert_eq!(target(&conn).as_deref(), Some("chief-demo"));
+        assert_eq!(db::get_pane_target(&conn, "demo").unwrap(), None);
 
         // Unknown, another project's, never started: the coordinator, and the target cleared.
         insert(&conn, "other-b-2222", "other", Role::Thread, Some("t2"));

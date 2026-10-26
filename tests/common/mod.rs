@@ -37,9 +37,11 @@ impl Fake {
         Gh::new(self.bin())
     }
 
+    /// The default account, whose folder is `config_dir` (as `CHIEF_CLAUDE_DIR` makes it).
     pub fn claude(&self) -> Claude {
         Claude {
             bin: self.bin(),
+            account: None,
             config_dir: self.config_dir(),
         }
     }
@@ -49,13 +51,28 @@ impl Fake {
         self.dir.path().join("claude-dir")
     }
 
-    /// Writes the job state of background session `short`, with `worktreePath` when given.
+    /// Writes the job state of background session `short`, with `worktreePath` when given and
+    /// the `worktreeBranch` Claude Code gives it (`worktree-<folder name>`).
     pub fn job(&self, short: &str, worktree: Option<&Path>) -> &Self {
+        let branch = worktree.map(|wt| {
+            format!(
+                "worktree-{}",
+                wt.file_name().unwrap_or_default().to_string_lossy()
+            )
+        });
+        self.job_on(short, worktree, branch.as_deref())
+    }
+
+    /// `job` with the branch given.
+    pub fn job_on(&self, short: &str, worktree: Option<&Path>, branch: Option<&str>) -> &Self {
         let dir = self.config_dir().join("jobs").join(short);
         std::fs::create_dir_all(&dir).unwrap();
         let mut state = serde_json::json!({"daemonShort": short, "state": "done"});
         if let Some(wt) = worktree {
             state["worktreePath"] = wt.to_string_lossy().into_owned().into();
+        }
+        if let Some(branch) = branch {
+            state["worktreeBranch"] = branch.into();
         }
         std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
         self
@@ -125,6 +142,29 @@ impl Fake {
         let text = std::fs::read_to_string(self.dir.path().join(format!("calls/{n}.cwd"))).unwrap();
         PathBuf::from(text.trim())
     }
+
+    /// The account (`CLAUDE_CONFIG_DIR`) of every call so far, with its first argument;
+    /// `unset` for the default account.
+    pub fn accounts(&self) -> Vec<(String, String)> {
+        self.calls()
+            .into_iter()
+            .enumerate()
+            .map(|(n, args)| {
+                let env = std::fs::read_to_string(self.dir.path().join(format!("calls/{n}.env")))
+                    .unwrap();
+                (args.first().cloned().unwrap_or_default(), env)
+            })
+            .collect()
+    }
+}
+
+/// A Claude Code account folder of its own (`CLAUDE_CONFIG_DIR`): its trust file, and canned
+/// `claude agents` output the fake serves under it.
+pub fn account(parent: &Path, name: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".claude.json"), "{}").unwrap();
+    dir.canonicalize().unwrap()
 }
 
 /// `~/.claude.json` stand-in that trusts `folders` (canonical paths).
@@ -234,7 +274,32 @@ impl Home {
     pub fn run_env(&self, args: &[&str], env: &[(&str, &str)], stdin: &str) -> Output {
         let mut cmd = self.command(args);
         cmd.envs(env.iter().copied());
-        let mut child = cmd.spawn().unwrap();
+        cmd.output_with_stdin(stdin)
+    }
+
+    pub fn db(&self) -> rusqlite::Connection {
+        chief::db::open(&self.home.path().join("chief.db")).unwrap()
+    }
+
+    /// Registers project `slug` with a default project.toml (the default account), as
+    /// `chief init` leaves it, without the other files.
+    pub fn register(&self, slug: &str) {
+        let dir = self.home.path().join("projects").join(slug);
+        chief::config::ProjectConfig::new(slug, slug, None, vec![])
+            .save(&dir.join("project.toml"))
+            .unwrap();
+        chief::db::register_project(&self.db(), slug, &dir, 0).unwrap();
+    }
+}
+
+/// Runs a piped command (`Home::command`) with `stdin` as its input.
+pub trait OutputWithStdin {
+    fn output_with_stdin(&mut self, stdin: &str) -> Output;
+}
+
+impl OutputWithStdin for Command {
+    fn output_with_stdin(&mut self, stdin: &str) -> Output {
+        let mut child = self.spawn().unwrap();
         child
             .stdin
             .take()
@@ -242,10 +307,6 @@ impl Home {
             .write_all(stdin.as_bytes())
             .unwrap();
         child.wait_with_output().unwrap()
-    }
-
-    pub fn db(&self) -> rusqlite::Connection {
-        chief::db::open(&self.home.path().join("chief.db")).unwrap()
     }
 }
 

@@ -64,6 +64,7 @@ impl Env {
             dir,
             db: db_path,
             claude_bin: claude.bin(),
+            claude_account: None,
             claude_dir: claude.config_dir(),
             gh_bin: gh.bin(),
         };

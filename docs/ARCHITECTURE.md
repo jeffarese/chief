@@ -25,7 +25,8 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
 - `CLAUDE_CONFIG_DIR` gives Claude Code a separate config folder (one per account): its own
   `.claude.json` (trust), `jobs/` and supervisor, so `claude agents`, `attach` and `rm` only see that
   folder's sessions. Unset, the folder is `~/.claude` and the config file `~/.claude.json`
-  (checked on this machine with two account folders).
+  (checked on this machine with two account folders). So each chief project belongs to one
+  account and every call for it runs there (§3).
 - `claude agents --json --all` rows: `id`, `sessionId`, `name`, `cwd`, `kind`, `startedAt`, `state`
   (seen: `working`, `blocked`, `done`; docs also list failed/stopped/idle), `status` (`busy`,
   `waiting`, `idle`, absent when the process is gone), `pid` (absent when the process is gone).
@@ -59,7 +60,8 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   deletes the worktree and the local branch, keeps any remote branch, and the session disappears
   from `claude agents --all` (a stopped session stays listed as `stopped`).
 - Threads name their own worktree (`EnterWorktree`), e.g. `.claude/worktrees/add-hello-txt` on
-  `worktree-add-hello-txt`, not after the thread; use the cwd and branch hooks report.
+  `worktree-add-hello-txt`, not after the thread; use the worktree and branch its job state
+  records.
 - A thread killed mid-turn stays `state: working` with no status and no pid in `claude agents`.
 - A `permissions.deny` rule `Edit(//<absolute canonical path>/**)` in `--settings` (a leading `//`
   means an absolute path) blocks both the Edit and the Write tool for every file under that folder
@@ -67,6 +69,12 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   and other folders stay writable. `Write(…)` and `NotebookEdit(…)` deny rules are useless: Claude
   Code prints "Deny rule Write(//…/**) never matches · use Edit(//…/**)" at startup (verified live
   on 2.1.310 with `--settings` and `--permission-mode auto`).
+- Also verified live on 2.1.310 (background, `--permission-mode auto`): with no deny rule a
+  session can write a project's `.claude/settings.json`, and `Edit(//<abs>/.claude/**)` blocks
+  it. A mid-path glob works: `Edit(//<abs>/projects/*/project.toml)` blocks
+  `projects/other/project.toml` while `projects/other/memory/note.md` stays writable. A file glob
+  works: `Edit(//<abs>/settings*.json)` blocks `settings.json` and `settings.local.json` while
+  `other.json` stays writable. So glob characters in a path are read as globs.
 
 Minimum Claude Code version: 2.1.310. `chief` checks `claude --version` on `init` and `up`.
 
@@ -99,14 +107,17 @@ taken, every `--repo` an existing folder, stored canonical and named after its f
 trust yet: the project folder always, plus untrusted repos. When stdin and stdout are terminals
 (and without `--no-trust-prompt`) it asks for each "Open Claude there now to trust it? [Y/n]" and
 runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twice), then re-checks;
-otherwise it prints `cd <folder> && claude` for each.
+otherwise it prints `cd <folder> && claude` for each (`cd <folder> && CLAUDE_CONFIG_DIR=<dir>
+claude` for a non-default account). The project belongs to the account `CLAUDE_CONFIG_DIR` names
+when `init` runs (§3); `init` says so for a non-default one.
 
-`chief up` checks the version, rewrites `generated/*`, runs the coordinator step (§7), then opens
-the layout (§9): with Rex when it is installed and its server runs (`rex list` succeeds), storing
-the session id in `ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux
-window, storing it in `ui_state.tmux_window`; else it prints why and the two commands to run side
-by side in terminals or splits of the user's own, `chief pane --project <slug>` and `chief board
---project <slug>`. When opening the chosen layout fails it prints why and the same two commands.
+`chief up` loads project.toml, checks the version in the project's account (§3), rewrites
+`generated/*`, runs the coordinator step (§7), then opens the layout (§9): with Rex when it is
+installed and its server runs (`rex list` succeeds), storing the session id in
+`ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux window, storing it
+in `ui_state.tmux_window`; else it prints why and the two commands to run side by side in
+terminals or splits of the user's own, `chief pane --project <slug>` and `chief board --project
+<slug>`. When opening the chosen layout fails it prints why and the same two commands.
 
 `chief down <slug> [--stop-threads]` closes the layout `chief up` opened, and only that: the Rex
 session and the tmux window it stored, each when stored (§9 `close`: kills the session or window
@@ -119,7 +130,8 @@ syncs `claude agents` (stored rows if it fails), and runs
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
-`chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
+`chief status [<slug>]` polls `claude agents` once per account among the projects shown (§3;
+stored rows if it fails), syncs each project with its account's snapshot (§5), and prints
 each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
 its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>` (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
@@ -154,13 +166,34 @@ hook command is shell-quoted.
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
 `CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
 `$XDG_DATA_HOME`, which the supervisor doesn't have, or from the default), and the variables
-`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`, `CHIEF_CLAUDE_CONFIG`,
-`CHIEF_NO_NOTIFY` and `CLAUDE_CONFIG_DIR` (§1: every chief process must talk to the same account's
-supervisor) are written when set at generation time: as `K='v'` prefixes on every hook command and
-in the MCP server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`,
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`, `CHIEF_CLAUDE_CONFIG` and
+`CHIEF_NO_NOTIFY` are written when set at generation time: as `K='v'` prefixes on every hook
+command and in the MCP server's `env`. `CLAUDE_CONFIG_DIR` is written from the project's account
+(below), never from the generating process: set to `claude_config_dir` for a non-default account,
+absent for the default one. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`,
 `CHIEF_GH_BIN`, `CHIEF_REX_BIN` or `CHIEF_TMUX_BIN` without a slash is kept for PATH lookup). Rex
 blocks start from the login shell's environment and tmux panes from the tmux server's, so the
 layout's commands carry the same variables (§9).
+
+A project belongs to one Claude Code account (§1), for good: the `CLAUDE_CONFIG_DIR` in effect at
+`chief init`, made absolute and recorded as `claude_config_dir` in project.toml (no key for the
+default account; a project.toml without the key, from before, is the default account). Every
+Claude Code call for the project (`agents`, `attach`, `rm`, `respawn`, `--bg`, `stop`, the trust
+prompt) runs with `CLAUDE_CONFIG_DIR` set to that folder, or removed for the default account
+(`Claude::command`); job state is read from that folder's `jobs/` and trust from its
+`.claude.json` (`claude::claude_dir`, `claude::claude_config_path`), and the generated env above
+carries it. This holds for every caller: the CLI, the board, the pane, the MCP server and the
+hooks (which read just `claude_config_dir` from project.toml, `ProjectConfig::read_account`, and
+fall back to the account their generated command set when the file can't say). A command about
+one project (`up`, `down`, `clean`, `gc <slug>`) run under another `CLAUDE_CONFIG_DIR` than the
+project's uses the project's and says so once on stderr (`note: <slug> belongs to …; chief uses
+that account, not …`). Commands across projects (`chief status`, `chief gc` without a slug) use
+each project's own account: `status` takes one `claude agents` snapshot per account and syncs each
+project with its account's; a project whose project.toml can't say shows its stored rows with a
+warning. Commands a user types to reach a session (`claude attach <id>`, `claude` for trust) are
+printed with the `CLAUDE_CONFIG_DIR=<dir> ` prefix for a non-default account. The board's settings
+screen shows the account read-only. `CHIEF_CLAUDE_DIR` and `CHIEF_CLAUDE_CONFIG` are test overrides
+for the default account's folder and config file (§11).
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -178,13 +211,19 @@ layout's commands carry the same variables (§9).
   call with exit 2, which Claude Code treats as a block and shows to the model. The guard's entry
   also sets `"timeout": 30` (seconds; the time budget is in §6). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
   `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
-  and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<dir>/generated/**)`,
-  `Edit(//<dir>/project.toml)` and `Edit(//<root>/chief.db*)` (the database and its -wal/-shm),
-  canonical paths, built in one place (`generated::coordinator_deny_rules`, syntax in
-  `generated::edit_deny_rule` and `edit_deny_files`). Per §1 that blocks Edit and Write there: a
-  routing slip can't edit a real checkout, the coordinator can't edit the files that hold its own
-  and its threads' guard, and settings and state stay the user's and chief's. Memory and
-  `instructions.md` stay editable.
+  and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<root>/projects/*/generated/**)`,
+  `Edit(//<root>/projects/*/project.toml)`, `Edit(//<dir>/.claude/**)` (its cwd's project
+  settings), `Edit(//<account dir>/settings*.json)` (the account's user settings: its
+  `claude_config_dir`, or the real `~/.claude` for the default account, never a test override)
+  and `Edit(//<root>/chief.db*)` (the database and its -wal/-shm), canonical paths, built in one
+  place (`generated::coordinator_deny_rules`, syntax in `generated::edit_deny_rule` and
+  `edit_deny_files`). Per §1 that blocks Edit and Write there: a routing slip can't edit a real
+  checkout; the coordinator can't edit the files that hold its own or its threads' guard, nor the
+  project.toml they are rewritten from, in this project or any other; it can't add hooks or
+  permissions through a project or user settings file; and state stays chief's. Memory and
+  `instructions.md` stay editable (another project's too). Since §1 shows paths in rules are read
+  as globs, `ProjectConfig::validate` (init, settings save, every load) refuses a repo path
+  holding `( ) * ? [ ] { } \` and says to rename or move the folder.
 - `mcp.json`: `{"mcpServers": {"chief": {"type": "stdio", "command": <chief>, "args": ["mcp",
   "--project", <slug>], "env": {...}}}}`.
 
@@ -198,6 +237,8 @@ one-line header.
 name = "Payments latency"          # display name
 slug = "payments-latency"          # [a-z0-9-], unique, immutable
 goal = "Hold p95 under 200 ms"     # optional
+claude_config_dir = "/Users/me/.claude-carlos"  # the account, absolute; set by init, never
+                                   # changed; no key = the default account (~/.claude)
 
 [coordinator]
 model = "opus"                     # passed to --model
@@ -319,8 +360,7 @@ Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
    matched: the hook comes from a copy of the session.)
 3. Else record the event with `session_name = NULL` and stop.
 
-Matching, the event row and the session update run in one `BEGIN IMMEDIATE` transaction; the git
-branch lookup runs before it so the write lock is never held for the 2 s timeout.
+Matching, the event row and the session update run in one `BEGIN IMMEDIATE` transaction.
 
 ## 5. Thread state and board groups
 
@@ -336,7 +376,7 @@ Hook updates (per matched session):
 | PostToolUse | `pending_permission = 0`; update `cwd`; provisional `working` |
 | Notification `permission_prompt` | `pending_permission = 1` |
 | Notification `idle_prompt` | nothing beyond `last_hook` |
-| Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` and `branch` (`git -C <cwd> branch --show-current`, 2 s timeout, threads only, kept on a detached HEAD or error) |
+| Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` (shown only; a thread's branch comes from its job state on sync, below) |
 
 Every hook above also sets `last_hook`, `updated_at` and `cc_fresh = 0`, re-derives the group, and
 (except Notification `idle_prompt`) sets `last_activity_at`. Other events (SubagentStop,
@@ -382,8 +422,11 @@ before running the command): match each project session by `session_id`, else by
 `id`. A row matched by short id under another session id (after `/clear`) takes the new
 `session_id`, unless another registered row already has it; a row without a `session_id` stores
 the listed one. Matched rows get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows
-get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. Rows with neither id (not
-spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
+get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. A thread's `branch` is its job
+state's `worktreeBranch` (§1) when that names a `worktreePath`, NULL when the job state names no
+worktree (the checkout's branch isn't the thread's), and kept when there is no job state to read;
+never anything read at the hooks' `cwd`, which follows the thread's shell into the checkout or
+another thread's worktree. Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
 `synced_at` = taken-at of the newest snapshot applied to it: a snapshot older than that is ignored
 for the row (polls from the board, hooks and the CLI run in separate processes and may commit out
 of order). A poll that changes nothing else moves only the watermark (`updated_at` stays).
@@ -393,14 +436,17 @@ Removed outside chief: a stopped session stays listed in `claude agents --all`, 
 marked removed, and is missing from a non-stale snapshot (neither its `session_id` nor its
 `short_id` listed) was removed, but only when the snapshot can know that: it was taken after the
 row was created and after its ids were last set (`ids_at`), and it lists at least one other
-session registered in this chief home (any project). A snapshot that lists none of them comes from
-another Claude config or supervisor, or from one that lists nothing for a moment; a wrong verdict
-would lock the thread out (§12). The coordinator is normally listed, so this only delays the
+registered session of the same project (normally its coordinator). A snapshot that lists none of
+them comes from another account's supervisor (another project of this chief home may live in it,
+§3), or from one that lists nothing for a moment; a wrong verdict would lock the thread out (§12). The coordinator is normally listed, so this only delays the
 verdict. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
 `resolved_reason = 'removed'`. When its worktree is gone too (job state names none, §12, or the
 folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
 otherwise `cleanup_blocked = 'session removed outside chief; worktree remains at <path>'`, and a
 later sync that finds that folder gone sets `cleaned_at`. The coordinator row is never marked.
+A row with `removed_at` has no session left (`claude respawn` would fail), so it can't be woken,
+reopened, messaged or shown in the pane (§6, §7, §9, §10), cleaned or not; the refusal says the
+session was removed outside chief and to start a new thread.
 If a later snapshot lists the session again, the sync undoes only what it did: `removed_at`
 cleared, `cleaned_at` cleared when it equals `removed_at`, `resolved`/`resolved_reason` cleared when
 the reason is `removed`, and the `session removed outside chief…` `cleanup_blocked` cleared.
@@ -430,7 +476,7 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 | Caller | Tool | Rule |
 | --- | --- | --- |
 | any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
-| coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not cleaned, not resolved, and reachable (below). Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
+| coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not removed outside chief, not cleaned, not resolved, and reachable (below). Removed outside chief (`removed_at`, §5) → deny: "<name>'s session was removed outside chief, so it can't be woken, reopened or messaged; start a new thread (its reports are still readable with read_report)". Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
 | thread | `SendMessage` | allow only if `to` is exactly `chief-<slug>` or exactly the coordinator's socket address, and the coordinator is reachable. Coordinator not running (or never started) → deny: "Your coordinator chief-<slug> isn't running, so the message can't be delivered. Just finish your turn: your final message is recorded as your report when you stop anyway, and the coordinator reads it there." Renamed or ambiguous → deny with the same advice. Everything else → deny ("Threads may message only their coordinator, by its exact name chief-<slug>."): siblings, other projects, the thread's own subagents, and any session the local `claude agents` doesn't list |
 
 An allow-list by byte-exact equality. `to` is never trimmed, case-folded or parsed, and a trailing
@@ -438,8 +484,9 @@ An allow-list by byte-exact equality. `to` is never trimmed, case-folded or pars
 ref could deliver a message that the bare name would allow to another session. A denied `to` that
 contains `[` gets "Use the bare name, without a `[ref]`: chief matches names exactly, and a ref can
 pick another session." before the reason. Lookalikes (another case, U+FEFF, U+200B, a tab before
-the ref) and sessions the local `claude agents` doesn't list (other machines, cloud sessions,
-Remote Control, teammates, subagents) match nothing and are denied.
+the ref) and sessions the local `claude agents` of the project's account (§3) doesn't list (other
+machines, cloud sessions, other accounts, Remote Control, teammates,
+subagents) match nothing and are denied.
 
 Reachable (the identity check, for a thread under its name and for the coordinator under
 `chief-<slug>`): the snapshot entry for the row's `session_id` (its `short_id` while the
@@ -487,8 +534,8 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}`, plus `warning` when it adopted a session whose spawn reported a failure |
 | `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text |
-| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)" |
-| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
+| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
+| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
@@ -503,8 +550,10 @@ a flag. If the spawn fails, the session may have started anyway (a timeout, an o
 the `backgrounded` line), and a deleted row would leave it working unseen and unreachable through
 the guard. So unless the error is `NotTrusted`, chief first looks for it in `claude agents` (polled
 up to the 5 s resolve timeout, each call bounded): a background session (it has an `id`) named
-exactly the new name that the pre-spawn snapshot didn't list is adopted (its short id, session id
-and pid are stored) and the call succeeds with a `warning` that quotes the failure. When listings
+exactly the new name, whose `cwd` is the folder the spawn ran in (compared canonically), that the
+pre-spawn snapshot didn't list is adopted (its short id, session id and pid are stored) and the
+call succeeds with a `warning` that quotes the failure. A session with that name in another
+folder is someone else's (another chief home's, or the user's own). When listings
 succeed without it, the row is deleted and the error returned. When every listing fails, chief
 can't tell: the row is kept without a short id (hooks attach it by title if the session did start)
 and the error says so. Failing to resolve the session id is not an error (hooks match by title,
@@ -544,12 +593,16 @@ Every external command chief waits on (`claude`, `git`, `gh`, `rex`) runs throug
 `proc::output_with_timeout`, and its timeout is a real bound: the child leads its own process
 group, and the call must see the child exit *and* both pipes close before the deadline. Otherwise
 the whole group gets SIGKILL and the call fails as a timeout, without waiting for readers still
-stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it open).
+stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it open). The pipes
+are awaited before the child is reaped, and the group is signalled only while the child is still
+unreaped: until then its pid, the group's id, can't be reused, so the kill can't reach another
+process group.
 
-Trust (`claude::is_trusted`) walks up both the path as given and its canonical form (macOS `/tmp`
-is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on the way
-counts. It reads `$CHIEF_CLAUDE_CONFIG` when set, else `$CLAUDE_CONFIG_DIR/.claude.json` when that
-is set (§1), else `~/.claude.json`.
+Trust (`claude::is_trusted_in`) walks up both the path as given and its canonical form (macOS
+`/tmp` is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on
+the way counts. It reads the project's account's config file (§3, `Claude::trust_config`):
+`<claude_config_dir>/.claude.json`, or for the default account `$CHIEF_CLAUDE_CONFIG` (tests) else
+`~/.claude.json`.
 
 ### Coordinator spawn (`chief up`)
 
@@ -566,17 +619,20 @@ claude --bg --name chief-<slug> --model <m> --effort <e> --permission-mode auto
 
 Its tools: everything but Bash (disallowed) and ListAgents (the guard, §6). It reads the
 repositories (Read, Grep, Glob; they are `--add-dir`s) but can't edit them: `permissions.deny`
-blocks Edit and Write in every repo and in `generated/` (§3), so it can edit only its own folder
-outside `generated/` (memory, `instructions.md`, `project.toml`). `SendMessage` goes through the
-guard; its chief MCP tools run without prompts.
+(§3) blocks Edit and Write in every repo, in every project's `generated/` and `project.toml`, in
+its own `.claude/`, in the account's `settings*.json` and on the database, so in its own folder it
+can edit only `memory/` and `instructions.md` (settings are the user's: the board's `s` or the
+file itself). `SendMessage` goes through the guard; its chief MCP tools run without prompts.
 
 No prompt: it waits for you. Started when it has no row or no `short_id` (the project folder must be
 trusted, and no other live session may already use the name). A failed spawn is handled as a
 thread's is (above): a session that started anyway is adopted, with a warning on stderr; a row it
 inserted is removed only when listings show no such session, and kept when chief can't tell. A
 kept row (no `short_id`) is adopted by the next `up` when `claude agents` lists its session (by
-`session_id` if a hook stored one, else a background session with exactly the name), instead of
-refusing the name as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
+`session_id` if a hook stored one, else a background session with exactly the name whose `cwd`
+is the project folder, compared canonically), instead of refusing the name as taken. A live
+session with the name in another folder (another chief home's coordinator, or the user's own) is
+never adopted: the name counts as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
 a pid. Otherwise it is left alone.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)
@@ -701,8 +757,15 @@ Then focus `main` and `show` the session. When Rex's `show` returns false, `up` 
 and start time in `ui_state.pane_pid` / `pane_started` (`proc::start_time`: `proc_pidinfo` on
 macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are still its own.
 
-1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned
-   (removed counts) or never started (no short id), means the coordinator, and a stale target is
+0. Read `project.toml`. When it can't be read, doesn't parse or doesn't validate, print
+   `chief · project.toml can't be used:`, the error indented below it, and
+   `Fix project.toml; retrying every 5 s · q quits`, then read it again after 5 s, reading keys.
+   Nothing is attached, rewritten or respawned meanwhile: step 2 respawns from the file read
+   here, never from stale generated files. Every `claude` call of this pass runs in the account
+   it names (§3), whatever the block's shell has in `CLAUDE_CONFIG_DIR`.
+1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned,
+   removed outside chief (`removed_at`, worktree left or not) or never started (no short id),
+   means the coordinator, and a stale target is
    cleared (only while it still holds that name, so a newer board write survives). No coordinator
    with a short id yet: print `chief · no coordinator yet: run chief up <slug>` and look again
    every 500 ms.
@@ -716,8 +779,8 @@ macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are
    every 50 ms, so a signal flag set at any moment is seen), take raw mode back, clear
    `pane_showing`.
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
-   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1. An attach ended for a
-   switch goes straight back to 1.
+   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 0. An attach ended for a
+   switch goes straight back to 0.
 
 `q` while chief has the terminal ends the loop; so does the block being closed or the session
 killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
@@ -796,9 +859,10 @@ are tested without a terminal (`TestBackend`).
   Working green `●`, Review blue `◆`, Landing magenta `▲`, Idle default `○`, Failed red `✗`,
   Resolved dim `✓`). `▸` marks what the main pane shows: a thread row, or the coordinator line.
 - Keys: ↑/↓ or j/k move over threads (headers skipped; g/G first/last); Enter shows the selected
-  thread in the main pane (refused for a cleaned one); Esc or c shows the coordinator; w wake
-  (`tools::wake_thread`, refused for cleaned); r resolve or reopen (`registry::set_resolved`,
-  reason `user`; reopening a cleaned thread is refused with its message); o open the PR URL
+  thread in the main pane (refused for a cleaned one or one removed outside chief); Esc or c
+  shows the coordinator; w wake (`tools::wake_thread`, refused for cleaned or removed); r resolve
+  or reopen (`registry::set_resolved`, reason `user`; reopening a cleaned or removed thread is
+  refused with its message); o open the PR URL
   (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
   uncleaned thread: `cleanup::clean(Safe)`. When blocked, a fresh `cleanup::inspect` decides the
   modal: if it lists the loss, "Discard unsaved work?" shows why plus `cleanup::render_loss` and
@@ -814,7 +878,9 @@ are tested without a terminal (`TestBackend`).
 - Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, default repo, cleanup (merged/manual),
   `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
-  in `init`; `d` removes one, moving the default repo to the first remaining). Efforts, modes,
+  in `init`; `d` removes one, moving the default repo to the first remaining). It also shows the
+  project's Claude Code account (`claude_config_dir`, or `default (~/.claude)`) read-only: Enter
+  or ←/→ there only says it can't be changed (§3). Efforts, modes,
   default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal and max_parallel are
   free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
   errors shown in the form), writes with `save`, regenerates `generated/*`, and says "Saved. New
@@ -826,7 +892,8 @@ are tested without a terminal (`TestBackend`).
   restored on quit and on error; input is polled every 100 ms, results are drained between frames,
   and resizes take effect on the next frame.
 - A thread with `cleanup_blocked` shows a "cleanup blocked" tag (the reason in the detail); a
-  cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread.
+  cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread
+  and for one removed outside chief.
 
 ## 11. Testing
 
@@ -843,10 +910,14 @@ are tested without a terminal (`TestBackend`).
   The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps. `claude rm` outputs from the live
   M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
   remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
-  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_CLAUDE_DIR` replaces
-  Claude Code's config folder (job state; checked before `CLAUDE_CONFIG_DIR`, never written into
-  generated files), `CLAUDE_CONFIG_DIR` is removed from the tests' environment, and
-  `CHIEF_NO_NOTIFY=1` turns off notifications.
+  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces the default account's `~/.claude.json`,
+  `CHIEF_CLAUDE_DIR` replaces the default account's folder `~/.claude` (job state; never written
+  into generated files); a project with its own account (`claude_config_dir`, §3) uses that folder
+  for both, so tests give such projects a temp account folder. `CLAUDE_CONFIG_DIR` is removed from
+  the tests' environment unless a test sets it, and `CHIEF_NO_NOTIFY=1` turns off notifications.
+  The fake records each call's `CLAUDE_CONFIG_DIR` (`calls/<n>.env`) and serves
+  `$CLAUDE_CONFIG_DIR/fake-<key>.stdout[.<k>]` before its own canned output, so each account has
+  its own sessions.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
 
 ## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)
@@ -856,9 +927,9 @@ Resolving a thread keeps its session, worktree and branch. Cleanup removes them 
 branch. The row stays, with its reports: `cleaned_at` is set and `cleanup_blocked` cleared.
 
 The worktree is the one `claude rm` itself deletes: the session's job state,
-`<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is
-`$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (as Claude Code reads it), else
-`~/.claude`. It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
+`<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is the
+project's account folder (§3: `claude_config_dir`, or for the default account `$CHIEF_CLAUDE_DIR`
+in tests, else `~/.claude`). It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
 `git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
 answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
 anywhere, another thread's worktree included, and never a name derived from the thread's. No state
@@ -866,7 +937,7 @@ file or no `worktreePath` means the thread has no worktree of its own: nothing t
 is reset or cleaned.
 
 `inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s): whether the worktree
-exists, its branch (`git branch --show-current`, else `sessions.branch`),
+exists, its branch (`git branch --show-current`, else the job state's `worktreeBranch`),
 `git status --porcelain --untracked-files=normal` lines (ignored files aren't listed, as Claude
 Code ignores them), and unpushed commits as Claude Code means them:
 `git rev-list --count HEAD refs/heads/<branch> --not --remotes`, listed with
@@ -892,13 +963,18 @@ head is the branch's sha.
    (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
    `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
-4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
+4. Either mode: when the job state of another session registered in this chief home (read in
+   that session's own project's account folder) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
+   `cleanup_blocked` and stop without calling `claude rm` (it would delete the worktree and its
+   branch under that session); `chief gc --dry-run` reports it as blocked, and neither the board
+   nor `chief clean` offers a discard for it (they say to finish and clean up the other thread
+   first).
+   `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
    in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
    `, `) and stop without calling `claude rm`.
    `Discard(confirmed)` carries the inspection the user was shown and confirmed. It is refused
    (stored in `cleanup_blocked`, nothing run) when a fresh `inspect` differs from it ("the
-   worktree changed after you confirmed …") or when the job state of another session registered
-   in this chief home names the same worktree; otherwise in a dirty worktree run
+   worktree changed after you confirmed …"); otherwise in a dirty worktree run
    `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`: ignored files stay),
    in step 5.
 5. Steps 1 and 2 again, with a fresh `claude agents`, right before anything is reset or
@@ -925,8 +1001,9 @@ clock skew. Worktree branches are named after threads, so a new thread can reuse
 old one whose PR merged long ago; that PR must not resolve and clean the new thread. A PR without a
 readable `createdAt` is ignored. A missing `gh`,
 a `gh` that isn't logged in, or a repository without a GitHub remote is no PR plus a hint returned
-once per `Gh`; other failures are errors. `poll_project` polls threads that work in a worktree,
-have a branch and aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
+once per `Gh`; other failures are errors. `poll_project` polls, on that branch, threads whose job
+state names their own worktree and a `worktreeBranch` (`cleanup::branch_of`; never the hooks'
+`cwd` or `sessions.branch`) and that aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
 closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
 auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
 `cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is
@@ -934,7 +1011,8 @@ neither working nor waiting nor showing in the pane and has no `cleanup_blocked`
 thread waits for the user, a
 working one is tried again on the next refresh. `cleanup = "manual"` never cleans on its own.
 
-`chief gc [<slug>] [--dry-run]` per project: `poll_project`, sync `claude agents`, then
+`chief gc [<slug>] [--dry-run]` per project, in that project's account (§3; a project whose
+project.toml can't say is skipped with a warning): `poll_project`, sync `claude agents`, then
 `clean(Safe)` on every resolved, uncleaned thread (dry: what it would do, from `inspect`). It prints
 `cleaned` / `would clean` / `blocked <reason>` / `skipped <why>` (working or waiting, or an error)
 per thread, or `nothing to clean`; warnings go to stderr. `--dry-run` still stores PR status, as
@@ -948,6 +1026,6 @@ won't discard it. With `--discard` it checks step 2 first, prints what would be 
 runs `clean(Discard(<that inspection>))`, so "Nothing unsaved will be lost" never discards a
 commit `claude rm` reports.
 
-A cleaned thread can't be woken, reopened or messaged (§6, §7) and is hidden from `list_threads`
-unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
+A cleaned thread, or one removed outside chief, can't be woken, reopened or messaged (§6, §7); a
+cleaned one is hidden from `list_threads` unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
 user's call (§8).

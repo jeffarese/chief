@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use crate::claude::{Claude, RmOutcome};
+use crate::claude::{self, Claude, RmOutcome};
 use crate::db::{self, SessionRow};
 use crate::pr::{self, Gh};
 use crate::state::{self, Group, Role};
@@ -117,20 +117,31 @@ pub fn active(row: &SessionRow) -> bool {
 /// `claude rm` deletes, and only when that is a `<repo>/.claude/worktrees/<name>` folder. Never
 /// the hooks' cwd: it follows the thread's shell anywhere, into another thread's worktree too.
 pub fn worktree_of(claude: &Claude, row: &SessionRow) -> Option<PathBuf> {
-    let path = claude.job_worktree(row.short_id.as_deref()?)?;
-    (worktree_root(&path).as_deref() == Some(path.as_path())).then_some(path)
+    own_job(claude, row).map(|(wt, _)| wt)
+}
+
+/// The branch the job state names with the thread's own worktree (`worktree_of`): what its PR is
+/// matched on. Never the hooks' cwd, which may sit in the checkout on `main`.
+pub fn branch_of(claude: &Claude, row: &SessionRow) -> Option<String> {
+    own_job(claude, row)?.1
+}
+
+fn own_job(claude: &Claude, row: &SessionRow) -> Option<(PathBuf, Option<String>)> {
+    let job = claude.job_state(row.short_id.as_deref()?)?;
+    let path = job.worktree?;
+    (worktree_root(&path).as_deref() == Some(path.as_path())).then_some((path, job.branch))
 }
 
 /// Reads the thread's worktree (`worktree_of`). A thread without one has nothing of its own to
 /// lose.
 pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
-    let Some(root) = worktree_of(claude, row) else {
+    let Some((root, branch)) = own_job(claude, row) else {
         return Ok(Inspection::default());
     };
     let mut ins = Inspection {
         exists: root.is_dir(),
         worktree: Some(root.clone()),
-        branch: row.branch.clone(),
+        branch,
         ..Default::default()
     };
     // Where to ask about commits: the worktree, or the repository if the worktree is gone.
@@ -325,6 +336,12 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         }
         (Err(e), Mode::Discard(_)) => return Err(e),
     };
+    // `claude rm` would delete the worktree and its branch under the other session, whatever the
+    // mode; a discard would reset its work too.
+    if let Some(why) = shared(ctx, &row, &ins)? {
+        record(ctx, name, Some(&why))?;
+        return Ok(Outcome::Blocked(why));
+    }
     let confirmed = match &mode {
         Mode::Safe => {
             if let Some(why) = ins.blocker() {
@@ -340,16 +357,6 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
                     .unwrap_or_else(|| "nothing unsaved".to_string());
                 let why = format!(
                     "the worktree changed after you confirmed (now: {now}); nothing was discarded"
-                );
-                record(ctx, name, Some(&why))?;
-                return Ok(Outcome::Blocked(why));
-            }
-            if let Some(wt) = &ins.worktree
-                && let Some(other) = sharing_worktree(ctx, &row, wt)?
-            {
-                let why = format!(
-                    "{} is also the worktree of {other}; not discarding anything there",
-                    wt.display()
                 );
                 record(ctx, name, Some(&why))?;
                 return Ok(Outcome::Blocked(why));
@@ -410,18 +417,46 @@ fn discards_only_confirmed(confirmed: &Inspection, token: &str) -> bool {
             .is_some_and(|head| head.eq_ignore_ascii_case(sha))
 }
 
+/// Why cleanup leaves the thread alone when another session works in its worktree: `claude rm`
+/// would delete the worktree and its branch under that session.
+fn shared(ctx: &Ctx, row: &SessionRow, ins: &Inspection) -> Result<Option<String>> {
+    let Some(wt) = &ins.worktree else {
+        return Ok(None);
+    };
+    Ok(sharing_worktree(ctx, row, wt)?.map(|other| {
+        format!(
+            "{} {SHARED_WORKTREE} {other}; chief won't remove or reset it",
+            wt.display()
+        )
+    }))
+}
+
+/// In a `cleanup_blocked` reason: another session's job state names the same worktree. No
+/// discard can help then.
+pub const SHARED_WORKTREE: &str = "is also the worktree of";
+
 /// Another registered session (any project of this chief home) whose job state names the same
-/// worktree, if any.
+/// worktree, if any. Each session's job state is in its own project's account folder; one whose
+/// project.toml can't say is looked up in this project's.
 fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<String>> {
     let wt = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
+    let mut folders: Vec<(String, PathBuf)> =
+        vec![(row.project_slug.clone(), ctx.claude.config_dir.clone())];
     for other in db::all_sessions(ctx.conn)? {
-        if other.name == row.name {
+        let Some(short) = other.short_id.as_deref().filter(|_| other.name != row.name) else {
             continue;
-        }
-        let theirs = other
-            .short_id
-            .as_deref()
-            .and_then(|s| ctx.claude.job_worktree(s));
+        };
+        let folder = match folders.iter().find(|(slug, _)| *slug == other.project_slug) {
+            Some((_, folder)) => folder.clone(),
+            None => {
+                let folder = crate::project::account_of(&other.project_slug)
+                    .map(|account| claude::claude_dir(account.as_deref()))
+                    .unwrap_or_else(|_| ctx.claude.config_dir.clone());
+                folders.push((other.project_slug.clone(), folder.clone()));
+                folder
+            }
+        };
+        let theirs = claude::job_worktree(&folder, short);
         if theirs.is_some_and(|p| p.canonicalize().unwrap_or(p) == wt) {
             return Ok(Some(other.name));
         }
@@ -503,7 +538,7 @@ pub fn gc(ctx: &Ctx, slug: &str, dry_run: bool) -> Result<Gc> {
     let mut verdicts = Vec::new();
     for row in rows {
         let verdict = if dry_run {
-            dry_verdict(ctx.claude, &row)
+            dry_verdict(ctx, &row)
         } else {
             match clean(ctx, &row.name, Mode::Safe) {
                 Ok(Outcome::Cleaned | Outcome::AlreadyCleaned) => Verdict::Cleaned,
@@ -530,19 +565,25 @@ fn sync_agents(ctx: &Ctx, slug: &str) -> Result<()> {
     )
 }
 
-fn dry_verdict(claude: &Claude, row: &SessionRow) -> Verdict {
+fn dry_verdict(ctx: &Ctx, row: &SessionRow) -> Verdict {
     if active(row) {
         return Verdict::Skipped("still working or waiting".to_string());
     }
     if row.short_id.is_none() {
         return Verdict::WouldClean;
     }
-    match inspect(claude, row) {
-        Ok(ins) => match ins.blocker() {
-            Some(why) => Verdict::Blocked(why),
-            None => Verdict::WouldClean,
-        },
-        Err(e) => Verdict::Blocked(format!("could not inspect the worktree: {e:#}")),
+    let ins = match inspect(ctx.claude, row) {
+        Ok(ins) => ins,
+        Err(e) => return Verdict::Blocked(format!("could not inspect the worktree: {e:#}")),
+    };
+    match shared(ctx, row, &ins) {
+        Ok(Some(why)) => return Verdict::Blocked(why),
+        Ok(None) => {}
+        Err(e) => return Verdict::Skipped(format!("{e:#}")),
+    }
+    match ins.blocker() {
+        Some(why) => Verdict::Blocked(why),
+        None => Verdict::WouldClean,
     }
 }
 
@@ -574,6 +615,7 @@ pub fn render_gc(slug: &str, verdicts: &[(String, Verdict)]) -> String {
 /// `chief gc [<slug>] [--dry-run]`.
 pub fn run_gc(slug: Option<&str>, dry_run: bool) -> Result<()> {
     let conn = db::open(&paths::db())?;
+    let slug_given = slug.is_some();
     let slugs: Vec<String> = match slug {
         Some(slug) => {
             if db::project_dir(&conn, slug)?.is_none() {
@@ -586,15 +628,26 @@ pub fn run_gc(slug: Option<&str>, dry_run: bool) -> Result<()> {
             .map(|(s, _)| s)
             .collect(),
     };
-    let claude = Claude::from_env();
     let gh = Gh::from_env();
-    let ctx = Ctx {
-        conn: &conn,
-        claude: &claude,
-        gh: &gh,
-        now: db::now_ms,
-    };
     for slug in &slugs {
+        // Each project in its own account (§3); across projects, no note about the shell's.
+        let account = match crate::project::account_of(slug) {
+            Ok(account) => account,
+            Err(e) => {
+                eprintln!("warning: {slug} skipped: {e:#}");
+                continue;
+            }
+        };
+        if slug_given && let Some(note) = claude::account_note(slug, account.as_deref()) {
+            eprintln!("{note}");
+        }
+        let claude = Claude::for_account(account);
+        let ctx = Ctx {
+            conn: &conn,
+            claude: &claude,
+            gh: &gh,
+            now: db::now_ms,
+        };
         let done = gc(&ctx, slug, dry_run)?;
         for w in &done.warnings {
             eprintln!("warning: {w}");
@@ -664,7 +717,7 @@ pub fn run_clean(slug: &str, thread: &str, discard: bool, yes: bool) -> Result<(
         Some(r) if r.project_slug == slug && r.role == Role::Thread.as_str() => {}
         _ => bail!("{name} is not a thread of {slug}; chief status {slug} lists them"),
     }
-    let claude = Claude::from_env();
+    let claude = crate::project::claude_for_slug(slug)?;
     let gh = Gh::from_env();
     let ctx = Ctx {
         conn: &conn,
@@ -695,7 +748,10 @@ pub fn run_clean(slug: &str, thread: &str, discard: bool, yes: bool) -> Result<(
             let listed = db::get_session(&conn, name)?
                 .and_then(|row| inspect(&claude, &row).ok())
                 .is_some_and(|ins| ins.blocker().is_some());
-            let hint = if discarding {
+            let hint = if why.contains(SHARED_WORKTREE) {
+                " Another thread works in that worktree: finish and clean up that thread first."
+                    .to_string()
+            } else if discarding {
                 " chief discards only what it listed and you confirmed; push or remove the rest \
                  yourself."
                     .to_string()

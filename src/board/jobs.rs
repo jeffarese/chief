@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::claude::{self, Claude, RESOLVE_TIMEOUT};
+use crate::claude::{Claude, RESOLVE_TIMEOUT};
 use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
 use crate::config::ProjectConfig;
 use crate::pr::Gh;
@@ -93,7 +93,7 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
     let conn = db::open(&src.db)?;
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
     let claude = src.claude();
-    let trust_config = claude::claude_config_path();
+    let trust_config = claude.trust_config();
     let ctx = ToolCtx {
         conn: &conn,
         config: &config,
@@ -162,6 +162,15 @@ fn loss(
     why: &str,
 ) -> Result<(String, Option<Inspection>)> {
     let row = db::get_session(conn, name)?.with_context(|| format!("no thread named {name}"))?;
+    if why.contains(cleanup::SHARED_WORKTREE) {
+        return Ok((
+            format!(
+                "Cleanup blocked: {why}.\nAnother thread works in that worktree: finish and \
+                 clean up that thread first.\n"
+            ),
+            None,
+        ));
+    }
     Ok(match cleanup::inspect(claude, &row) {
         Ok(ins) if ins.blocker().is_some() => (
             format!(

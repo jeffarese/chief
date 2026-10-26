@@ -17,7 +17,9 @@ use crate::text::shell_quote;
 /// tmux server's environment, §9).
 /// `CHIEF_HOME` is always written, as the resolved root: the supervisor doesn't have our
 /// `XDG_DATA_HOME` either.
-pub const PASSTHROUGH: [&str; 8] = [
+/// `CLAUDE_CONFIG_DIR` isn't among them: it comes from the project's account, not from this
+/// process (`passthrough_env`).
+pub const PASSTHROUGH: [&str; 7] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
     "CHIEF_GH_BIN",
@@ -25,9 +27,6 @@ pub const PASSTHROUGH: [&str; 8] = [
     "CHIEF_TMUX_BIN",
     "CHIEF_CLAUDE_CONFIG",
     "CHIEF_NO_NOTIFY",
-    // Claude Code's per-account config folder: each has its own supervisor, sessions, job state
-    // and trust file, and Rex blocks don't inherit this process's environment.
-    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Hook events chief records, with the PreToolUse/PostToolUse matcher where one applies.
@@ -67,8 +66,22 @@ pub fn chief_exe() -> Result<PathBuf> {
 }
 
 /// The `PASSTHROUGH` variables set in this process, with `CHIEF_HOME` always set to the resolved
-/// root (`paths::root`). Paths are made absolute: hooks run in the session's cwd.
-pub fn passthrough_env() -> Vec<(String, String)> {
+/// root (`paths::root`), then `CLAUDE_CONFIG_DIR` for a project of a non-default `account`
+/// (§3): Claude Code's per-account config folder, with its own supervisor, sessions, job state
+/// and trust file, which Rex blocks and the supervisor don't inherit from this process. Paths
+/// are made absolute: hooks run in the session's cwd.
+pub fn passthrough_env(account: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = this_process_env();
+    if let Some(dir) = account {
+        env.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ));
+    }
+    env
+}
+
+fn this_process_env() -> Vec<(String, String)> {
     PASSTHROUGH
         .iter()
         .filter_map(|key| {
@@ -110,7 +123,12 @@ pub fn write_all(
             exe,
             slug,
             env,
-            &coordinator_deny_rules(dir, &repos, &crate::paths::db()),
+            &coordinator_deny_rules(
+                dir,
+                &repos,
+                &account_settings_dir(config.claude_config_dir.as_deref()),
+                &crate::paths::db(),
+            ),
         ),
     )?;
     write_json(
@@ -124,7 +142,8 @@ pub fn write_all(
 /// Claude Code reads the hook settings when a session starts, so any edit to them since the
 /// last write (one that drops the guard, say) never reaches a later session (§3).
 pub fn rewrite(dir: &Path, config: &ProjectConfig) -> Result<()> {
-    write_all(dir, config, &chief_exe()?, &passthrough_env())
+    let env = passthrough_env(config.claude_config_dir.as_deref());
+    write_all(dir, config, &chief_exe()?, &env)
         .with_context(|| format!("rewriting {}", dir.join("generated").display()))
 }
 
@@ -141,28 +160,50 @@ pub fn coordinator_settings(
     settings
 }
 
-/// Edit deny rules for the coordinator: one per repository, the project's `generated/` folder,
-/// its `project.toml`, and chief's database. A routing slip must not edit a real checkout; an
-/// edit to `generated/*-settings.json` could drop the guard for later spawns; settings and state
-/// are the user's and chief's. Memory and instructions in the project folder stay editable.
-/// Paths are canonical. This is the one place that builds them; the rule syntax itself is in
-/// `edit_deny_rule` and `edit_deny_files`.
-pub fn coordinator_deny_rules(dir: &Path, repos: &[&Path], db: &Path) -> Vec<String> {
+/// Edit deny rules for the coordinator in `dir` (`<root>/projects/<slug>`), §3: one per
+/// repository; every project's `generated/` folder and `project.toml`; its own `.claude/`
+/// folder; the account's user settings (`<account dir>/settings*.json`); chief's database. A
+/// routing slip must not edit a real checkout. `generated/*-settings.json` hold the guard and
+/// project.toml is what they are rewritten from, in this project and any other; a project
+/// `.claude/settings.json` in its cwd, or the account's user settings, could add hooks or
+/// permissions to later sessions (§1: without a rule, a background session can write them).
+/// Memory and instructions stay editable, here and in other projects. Paths are canonical. This is
+/// the one place that builds them; the rule syntax itself is in `edit_deny_rule` and
+/// `edit_deny_files`, and `config::validate` keeps glob characters out of repo paths.
+pub fn coordinator_deny_rules(
+    dir: &Path,
+    repos: &[&Path],
+    account_dir: &Path,
+    db: &Path,
+) -> Vec<String> {
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let dir = canonical(dir);
+    let projects = dir.parent().map(Path::to_path_buf).unwrap_or_default();
     let db_dir = db.parent().map(canonical).unwrap_or_default();
     let db_name = db.file_name().unwrap_or_default().to_string_lossy();
     repos
         .iter()
         .map(|repo| canonical(repo))
-        .chain([dir.join("generated")])
+        .chain([projects.join("*/generated")])
         .map(|path| edit_deny_rule(&path))
         .chain([
-            edit_deny_files(&dir.join("project.toml")),
+            edit_deny_files(&projects.join("*/project.toml")),
+            edit_deny_rule(&dir.join(".claude")),
+            edit_deny_files(&canonical(account_dir).join("settings*.json")),
             // `chief.db*` also covers the -wal and -shm files.
             edit_deny_files(&db_dir.join(format!("{db_name}*"))),
         ])
         .collect()
+}
+
+/// The folder whose `settings*.json` are the account's user settings: `claude_config_dir`, or
+/// `~/.claude` for the default account. Real paths only, never a test override: these rules
+/// guard the user's own files.
+fn account_settings_dir(account: Option<&Path>) -> PathBuf {
+    match account {
+        Some(dir) => dir.to_path_buf(),
+        None => dirs::home_dir().unwrap_or_default().join(".claude"),
+    }
 }
 
 /// `Edit(//<absolute path>/**)`: Claude Code's permission rule for every file under an
@@ -431,26 +472,46 @@ mod tests {
         };
         let coord = read(coordinator_settings_path(&dir));
         // Canonical: macOS temp dirs live under /private.
-        let repo = repo.canonicalize().unwrap();
-        let dir = dir.canonicalize().unwrap();
+        let repo_c = repo.canonicalize().unwrap();
+        let dir_c = dir.canonicalize().unwrap();
+        let projects = tmp.path().join("projects").canonicalize().unwrap();
         let db = crate::paths::db();
         let db_dir = db.parent().unwrap();
         let db_glob = db_dir
             .canonicalize()
             .unwrap_or_else(|_| db_dir.to_path_buf())
             .join("chief.db*");
+        // The default account's folder, as Claude Code finds it (no test override).
+        let home_claude = PathBuf::from(std::env::var("HOME").unwrap()).join(".claude");
+        let home_claude = home_claude.canonicalize().unwrap_or(home_claude);
+        // Every repo; every project's generated files and project.toml, the guard's and
+        // settings' source (§3); the coordinator's own .claude folder (its project settings);
+        // the account's user settings; the database.
+        let deny = |account: &Path| {
+            json!([
+                format!("Edit(/{}/**)", repo_c.display()),
+                format!("Edit(/{}/*/generated/**)", projects.display()),
+                format!("Edit(/{}/*/project.toml)", projects.display()),
+                format!("Edit(/{}/.claude/**)", dir_c.display()),
+                format!("Edit(/{}/settings*.json)", account.display()),
+                edit_deny_files(&db_glob),
+            ])
+        };
         assert_eq!(
             coord["permissions"],
-            json!({
-                "allow": ["mcp__chief"],
-                "deny": [
-                    format!("Edit(/{}/**)", repo.display()),
-                    format!("Edit(/{}/generated/**)", dir.display()),
-                    format!("Edit(/{}/project.toml)", dir.display()),
-                    edit_deny_files(&db_glob),
-                ],
-            })
+            json!({"allow": ["mcp__chief"], "deny": deny(&home_claude)})
         );
+        let account = tmp.path().join("claude-carlos");
+        std::fs::create_dir_all(&account).unwrap();
+        let mut carlos = config.clone();
+        carlos.claude_config_dir = Some(account.clone());
+        write_all(&dir, &carlos, Path::new("/bin/chief"), &[]).unwrap();
+        let coord = read(coordinator_settings_path(&dir));
+        assert_eq!(
+            coord["permissions"]["deny"],
+            deny(&account.canonicalize().unwrap())
+        );
+        let dir = dir_c;
         assert_eq!(coord["worktree"], json!({"bgIsolation": "none"}));
         assert!(
             read(thread_settings_path(&dir))

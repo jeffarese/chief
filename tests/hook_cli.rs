@@ -9,7 +9,7 @@ use std::process::{Command, Output, Stdio};
 
 use chief::db::{self, SessionRow};
 use chief::state::Role;
-use common::{Home, agent, stderr};
+use common::{Home, OutputWithStdin, agent, stderr};
 use serde_json::Value;
 
 fn hook(home: &Path, args: &[&str], stdin: &str) -> Output {
@@ -313,6 +313,48 @@ fn guarded_home() -> Home {
         .to_string(),
     );
     home
+}
+
+/// The guard asks the project's account who is alive, whatever account the hook's environment
+/// names: another account's supervisor knows nothing about this project's sessions.
+#[test]
+fn the_guard_asks_the_projects_account() {
+    let home = guarded_home();
+    let carlos = common::account(home.path(), "claude-carlos");
+    let mut config = chief::config::ProjectConfig::new("Demo", "demo", None, vec![]);
+    config.claude_config_dir = Some(carlos.clone());
+    config
+        .save(&home.path().join("projects/demo/project.toml"))
+        .unwrap();
+    // The default account's supervisor lists none of them.
+    home.fake.set("agents.stdout", "[]");
+    std::fs::write(
+        carlos.join("fake-agents.stdout"),
+        serde_json::json!([
+            agent("c1", "coord-sid", "chief-demo", "done", Some(100)),
+            agent("a1", "a-sid", "demo-a-1111", "working", Some(201)),
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let other = common::account(home.path(), "claude-other");
+    let out = home
+        .command(&[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ])
+        .env("CLAUDE_CONFIG_DIR", &other)
+        .output_with_stdin(&send("demo-a-1111"));
+    assert_eq!(deny_reason(&out), None);
+    let accounts = home.fake.accounts();
+    assert_eq!(
+        accounts,
+        [("agents".to_string(), carlos.to_string_lossy().into_owned())]
+    );
 }
 
 #[test]

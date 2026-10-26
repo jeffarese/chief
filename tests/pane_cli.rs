@@ -139,7 +139,7 @@ fn gone(pid: i32) -> bool {
 fn a_switch_ends_attach_and_attaches_to_the_new_target() {
     let home = Home::new();
     let conn = home.db();
-    db::register_project(&conn, "demo", home.path(), 0).unwrap();
+    home.register("demo");
     for (name, role, short) in [
         (COORD, Role::Coordinator, "c0"),
         (THREAD, Role::Thread, "t1"),

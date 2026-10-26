@@ -1,14 +1,13 @@
 //! Keeps `sessions` in step with `claude agents` and PR status (ARCHITECTURE §5): stores the
 //! snapshot, re-derives groups and applies auto-resolve. Callers fetch the inputs; this module
-//! only touches the database, plus, for a session found removed, the job state that says whether
-//! its worktree is still there.
+//! only touches the database, plus the job state that names a thread's worktree and branch.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::claude::{self, AgentRow};
+use crate::claude::{self, AgentRow, JobState};
 use crate::db::{self, SessionRow};
 use crate::state::{self, Facts, Group, HookKind, Role};
 
@@ -24,8 +23,8 @@ pub struct Poll<'a> {
     /// Every session registered in this chief home (all projects). A snapshot that lists none of
     /// them but the row itself comes from another Claude config or supervisor.
     pub registered: &'a [SessionRow],
-    /// A short id's worktree while it is still on disk (job state, `claude::job_worktree`).
-    pub worktree: &'a dyn Fn(&str) -> Option<PathBuf>,
+    /// A short id's job state (`claude::job_state`): its worktree and branch.
+    pub job: &'a dyn Fn(&str) -> Option<JobState>,
 }
 
 /// The derivation inputs a row carries. The stored `claude agents` state only counts while it is
@@ -158,6 +157,7 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
             }
         }
     }
+    refresh_branch(row, poll);
     if row.short_id != before.short_id || row.session_id != before.session_id {
         // What `db::update_session` stamps, so the row in hand agrees.
         row.ids_at = Some(now);
@@ -180,10 +180,10 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
 /// A stopped session stays listed in `claude agents --all`; only `claude rm` (here, or from
 /// `claude agents` itself) takes it off. So a thread missing from a non-stale snapshot (neither
 /// its session id nor its short id listed) was removed, but only when the snapshot can know: it
-/// was taken after the row was created and got its ids, and it lists another session registered
-/// in this chief home. A snapshot listing none of them comes from another Claude config or
-/// supervisor, or a supervisor that lists nothing for a moment. The coordinator is normally
-/// listed, so this only delays the verdict.
+/// was taken after the row was created and got its ids, and it lists another registered session
+/// of the same project. A snapshot listing none of them comes from another account's supervisor
+/// (another project of this chief home may live there), or a supervisor that lists nothing for a
+/// moment. The coordinator is normally listed, so this only delays the verdict.
 fn removed_outside(row: &SessionRow, poll: &Poll) -> bool {
     row.role == Role::Thread.as_str()
         && row.session_id.is_some()
@@ -198,6 +198,7 @@ fn lists_another_registered(row: &SessionRow, poll: &Poll) -> bool {
     poll.agents.iter().any(|a| {
         poll.registered.iter().any(|r| {
             r.name != row.name
+                && r.project_slug == row.project_slug
                 && (r.session_id.as_deref() == Some(a.session_id.as_str())
                     || (r.short_id.is_some() && r.short_id == a.id))
         })
@@ -219,7 +220,7 @@ fn mark_removed(row: &mut SessionRow, poll: &Poll) {
         row.resolved = true;
         row.resolved_reason = Some("removed".to_string());
     }
-    match row.short_id.as_deref().and_then(|s| (poll.worktree)(s)) {
+    match worktree_on_disk(row, poll) {
         Some(wt) => {
             row.cleanup_blocked = Some(format!(
                 "{REMOVED_OUTSIDE}; worktree remains at {}",
@@ -234,10 +235,26 @@ fn mark_removed(row: &mut SessionRow, poll: &Poll) {
 }
 
 fn worktree_gone(row: &SessionRow, poll: &Poll) -> bool {
-    row.short_id
-        .as_deref()
-        .and_then(|s| (poll.worktree)(s))
-        .is_none()
+    worktree_on_disk(row, poll).is_none()
+}
+
+/// The worktree the row's job state names, while it is still on disk.
+fn worktree_on_disk(row: &SessionRow, poll: &Poll) -> Option<PathBuf> {
+    (poll.job)(row.short_id.as_deref()?)?
+        .worktree
+        .filter(|p| p.is_dir())
+}
+
+/// A thread's branch is the one its job state names with its worktree; one that never entered a
+/// worktree has none of its own (its checkout's branch isn't the thread's). Without a readable
+/// job state the stored branch stays, for display.
+fn refresh_branch(row: &mut SessionRow, poll: &Poll) {
+    if row.role != Role::Thread.as_str() {
+        return;
+    }
+    if let Some(job) = row.short_id.as_deref().and_then(|s| (poll.job)(s)) {
+        row.branch = job.worktree.and(job.branch);
+    }
 }
 
 /// The session is listed again: undo what `mark_removed` did, and only that.
@@ -262,26 +279,8 @@ fn restore_removed(row: &mut SessionRow) {
 }
 
 /// Writes a `claude agents` snapshot taken at `taken_at` into every session of the project (one
-/// transaction). Take `taken_at` just before running `claude agents`. Job state comes from
-/// `claude::claude_dir()`.
-pub fn sync(
-    conn: &Connection,
-    project_slug: &str,
-    snapshot: &[AgentRow],
-    taken_at: i64,
-    now: i64,
-) -> Result<()> {
-    sync_in(
-        conn,
-        project_slug,
-        snapshot,
-        taken_at,
-        now,
-        &claude::claude_dir(),
-    )
-}
-
-/// `sync` with job state read from `claude_dir`.
+/// transaction). Take `taken_at` just before running `claude agents`, in the project's account;
+/// job state comes from that account's folder, `claude_dir` (`Claude::config_dir`).
 pub fn sync_in(
     conn: &Connection,
     project_slug: &str,
@@ -290,14 +289,14 @@ pub fn sync_in(
     now: i64,
     claude_dir: &Path,
 ) -> Result<()> {
-    let worktree = |short: &str| claude::job_worktree(claude_dir, short).filter(|p| p.is_dir());
+    let job = |short: &str| claude::job_state(claude_dir, short);
     db::immediate(conn, |conn| {
         let registered = db::all_sessions(conn)?;
         let poll = Poll {
             agents: snapshot,
             taken_at,
             registered: &registered,
-            worktree: &worktree,
+            job: &job,
         };
         for row in registered.iter().filter(|r| r.project_slug == project_slug) {
             let mut row = row.clone();
@@ -313,7 +312,8 @@ pub fn sync_in(
 }
 
 /// Resolves (`reason` = user | coordinator) or reopens a session. Reopening counts as activity so
-/// the inactivity rule doesn't fire again right away.
+/// the inactivity rule doesn't fire again right away. A session removed outside chief, or cleaned
+/// up, can't be reopened: there is no session left to run.
 pub fn set_resolved(
     conn: &Connection,
     name: &str,
@@ -323,6 +323,9 @@ pub fn set_resolved(
 ) -> Result<SessionRow> {
     db::immediate(conn, |conn| {
         let mut row = db::get_session(conn, name)?.with_context(|| format!("no session {name}"))?;
+        if !resolved && row.removed_at.is_some() {
+            anyhow::bail!(crate::guard::removed_message(name));
+        }
         if !resolved && row.cleaned_at.is_some() {
             anyhow::bail!(crate::guard::cleaned_message(name));
         }
@@ -427,7 +430,7 @@ mod tests {
         r
     }
 
-    fn no_worktree(_: &str) -> Option<PathBuf> {
+    fn no_job(_: &str) -> Option<JobState> {
         None
     }
 
@@ -453,7 +456,7 @@ mod tests {
             agents,
             taken_at,
             registered: &registered,
-            worktree: &no_worktree,
+            job: &no_job,
         };
         sync_row(row, &poll, now)
     }
@@ -525,7 +528,7 @@ mod tests {
             agents: &agents,
             taken_at: 100,
             registered: &registered,
-            worktree: &no_worktree,
+            job: &no_job,
         };
         sync_row(&mut t, &poll, 110);
         assert_eq!(
@@ -554,10 +557,50 @@ mod tests {
             agents: &agents,
             taken_at: 100,
             registered: &registered,
-            worktree: &no_worktree,
+            job: &no_job,
         };
         sync_row(&mut t, &poll, 110);
         assert_eq!((t.cleaned_at, t.resolved), (None, false));
+    }
+
+    /// The reviewer's probe: another project of this chief home lives in the account that ran
+    /// `claude agents`, this one in another. Its sessions prove nothing about this project's.
+    #[test]
+    fn a_snapshot_listing_only_another_projects_sessions_removes_nothing() {
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        let mut theirs = thread("chief-other", Some("o1"), Some("o-sid"), 0);
+        theirs.project_slug = "other".into();
+        theirs.role = Role::Coordinator.as_str().into();
+        let registered = vec![
+            t.clone(),
+            thread("chief-demo", Some("c1"), Some("c-sid"), 0),
+            theirs,
+        ];
+        let other_coordinator = AgentRow {
+            id: Some("o1".into()),
+            session_id: "o-sid".into(),
+            name: Some("chief-other".into()),
+            ..coordinator_agent()
+        };
+        let sync = |t: &mut SessionRow, agents: &[AgentRow]| {
+            let poll = Poll {
+                agents,
+                taken_at: 100,
+                registered: &registered,
+                job: &no_job,
+            };
+            sync_row(t, &poll, 110);
+        };
+        sync(&mut t, std::slice::from_ref(&other_coordinator));
+        assert_eq!(
+            (t.removed_at, t.cleaned_at, t.resolved),
+            (None, None, false)
+        );
+
+        // Listing this project's coordinator, it can know.
+        t.synced_at = None;
+        sync(&mut t, &[other_coordinator, coordinator_agent()]);
+        assert_eq!(t.removed_at, Some(100));
     }
 
     /// A poll from another process that started before one already applied is ignored.
@@ -587,7 +630,15 @@ mod tests {
     /// worktree named. Showing up again undoes what the sync did.
     #[test]
     fn a_removed_session_keeps_its_worktree_and_can_come_back() {
-        let wt = |_: &str| Some(PathBuf::from("/r/.claude/worktrees/fix"));
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = tmp.path().join("fix");
+        std::fs::create_dir(&fix).unwrap();
+        let job = |_: &str| {
+            Some(JobState {
+                worktree: Some(fix.clone()),
+                branch: Some("worktree-fix".into()),
+            })
+        };
         let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
         t.pid = Some(3);
         let registered = listed_registered(&[coordinator_agent()]);
@@ -596,9 +647,13 @@ mod tests {
             agents: &agents,
             taken_at: 100,
             registered: &registered,
-            worktree: &wt,
+            job: &job,
         };
         assert!(sync_row(&mut t, &poll, 110));
+        let remains = format!(
+            "session removed outside chief; worktree remains at {}",
+            fix.display()
+        );
         assert_eq!(
             (
                 t.cleaned_at,
@@ -612,7 +667,7 @@ mod tests {
                 Some(100),
                 true,
                 Some("removed"),
-                Some("session removed outside chief; worktree remains at /r/.claude/worktrees/fix")
+                Some(remains.as_str())
             )
         );
 
@@ -658,6 +713,49 @@ mod tests {
         listed.session_id = "t-sid".into();
         sync_one(&mut c, &[coordinator_agent(), listed], 200, 210);
         assert_eq!(c.cleaned_at, Some(50));
+    }
+
+    /// The reviewer's probe: a thread whose shell wandered into the checkout (`main`) or another
+    /// thread's worktree reports that branch in its hooks. The branch is what its job state names.
+    #[test]
+    fn the_branch_comes_from_the_job_state() {
+        let listed = {
+            let mut a = coordinator_agent();
+            a.id = Some("t1".into());
+            a.session_id = "t-sid".into();
+            a
+        };
+        let agents = [coordinator_agent(), listed];
+        let registered = listed_registered(&agents);
+        let sync = |row: &mut SessionRow, job: &dyn Fn(&str) -> Option<JobState>| {
+            let poll = Poll {
+                agents: &agents,
+                taken_at: 100,
+                registered: &registered,
+                job,
+            };
+            sync_row(row, &poll, 110);
+        };
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        t.branch = Some("main".into());
+        sync(&mut t, &|_| {
+            Some(JobState {
+                worktree: Some("/r/.claude/worktrees/fix".into()),
+                branch: Some("worktree-fix".into()),
+            })
+        });
+        assert_eq!(t.branch.as_deref(), Some("worktree-fix"));
+
+        // Its job never entered a worktree: the checkout's branch isn't the thread's.
+        t.synced_at = None;
+        sync(&mut t, &|_| Some(JobState::default()));
+        assert_eq!(t.branch, None);
+
+        // No job state to read (removed, say): what was stored stays, for display.
+        t.branch = Some("worktree-fix".into());
+        t.synced_at = None;
+        sync(&mut t, &|_| None);
+        assert_eq!(t.branch.as_deref(), Some("worktree-fix"));
     }
 
     #[test]

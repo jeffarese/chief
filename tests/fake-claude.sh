@@ -4,6 +4,7 @@
 #   calls/<n>          the arguments of call n, each followed by a NUL byte
 #   calls/<n>.cwd      the working directory of call n
 #   calls/<n>.pid      the process id of call n
+#   calls/<n>.env      the CLAUDE_CONFIG_DIR of call n (the account), or `unset`
 #   <key>.stdout       canned stdout for a subcommand (<key> = first argument without dashes)
 #   <key>.stdout.<k>   canned stdout for the k-th call of that subcommand (1-based), if present
 #   <key>.stderr       canned stderr
@@ -11,6 +12,9 @@
 #   <key>.exit.<k>     exit code for the k-th call of that subcommand, if present
 #   <key>.sleep        after the output, sleep this many seconds in place (exec, same pid) instead
 #                      of exiting: a `claude attach` that stays attached
+# With CLAUDE_CONFIG_DIR set, `$CLAUDE_CONFIG_DIR/fake-<key>.stdout.<k>`, else
+# `$CLAUDE_CONFIG_DIR/fake-<key>.stdout`, wins over the stdout files above: each account has its
+# own supervisor and sessions.
 # The same script stands in for `gh` (tests link it as `gh`; `pr list` has key `pr`) and `tmux`
 # (a leading `-S <socket>`, as chief passes it, is skipped: `-S s new-window …` has key
 # `new-window`).
@@ -20,6 +24,7 @@ n=$(ls "$dir/calls" | grep -c '^[0-9][0-9]*$')
 printf '%s\0' "$@" > "$dir/calls/$n"
 pwd > "$dir/calls/$n.cwd"
 echo $$ > "$dir/calls/$n.pid"
+printf '%s' "${CLAUDE_CONFIG_DIR-unset}" > "$dir/calls/$n.env"
 
 first=$1
 [ "$1" = "-S" ] && first=$3
@@ -28,7 +33,12 @@ count_file="$dir/$key.count"
 k=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
 echo "$k" > "$count_file"
 
-if [ -f "$dir/$key.stdout.$k" ]; then
+account_stdout="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/fake-$key.stdout}"
+if [ -n "$account_stdout" ] && [ -f "$account_stdout.$k" ]; then
+  cat "$account_stdout.$k"
+elif [ -n "$account_stdout" ] && [ -f "$account_stdout" ]; then
+  cat "$account_stdout"
+elif [ -f "$dir/$key.stdout.$k" ]; then
   cat "$dir/$key.stdout.$k"
 elif [ -f "$dir/$key.stdout" ]; then
   cat "$dir/$key.stdout"

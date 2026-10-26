@@ -77,30 +77,72 @@ pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Claude {
     pub bin: PathBuf,
-    /// Claude Code's config folder (`claude_dir`), where background sessions' job state lives.
+    /// The Claude Code account every call runs in (§1): Some sets `CLAUDE_CONFIG_DIR` to that
+    /// folder, None removes it (the default account), whatever this process's environment says.
+    pub account: Option<PathBuf>,
+    /// The account's config folder (`claude_dir`), where background sessions' job state lives.
     pub config_dir: PathBuf,
 }
 
 impl Claude {
+    /// The account this process's `CLAUDE_CONFIG_DIR` names: for `chief init`, which gives a new
+    /// project that account, and tests. Everything about an existing project uses
+    /// `for_account(config.claude_config_dir)`.
     pub fn from_env() -> Self {
+        Claude::for_account(env_account())
+    }
+
+    /// `bin` with the account from the environment.
+    pub fn new(bin: PathBuf) -> Self {
+        Claude::with_bin(bin, env_account())
+    }
+
+    /// `CHIEF_CLAUDE_BIN` (else `claude`) in `account`.
+    pub fn for_account(account: Option<PathBuf>) -> Self {
         let bin = std::env::var_os("CHIEF_CLAUDE_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        Claude::new(bin)
+        Claude::with_bin(bin, account)
     }
 
-    /// `bin` with the config folder from the environment.
-    pub fn new(bin: PathBuf) -> Self {
+    pub fn with_bin(bin: PathBuf, account: Option<PathBuf>) -> Self {
+        let config_dir = claude_dir(account.as_deref());
         Claude {
             bin,
-            config_dir: claude_dir(),
+            account,
+            config_dir,
         }
+    }
+
+    /// The account's `.claude.json`, where Claude Code keeps folder trust (`claude_config_path`).
+    pub fn trust_config(&self) -> PathBuf {
+        claude_config_path(self.account.as_deref())
+    }
+
+    /// `claude` in this account; every call chief makes goes through here.
+    pub fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        match &self.account {
+            Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
+            None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
+        };
+        cmd
+    }
+
+    /// What a user types before `claude` to reach this account's sessions (`shell_prefix`).
+    pub fn shell_prefix(&self) -> String {
+        shell_prefix(self.account.as_deref())
     }
 
     /// The worktree a background session works in, as its job state records it: the folder
     /// `claude rm` deletes (ARCHITECTURE §12). None without a state file or a `worktreePath`.
     pub fn job_worktree(&self, short_id: &str) -> Option<PathBuf> {
         job_worktree(&self.config_dir, short_id)
+    }
+
+    /// A background session's job state (`job_state`).
+    pub fn job_state(&self, short_id: &str) -> Option<JobState> {
+        job_state(&self.config_dir, short_id)
     }
 
     /// Fails when `claude --version` is older than MIN_VERSION.
@@ -135,7 +177,7 @@ impl Claude {
 
     /// Runs `claude` in `cwd` on this terminal and waits for it to exit (for the trust prompt).
     pub fn run_interactive(&self, cwd: &Path) -> Result<std::process::ExitStatus> {
-        Command::new(&self.bin)
+        self.command()
             .current_dir(cwd)
             .status()
             .with_context(|| format!("running {} in {}", self.bin.display(), cwd.display()))
@@ -215,14 +257,15 @@ impl Claude {
         }
     }
 
-    /// After a `claude --bg` that failed or printed no id, which may have started the session
-    /// anyway (a timeout, output chief doesn't recognise): `claude agents` until `timeout`, for
-    /// `started_session`. Ok(None) once a listing succeeded without it; the last error when every
-    /// listing failed (chief can't tell).
+    /// After a `claude --bg` in `cwd` that failed or printed no id, which may have started the
+    /// session anyway (a timeout, output chief doesn't recognise): `claude agents` until
+    /// `timeout`, for `started_session`. Ok(None) once a listing succeeded without it; the last
+    /// error when every listing failed (chief can't tell).
     pub fn find_started(
         &self,
         name: &str,
         before: &[AgentRow],
+        cwd: &Path,
         timeout: Duration,
     ) -> Result<Option<AgentRow>> {
         let deadline = Instant::now() + timeout;
@@ -230,7 +273,7 @@ impl Claude {
         loop {
             let error = match self.agents() {
                 Ok(rows) => {
-                    if let Some(row) = started_session(&rows, name, before) {
+                    if let Some(row) = started_session(&rows, name, before, cwd) {
                         return Ok(Some(row.clone()));
                     }
                     listed = true;
@@ -250,7 +293,7 @@ impl Claude {
 
     /// Runs the binary; fails only if it can't start or outlives `timeout`.
     fn run(&self, args: &[OsString], cwd: Option<&Path>, timeout: Duration) -> Result<Output> {
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = self.command();
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -321,18 +364,30 @@ pub fn bg_args(spec: &BgSpawn) -> Vec<OsString> {
     args
 }
 
-/// The background session (it has a short id) named exactly `name` that `before` didn't list:
-/// the one a spawn of `name` just started.
+/// The background session (it has a short id) named exactly `name`, working in `cwd`, that
+/// `before` didn't list: the one a spawn of `name` in `cwd` just started. A session with the name
+/// in another folder is someone else's (another chief home's, or the user's own).
 pub fn started_session<'a>(
     rows: &'a [AgentRow],
     name: &str,
     before: &[AgentRow],
+    cwd: &Path,
 ) -> Option<&'a AgentRow> {
     rows.iter().find(|r| {
         r.id.is_some()
             && r.name.as_deref() == Some(name)
+            && r.cwd
+                .as_deref()
+                .is_some_and(|c| same_folder(Path::new(c), cwd))
             && !before.iter().any(|b| b.session_id == r.session_id)
     })
+}
+
+/// Whether two paths name one folder, compared canonically when both exist (macOS `/tmp` is
+/// `/private/tmp`).
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canonical(a) == canonical(b)
 }
 
 /// Parses `2.1.310 (Claude Code)`.
@@ -431,20 +486,84 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Claude Code's config folder: `$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (Claude
-/// Code's own override), else `~/.claude`.
-pub fn claude_dir() -> PathBuf {
-    for var in ["CHIEF_CLAUDE_DIR", "CLAUDE_CONFIG_DIR"] {
-        if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
-            return PathBuf::from(dir);
-        }
+/// The account this process's `CLAUDE_CONFIG_DIR` names, made absolute; None (the default
+/// account) when it is unset or empty.
+pub fn env_account() -> Option<PathBuf> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty())?;
+    let dir = PathBuf::from(dir);
+    Some(
+        dir.canonicalize()
+            .or_else(|_| std::path::absolute(&dir))
+            .unwrap_or(dir),
+    )
+}
+
+/// An account's config folder: the folder itself, or for the default account
+/// `$CHIEF_CLAUDE_DIR` (tests) else `~/.claude`.
+pub fn claude_dir(account: Option<&Path>) -> PathBuf {
+    if let Some(dir) = account {
+        return dir.to_path_buf();
+    }
+    if let Some(dir) = std::env::var_os("CHIEF_CLAUDE_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
     }
     dirs::home_dir().unwrap_or_default().join(".claude")
 }
 
-/// `<config_dir>/jobs/<short_id>/state.json` → `worktreePath`. A missing or unreadable file, or
-/// a short id that isn't a plain name, is None: no worktree chief may touch.
-pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
+/// `CLAUDE_CONFIG_DIR=<dir> `, or nothing for the default account: what a user types before
+/// `claude` to reach that account's sessions.
+pub fn shell_prefix(account: Option<&Path>) -> String {
+    match account {
+        Some(dir) => format!(
+            "CLAUDE_CONFIG_DIR={} ",
+            crate::text::shell_quote(&dir.to_string_lossy())
+        ),
+        None => String::new(),
+    }
+}
+
+/// The account's own folder for display: the path, or `default (~/.claude)`.
+pub fn account_label(account: Option<&Path>) -> String {
+    match account {
+        Some(dir) => dir.display().to_string(),
+        None => "default (~/.claude)".to_string(),
+    }
+}
+
+/// When this process's `CLAUDE_CONFIG_DIR` names another account than the project's: the line
+/// that says chief uses the project's (§3). Folders are compared canonically.
+pub fn account_note(slug: &str, account: Option<&Path>) -> Option<String> {
+    let here = env_account();
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if here.as_deref().map(canonical) == account.map(canonical) {
+        return None;
+    }
+    let theirs = match account {
+        Some(dir) => format!("the Claude Code account in {}", dir.display()),
+        None => "the default Claude Code account (~/.claude)".to_string(),
+    };
+    let ours = match &here {
+        Some(dir) => format!("CLAUDE_CONFIG_DIR={}", dir.display()),
+        None => "the default account (CLAUDE_CONFIG_DIR is unset here)".to_string(),
+    };
+    Some(format!(
+        "note: {slug} belongs to {theirs}; chief uses that account, not {ours}"
+    ))
+}
+
+/// What the supervisor records about a background session's worktree (§1): the source of truth
+/// for a thread's worktree and branch, unlike the hooks' cwd.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobState {
+    /// `worktreePath`; None for a session that never left its folder.
+    pub worktree: Option<PathBuf>,
+    /// `worktreeBranch`.
+    pub branch: Option<String>,
+}
+
+/// `<config_dir>/jobs/<short_id>/state.json`. A missing or unreadable file, or a short id that
+/// isn't a plain name, is None.
+pub fn job_state(config_dir: &Path, short_id: &str) -> Option<JobState> {
     let plain = !short_id.is_empty()
         && short_id
             .chars()
@@ -455,30 +574,38 @@ pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
     let state = config_dir.join("jobs").join(short_id).join("state.json");
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()?;
-    json["worktreePath"]
-        .as_str()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
+    let text = |key: &str| {
+        json[key]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    };
+    Some(JobState {
+        worktree: text("worktreePath").map(PathBuf::from),
+        branch: text("worktreeBranch"),
+    })
 }
 
-/// `$CHIEF_CLAUDE_CONFIG`, else `$CLAUDE_CONFIG_DIR/.claude.json` (where Claude Code keeps it
-/// when that folder is set, one per account), else `~/.claude.json`.
-pub fn claude_config_path() -> PathBuf {
+/// `job_state` → `worktreePath`: None is no worktree chief may touch.
+pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
+    job_state(config_dir, short_id)?.worktree
+}
+
+/// An account's Claude Code config file, where folder trust lives: `<dir>/.claude.json` (one
+/// per account folder), or for the default account `$CHIEF_CLAUDE_CONFIG` (tests) else
+/// `~/.claude.json`.
+pub fn claude_config_path(account: Option<&Path>) -> PathBuf {
+    if let Some(dir) = account {
+        return dir.join(".claude.json");
+    }
     if let Some(p) = std::env::var_os("CHIEF_CLAUDE_CONFIG") {
         return PathBuf::from(p);
-    }
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir).join(".claude.json");
     }
     dirs::home_dir().unwrap_or_default().join(".claude.json")
 }
 
-/// Reads `~/.claude.json` → `projects[<path>].hasTrustDialogAccepted`. Read-only, never writes.
-pub fn is_trusted(path: &Path) -> Result<bool> {
-    is_trusted_in(&claude_config_path(), path)
-}
-
-/// `is_trusted` against an explicit config file. A missing file trusts nothing. Matches what
+/// Reads `config` (`claude_config_path`) → `projects[<path>].hasTrustDialogAccepted`.
+/// Read-only, never writes. A missing file trusts nothing. Matches what
 /// Claude Code 2.1.310 did live: a trusted folder covers the folders under it (with `/` trusted, a
 /// background session started in a folder whose own entry said false), but not past a git
 /// repository's root (the same `/` didn't cover a fresh repo; Claude asked to trust it). So the
@@ -778,14 +905,11 @@ mod tests {
         };
         write(
             "a1b2c3d4",
-            r#"{"state":"done","daemonShort":"a1b2c3d4","worktreePath":"/r/.claude/worktrees/fix"}"#,
+            r#"{"state":"done","daemonShort":"a1b2c3d4","worktreePath":"/r/.claude/worktrees/fix","worktreeBranch":"worktree-fix"}"#,
         );
         write("e5f6", r#"{"state":"done","bgIsolation":"none"}"#);
         write("bad", "{");
-        let claude = Claude {
-            bin: "claude".into(),
-            config_dir: dir.path().to_path_buf(),
-        };
+        let claude = Claude::with_bin("claude".into(), Some(dir.path().to_path_buf()));
         assert_eq!(
             claude.job_worktree("a1b2c3d4"),
             Some(PathBuf::from("/r/.claude/worktrees/fix"))
@@ -793,6 +917,12 @@ mod tests {
         for short in ["e5f6", "bad", "missing", "", "../a1b2c3d4", "a1b2c3d4/x"] {
             assert_eq!(claude.job_worktree(short), None, "{short:?}");
         }
+        assert_eq!(
+            claude.job_state("a1b2c3d4").unwrap().branch.as_deref(),
+            Some("worktree-fix")
+        );
+        assert_eq!(claude.job_state("e5f6"), Some(JobState::default()));
+        assert_eq!(claude.job_state("bad"), None);
     }
 
     #[test]
