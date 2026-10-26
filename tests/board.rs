@@ -27,7 +27,6 @@ struct Env {
     conn: Connection,
     claude: Fake,
     gh: Fake,
-    rex: Fake,
     git: GitRepo,
     worktree: PathBuf,
 }
@@ -60,8 +59,6 @@ impl Env {
         let claude = Fake::new();
         let gh = Fake::named("gh");
         gh.set("pr.stdout", "[]");
-        let rex = Fake::named("rex");
-        rex.set("list.stdout", r#"{"sessions": []}"#);
         let src = Sources {
             slug: "demo".into(),
             dir,
@@ -69,7 +66,6 @@ impl Env {
             claude_bin: claude.bin(),
             claude_dir: claude.config_dir(),
             gh_bin: gh.bin(),
-            rex_bin: rex.bin(),
         };
         let env = Env {
             _root: root,
@@ -77,7 +73,6 @@ impl Env {
             conn,
             claude,
             gh,
-            rex,
             git,
             worktree,
         };
@@ -189,51 +184,29 @@ fn old_events_are_pruned() {
     assert_eq!(db::recent_events(&env.conn, "demo", 10).unwrap().len(), 1);
 }
 
-/// Showing a thread while the layout is open and the pane shows the coordinator sends exactly one
-/// Ctrl+Z to the `main` block; showing what is already there sends nothing.
+/// Showing a thread while the pane shows the coordinator signals the recorded pane process once
+/// (SIGUSR1); showing what is already there sends nothing. No multiplexer is involved.
 #[test]
 fn show_switches_the_main_pane() {
+    use std::os::unix::process::ExitStatusExt;
     let env = Env::new();
-    env.rex
-        .set(
-            "list.stdout",
-            r#"{"sessions": [{"session_id": "session:other", "label": "chief-demo-2"},
-                             {"session_id": "session:1", "label": "chief-demo"}]}"#,
-        )
-        .set(
-            "block.stdout",
-            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
-                           {"block_id": "block:board", "label": "board"}]}"#,
-        );
-    db::set_pane_showing(&env.conn, "demo", Some("chief-demo")).unwrap();
-    // Only the session `chief up` created and stored: never the label-alike listed first.
-    db::set_rex_session(&env.conn, "demo", Some("session:1")).unwrap();
-    let msg = jobs::run(&env.src, Action::Show(Some(NAME.into())));
-    assert_eq!(msg, Msg::Notice(format!("Main pane: {NAME}")));
-    assert_eq!(
-        env.rex.calls_of("send-key"),
-        [vec![
-            "send-key",
-            "--autostart=false",
-            "-b",
-            "block:main",
-            "ctrl+z"
-        ]]
-    );
-    assert_eq!(
-        env.rex.calls_of("block")[0],
-        [
-            "block",
-            "ls",
-            "--autostart=false",
-            "-s",
-            "session:1",
-            "--json"
-        ]
-    );
+    // Stands in for `chief pane`: SIGUSR1's default action ends it.
+    let mut pane = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = pane.id() as i32;
+    let started = chief::proc::start_time(pid).unwrap();
+    db::set_pane_process(&env.conn, "demo", pid, &started).unwrap();
+    db::set_pane_showing(&env.conn, "demo", Some("demo-notes-1a2b")).unwrap();
 
-    jobs::run(&env.src, Action::Show(None));
-    assert_eq!(env.rex.calls_of("send-key").len(), 1, "already showing it");
+    jobs::run(&env.src, Action::Show(Some(NAME.into())));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(pane.try_wait().unwrap(), None, "already showing it");
+
+    let msg = jobs::run(&env.src, Action::Show(None));
+    assert_eq!(msg, Msg::Notice("Main pane: coordinator".into()));
+    assert_eq!(pane.wait().unwrap().signal(), Some(libc::SIGUSR1));
 }
 
 #[test]

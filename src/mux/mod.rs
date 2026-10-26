@@ -52,7 +52,6 @@ pub trait Mux {
     /// Whether the block's program still runs (a kept-open block outlives it).
     fn is_running(&self, block: &BlockRef) -> Result<bool>;
     fn close_block(&self, block: &BlockRef) -> Result<()>;
-    fn send_key(&self, block: &BlockRef, key: &str) -> Result<()>;
     fn focus(&self, block: &BlockRef) -> Result<()>;
     /// Brings the session into the user's view. Ok(false) when the multiplexer can't (no app
     /// connected, or several to choose from).

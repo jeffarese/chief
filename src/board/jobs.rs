@@ -11,7 +11,6 @@ use rusqlite::Connection;
 use crate::claude::{self, Claude, RESOLVE_TIMEOUT};
 use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
 use crate::config::ProjectConfig;
-use crate::mux::rex::Rex;
 use crate::pr::Gh;
 use crate::tools::{self, NameArgs, ToolCtx};
 use crate::{db, generated, pane, registry};
@@ -46,10 +45,7 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
         Action::Show(target) => {
             let conn = db::open(&src.db)?;
             db::set_pane_target(&conn, &src.slug, target.as_deref())?;
-            let rex = Rex {
-                bin: src.rex_bin.clone(),
-            };
-            pane::request_switch(&rex, &conn, &src.slug)?;
+            pane::request_switch(&conn, &src.slug)?;
             Ok(Msg::Notice(match target {
                 Some(name) => format!("Main pane: {name}"),
                 None => "Main pane: coordinator".to_string(),

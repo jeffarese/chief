@@ -164,14 +164,6 @@ pub fn open(
     })
 }
 
-/// The `main` block of the project's layout (`ours`), if it is open.
-pub fn main_block(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Option<BlockRef>> {
-    match live(mux, ours)? {
-        Some(s) => mux.find_block(&s, MAIN),
-        None => Ok(None),
-    }
-}
-
 /// Closes the project's layout (`ours`): kills the session when it holds only `main` and
 /// `board`, otherwise closes just those two blocks so the user's blocks stay.
 pub fn close(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Closed> {
@@ -204,7 +196,6 @@ pub mod testing {
         Create(String, BlockSpec),
         Run(String, BlockSpec),
         Close(String),
-        Key(String, String),
         Focus(String),
         Show(String),
         Kill(String),
@@ -314,13 +305,6 @@ pub mod testing {
             for s in self.sessions.borrow_mut().iter_mut() {
                 s.2.retain(|b| b.0 != block.0);
             }
-            Ok(())
-        }
-
-        fn send_key(&self, block: &BlockRef, key: &str) -> Result<()> {
-            self.calls
-                .borrow_mut()
-                .push(Call::Key(block.0.clone(), key.into()));
             Ok(())
         }
 
@@ -501,7 +485,6 @@ mod tests {
         let gone = SessionRef("s-gone".into());
         assert_eq!(open_in(&theirs, Some(&gone)).opened, Opened::Created);
         assert_eq!(close(&theirs, Some(&gone)).unwrap(), Closed::Nothing);
-        assert_eq!(main_block(&theirs, None).unwrap(), None);
         assert!(!theirs.calls().iter().any(|c| matches!(c, Call::Kill(_))));
         let untouched = theirs.sessions.borrow()[0].clone();
         assert_eq!((untouched.0.as_str(), untouched.2.len()), ("s0", 2));
@@ -526,7 +509,7 @@ mod tests {
             mux.calls(),
             [Call::Close("b0".into()), Call::Close("b2".into())]
         );
-        assert_eq!(main_block(&mux, Some(&s0())).unwrap(), None);
+        assert_eq!(mux.find_block(&s0(), MAIN).unwrap(), None);
     }
 
     #[test]

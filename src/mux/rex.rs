@@ -217,16 +217,6 @@ impl Mux for Rex {
         Ok(())
     }
 
-    fn send_key(&self, block: &BlockRef, key: &str) -> Result<()> {
-        self.run(&[
-            "send-key".into(),
-            "-b".into(),
-            (&block.0).into(),
-            key.into(),
-        ])?;
-        Ok(())
-    }
-
     fn focus(&self, block: &BlockRef) -> Result<()> {
         self.run(&["focus".into(), (&block.0).into()])?;
         Ok(())

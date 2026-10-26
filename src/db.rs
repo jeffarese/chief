@@ -113,6 +113,10 @@ CREATE TABLE ui_state (
     "ALTER TABLE sessions ADD COLUMN cleaning_at INTEGER;",
     // The multiplexer session `chief up` created (§9): the only one chief reuses or kills.
     "ALTER TABLE ui_state ADD COLUMN rex_session TEXT;",
+    // The running `chief pane`, which the board signals to switch (§9): its pid, and its start
+    // time to prove a pid is still that pane and not a reuse.
+    "ALTER TABLE ui_state ADD COLUMN pane_pid INTEGER;
+     ALTER TABLE ui_state ADD COLUMN pane_started TEXT;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -748,6 +752,44 @@ pub fn set_rex_session(conn: &Connection, project_slug: &str, id: Option<&str>) 
     Ok(())
 }
 
+/// The running `chief pane`'s pid and start time (`proc::start_time`), if one recorded itself.
+pub fn get_pane_process(conn: &Connection, project_slug: &str) -> Result<Option<(i32, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT pane_pid, pane_started FROM ui_state
+             WHERE project_slug = ?1 AND pane_pid IS NOT NULL AND pane_started IS NOT NULL",
+            [project_slug],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+pub fn set_pane_process(
+    conn: &Connection,
+    project_slug: &str,
+    pid: i32,
+    started: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ui_state (project_slug, pane_pid, pane_started) VALUES (?1, ?2, ?3)
+         ON CONFLICT(project_slug) DO UPDATE SET pane_pid = excluded.pane_pid,
+           pane_started = excluded.pane_started",
+        params![project_slug, pid, started],
+    )?;
+    Ok(())
+}
+
+/// Forgets the recorded pane only while it is still `pid`, so a pane that started since keeps
+/// its record.
+pub fn clear_pane_process_if(conn: &Connection, project_slug: &str, pid: i32) -> Result<()> {
+    conn.execute(
+        "UPDATE ui_state SET pane_pid = NULL, pane_started = NULL
+         WHERE project_slug = ?1 AND pane_pid = ?2",
+        params![project_slug, pid],
+    )?;
+    Ok(())
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -977,5 +1019,21 @@ mod tests {
         assert_eq!(get_pane_showing(&conn, "p").unwrap(), None, "kept apart");
         set_rex_session(&conn, "p", None).unwrap();
         assert_eq!(get_rex_session(&conn, "p").unwrap(), None);
+
+        assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
+        set_pane_process(&conn, "p", 41, "100.5").unwrap();
+        assert_eq!(
+            get_pane_process(&conn, "p").unwrap(),
+            Some((41, "100.5".to_string()))
+        );
+        // A newer pane took over: the old one's exit leaves it alone.
+        set_pane_process(&conn, "p", 42, "200.5").unwrap();
+        clear_pane_process_if(&conn, "p", 41).unwrap();
+        assert_eq!(
+            get_pane_process(&conn, "p").unwrap(),
+            Some((42, "200.5".to_string()))
+        );
+        clear_pane_process_if(&conn, "p", 42).unwrap();
+        assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
     }
 }

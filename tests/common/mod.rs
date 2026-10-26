@@ -100,6 +100,27 @@ impl Fake {
             .collect()
     }
 
+    /// The process id of call `n`, waiting up to 2 s for the call to write it.
+    pub fn pid(&self, n: usize) -> i32 {
+        let path = self.dir.path().join(format!("calls/{n}.pid"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .trim()
+                .parse()
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     pub fn cwd(&self, n: usize) -> PathBuf {
         let text = std::fs::read_to_string(self.dir.path().join(format!("calls/{n}.cwd"))).unwrap();
         PathBuf::from(text.trim())

@@ -33,8 +33,6 @@ pub struct Sources {
     /// Claude Code's config folder, for job state (`claude::claude_dir`).
     pub claude_dir: PathBuf,
     pub gh_bin: PathBuf,
-    /// `rex`, for switching the layout's main pane.
-    pub rex_bin: PathBuf,
 }
 
 impl Sources {

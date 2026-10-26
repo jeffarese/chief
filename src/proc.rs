@@ -78,6 +78,42 @@ pub fn output_with_timeout(
     }))
 }
 
+/// When process `pid` started, as an opaque string; None when there is no such process. A pid
+/// and its start time together name one process: a reused pid has a later start.
+#[cfg(target_os = "macos")]
+pub fn start_time(pid: i32) -> Option<String> {
+    // SAFETY: proc_pidinfo fills at most `size` bytes of a zeroed struct of the matching flavor.
+    let info = unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        );
+        if got != size {
+            return None;
+        }
+        info
+    };
+    Some(format!(
+        "{}.{:06}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+/// When process `pid` started (`starttime` in `/proc/<pid>/stat`, clock ticks since boot).
+#[cfg(not(target_os = "macos"))]
+pub fn start_time(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name in parentheses may hold spaces; fields after it are plain. `starttime`
+    // is field 22, the 20th after the name.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +214,20 @@ mod tests {
         .unwrap();
         assert!(out.is_none());
         assert!(gone(read_pid(&pidfile)), "the grandchild was killed");
+    }
+
+    #[test]
+    fn start_time_tells_processes_apart() {
+        let me = std::process::id() as i32;
+        let mine = start_time(me).expect("this process has a start time");
+        assert_eq!(start_time(me).as_deref(), Some(mine.as_str()), "stable");
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        // Microseconds (macOS) or clock ticks (Linux) after this test process started.
+        assert!(start_time(pid).is_some_and(|t| t != mine));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(start_time(pid), None, "gone");
     }
 
     /// Output that a grandchild finishes writing before the deadline is kept.

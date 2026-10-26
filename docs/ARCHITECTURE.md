@@ -297,7 +297,9 @@ CREATE TABLE ui_state (
   project_slug TEXT PRIMARY KEY,
   pane_target  TEXT,                      -- session name the left pane should show
   pane_showing TEXT,                      -- session `chief pane` is attached to now; NULL between attaches (migration 5)
-  rex_session  TEXT                       -- id of the Rex session `chief up` created, §9 (migration 8)
+  rex_session  TEXT,                      -- id of the Rex session `chief up` created, §9 (migration 8)
+  pane_pid     INTEGER,                   -- the running `chief pane`, which the board signals to switch, §9 (migration 9)
+  pane_started TEXT                       -- that process's start time, proving the pid is still it (migration 9)
 );
 ```
 
@@ -621,7 +623,6 @@ pub trait Mux {
     fn blocks(&self, s: &SessionRef) -> Result<Vec<BlockInfo>>;            // id + label
     fn is_running(&self, b: &BlockRef) -> Result<bool>;                    // a kept-open block outlives its program
     fn close_block(&self, b: &BlockRef) -> Result<()>;
-    fn send_key(&self, b: &BlockRef, key: &str) -> Result<()>;
     fn focus(&self, b: &BlockRef) -> Result<()>;
     fn show(&self, s: &SessionRef) -> Result<bool>;                        // false: can't bring it into view
     fn kill_session(&self, s: &SessionRef) -> Result<()>;
@@ -635,7 +636,7 @@ timeout: `rex list --json`; `rex new <label> --cwd <dir> --keep-open --json -- <
 `rex block rename -s <s> <block> <label>` (`new` labels its first block "shell"); `rex run -s <s>
 --label <l> --focus=<bool> [-b <anchor> --split <dir> --ratio <n>] --cwd <dir> --keep-open --json
 -- <cmd>`; `rex block ls -s <s> --json`; `rex block call -b <b> process` (running while it lists a
-`child`); `rex block close <b>`; `rex send-key -b <b> <key>`; `rex focus <b>`; `rex kill <s>`; and
+`child`); `rex block close <b>`; `rex focus <b>`; `rex kill <s>`; and
 `rex do session.select session_id=<s>` for `show` (a client action: Rex picks the app when exactly
 one is connected, and fails otherwise). chief only touches the session `chief up` created, by the
 id it stored in `ui_state.rex_session` (migration 8): a session that merely carries the label
@@ -662,7 +663,9 @@ user added them) keeps running with those, and only `main` and `board` are close
 Then focus `main` and `show` the session. When `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
 
-`chief pane` loop (`src/pane.rs`):
+`chief pane` loop (`src/pane.rs`). On start it catches its signals (below), then records its pid
+and start time in `ui_state.pane_pid` / `pane_started` (`proc::start_time`: `proc_pidinfo` on
+macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are still its own.
 
 1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned
    (removed counts) or never started (no short id), means the coordinator, and a stale target is
@@ -675,10 +678,12 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
 3. Write `pane_showing = <name>`, then read the target again; if it changed, clear
    `pane_showing` and start over (see board switching below).
 4. Drain queued keys (`q` quits), restore the terminal mode the pane started in but with ISIG off,
-   run `claude attach <short_id>` as a child on the same TTY, wait, take raw mode back, clear
+   run `claude attach <short_id>` as a child on the same TTY, wait (polling `waitpid(WNOHANG)`
+   every 50 ms, so a signal flag set at any moment is seen), take raw mode back, clear
    `pane_showing`.
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
-   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1.
+   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1. An attach ended for a
+   switch goes straight back to 1.
 
 `q` while chief has the terminal ends the loop; so does the block being closed or the session
 killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
@@ -688,25 +693,37 @@ SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either
 then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
 thread).
 
-Ctrl+Z: the board switches by sending Ctrl+Z to `main`. Inside `claude attach` it detaches. While
-chief itself has the terminal, the terminal is in raw mode (ISIG off), so Ctrl+Z, Ctrl+C and
-other keys are plain bytes chief reads and drops (only `q` counts). Attach starts with ISIG still
-off, so a Ctrl+Z that arrives before Claude's UI is up stays queued as input; Claude reads it once
-it takes the terminal and detaches, and the loop attaches to the current target (a switch is never
-lost). In case a SIGTSTP gets through anyway, chief ignores it and spawns attach with SIGTSTP reset
-to default (an ignored signal would survive exec); it waits with `waitpid(WUNTRACED)` and sends
-SIGCONT to a stopped attach, so the loop can't hang. On exit chief restores the terminal mode it
-started with. Also, Rex runs the command as the leader of its own session, an orphaned process
-group, so the kernel discards terminal stop signals there anyway (verified in M4: with ISIG on,
-`^Z` echoes and nothing stops).
+Ctrl+Z: the user can detach by hand with Claude's own Ctrl+Z inside `claude attach`; the loop then
+attaches to the current target. While chief itself has the terminal, the terminal is in raw mode
+(ISIG off), so Ctrl+Z, Ctrl+C and other keys are plain bytes chief reads and drops (only `q`
+counts). Attach starts with ISIG still off, so a Ctrl+Z that arrives before Claude's UI is up
+stays queued as input; Claude reads it once it takes the terminal and detaches. In case a SIGTSTP
+gets through anyway, chief ignores it and spawns attach with SIGTSTP reset to default (an ignored
+signal would survive exec); it waits with `WUNTRACED` and sends SIGCONT to a stopped attach, so the
+loop can't hang. On exit chief restores the terminal mode it started with. Also, Rex runs the
+command as the leader of its own session, an orphaned process group, so the kernel discards
+terminal stop signals there anyway (verified in M4: with ISIG on, `^Z` echoes and nothing stops).
 
-Board switching: write `pane_target`, then `pane::request_switch(mux, conn, slug)`: when
-`pane_showing` is NULL (between attaches, or no pane) or equals the target (NULL target = the
-coordinator's name), do nothing; otherwise find the stored session (`ui_state.rex_session`) and
-its `main` block and `send_key(main, "ctrl+z")`, or do nothing when either is missing (a board run
-on its own). The pane
-writes `pane_showing` before its last read of the target and the board writes the target before
-reading `pane_showing`, so a switch that sends nothing is always seen by the pane's next read.
+Board switching works in any terminal, with or without a multiplexer: write `pane_target`, then
+`pane::request_switch(conn, slug)`. When `pane_showing` is NULL (between attaches, or no pane) or
+equals the target (NULL target = the coordinator's name), or no pane is recorded, do nothing.
+Otherwise check that the recorded pid's start time still matches `pane_started`; if not, the pane
+is gone and the pid may be another process's by now, so clear the record (only while it holds that
+pid) and send nothing. Else send it SIGUSR1. The pane catches SIGUSR1 like SIGHUP (a handler that
+only sets a flag, no `SA_RESTART`), before it records its pid, since the default action would end
+it. When the wait sees the flag it clears it and reads the target again: a target it already shows
+(the board saw the pane just before it moved on) is ignored. Otherwise it sends SIGTERM to `claude
+attach`, gives it 2 s to exit, then SIGKILLs it, and reaps it. SIGTERM ends the attach client and
+leaves the background session running (verified on Claude Code 2.1.310: still listed, idle, with
+its pid). A killed attach leaves its screen behind, so the pane then restores the terminal mode it
+started with and writes a reset: leave the alternate screen (`ESC[?1049l`), show the cursor
+(`ESC[?25h`), turn off mouse reporting (`ESC[?1000l ESC[?1002l ESC[?1003l ESC[?1006l`), bracketed
+paste (`ESC[?2004l`) and focus events (`ESC[?1004l`), reset attributes (`ESC[0m`), clear
+(`ESC[2J ESC[H`); then it takes raw mode back, clears `pane_showing` and attaches to the new
+target. The pane writes `pane_showing` before its last read of the target and the board writes the
+target before reading `pane_showing`, so a switch that sends nothing is always seen by the pane's
+next read; a SIGUSR1 that lands before attach starts leaves the flag set, and the first look of the
+wait ends that attach at once. One pane per project receives switches: the latest one started.
 
 ## 10. Board
 
@@ -758,9 +775,8 @@ are tested without a terminal (`TestBackend`).
   short terminals; s settings; ? help (any key closes); q or Ctrl+C quit the board only. Wake and
   cleanup run one at a time on a worker thread ("waking …" in the status line).
 - Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
-  `pane::request_switch` with Rex (`CHIEF_REX_BIN`, kept in the board's `Sources`), which sends
-  Ctrl+Z to the layout's `main` block unless the pane already shows the target or no layout is
-  open (§9).
+  `pane::request_switch`, which signals the running `chief pane` unless it already shows the
+  target or no pane runs (§9).
 - Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, default repo, cleanup (merged/manual),
   `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
