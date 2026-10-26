@@ -143,29 +143,39 @@ fn write_files(
 fn repo_entries(paths: &[PathBuf]) -> Result<Vec<Repo>> {
     let mut repos: Vec<Repo> = Vec::new();
     for path in paths {
-        if !path.is_dir() {
-            bail!("repository folder {} doesn't exist", path.display());
-        }
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("resolving {}", path.display()))?;
-        if repos.iter().any(|r| r.path == path) {
-            continue;
-        }
-        let base = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "repo".to_string());
-        let mut name = base.clone();
-        let mut n = 2;
-        while repos.iter().any(|r| r.name == name) {
-            name = format!("{base}-{n}");
-            n += 1;
-        }
-        repos.push(Repo { name, path });
+        add_repo(&mut repos, path)?;
     }
     Ok(repos)
+}
+
+/// Appends `path` (canonical, named after its folder with `-2`, `-3` … on a clash) unless it is
+/// already listed. Returns the entry's name and whether it was added.
+pub fn add_repo(repos: &mut Vec<Repo>, path: &Path) -> Result<(String, bool)> {
+    if !path.is_dir() {
+        bail!("repository folder {} doesn't exist", path.display());
+    }
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    if let Some(r) = repos.iter().find(|r| r.path == path) {
+        return Ok((r.name.clone(), false));
+    }
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    let mut name = base.clone();
+    let mut n = 2;
+    while repos.iter().any(|r| r.name == name) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    repos.push(Repo {
+        name: name.clone(),
+        path,
+    });
+    Ok((name, true))
 }
 
 /// The project folder (always checked) and every repo Claude Code doesn't trust.

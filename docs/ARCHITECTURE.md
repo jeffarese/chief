@@ -502,22 +502,66 @@ Board switching: write `pane_target`, then `send_key(main, "ctrl+z")`.
 
 ## 10. Board
 
-- Refresh every 2 s from SQLite and `claude agents --json --all` (filtered to the project's session
-  ids, written back through §5). PR status every 30 s with `pr::refresh_project` (§12), which runs
+`chief board --project <slug>` (`src/board/`): `app.rs` holds the state and turns keys into actions
+(`App::on_key(KeyEvent) -> Vec<Action>`), `ui.rs` draws it, `refresh.rs` polls in the background,
+`jobs.rs` runs actions on worker threads, `settings.rs` is the settings form. Logic and rendering
+are tested without a terminal (`TestBackend`).
+
+- Refresh: two background threads, each with its own SQLite connection, send results to the UI over
+  a channel; the UI never waits on them. Every 2 s: take `taken_at`, run
+  `claude agents --json --all`, sync (§5), read the project's rows, guard denial count and
+  `pane_target`. A failing `claude agents` still sends the stored rows, with "refresh failed: …" in
+  the status line; a failing database read keeps the last rows. After each action the worker asks
+  for an immediate re-read (database only). Every 30 s (first at start): `pr::refresh_project` with
+  one `Gh` kept for the board's lifetime and `project.toml` re-read each time (§12), which runs
   `gh pr list --head <branch> --state all --json url,state,isDraft,reviewDecision --limit 1`
   in `repo_path` and, with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
-  (no `gh`, not logged in, no GitHub remote) goes in the status line.
-- Layout: header (project, goal, coordinator state, denials count); groups in §5 order with counts;
-  detail panel for the selection (title, name, group, reason, branch, PR, model, last report).
-- Keys: ↑/↓ or j/k move; Enter view thread in the main pane; Esc or c view coordinator; w wake;
-  r resolve or reopen; o open PR; x clean up the selected resolved thread (`cleanup::clean`, Safe;
-  when blocked, show what would be lost and offer Discard after typing the thread's name);
-  s settings; ? help; q quit the board only.
-- A thread with `cleanup_blocked` shows a "cleanup blocked: <reason>" badge; a cleaned thread
-  shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread.
-- Settings screen edits `project.toml` (goal, models, efforts, permission mode, max_parallel,
-  default repo, repos) and opens `instructions.md` or `memory/` in `$EDITOR`. Saving regenerates
-  `generated/*`. Changes reach new threads; coordinator model and effort apply on its next start.
+  (no `gh`, not logged in, no GitHub remote) stays in the status line; blocked and error counts
+  prefix it (`PR 1 blocked, 2 errors · …`). At start the board deletes `events` older than 30 days
+  (`db::prune_events`).
+- Layout, designed for a 40–70 column pane and usable down to 30: header (project name, goal,
+  `coordinator: <state>` with the guard denial count when > 0); the groups in §5 order with counts,
+  empty groups hidden, "No threads yet" when there are none, Resolved collapsed by default
+  (`Resolved N · R shows`). A row is `<target mark><glyph> <title or name>  <tags>`, cut to the
+  width with an ellipsis and never wrapped; the title gives way first so tags stay readable. Tags:
+  waiting reason, `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`),
+  `cleanup blocked`, `cleaned up`. Detail panel for the selection (title, name, group and reason or
+  resolved reason, asleep, branch, PR URL, model · effort, last activity, cleanup state, the last
+  report wrapped): below the list when the body has ≥ 16 lines (the list takes what it needs up to
+  3/5), otherwise Tab swaps the list for it. One status line: a running worker, else the last
+  action's result (cleared by the next key), else refresh errors, else the PR hint, else key help.
+  Colours: a fixed palette that reads on dark and light terminals (Waiting bold red with `!`,
+  Working green `●`, Review blue `◆`, Landing magenta `▲`, Idle default `○`, Failed red `✗`,
+  Resolved dim `✓`). `▸` marks what the main pane shows: a thread row, or the coordinator line.
+- Keys: ↑/↓ or j/k move over threads (headers skipped; g/G first/last); Enter shows the selected
+  thread in the main pane (refused for a cleaned one); Esc or c shows the coordinator; w wake
+  (`tools::wake_thread`, refused for cleaned); r resolve or reopen (`registry::set_resolved`,
+  reason `user`; reopening a cleaned thread is refused with its message); o open the PR URL
+  (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
+  uncleaned thread: `cleanup::clean(Safe)`, and when blocked a modal shows why plus
+  `cleanup::render_loss` and runs `clean(Discard)` only after the thread's name is typed exactly
+  (Enter with a wrong name clears the input; Esc cancels); R show or hide resolved; Tab detail on
+  short terminals; s settings; ? help (any key closes); q or Ctrl+C quit the board only. Wake and
+  cleanup run one at a time on a worker thread ("waking …" in the status line).
+- Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
+  `pane::request_switch(slug)`. Until the layout lands it is a no-op; milestone 4 makes it
+  `send_key(main, "ctrl+z")` (§9).
+- Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
+  model, effort, permission mode, max_parallel, default repo, cleanup (merged/manual),
+  `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
+  in `init`; `d` removes one, moving the default repo to the first remaining). Efforts, modes,
+  default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal and max_parallel are
+  free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
+  errors shown in the form), writes with `save`, regenerates `generated/*`, and says "Saved. New
+  threads use these settings; the coordinator's model and effort apply on its next start." Esc
+  with unsaved changes asks for a second Esc. Two entries open `instructions.md` and
+  `memory/MEMORY.md` in `$EDITOR` (run through `sh -c`, so arguments work; fallback `vi`): the
+  board leaves the alternate screen and raw mode, runs the editor on the same TTY, and restores.
+- Terminal: `ratatui::init` (alternate screen, raw mode, a panic hook that restores the terminal);
+  restored on quit and on error; input is polled every 100 ms, results are drained between frames,
+  and resizes take effect on the next frame.
+- A thread with `cleanup_blocked` shows a "cleanup blocked" tag (the reason in the detail); a
+  cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread.
 
 ## 11. Testing
 

@@ -469,6 +469,12 @@ pub fn insert_event(conn: &Connection, e: &Event) -> Result<()> {
     Ok(())
 }
 
+/// Deletes events older than `before` (unix ms) in every project; returns how many. The board
+/// runs it at start so the table doesn't grow without bound.
+pub fn prune_events(conn: &Connection, before: i64) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM events WHERE ts < ?1", [before])?)
+}
+
 /// The project's latest events, newest first.
 pub fn recent_events(conn: &Connection, project_slug: &str, limit: usize) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
@@ -712,6 +718,10 @@ mod tests {
         }
         let ev = recent_events(&conn, "p", 10).unwrap();
         assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].hook, "Stop");
+        assert_eq!(prune_events(&conn, 2).unwrap(), 1);
+        let ev = recent_events(&conn, "p", 10).unwrap();
+        assert_eq!(ev.len(), 1, "the event at the cutoff stays");
         assert_eq!(ev[0].hook, "Stop");
 
         insert_report(&conn, "t", 1, "first").unwrap();
