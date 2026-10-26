@@ -60,11 +60,12 @@ extern "C" fn on_switch(_: libc::c_int) {
     SWITCH.store(true, Ordering::SeqCst);
 }
 
-/// Rex closing the block or killing the session hangs up the pty, and the kernel sends SIGHUP to
-/// the session leader: this process, not `claude attach`. Its default action would end chief at
-/// once, leaving `pane_showing` set (which also keeps cleanup away from that thread, §12) and
-/// attach unreaped. The handler only records it; without `SA_RESTART` the blocking `waitpid` is
-/// interrupted, and the loop winds down. SIGTERM (`kill <pid>`) is handled the same way. A caught
+/// The multiplexer closing the pane or killing the session hangs up the pty, and the kernel sends
+/// SIGHUP to the session leader: this process, not `claude attach`. Its default action would end
+/// chief at once, leaving `pane_showing` set (which also keeps cleanup away from that thread,
+/// §12) and attach unreaped. The handler only records it; without `SA_RESTART` a blocking call is
+/// interrupted, the wait for attach sees the flag, and the loop winds down. SIGTERM (`kill
+/// <pid>`) is handled the same way. A caught
 /// signal reverts to the default across exec, so attach keeps the usual behaviour.
 fn catch_hangup() {
     catch(&[libc::SIGHUP, libc::SIGTERM], on_hangup);

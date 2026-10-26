@@ -722,7 +722,7 @@ macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are
 `q` while chief has the terminal ends the loop; so does the block being closed or the session
 killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
 `claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
-`SA_RESTART`, so the default action can't end it before cleanup: the interrupted wait passes
+`SA_RESTART`, so the default action can't end it before cleanup: the wait sees the flag, passes
 SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either way; the loop
 then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
 thread).
