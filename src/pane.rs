@@ -21,6 +21,7 @@ use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_ra
 use rusqlite::Connection;
 
 use crate::claude::Claude;
+use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::mux::Mux;
 use crate::{layout, names, paths, project, registry};
@@ -140,10 +141,10 @@ fn wake(
     if row.pid.is_some() {
         return Ok(());
     }
-    let short_id = row.short_id.as_deref().context("target has no short id")?;
     tty.say(&format!("chief · waking {} …", row.name))?;
-    claude.respawn(short_id)?;
-    project::wait_for_pid(conn, claude, project, &row.name, WAKE_WAIT)?;
+    let dir = project::project_dir(project);
+    let config = ProjectConfig::load(&dir.join("project.toml"))?;
+    project::respawn(conn, claude, &dir, &config, &row, WAKE_WAIT)?;
     Ok(())
 }
 

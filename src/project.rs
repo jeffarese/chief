@@ -138,7 +138,7 @@ fn write_files(
             config.name
         ),
     )?;
-    generated::write_all(dir, &config.slug, exe, env)
+    generated::write_all(dir, config, exe, env)
 }
 
 /// Canonical repo folders, named after their folder (`-2`, `-3` … on a clash).
@@ -245,7 +245,7 @@ pub fn up(slug: &str) -> Result<()> {
         );
     }
     let env = generated::passthrough_env();
-    generated::write_all(&dir, slug, &exe, &env)?;
+    generated::write_all(&dir, &config, &exe, &env)?;
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
         db::register_project(&conn, slug, &dir, db::now_ms())?;
@@ -299,9 +299,7 @@ pub fn ensure_coordinator(
     let slug = config.slug.as_str();
     let name = names::coordinator_name(slug);
     let existing = db::get_coordinator(conn, slug)?;
-    if let Some(row) = existing.as_ref()
-        && let Some(short_id) = row.short_id.clone()
-    {
+    if let Some(row) = existing.as_ref().filter(|r| r.short_id.is_some()) {
         let taken_at = db::now_ms();
         let snapshot = claude.agents()?;
         registry::sync(conn, slug, &snapshot, taken_at, db::now_ms())?;
@@ -309,8 +307,7 @@ pub fn ensure_coordinator(
         if row.pid.is_some() {
             return Ok((row, CoordinatorAction::Running));
         }
-        claude.respawn(&short_id)?;
-        let row = wait_for_pid(conn, claude, slug, &row.name, RESPAWN_WAIT)?;
+        let row = respawn(conn, claude, dir, config, &row, RESPAWN_WAIT)?;
         return Ok((row, CoordinatorAction::Respawned));
     }
 
@@ -376,6 +373,27 @@ pub fn ensure_coordinator(
         Ok(row)
     })?;
     Ok((row, CoordinatorAction::Started))
+}
+
+/// `claude respawn` for `row`, after rewriting `<dir>/generated/*` from `config` (a respawned
+/// session reads its hooks again, §3), then waits up to `wait` for a pid; returns the row.
+pub fn respawn(
+    conn: &Connection,
+    claude: &Claude,
+    dir: &Path,
+    config: &ProjectConfig,
+    row: &SessionRow,
+    wait: Duration,
+) -> Result<SessionRow> {
+    let short_id = row.short_id.as_deref().with_context(|| {
+        format!(
+            "{} was never started, so there is nothing to respawn",
+            row.name
+        )
+    })?;
+    generated::rewrite(dir, config)?;
+    claude.respawn(short_id)?;
+    wait_for_pid(conn, claude, &row.project_slug, &row.name, wait)
 }
 
 /// Polls `claude agents` until `name` has a pid or `timeout` passes; returns the row either way.

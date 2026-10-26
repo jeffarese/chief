@@ -54,6 +54,12 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
 - Threads name their own worktree (`EnterWorktree`), e.g. `.claude/worktrees/add-hello-txt` on
   `worktree-add-hello-txt`, not after the thread; use the cwd and branch hooks report.
 - A thread killed mid-turn stays `state: working` with no status and no pid in `claude agents`.
+- A `permissions.deny` rule `Edit(//<absolute canonical path>/**)` in `--settings` (a leading `//`
+  means an absolute path) blocks both the Edit and the Write tool for every file under that folder
+  in a background session ("File is in a directory that is denied by your permission settings."),
+  and other folders stay writable. `Write(…)` and `NotebookEdit(…)` deny rules are useless: Claude
+  Code prints "Deny rule Write(//…/**) never matches · use Edit(//…/**)" at startup (verified live
+  on 2.1.310 with `--settings` and `--permission-mode auto`).
 
 Minimum Claude Code version: 2.1.310. `chief` checks `claude --version` on `init` and `up`.
 
@@ -119,7 +125,11 @@ each project's coordinator and threads grouped in board order. A thread's line e
   generated/mcp.json
 ```
 
-`generated/*` is rewritten by `init`, `up` and whenever settings change. Commands inside them use the
+`generated/*` is rewritten from `project.toml` by `init`, `up` and whenever settings change, and
+right before every spawn and respawn (`start_thread`, `wake_thread`, the pane's respawn, `chief up`):
+Claude Code reads hooks and permissions when a session starts, so an edit to these files (one that
+drops the guard, say) never reaches a later start. A rewrite that fails stops the spawn or
+respawn. Commands inside them use the
 canonical absolute path of the `chief` binary (`std::env::current_exe()`), so install with
 `cargo install --path .`: `chief up` prints a one-line warning when that path is inside a cargo
 `target/` folder (an ancestor named `target` beside a `Cargo.toml`), since `cargo clean` would
@@ -145,9 +155,13 @@ variables (§9).
   (the message is one shell-quoted word), so a missing or broken binary (exit 127 or any non-zero
   exit) blocks the call with exit 2, which Claude Code treats as a block and shows to the model.
   The guard's entry also sets `"timeout": 30` (seconds; the time budget is in §6).
-  The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and
-  `"permissions": {"allow": ["mcp__chief"]}` (nobody watches its background session for prompts
-  on its own tools).
+  The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
+  `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
+  and `"deny"`: `Edit(//<repo path>/**)` for every repo and `Edit(//<dir>/generated/**)`, canonical
+  paths, built in one place (`generated::coordinator_deny_rules`, syntax in
+  `generated::edit_deny_rule`). Per §1 that blocks Edit and Write there: a routing slip can't edit
+  a real checkout, and the coordinator can't edit the files that hold its own and its threads'
+  guard. Memory, `instructions.md` and `project.toml` stay editable.
 - `mcp.json`: `{"mcpServers": {"chief": {"type": "stdio", "command": <chief>, "args": ["mcp",
   "--project", <slug>], "env": {...}}}}`.
 
@@ -496,6 +510,12 @@ claude --bg --name chief-<slug> --model <m> --effort <e> --permission-mode auto
        --append-system-prompt <coordinator prompt, §8>
 ```
 
+Its tools: everything but Bash (disallowed) and ListAgents (the guard, §6). It reads the
+repositories (Read, Grep, Glob; they are `--add-dir`s) but can't edit them: `permissions.deny`
+blocks Edit and Write in every repo and in `generated/` (§3), so it can edit only its own folder
+outside `generated/` (memory, `instructions.md`, `project.toml`). `SendMessage` goes through the
+guard; its chief MCP tools run without prompts.
+
 No prompt: it waits for you. Started when it has no row or no `short_id` (the project folder must be
 trusted, and no other live session may already use the name; a failed spawn removes a row it
 inserted). If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
@@ -503,7 +523,8 @@ a pid. Otherwise it is left alone.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)
 
-- `coordinator.md`: role (route, never do the work), routing rules (quick question → answer;
+- `coordinator.md`: role (route, never do the work), its tools (§7: read the repos, edit only
+  memory and instructions, no shell), routing rules (quick question → answer;
   new work → `start_thread`; follow-up → `SendMessage` to the matching thread with
   `notify_when_idle`, waking it first if asleep, by its exact name with no `[ref]`; several tasks →
   several threads), say which thread got what, keep `max_parallel`, save preferences and decisions

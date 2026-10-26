@@ -170,6 +170,8 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         .agents()
         .context("checking `claude agents` for a free thread name")?;
     let name = free_name(ctx, title, &live)?;
+    // From the settings, not whatever is on disk: the session reads these hooks at start.
+    generated::rewrite(ctx.project_dir, ctx.config)?;
     let now = (ctx.now)();
     let mut row = SessionRow::new(&name, ctx.slug(), Role::Thread, now);
     row.title = Some(title.to_string());
@@ -380,6 +382,8 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     let short_id = row
         .short_id
         .with_context(|| format!("{name} was never started, so there is nothing to wake"))?;
+    // A respawned session reads its hooks again.
+    generated::rewrite(ctx.project_dir, ctx.config)?;
     ctx.claude.respawn(&short_id)?;
     let deadline = Instant::now() + ctx.wake_timeout;
     loop {

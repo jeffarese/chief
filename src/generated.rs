@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::config::ProjectConfig;
 use crate::state::Role;
 use crate::text::shell_quote;
 
@@ -89,17 +90,68 @@ pub fn passthrough_env() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Writes all three files.
-pub fn write_all(dir: &Path, slug: &str, exe: &Path, env: &[(String, String)]) -> Result<()> {
+/// Writes all three files for the project in `dir` with these settings.
+pub fn write_all(
+    dir: &Path,
+    config: &ProjectConfig,
+    exe: &Path,
+    env: &[(String, String)],
+) -> Result<()> {
+    let slug = config.slug.as_str();
+    let repos: Vec<&Path> = config.repos.iter().map(|r| r.path.as_path()).collect();
     write_json(
         &coordinator_settings_path(dir),
-        &hook_settings(exe, slug, Role::Coordinator, env),
+        &coordinator_settings(exe, slug, env, &coordinator_deny_rules(dir, &repos)),
     )?;
     write_json(
         &thread_settings_path(dir),
         &hook_settings(exe, slug, Role::Thread, env),
     )?;
     write_json(&mcp_config_path(dir), &mcp_config(exe, slug, env))
+}
+
+/// `write_all` with this binary and environment, right before a session starts or respawns:
+/// Claude Code reads the hook settings when a session starts, so any edit to them since the
+/// last write (one that drops the guard, say) never reaches a later session (§3).
+pub fn rewrite(dir: &Path, config: &ProjectConfig) -> Result<()> {
+    write_all(dir, config, &chief_exe()?, &passthrough_env())
+        .with_context(|| format!("rewriting {}", dir.join("generated").display()))
+}
+
+/// The coordinator's file: the hooks, worktree isolation off, its own MCP tools allowed, and
+/// `deny` (from `coordinator_deny_rules`).
+pub fn coordinator_settings(
+    exe: &Path,
+    slug: &str,
+    env: &[(String, String)],
+    deny: &[String],
+) -> Value {
+    let mut settings = hook_settings(exe, slug, Role::Coordinator, env);
+    settings["permissions"]["deny"] = json!(deny);
+    settings
+}
+
+/// Edit deny rules for the coordinator, one per repository and one for the project's
+/// `generated/` folder: a routing slip must not edit a real checkout, and an edit to
+/// `generated/*-settings.json` could drop the guard for later spawns. Memory and instructions in
+/// the project folder stay editable. Paths are canonical. This is the one place that builds
+/// them; the rule syntax itself is in `edit_deny_rule`.
+pub fn coordinator_deny_rules(dir: &Path, repos: &[&Path]) -> Vec<String> {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    repos
+        .iter()
+        .map(|repo| canonical(repo))
+        .chain([canonical(dir).join("generated")])
+        .map(|path| edit_deny_rule(&path))
+        .collect()
+}
+
+/// `Edit(//<absolute path>/**)`: Claude Code's permission rule for every file under an
+/// absolute folder (a leading `//` means absolute). Verified live on 2.1.310 (§1): one such
+/// `Edit` rule blocks both Edit and Write there, while `Write(…)` and `NotebookEdit(…)` rules
+/// never match (Claude Code says so at startup), so only `Edit` rules are written.
+pub fn edit_deny_rule(abs: &Path) -> String {
+    format!("Edit(/{}/**)", abs.display())
 }
 
 /// Claude Code `--settings` JSON with every chief hook. The coordinator also stays in its
@@ -333,9 +385,56 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_settings_deny_edits_in_repos_and_generated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects/demo");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = ProjectConfig::new(
+            "Demo",
+            "demo",
+            None,
+            vec![crate::config::Repo {
+                name: "repo".into(),
+                path: repo.clone(),
+            }],
+        );
+        write_all(&dir, &config, Path::new("/bin/chief"), &[]).unwrap();
+        let read = |p: PathBuf| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let coord = read(coordinator_settings_path(&dir));
+        // Canonical: macOS temp dirs live under /private.
+        let repo = repo.canonicalize().unwrap();
+        let dir = dir.canonicalize().unwrap();
+        assert_eq!(
+            coord["permissions"],
+            json!({
+                "allow": ["mcp__chief"],
+                "deny": [
+                    format!("Edit(/{}/**)", repo.display()),
+                    format!("Edit(/{}/generated/**)", dir.display()),
+                ],
+            })
+        );
+        assert_eq!(coord["worktree"], json!({"bgIsolation": "none"}));
+        assert!(
+            read(thread_settings_path(&dir))
+                .get("permissions")
+                .is_none()
+        );
+        assert_eq!(
+            edit_deny_rule(Path::new("/Users/me/repo")),
+            "Edit(//Users/me/repo/**)"
+        );
+    }
+
+    #[test]
     fn write_all_writes_three_files() {
         let dir = tempfile::tempdir().unwrap();
-        write_all(dir.path(), "demo", Path::new("/bin/chief"), &[]).unwrap();
+        let config = ProjectConfig::new("Demo", "demo", None, vec![]);
+        write_all(dir.path(), &config, Path::new("/bin/chief"), &[]).unwrap();
         for p in [
             coordinator_settings_path(dir.path()),
             thread_settings_path(dir.path()),

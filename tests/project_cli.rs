@@ -123,8 +123,19 @@ fn init_creates_the_project() {
     );
     let coord = read_json(&dir.join("generated/coordinator-settings.json"));
     assert_eq!(coord["worktree"]["bgIsolation"], "none");
+    // The coordinator can't edit the repositories or its own generated files; memory and
+    // instructions stay editable.
+    assert_eq!(
+        coord["permissions"]["deny"],
+        json!([
+            format!("Edit(/{}/**)", a.display()),
+            format!("Edit(/{}/**)", b.display()),
+            format!("Edit(/{}/generated/**)", dir.display()),
+        ])
+    );
     let thread = read_json(&dir.join("generated/thread-settings.json"));
     assert!(thread.get("worktree").is_none());
+    assert!(thread.get("permissions").is_none());
 
     let conn = home.db();
     assert_eq!(
@@ -455,6 +466,62 @@ fn up_starts_then_leaves_then_respawns_the_coordinator() {
     let all = home.run(&["status"], "");
     assert_eq!(stdout(&all), text);
     assert!(!home.run(&["status", "nope"], "").status.success());
+}
+
+/// The respawn `chief up` and the pane use rewrites `generated/*` from project.toml first: a
+/// respawned session reads its hooks again.
+#[test]
+fn respawn_rewrites_the_generated_files_first() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    assert!(init(&home, &a, &b).status.success());
+    let dir = project_dir(&home);
+    let settings = dir.join("generated/coordinator-settings.json");
+    std::fs::write(&settings, "{}").unwrap();
+    let conn = home.db();
+    let name = "chief-payments-latency";
+    let mut row = db::SessionRow::new(name, SLUG, chief::state::Role::Coordinator, db::now_ms());
+    row.short_id = Some("c0ffee".into());
+    row.session_id = Some("coord-sid".into());
+    db::insert_session(&conn, &row).unwrap();
+    home.fake.set(
+        "agents.stdout",
+        &json!([agent("c0ffee", "coord-sid", name, "done", Some(7))]).to_string(),
+    );
+    let config = ProjectConfig::load(&dir.join("project.toml")).unwrap();
+    let woke = chief::project::respawn(
+        &conn,
+        &home.fake.claude(),
+        &dir,
+        &config,
+        &row,
+        std::time::Duration::from_millis(500),
+    )
+    .unwrap();
+    assert_eq!(woke.pid, Some(7));
+    assert_eq!(home.fake.calls_of("respawn"), [vec!["respawn", "c0ffee"]]);
+    let v = read_json(&settings);
+    assert_eq!(
+        v["hooks"]["PreToolUse"][1]["matcher"],
+        "SendMessage|ListAgents"
+    );
+    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 3);
+
+    // Can't rewrite: no respawn.
+    std::fs::remove_dir_all(dir.join("generated")).unwrap();
+    std::fs::write(dir.join("generated"), "not a folder").unwrap();
+    let err = chief::project::respawn(
+        &conn,
+        &home.fake.claude(),
+        &dir,
+        &config,
+        &row,
+        std::time::Duration::from_millis(100),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("generated"), "{err:#}");
+    assert_eq!(home.fake.calls_of("respawn").len(), 1);
 }
 
 /// A project whose coordinator runs (started by a first `up` that found no Rex).

@@ -37,8 +37,9 @@ subcommand of one binary, `chief`:
 
 Per-project files in `~/.local/share/chief/<project>/`: `project.toml` (goal, repos, coordinator and
 thread model and effort), `instructions.md`, `memory/MEMORY.md`, `chief.db`, generated `hooks.json`
-and `mcp.json`. The coordinator runs in this folder with worktree isolation off and no file-editing
-tools. Threads run in the chosen repository and get their own worktree.
+and `mcp.json`. The coordinator runs in this folder with worktree isolation off and no shell; it
+can read the repositories, but deny rules block its edits there and in `generated/`, so it edits
+only memory and instructions. Threads run in the chosen repository and get their own worktree.
 
 Thread names are unique (`<project>-<slug>-<4 hex>`) so `SendMessage` never hits two sessions.
 

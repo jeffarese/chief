@@ -277,6 +277,63 @@ fn start_thread_removes_the_row_when_spawn_fails() {
     assert_eq!(env.fake.calls_of("--bg").len(), 1);
 }
 
+fn has_guard(settings: &Path) -> bool {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(settings).unwrap()).unwrap();
+    v["hooks"]["PreToolUse"][1]["matcher"] == "SendMessage|ListAgents"
+}
+
+/// Claude Code reads hooks when a session starts, so chief rewrites `generated/*` from the
+/// settings right before every spawn and respawn: an edit (say, one that drops the guard) never
+/// reaches a session started after it.
+#[test]
+fn spawns_and_respawns_rewrite_the_generated_files_first() {
+    let env = Env::new();
+    let generated = env.dir.join("generated");
+    let settings = generated.join("thread-settings.json");
+    std::fs::create_dir_all(&generated).unwrap();
+    std::fs::write(&settings, "{}").unwrap();
+    env.fake.set("bg.stdout", "backgrounded · s1 · x\n");
+    env.agents(&[]);
+    env.with(|ctx| tools::start_thread(ctx, &start_args("Fix", "Fix it")))
+        .unwrap();
+    assert!(has_guard(&settings), "rewritten before the spawn");
+
+    std::fs::write(&settings, "{}").unwrap();
+    env.insert("demo-w-1111", |r| {
+        r.short_id = Some("w1".into());
+        r.session_id = Some("sid-w1".into());
+    });
+    env.agents(&[agent("w1", "sid-w1", "demo-w-1111", "done", None)]);
+    let wake = || {
+        env.with(|ctx| {
+            tools::wake_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-w-1111".into(),
+                },
+            )
+        })
+    };
+    assert_eq!(wake().unwrap()["respawned"], true);
+    assert!(has_guard(&settings), "rewritten before the respawn");
+
+    // When the files can't be rewritten, nothing starts.
+    std::fs::remove_dir_all(&generated).unwrap();
+    std::fs::write(&generated, "not a folder").unwrap();
+    let rows = db::list_sessions(&env.conn, "demo", None).unwrap().len();
+    assert!(
+        env.with(|ctx| tools::start_thread(ctx, &start_args("Fix", "Again")))
+            .is_err()
+    );
+    assert!(wake().is_err());
+    assert_eq!(env.fake.calls_of("--bg").len(), 1);
+    assert_eq!(env.fake.calls_of("respawn").len(), 1);
+    assert_eq!(
+        db::list_sessions(&env.conn, "demo", None).unwrap().len(),
+        rows
+    );
+}
+
 #[test]
 fn repo_resolution() {
     let env = Env::new();

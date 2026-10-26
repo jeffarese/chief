@@ -85,12 +85,7 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
         Action::Clean { name, mode } => clean(src, &name, mode),
         Action::SaveSettings(config) => {
             config.save(&src.dir.join("project.toml"))?;
-            generated::write_all(
-                &src.dir,
-                &config.slug,
-                &generated::chief_exe()?,
-                &generated::passthrough_env(),
-            )?;
+            generated::rewrite(&src.dir, &config)?;
             Ok(Msg::Saved(config))
         }
         // The runner handles these itself.
