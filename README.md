@@ -142,7 +142,9 @@ readable.
   session a thread may message is its coordinator. `ListAgents` is blocked for both. Each target is
   checked against the project's registered threads and a fresh `claude agents` listing matched by
   session id; anything chief can't verify is blocked, including when chief itself can't run.
-  Blocked attempts are counted on the board.
+  Blocked attempts are counted on the board. Each session may also use its own subagents: it
+  messages them by the name or agent id the Agent tool gave them, they report back to it, and a
+  subagent can't take the name of another session (it would get that session's messages).
 - **Trust.** chief never edits Claude Code's trust settings; it only reads them.
 - Threads run with the permission mode you choose (default `auto`); permission prompts show as
   Waiting on you, and you answer them by opening the thread.
