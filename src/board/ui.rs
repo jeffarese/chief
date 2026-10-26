@@ -515,6 +515,26 @@ fn draw_help(f: &mut Frame, area: Rect) {
 fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     let rect = centred(area, area.width, area.height);
     f.render_widget(Clear, rect);
+    if c.confirmed.is_none() {
+        // chief can't list what a discard would lose, so there is nothing to confirm.
+        let block = Block::bordered()
+            .border_style(Style::new().fg(Color::Yellow))
+            .title(" Cleanup blocked ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let [text_area, foot] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        let text: Vec<Line> = c.loss.lines().map(|l| Line::raw(l.to_string())).collect();
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), text_area);
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                "Any key closes.",
+                Style::new().add_modifier(Modifier::BOLD),
+            )),
+            foot,
+        );
+        return;
+    }
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::Red))
         .title(" Discard unsaved work? ");
@@ -776,10 +796,23 @@ mod tests {
         app.apply(Msg::CleanBlocked {
             name: "demo-old-7a8b".into(),
             loss: "This loses:\n".repeat(30),
+            confirmed: Some(Default::default()),
         });
         let out = render(&app, 30, 10);
         assert!(out.contains("> ▏"), "the input stays visible:\n{out}");
         render(&app, 4, 2);
+
+        // Nothing chief can list: no discard prompt, no input.
+        app.apply(Msg::CleanBlocked {
+            name: "demo-old-7a8b".into(),
+            loss: "Cleanup blocked: 1 unpushed commit.".into(),
+            confirmed: None,
+        });
+        let out = render(&app, 70, 12);
+        assert!(out.contains("Cleanup blocked"), "{out}");
+        assert!(!out.contains("Discard"), "{out}");
+        assert!(!out.contains("> ▏"), "{out}");
+        assert!(out.contains("Any key closes"), "{out}");
     }
 
     #[test]

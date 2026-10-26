@@ -10,7 +10,8 @@ use rusqlite::Connection;
 use crate::claude::{self, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT};
 use crate::config::{ProjectConfig, Repo};
 use crate::db::{self, SessionRow};
-use crate::layout::{self, Opened};
+use crate::layout::{self, Closed, Opened};
+use crate::mux::SessionRef;
 use crate::mux::rex::Rex;
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
@@ -260,8 +261,10 @@ pub fn up(slug: &str) -> Result<()> {
     println!("Coordinator {} {verb}.", row.name);
 
     let label = layout::session_label(slug);
-    match layout::open(&Rex::from_env(), slug, &dir, &exe, &env) {
+    let ours = db::get_rex_session(&conn, slug)?.map(SessionRef);
+    match layout::open(&Rex::from_env(), slug, &dir, &exe, &env, ours.as_ref()) {
         Ok(opened) => {
+            db::set_rex_session(&conn, slug, Some(&opened.session.0))?;
             let what = match opened.opened {
                 Opened::Created => "opened",
                 Opened::Repaired => "repaired",
@@ -480,15 +483,29 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     }
     let mut failed = 0;
     let label = layout::session_label(slug);
-    match layout::close(&Rex::from_env(), slug) {
-        Ok(Some(_)) => println!("Closed Rex session {label}."),
-        Ok(None) => println!("No Rex session {label} was open."),
+    let ours = db::get_rex_session(&conn, slug)?.map(SessionRef);
+    match layout::close(&Rex::from_env(), ours.as_ref()) {
+        Ok(Closed::Killed(_)) => {
+            db::set_rex_session(&conn, slug, None)?;
+            println!("Closed Rex session {label}.");
+        }
+        Ok(Closed::Blocks(_)) => println!(
+            "Closed chief's blocks in Rex session {label}; it holds other blocks too, so it stays \
+             open."
+        ),
+        Ok(Closed::Nothing) => {
+            db::set_rex_session(&conn, slug, None)?;
+            println!("No Rex session {label} was open.");
+        }
         Err(e) => {
             failed += 1;
             println!("Rex session {label} not closed: {e:#}");
         }
     }
     db::set_pane_showing(&conn, slug, None)?;
+    // The next `chief up` starts on the coordinator: a pane that went back to the thread it last
+    // showed would wake it right after `--stop-threads` stopped it.
+    db::set_pane_target(&conn, slug, None)?;
 
     let claude = Claude::from_env();
     let taken_at = db::now_ms();

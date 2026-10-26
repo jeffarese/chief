@@ -26,7 +26,6 @@ struct Sessions {
 #[derive(Deserialize)]
 struct SessionEntry {
     session_id: String,
-    label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,13 +127,9 @@ fn split_name(split: Split) -> &'static str {
 }
 
 impl Mux for Rex {
-    fn find_session(&self, label: &str) -> Result<Option<SessionRef>> {
+    fn has_session(&self, session: &SessionRef) -> Result<bool> {
         let list: Sessions = self.json(&["list".into(), "--json".into()])?;
-        Ok(list
-            .sessions
-            .into_iter()
-            .find(|s| s.label.as_deref() == Some(label))
-            .map(|s| SessionRef(s.session_id)))
+        Ok(list.sessions.iter().any(|s| s.session_id == session.0))
     }
 
     fn create_session(&self, label: &str, first: &BlockSpec) -> Result<(SessionRef, BlockRef)> {

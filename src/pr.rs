@@ -44,10 +44,11 @@ impl Gh {
         Gh::new(bin)
     }
 
-    /// The PR whose head is `branch`, run in `repo_path`. A missing `gh`, a `gh` that isn't
-    /// logged in, or a repository without a GitHub remote is `Ok(None)` plus a hint
+    /// The PR whose head is `branch`, run in `repo_path`, opened from this repository no earlier
+    /// than `since` (the thread row's `created_at`, see `parse_pr_list`). A missing `gh`, a `gh`
+    /// that isn't logged in, or a repository without a GitHub remote is `Ok(None)` plus a hint
     /// (`take_hint`); other failures are errors.
-    pub fn poll(&self, repo_path: &Path, branch: &str) -> Result<Option<PrInfo>> {
+    pub fn poll(&self, repo_path: &Path, branch: &str, since: i64) -> Result<Option<PrInfo>> {
         let mut cmd = Command::new(&self.bin);
         cmd.current_dir(repo_path).args([
             "pr",
@@ -57,9 +58,9 @@ impl Gh {
             "--state",
             "all",
             "--json",
-            "url,state,isDraft,reviewDecision",
+            "url,state,isDraft,reviewDecision,createdAt,isCrossRepository",
             "--limit",
-            "1",
+            "10",
         ]);
         let out = match crate::proc::output_with_timeout(&mut cmd, GH_TIMEOUT) {
             Ok(Some(out)) => out,
@@ -85,7 +86,7 @@ impl Gh {
                 out.status
             );
         }
-        parse_pr_list(&String::from_utf8_lossy(&out.stdout))
+        parse_pr_list(&String::from_utf8_lossy(&out.stdout), since)
     }
 
     /// The first hint, once per `Gh`; None afterwards.
@@ -133,12 +134,34 @@ struct GhPr {
     is_draft: bool,
     #[serde(default)]
     review_decision: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    is_cross_repository: bool,
 }
 
-/// `gh pr list --json url,state,isDraft,reviewDecision` output → the first PR.
-pub fn parse_pr_list(json: &str) -> Result<Option<PrInfo>> {
+/// How far a PR's `createdAt` (GitHub's clock) may precede the thread row (this machine's clock)
+/// and still be the thread's.
+const CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// `gh pr list --json url,state,isDraft,reviewDecision,createdAt,isCrossRepository` output → the
+/// thread's PR: the newest one opened from this repository (a fork's branch can share the name)
+/// no earlier than `since` minus the clock-skew allowance. Worktree branch names come from thread
+/// names, so a new thread can reuse the branch of an old one whose PR merged long ago; that PR
+/// must not resolve and clean the new thread. A PR without a readable `createdAt` is ignored.
+pub fn parse_pr_list(json: &str, since: i64) -> Result<Option<PrInfo>> {
     let prs: Vec<GhPr> = serde_json::from_str(json).context("parsing `gh pr list` output")?;
-    Ok(prs.into_iter().next().map(|p| PrInfo {
+    let created = |p: &GhPr| {
+        let at = chrono::DateTime::parse_from_rfc3339(p.created_at.as_deref()?).ok()?;
+        Some(at.timestamp_millis())
+    };
+    let newest = prs
+        .into_iter()
+        .filter(|p| !p.is_cross_repository)
+        .filter_map(|p| Some((created(&p)?, p)))
+        .filter(|(at, _)| *at >= since - CLOCK_SKEW_MS)
+        .max_by_key(|(at, _)| *at);
+    Ok(newest.map(|(_, p)| PrInfo {
         url: p.url,
         state: p.state,
         draft: p.is_draft,
@@ -194,7 +217,7 @@ pub fn poll_project(ctx: &Ctx, slug: &str) -> Result<Refresh> {
         refresh.polled += 1;
         let stored = ctx
             .gh
-            .poll(Path::new(repo), branch)
+            .poll(Path::new(repo), branch, row.created_at)
             .and_then(|pr| registry::set_pr(ctx.conn, &row.name, pr.as_ref(), (ctx.now)()));
         if let Err(e) = stored {
             refresh.errors.push(format!("{}: {e:#}", row.name));
@@ -205,26 +228,29 @@ pub fn poll_project(ctx: &Ctx, slug: &str) -> Result<Refresh> {
 }
 
 /// The board's 30 s refresh: `poll_project`, then with `cleanup = "merged"` a safe cleanup of
-/// every resolved thread whose PR merged, that isn't working or waiting, and that no earlier
-/// attempt found blocked (those wait for `chief gc`, `chief clean` or the board's `x`).
+/// every resolved thread whose PR merged, that isn't working, waiting or showing in the pane, and
+/// that no earlier attempt found blocked (those wait for `chief gc`, `chief clean` or the board's
+/// `x`).
 pub fn refresh_project(ctx: &Ctx, config: &ProjectConfig) -> Result<Refresh> {
     let mut refresh = poll_project(ctx, &config.slug)?;
     if config.threads.cleanup != Cleanup::Merged {
         return Ok(refresh);
     }
+    let showing = db::get_pane_showing(ctx.conn, &config.slug)?;
     for row in db::list_sessions(ctx.conn, &config.slug, Some(Role::Thread))? {
         let due = row.resolved
             && row.cleaned_at.is_none()
             && row.cleanup_blocked.is_none()
             && row.pr_state.as_deref() == Some("MERGED")
-            && !cleanup::active(&row);
+            && !cleanup::active(&row)
+            && showing.as_deref() != Some(row.name.as_str());
         if !due {
             continue;
         }
         match cleanup::clean(ctx, &row.name, Mode::Safe) {
             Ok(Outcome::Cleaned) => refresh.cleaned.push(row.name),
             Ok(Outcome::Blocked(why)) => refresh.blocked.push((row.name, why)),
-            Ok(Outcome::AlreadyCleaned) => {}
+            Ok(Outcome::AlreadyCleaned | Outcome::InProgress) => {}
             Err(e) => refresh.errors.push(format!("{}: {e:#}", row.name)),
         }
     }
@@ -235,11 +261,19 @@ pub fn refresh_project(ctx: &Ctx, config: &ProjectConfig) -> Result<Refresh> {
 mod tests {
     use super::*;
 
+    /// 2027-01-15T08:00:00Z, when the thread row was created.
+    const CREATED: i64 = 1_800_000_000_000;
+
+    fn pr(url: &str, state: &str, created: &str, cross: bool) -> serde_json::Value {
+        serde_json::json!({"url": url, "state": state, "isDraft": false, "reviewDecision": "",
+                           "createdAt": created, "isCrossRepository": cross})
+    }
+
     #[test]
     fn pr_list_parsing() {
-        let json = r#"[{"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":true,"reviewDecision":""}]"#;
+        let json = r#"[{"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":true,"reviewDecision":"","createdAt":"2027-01-15T09:00:00Z","isCrossRepository":false}]"#;
         assert_eq!(
-            parse_pr_list(json).unwrap(),
+            parse_pr_list(json, CREATED).unwrap(),
             Some(PrInfo {
                 url: "https://github.com/o/r/pull/7".into(),
                 state: "OPEN".into(),
@@ -247,14 +281,51 @@ mod tests {
                 review: None,
             })
         );
-        let approved =
-            r#"[{"url":"u","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED"}]"#;
+        let approved = r#"[{"url":"u","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","createdAt":"2027-01-15T09:00:00+01:00","isCrossRepository":false}]"#;
         assert_eq!(
-            parse_pr_list(approved).unwrap().unwrap().review.as_deref(),
+            parse_pr_list(approved, CREATED)
+                .unwrap()
+                .unwrap()
+                .review
+                .as_deref(),
             Some("APPROVED")
         );
-        assert_eq!(parse_pr_list("[]").unwrap(), None);
-        assert!(parse_pr_list("nope").is_err());
+        assert_eq!(parse_pr_list("[]", CREATED).unwrap(), None);
+        assert!(parse_pr_list("nope", CREATED).is_err());
+    }
+
+    /// A branch name reused by a new thread must not pick up the old thread's PR, nor a fork's.
+    #[test]
+    fn only_this_threads_own_newest_pr_counts() {
+        let list = |prs: &[serde_json::Value]| {
+            parse_pr_list(&serde_json::Value::from(prs.to_vec()).to_string(), CREATED)
+                .unwrap()
+                .map(|p| p.url)
+        };
+        let old = pr("old", "MERGED", "2026-06-01T10:00:00Z", false);
+        assert_eq!(list(std::slice::from_ref(&old)), None, "before the thread");
+        let fork = pr("fork", "OPEN", "2027-01-15T09:00:00Z", true);
+        assert_eq!(
+            list(&[fork.clone(), old.clone()]),
+            None,
+            "another repository"
+        );
+        // Within the clock-skew allowance (5 min) still counts.
+        let skewed = pr("skewed", "OPEN", "2027-01-15T07:56:00Z", false);
+        assert_eq!(list(&[old.clone(), skewed]).as_deref(), Some("skewed"));
+        let early = pr("early", "OPEN", "2027-01-15T07:54:00Z", false);
+        assert_eq!(list(&[early]), None);
+        // The newest of the rest, whatever order gh lists them in.
+        let first = pr("first", "CLOSED", "2027-01-15T09:00:00Z", false);
+        let second = pr("second", "OPEN", "2027-01-16T09:00:00Z", false);
+        assert_eq!(
+            list(&[first.clone(), fork, second.clone(), old]).as_deref(),
+            Some("second")
+        );
+        assert_eq!(list(&[second, first]).as_deref(), Some("second"));
+        // No usable createdAt: can't tell whose it is.
+        let undated = serde_json::json!([{"url": "u", "state": "MERGED"}]);
+        assert_eq!(list(undated.as_array().unwrap()), None);
     }
 
     #[test]

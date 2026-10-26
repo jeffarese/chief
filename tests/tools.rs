@@ -362,7 +362,9 @@ esac
     std::fs::write(&bin, script).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    chief::claude::Claude { bin }
+    // No job state: these threads never entered a worktree.
+    let config_dir = dir.join("claude-config");
+    chief::claude::Claude { bin, config_dir }
 }
 
 /// A `claude --bg` that timed out or printed no id may still have started the session: chief

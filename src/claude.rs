@@ -77,6 +77,8 @@ pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Claude {
     pub bin: PathBuf,
+    /// Claude Code's config folder (`claude_dir`), where background sessions' job state lives.
+    pub config_dir: PathBuf,
 }
 
 impl Claude {
@@ -84,7 +86,21 @@ impl Claude {
         let bin = std::env::var_os("CHIEF_CLAUDE_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        Claude { bin }
+        Claude::new(bin)
+    }
+
+    /// `bin` with the config folder from the environment.
+    pub fn new(bin: PathBuf) -> Self {
+        Claude {
+            bin,
+            config_dir: claude_dir(),
+        }
+    }
+
+    /// The worktree a background session works in, as its job state records it: the folder
+    /// `claude rm` deletes (ARCHITECTURE §12). None without a state file or a `worktreePath`.
+    pub fn job_worktree(&self, short_id: &str) -> Option<PathBuf> {
+        job_worktree(&self.config_dir, short_id)
     }
 
     /// Fails when `claude --version` is older than MIN_VERSION.
@@ -415,10 +431,44 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// `$CHIEF_CLAUDE_CONFIG`, else `~/.claude.json`.
+/// Claude Code's config folder: `$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (Claude
+/// Code's own override), else `~/.claude`.
+pub fn claude_dir() -> PathBuf {
+    for var in ["CHIEF_CLAUDE_DIR", "CLAUDE_CONFIG_DIR"] {
+        if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir);
+        }
+    }
+    dirs::home_dir().unwrap_or_default().join(".claude")
+}
+
+/// `<config_dir>/jobs/<short_id>/state.json` → `worktreePath`. A missing or unreadable file, or
+/// a short id that isn't a plain name, is None: no worktree chief may touch.
+pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
+    let plain = !short_id.is_empty()
+        && short_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !plain {
+        return None;
+    }
+    let state = config_dir.join("jobs").join(short_id).join("state.json");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()?;
+    json["worktreePath"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `$CHIEF_CLAUDE_CONFIG`, else `$CLAUDE_CONFIG_DIR/.claude.json` (where Claude Code keeps it
+/// when that folder is set, one per account), else `~/.claude.json`.
 pub fn claude_config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("CHIEF_CLAUDE_CONFIG") {
         return PathBuf::from(p);
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir).join(".claude.json");
     }
     dirs::home_dir().unwrap_or_default().join(".claude.json")
 }
@@ -716,6 +766,33 @@ mod tests {
             parse_rm("abc", false, "", "error: no session abc\n"),
             RmOutcome::Other(t) if t == "error: no session abc"
         ));
+    }
+
+    #[test]
+    fn job_worktree_comes_from_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |short: &str, json: &str| {
+            let job = dir.path().join("jobs").join(short);
+            std::fs::create_dir_all(&job).unwrap();
+            std::fs::write(job.join("state.json"), json).unwrap();
+        };
+        write(
+            "a1b2c3d4",
+            r#"{"state":"done","daemonShort":"a1b2c3d4","worktreePath":"/r/.claude/worktrees/fix"}"#,
+        );
+        write("e5f6", r#"{"state":"done","bgIsolation":"none"}"#);
+        write("bad", "{");
+        let claude = Claude {
+            bin: "claude".into(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        assert_eq!(
+            claude.job_worktree("a1b2c3d4"),
+            Some(PathBuf::from("/r/.claude/worktrees/fix"))
+        );
+        for short in ["e5f6", "bad", "missing", "", "../a1b2c3d4", "a1b2c3d4/x"] {
+            assert_eq!(claude.job_worktree(short), None, "{short:?}");
+        }
     }
 
     #[test]

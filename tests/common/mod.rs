@@ -38,7 +38,33 @@ impl Fake {
     }
 
     pub fn claude(&self) -> Claude {
-        Claude { bin: self.bin() }
+        Claude {
+            bin: self.bin(),
+            config_dir: self.config_dir(),
+        }
+    }
+
+    /// The Claude Code config folder this fake stands for (`CHIEF_CLAUDE_DIR`).
+    pub fn config_dir(&self) -> PathBuf {
+        self.dir.path().join("claude-dir")
+    }
+
+    /// Writes the job state of background session `short`, with `worktreePath` when given.
+    pub fn job(&self, short: &str, worktree: Option<&Path>) -> &Self {
+        let dir = self.config_dir().join("jobs").join(short);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = serde_json::json!({"daemonShort": short, "state": "done"});
+        if let Some(wt) = worktree {
+            state["worktreePath"] = wt.to_string_lossy().into_owned().into();
+        }
+        std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+        self
+    }
+
+    /// Removes a job's state, as `claude rm` does.
+    pub fn drop_job(&self, short: &str) -> &Self {
+        let _ = std::fs::remove_dir_all(self.config_dir().join("jobs").join(short));
+        self
     }
 
     pub fn set(&self, file: &str, text: &str) -> &Self {
@@ -134,9 +160,12 @@ impl Home {
         std::fs::write(&trust, "{}").unwrap();
         let gh = Fake::named("gh");
         gh.set("pr.stdout", "[]");
+        // No Rex server: every command chief starts with fails.
         let rex = Fake::named("rex");
         rex.set("list.exit", "1")
-            .set("list.stderr", "Error: no Rex server is running\n");
+            .set("list.stderr", "Error: no Rex server is running\n")
+            .set("new.exit", "1")
+            .set("new.stderr", "Error: no Rex server is running\n");
         Home {
             home,
             fake: Fake::new(),
@@ -158,7 +187,10 @@ impl Home {
             .env("CHIEF_GH_BIN", self.gh.bin())
             .env("CHIEF_REX_BIN", self.rex.bin())
             .env("CHIEF_CLAUDE_CONFIG", &self.trust)
+            .env("CHIEF_CLAUDE_DIR", self.fake.config_dir())
             .env("CHIEF_NO_NOTIFY", "1")
+            // A developer's own account folder must not leak into the generated files.
+            .env_remove("CLAUDE_CONFIG_DIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

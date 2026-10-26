@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::claude::{self, Claude, RESOLVE_TIMEOUT};
-use crate::cleanup::{self, Ctx, Mode, Outcome};
+use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
 use crate::config::ProjectConfig;
 use crate::mux::rex::Rex;
 use crate::pr::Gh;
@@ -96,9 +96,7 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
 fn wake(src: &Sources, name: &str) -> Result<Msg> {
     let conn = db::open(&src.db)?;
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
-    let claude = Claude {
-        bin: src.claude_bin.clone(),
-    };
+    let claude = src.claude();
     let trust_config = claude::claude_config_path();
     let ctx = ToolCtx {
         conn: &conn,
@@ -131,9 +129,7 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
 
 fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
     let conn = db::open(&src.db)?;
-    let claude = Claude {
-        bin: src.claude_bin.clone(),
-    };
+    let claude = src.claude();
     let gh = Gh::new(src.gh_bin.clone());
     let ctx = Ctx {
         conn: &conn,
@@ -141,25 +137,63 @@ fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
         gh: &gh,
         now: db::now_ms,
     };
-    Ok(match (cleanup::clean(&ctx, name, mode)?, mode) {
+    let discarding = matches!(mode, Mode::Discard(_));
+    Ok(match (cleanup::clean(&ctx, name, mode)?, discarding) {
         (Outcome::Cleaned, _) => Msg::Done(format!("Cleaned up {name}.")),
         (Outcome::AlreadyCleaned, _) => Msg::Done(format!("{name} is already cleaned up.")),
-        (Outcome::Blocked(why), Mode::Safe) => Msg::CleanBlocked {
-            name: name.to_string(),
-            loss: loss(&conn, name, &why)?,
-        },
-        (Outcome::Blocked(why), Mode::Discard) => {
+        (Outcome::InProgress, _) => Msg::Done(format!("{name}: {}.", cleanup::IN_PROGRESS)),
+        (Outcome::Blocked(why), false) => {
+            let (loss, confirmed) = loss(&conn, &claude, name, &why)?;
+            Msg::CleanBlocked {
+                name: name.to_string(),
+                loss,
+                confirmed,
+            }
+        }
+        (Outcome::Blocked(why), true) => {
             Msg::Done(format!("{name} is still not cleaned up: {why}"))
         }
     })
 }
 
-/// What the confirmation shows: why the safe cleanup stopped and what discarding would lose.
-fn loss(conn: &Connection, name: &str, why: &str) -> Result<String> {
+/// What the modal shows after a safe cleanup stopped, and the inspection a discard would act on.
+/// A discard is offered only for a loss chief lists itself; when `claude rm` refused over work
+/// chief can't see, or the worktree couldn't be read, the modal says why and offers none.
+fn loss(
+    conn: &Connection,
+    claude: &Claude,
+    name: &str,
+    why: &str,
+) -> Result<(String, Option<Inspection>)> {
     let row = db::get_session(conn, name)?.with_context(|| format!("no thread named {name}"))?;
-    let detail = match cleanup::inspect(&row) {
-        Ok(ins) => cleanup::render_loss(name, &ins),
-        Err(e) => format!("Could not inspect the worktree: {e:#}\n"),
-    };
-    Ok(format!("Cleanup stopped: {why}.\n{detail}"))
+    Ok(match cleanup::inspect(claude, &row) {
+        Ok(ins) if ins.blocker().is_some() => (
+            format!(
+                "Cleanup stopped: {why}.\n{}",
+                cleanup::render_loss(name, &ins)
+            ),
+            Some(ins),
+        ),
+        Ok(ins) => {
+            let seen = match &ins.worktree {
+                Some(wt) => format!("chief sees nothing unsaved in {}", wt.display()),
+                None => "chief knows no worktree of this thread".to_string(),
+            };
+            (
+                format!(
+                    "Cleanup blocked: {why}.\n{seen}, so it can't show what a discard would \
+                     lose and offers none. Push or commit the work, or remove the session \
+                     yourself with claude rm.\n"
+                ),
+                None,
+            )
+        }
+        Err(e) => (
+            format!(
+                "Cleanup blocked: {why}.\nCould not inspect the worktree: {e:#}\nchief offers \
+                 no discard for work it can't see.\n"
+            ),
+            None,
+        ),
+    })
 }

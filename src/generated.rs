@@ -16,13 +16,16 @@ use crate::text::shell_quote;
 /// layout's blocks get them too (they start from the login shell's environment, §9).
 /// `CHIEF_HOME` is always written, as the resolved root: the supervisor doesn't have our
 /// `XDG_DATA_HOME` either.
-pub const PASSTHROUGH: [&str; 6] = [
+pub const PASSTHROUGH: [&str; 7] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
     "CHIEF_GH_BIN",
     "CHIEF_REX_BIN",
     "CHIEF_CLAUDE_CONFIG",
     "CHIEF_NO_NOTIFY",
+    // Claude Code's per-account config folder: each has its own supervisor, sessions, job state
+    // and trust file, and Rex blocks don't inherit this process's environment.
+    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Hook events chief records, with the PreToolUse/PostToolUse matcher where one applies.

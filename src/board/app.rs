@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::cleanup::Mode;
+use crate::cleanup::{Inspection, Mode};
 use crate::config::ProjectConfig;
 use crate::db::SessionRow;
 use crate::state::{Group, Role};
@@ -47,10 +47,12 @@ pub enum Msg {
     Done(String),
     /// A quick action's result for the status line; leaves `busy` alone.
     Notice(String),
-    /// A safe cleanup would lose work: ask before discarding it.
+    /// A safe cleanup stopped: ask before discarding what `confirmed` lists, or, when chief
+    /// can't list the loss itself (None), only say why.
     CleanBlocked {
         name: String,
         loss: String,
+        confirmed: Option<Inspection>,
     },
     Saved(Box<ProjectConfig>),
     SaveFailed(String),
@@ -80,6 +82,8 @@ pub struct Confirm {
     pub name: String,
     pub loss: String,
     pub input: String,
+    /// What typing the name discards; None: nothing chief can list, so no discard is offered.
+    pub confirmed: Option<Inspection>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,12 +198,17 @@ impl App {
                 self.status = Some(text);
             }
             Msg::Notice(text) => self.status = Some(text),
-            Msg::CleanBlocked { name, loss } => {
+            Msg::CleanBlocked {
+                name,
+                loss,
+                confirmed,
+            } => {
                 self.busy = None;
                 self.screen = Screen::Confirm(Confirm {
                     name,
                     loss,
                     input: String::new(),
+                    confirmed,
                 });
             }
             Msg::Saved(config) => {
@@ -419,6 +428,12 @@ impl App {
         let Screen::Confirm(confirm) = &mut self.screen else {
             return Vec::new();
         };
+        let Some(confirmed) = confirm.confirmed.clone() else {
+            // Nothing to confirm: the modal only explains, and any key closes it.
+            self.screen = Screen::Board;
+            self.status = Some("Not cleaned up; nothing was removed.".to_string());
+            return Vec::new();
+        };
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Board;
@@ -440,7 +455,7 @@ impl App {
                 self.busy = Some(format!("discarding and cleaning up {name}…"));
                 return vec![Action::Clean {
                     name,
-                    mode: Mode::Discard,
+                    mode: Mode::Discard(confirmed),
                 }];
             }
             _ => {}
@@ -682,6 +697,17 @@ pub(crate) mod tests {
         assert!(app.on_key(key(KeyCode::Enter)).is_empty());
     }
 
+    fn listed_loss() -> Inspection {
+        Inspection {
+            worktree: Some("/r/.claude/worktrees/done".into()),
+            exists: true,
+            unpushed_count: 1,
+            unpushed: vec!["abc123 Draft".into()],
+            head: Some("abc123".into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn discard_needs_the_thread_name_typed() {
         let mut app = app_with(vec![thread("done-1", Group::Resolved, 3)]);
@@ -690,6 +716,7 @@ pub(crate) mod tests {
         app.apply(Msg::CleanBlocked {
             name: "done-1".into(),
             loss: "This loses:\n  1 commit on no remote".into(),
+            confirmed: Some(listed_loss()),
         });
         assert_eq!(app.busy, None);
         assert!(matches!(app.screen, Screen::Confirm(_)));
@@ -712,7 +739,7 @@ pub(crate) mod tests {
             app.on_key(key(KeyCode::Enter)),
             [Action::Clean {
                 name: "done-1".into(),
-                mode: Mode::Discard
+                mode: Mode::Discard(listed_loss())
             }]
         );
         assert_eq!(app.screen, Screen::Board);
@@ -722,10 +749,43 @@ pub(crate) mod tests {
         app.apply(Msg::CleanBlocked {
             name: "done-1".into(),
             loss: "x".into(),
+            confirmed: Some(listed_loss()),
         });
         assert!(app.on_key(key(KeyCode::Esc)).is_empty());
         assert_eq!(app.screen, Screen::Board);
         assert!(app.status.as_deref().unwrap().contains("cancelled"));
+    }
+
+    /// When chief can't list what a discard would lose, the modal only explains: typing the name
+    /// discards nothing.
+    #[test]
+    fn a_blocked_modal_without_a_loss_list_never_discards() {
+        let mut app = app_with(vec![thread("done-1", Group::Resolved, 3)]);
+        app.apply(Msg::CleanBlocked {
+            name: "done-1".into(),
+            loss: "Cleanup blocked: 1 unpushed commit.".into(),
+            confirmed: None,
+        });
+        for c in "done-1".chars() {
+            assert!(app.on_key(ch(c)).is_empty());
+            if app.screen == Screen::Board {
+                break;
+            }
+        }
+        assert_eq!(app.screen, Screen::Board, "any key closes it");
+        app.apply(Msg::CleanBlocked {
+            name: "done-1".into(),
+            loss: "x".into(),
+            confirmed: None,
+        });
+        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.screen, Screen::Board);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("nothing was removed")
+        );
     }
 
     #[test]

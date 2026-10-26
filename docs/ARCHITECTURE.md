@@ -18,7 +18,14 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   under it, even one whose own entry is false, but not past a git repository's root: with `/`
   trusted, a plain folder worked and a fresh git repo was refused (verified live in M2b).
 - Before editing, a background thread moves into `<repo>/.claude/worktrees/<name>` on branch
-  `worktree-<name>`. `worktree.bgIsolation: "none"` in its settings turns that off.
+  `worktree-<name>`. `worktree.bgIsolation: "none"` in its settings turns that off. The
+  supervisor records it in `<claude dir>/jobs/<short_id>/state.json` → `worktreePath` (with
+  `worktreeBranch`); a session that never moved has no `worktreePath`. That file, not a hook's
+  `cwd`, is the source of truth for a thread's worktree (§12).
+- `CLAUDE_CONFIG_DIR` gives Claude Code a separate config folder (one per account): its own
+  `.claude.json` (trust), `jobs/` and supervisor, so `claude agents`, `attach` and `rm` only see that
+  folder's sessions. Unset, the folder is `~/.claude` and the config file `~/.claude.json`
+  (checked on this machine with two account folders).
 - `claude agents --json --all` rows: `id`, `sessionId`, `name`, `cwd`, `kind`, `startedAt`, `state`
   (seen: `working`, `blocked`, `done`; docs also list failed/stopped/idle), `status` (`busy`,
   `waiting`, `idle`, absent when the process is gone), `pid` (absent when the process is gone).
@@ -95,19 +102,24 @@ runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twi
 otherwise it prints `cd <folder> && claude` for each.
 
 `chief up` checks the version, rewrites `generated/*`, runs the coordinator step (§7), then opens
-the layout (§9). When Rex isn't installed or its server isn't running (or opening the layout fails)
+the layout (§9) and stores its session id in `ui_state.rex_session`. When Rex isn't installed or its server isn't running (or opening the layout fails)
 it prints why, `claude attach <short_id>`, and `chief board --project <slug>` to run in another
 terminal.
 
-`chief down <slug> [--stop-threads]` kills the `chief-<slug>` Rex session (exact id, if there is
-one), clears `ui_state.pane_showing`, syncs `claude agents` (stored rows if it fails), and runs
+`chief down <slug> [--stop-threads]` closes the Rex layout (§9 `close`: kills the session `chief up`
+created when it holds only chief's blocks, else closes just `main` and `board`), clears
+`ui_state.pane_showing` and `ui_state.pane_target` (the next `chief up` shows the coordinator; a
+pane back on the thread it last showed would respawn it right after `--stop-threads` stopped it),
+syncs `claude agents` (stored rows if it fails), and runs
 `claude stop` on the coordinator when it has a process; with `--stop-threads` also on every
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
 `chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
-each project's coordinator and threads grouped in board order. A thread's line ends with
-`cleaned up` or `cleanup blocked: <reason>` when §12 applies.
+each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
+its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>` (each when there is
+one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
+it was last active (`5m ago`, `just now`).
 
 ## 3. Files
 
@@ -138,7 +150,8 @@ hook command is shell-quoted.
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
 `CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
 `$XDG_DATA_HOME`, which the supervisor doesn't have, or from the default), and the variables
-`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY` are
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG`, `CHIEF_NO_NOTIFY` and
+`CLAUDE_CONFIG_DIR` (§1: every chief process must talk to the same account's supervisor) are
 written when set at generation time: as `K='v'` prefixes on every hook command and in the MCP
 server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or
 `CHIEF_REX_BIN` without a slash is kept for PATH lookup). Rex blocks start from the login shell's
@@ -246,7 +259,11 @@ CREATE TABLE sessions (                   -- coordinator and threads
   last_hook_at    INTEGER,                -- when last_hook ran (migration 2); see §5 sync
   gone_at         INTEGER,                -- when a snapshot no older than the last hook showed no process (migration 3)
   cleaned_at      INTEGER,                -- when the session, worktree and local branch were removed, §12 (migration 4)
-  cleanup_blocked TEXT                    -- why the last cleanup kept it, e.g. '2 unpushed commits' (migration 4)
+  cleanup_blocked TEXT,                   -- why the last cleanup kept it, e.g. '2 unpushed commits' (migration 4)
+  synced_at       INTEGER,                -- taken-at of the newest snapshot applied; older ones are ignored, §5 (migration 6)
+  ids_at          INTEGER,                -- when short_id or session_id last changed; db::update_session stamps it (migration 6)
+  removed_at      INTEGER,                -- when a sync found the session removed outside chief, §5 (migration 6)
+  cleaning_at     INTEGER                 -- cleanup claim: when a process claimed it, §12 (migration 7; not in SessionRow)
 );
 
 CREATE TABLE events (
@@ -279,7 +296,8 @@ CREATE TABLE guard_denials (
 CREATE TABLE ui_state (
   project_slug TEXT PRIMARY KEY,
   pane_target  TEXT,                      -- session name the left pane should show
-  pane_showing TEXT                       -- session `chief pane` is attached to now; NULL between attaches (migration 5)
+  pane_showing TEXT,                      -- session `chief pane` is attached to now; NULL between attaches (migration 5)
+  rex_session  TEXT                       -- id of the Rex session `chief up` created, §9 (migration 8)
 );
 ```
 
@@ -352,19 +370,32 @@ again automatically; reopening also sets `last_activity_at`): `pr_state = MERGED
 (`merged`); no activity for 7 days and not working or waiting → resolved (`inactive`).
 
 Sync (`src/registry.rs`, run with each `claude agents` snapshot and the time it was taken, read just
-before running the command): match each project session by `session_id`, or by `short_id` = row
-`id` while `session_id` is NULL (then store it). Matched rows get `cc_state`, `cc_status`, `pid` and
-`cc_fresh = 1`; unmatched rows get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`.
-Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve.
+before running the command): match each project session by `session_id`, else by `short_id` = row
+`id`. A row matched by short id under another session id (after `/clear`) takes the new
+`session_id`, unless another registered row already has it; a row without a `session_id` stores
+the listed one. Matched rows get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows
+get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. Rows with neither id (not
+spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
+`synced_at` = taken-at of the newest snapshot applied to it: a snapshot older than that is ignored
+for the row (polls from the board, hooks and the CLI run in separate processes and may commit out
+of order). A poll that changes nothing else moves only the watermark (`updated_at` stays).
 
 Removed outside chief: a stopped session stays listed in `claude agents --all`, and only
-`claude rm` takes one off. So a thread row that has a `session_id`, isn't cleaned, and is missing
-from a non-stale snapshot that lists at least one session was removed: it gets `cleaned_at` =
-taken-at, `cleanup_blocked = NULL`, and, if it wasn't resolved, `resolved = 1` with
-`resolved_reason = 'removed'`. An empty list never counts: chief can't tell "every session was
-removed" from a supervisor that lists nothing for a moment, and a wrong verdict would lock the
-thread out for good (§12). The coordinator is normally listed, so this only delays the verdict.
-The coordinator row is never marked.
+`claude rm` takes one off. So a thread row that has a `session_id`, isn't cleaned or already
+marked removed, and is missing from a non-stale snapshot (neither its `session_id` nor its
+`short_id` listed) was removed, but only when the snapshot can know that: it was taken after the
+row was created and after its ids were last set (`ids_at`), and it lists at least one other
+session registered in this chief home (any project). A snapshot that lists none of them comes from
+another Claude config or supervisor, or from one that lists nothing for a moment; a wrong verdict
+would lock the thread out (§12). The coordinator is normally listed, so this only delays the
+verdict. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
+`resolved_reason = 'removed'`. When its worktree is gone too (job state names none, §12, or the
+folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
+otherwise `cleanup_blocked = 'session removed outside chief; worktree remains at <path>'`, and a
+later sync that finds that folder gone sets `cleaned_at`. The coordinator row is never marked.
+If a later snapshot lists the session again, the sync undoes only what it did: `removed_at`
+cleared, `cleaned_at` cleared when it equals `removed_at`, `resolved`/`resolved_reason` cleared when
+the reason is `removed`, and the `session removed outside chief…` `cleanup_blocked` cleared.
 
 A snapshot taken before a row's last hook (`last_hook_at` > taken-at) is stale for that row: it keeps
 `cc_fresh = 0` and its `cc_state`/`cc_status`, so the hook's provisional group stands. Ids are still
@@ -509,7 +540,8 @@ stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it 
 
 Trust (`claude::is_trusted`) walks up both the path as given and its canonical form (macOS `/tmp`
 is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on the way
-counts. It reads `$CHIEF_CLAUDE_CONFIG` instead of `~/.claude.json` when set.
+counts. It reads `$CHIEF_CLAUDE_CONFIG` when set, else `$CLAUDE_CONFIG_DIR/.claude.json` when that
+is set (§1), else `~/.claude.json`.
 
 ### Coordinator spawn (`chief up`)
 
@@ -583,7 +615,7 @@ with a marker, then the board itself.
 
 ```rust
 pub trait Mux {
-    fn find_session(&self, label: &str) -> Result<Option<SessionRef>>;   // exact label; Err = not installed / not running
+    fn has_session(&self, s: &SessionRef) -> Result<bool>;                // by id, never by label; Err = not installed / not running
     fn create_session(&self, label: &str, first: &BlockSpec) -> Result<(SessionRef, BlockRef)>;
     fn run_block(&self, s: &SessionRef, spec: &BlockSpec) -> Result<BlockRef>; // split, ratio, label, cwd, cmd, focus
     fn blocks(&self, s: &SessionRef) -> Result<Vec<BlockInfo>>;            // id + label
@@ -605,19 +637,27 @@ timeout: `rex list --json`; `rex new <label> --cwd <dir> --keep-open --json -- <
 -- <cmd>`; `rex block ls -s <s> --json`; `rex block call -b <b> process` (running while it lists a
 `child`); `rex block close <b>`; `rex send-key -b <b> <key>`; `rex focus <b>`; `rex kill <s>`; and
 `rex do session.select session_id=<s>` for `show` (a client action: Rex picks the app when exactly
-one is connected, and fails otherwise). chief only touches the session labelled `chief-<slug>`, by
-its exact id.
+one is connected, and fails otherwise). chief only touches the session `chief up` created, by the
+id it stored in `ui_state.rex_session` (migration 8): a session that merely carries the label
+`chief-<slug>` may be the user's, and is never reused, sent keys or killed.
 
 `src/layout.rs` builds the layout over any `Mux`: session `chief-<slug>`, block `main` running
 `chief pane --project <slug>`, block `board` split right of it at 32 % running
 `chief board --project <slug>`, both with the project folder as cwd. Each command is the canonical
 chief path, behind `env K=V…` with the §3 passthrough variables when any is set. `open`:
 
-1. No session `chief-<slug>`: create it with `main`, add `board` with `--focus=false`.
+1. No stored session, or the stored id is gone: create `chief-<slug>` with `main`, add `board`
+   with `--focus=false`. `up` stores the new id.
 2. Both blocks there and running: reuse.
 3. One running: close the other if it is there but ended, and run it again beside the running one
    (`board` right of `main` at 32 %, or `main` left of `board` at 68 %).
-4. Neither running: kill the session and create it again (closing its last block could end it).
+4. Neither running: run `main` in a new window of the same session first, then close the dead
+   `main`/`board` blocks (closing the last block first could end the session), then add `board`
+   beside the new `main`. The session may hold the user's blocks, so `open` never kills it.
+
+`close` (for `chief down`): nothing stored or the id gone → nothing to close. A session holding
+only `main` and `board` is killed and the stored id cleared; one that holds other blocks too (the
+user added them) keeps running with those, and only `main` and `board` are closed.
 
 Then focus `main` and `show` the session. When `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
@@ -640,8 +680,13 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
    (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1.
 
-`q` while chief has the terminal ends the loop; so does the session being killed (the pty hangs
-up). On exit `pane_showing` is cleared.
+`q` while chief has the terminal ends the loop; so does the block being closed or the session
+killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
+`claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
+`SA_RESTART`, so the default action can't end it before cleanup: the interrupted wait passes
+SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either way; the loop
+then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
+thread).
 
 Ctrl+Z: the board switches by sending Ctrl+Z to `main`. Inside `claude attach` it detaches. While
 chief itself has the terminal, the terminal is in raw mode (ISIG off), so Ctrl+Z, Ctrl+C and
@@ -657,8 +702,9 @@ group, so the kernel discards terminal stop signals there anyway (verified in M4
 
 Board switching: write `pane_target`, then `pane::request_switch(mux, conn, slug)`: when
 `pane_showing` is NULL (between attaches, or no pane) or equals the target (NULL target = the
-coordinator's name), do nothing; otherwise find `chief-<slug>` and its `main` block and
-`send_key(main, "ctrl+z")`, or do nothing when either is missing (a board run on its own). The pane
+coordinator's name), do nothing; otherwise find the stored session (`ui_state.rex_session`) and
+its `main` block and `send_key(main, "ctrl+z")`, or do nothing when either is missing (a board run
+on its own). The pane
 writes `pane_showing` before its last read of the target and the board writes the target before
 reading `pane_showing`, so a switch that sends nothing is always seen by the pane's next read.
 
@@ -676,8 +722,9 @@ are tested without a terminal (`TestBackend`).
   the status line; a failing database read keeps the last rows. After each action the worker asks
   for an immediate re-read (database only). Every 30 s (first at start): `pr::refresh_project` with
   one `Gh` kept for the board's lifetime and `project.toml` re-read each time (§12), which runs
-  `gh pr list --head <branch> --state all --json url,state,isDraft,reviewDecision --limit 1`
-  in `repo_path` and, with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
+  `gh pr list --head <branch> --state all --json
+  url,state,isDraft,reviewDecision,createdAt,isCrossRepository --limit 10` in `repo_path` and,
+  with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
   (no `gh`, not logged in, no GitHub remote) stays in the status line; blocked and error counts
   prefix it (`PR 1 blocked, 2 errors · …`). At start the board deletes `events` older than 30 days
   (`db::prune_events`).
@@ -702,9 +749,12 @@ are tested without a terminal (`TestBackend`).
   (`tools::wake_thread`, refused for cleaned); r resolve or reopen (`registry::set_resolved`,
   reason `user`; reopening a cleaned thread is refused with its message); o open the PR URL
   (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
-  uncleaned thread: `cleanup::clean(Safe)`, and when blocked a modal shows why plus
-  `cleanup::render_loss` and runs `clean(Discard)` only after the thread's name is typed exactly
-  (Enter with a wrong name clears the input; Esc cancels); R show or hide resolved; Tab detail on
+  uncleaned thread: `cleanup::clean(Safe)`. When blocked, a fresh `cleanup::inspect` decides the
+  modal: if it lists the loss, "Discard unsaved work?" shows why plus `cleanup::render_loss` and
+  runs `clean(Discard(<that inspection>))` only after the thread's name is typed exactly (Enter
+  with a wrong name clears the input; Esc cancels); if it lists nothing or fails (`claude rm`
+  refused over work chief can't see), "Cleanup blocked" says `Cleanup blocked: <why>.` and why no
+  discard is offered, and any key closes it; R show or hide resolved; Tab detail on
   short terminals; s settings; ? help (any key closes); q or Ctrl+C quit the board only. Wake and
   cleanup run one at a time on a worker thread ("waking …" in the status line).
 - Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
@@ -740,8 +790,10 @@ are tested without a terminal (`TestBackend`).
   reaches the real one). Layout and switch logic is also tested against an in-memory `Mux`. `claude rm` outputs from the live
   M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
   remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
-  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_NO_NOTIFY=1` turns off
-  notifications.
+  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_CLAUDE_DIR` replaces
+  Claude Code's config folder (job state; checked before `CLAUDE_CONFIG_DIR`, never written into
+  generated files), `CLAUDE_CONFIG_DIR` is removed from the tests' environment, and
+  `CHIEF_NO_NOTIFY=1` turns off notifications.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
 
 ## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)
@@ -750,49 +802,83 @@ Resolving a thread keeps its session, worktree and branch. Cleanup removes them 
 `claude rm <short_id>` (§1), which deletes the worktree and the local branch and keeps any remote
 branch. The row stays, with its reports: `cleaned_at` is set and `cleanup_blocked` cleared.
 
-The worktree is the stored `cwd` (hooks report the latest; the worktree once the thread moved):
-`<repo>/.claude/worktrees/<name>` at or above it, confirmed with
-`git -C <cwd> rev-parse --show-toplevel` while it exists. Never a name derived from the thread's.
-A thread whose `cwd` never entered `.claude/worktrees/` has nothing of its own to lose.
+The worktree is the one `claude rm` itself deletes: the session's job state,
+`<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is
+`$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (as Claude Code reads it), else
+`~/.claude`. It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
+`git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
+answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
+anywhere, another thread's worktree included, and never a name derived from the thread's. No state
+file or no `worktreePath` means the thread has no worktree of its own: nothing to lose, and nothing
+is reset or cleaned.
 
 `inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s): whether the worktree
 exists, its branch (`git branch --show-current`, else `sessions.branch`),
 `git status --porcelain --untracked-files=normal` lines (ignored files aren't listed, as Claude
 Code ignores them), and unpushed commits as Claude Code means them:
 `git rev-list --count HEAD refs/heads/<branch> --not --remotes`, listed with
-`git log --format='%h %s' -n20 …`. When the worktree is gone, commits are checked in `repo_path`
-if the branch still exists there.
+`git log --format='%h %s' -n20 …`, and the head they end at (`git rev-parse HEAD`). When the
+worktree is gone, commits are checked in `repo_path` if the branch still exists there, and the
+head is the branch's sha.
 
 `clean(ctx, name, mode)`:
 
-1. Refresh from `claude agents` and sync (§5); if that finds the session removed, it is already
-   clean.
+0. Claim the thread (`db::claim_cleanup`, one `BEGIN IMMEDIATE` transaction on
+   `sessions.cleaning_at`, migration 7): already cleaned → `AlreadyCleaned`; claimed by another
+   process less than 10 minutes ago → `InProgress`, nothing run (the board's refresh skips it,
+   `chief gc` says `skipped  another chief process is cleaning it up`, the board's `x` and
+   `chief clean` say so too); an older claim was left by a process that died and is taken over.
+   Every path below releases the claim (`db::release_cleanup`, only if it is still this one's).
+1. Refresh from `claude agents` and sync (§5); if that finds the session removed with its
+   worktree, it is already clean. Removed outside chief with the worktree still there
+   (`removed_at` set, not cleaned): no `claude rm` (it has no session to remove); cleaned when the
+   job state's worktree is gone, otherwise blocked with `session removed outside chief; worktree
+   remains at <path>` (the folder is the user's to delete).
 2. Refuse (error, nothing run) unless the thread is resolved and, derived as if it weren't
-   resolved, neither working nor waiting: `claude rm` stops the session even when it refuses.
+   resolved, neither working nor waiting, and isn't the session `chief pane` shows
+   (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
+   `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
 4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
    in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
    `, `) and stop without calling `claude rm`.
-   `Discard` (the user confirmed): in a dirty worktree run `git -C <wt> reset --hard -q` and
-   `git -C <wt> clean -fdq` (never `-x`: ignored files stay).
-5. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
-   `--discard-unpushed <token>` from the refusal. Removed → cleaned. Unpushed → `N unpushed
-   commits`; dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in
-   `cleanup_blocked`.
+   `Discard(confirmed)` carries the inspection the user was shown and confirmed. It is refused
+   (stored in `cleanup_blocked`, nothing run) when a fresh `inspect` differs from it ("the
+   worktree changed after you confirmed …") or when the job state of another session registered
+   in this chief home names the same worktree; otherwise in a dirty worktree run
+   `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`: ignored files stay),
+   in step 5.
+5. Steps 1 and 2 again, with a fresh `claude agents`, right before anything is reset or
+   stopped (the thread may have got a message, or the pane attached to it, meanwhile); then the
+   `Discard` reset from step 4.
+6. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
+   `--discard-unpushed <token>` only when the confirmed inspection itself listed unpushed commits
+   and the token's head sha (`<sha>@<worktree-id>`) equals the head it saw (`git rev-parse HEAD`
+   in the worktree, else the branch's sha). Otherwise `claude rm` counts work nobody was shown,
+   and no destructive flag is ever passed. Removed → cleaned. Unpushed → `N unpushed commits`;
+   dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in
+   `cleanup_blocked`. A row that is cleaned by then (a sync found it removed) keeps its
+   `cleaned_at` and never gets a `cleanup_blocked`.
 
 `claude rm` output (`claude::parse_rm`): a `removed <id>` line is removed (exit status alone isn't:
 a stale token printed usage and exited 0); `kept <id> — …` with a `--discard-unpushed <hex>@<hex>`
 line is unpushed (its `unpushed commit` summary lines kept); `kept` with "uncommitted changes" is
 dirty; anything else is `Other` with the text.
 
-PR status (`pr.rs`): `Gh::poll(repo_path, branch)` runs the §10 `gh pr list` (10 s). A missing `gh`,
+PR status (`pr.rs`): `Gh::poll(repo_path, branch, since)` runs the §10 `gh pr list` (10 s) and
+takes the thread's PR: the newest listed one that isn't cross-repository (a fork's branch can share
+the name) and whose `createdAt` is no earlier than the thread row's `created_at` minus 5 minutes of
+clock skew. Worktree branches are named after threads, so a new thread can reuse the branch of an
+old one whose PR merged long ago; that PR must not resolve and clean the new thread. A PR without a
+readable `createdAt` is ignored. A missing `gh`,
 a `gh` that isn't logged in, or a repository without a GitHub remote is no PR plus a hint returned
 once per `Gh`; other failures are errors. `poll_project` polls threads that work in a worktree,
 have a branch and aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
 closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
 auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
 `cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is
-neither working nor waiting and has no `cleanup_blocked`: a blocked thread waits for the user, a
+neither working nor waiting nor showing in the pane and has no `cleanup_blocked`: a blocked
+thread waits for the user, a
 working one is tried again on the next refresh. `cleanup = "manual"` never cleans on its own.
 
 `chief gc [<slug>] [--dry-run]` per project: `poll_project`, sync `claude agents`, then
@@ -801,10 +887,13 @@ working one is tried again on the next refresh. `cleanup = "manual"` never clean
 per thread, or `nothing to clean`; warnings go to stderr. `--dry-run` still stores PR status, as
 the board would.
 
-`chief clean <slug> <thread>` runs `clean(Safe)` and fails with the reason and the `--discard`
-command when blocked. With `--discard` it checks step 2 first, prints what would be deleted and
-lost (`git status --short` lines, the unpushed commits), and, when something would be lost, asks
-`Type the thread name to confirm:` on a terminal; without one it refuses unless `--yes`.
+`chief clean <slug> <thread>` runs `clean(Safe)` and fails with the reason when blocked, plus the
+`--discard` command when `inspect` lists the loss, or else that chief can't list that work and
+won't discard it. With `--discard` it checks step 2 first, prints what would be deleted and lost
+(`git status --short` lines, the unpushed commits), and, when something would be lost, asks
+`Type the thread name to confirm:` on a terminal; without one it refuses unless `--yes`. It then
+runs `clean(Discard(<that inspection>))`, so "Nothing unsaved will be lost" never discards a
+commit `claude rm` reports.
 
 A cleaned thread can't be woken, reopened or messaged (§6, §7) and is hidden from `list_threads`
 unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the

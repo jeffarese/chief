@@ -158,6 +158,54 @@ fn init_creates_the_project() {
     );
 }
 
+/// With `CLAUDE_CONFIG_DIR` set (one folder per account), trust comes from that folder's
+/// `.claude.json`, and every generated command carries the folder: each account has its own
+/// supervisor, sessions and job state.
+#[test]
+fn init_follows_claude_config_dir() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    let account = home.path().join("claude-account");
+    std::fs::create_dir_all(&account).unwrap();
+    trust_file(&account.join(".claude.json"), &[&a, &b]);
+    let mut cmd = home.command(&[
+        "init",
+        "Payments Latency",
+        "--repo",
+        a.to_str().unwrap(),
+        "--repo",
+        b.to_str().unwrap(),
+    ]);
+    cmd.env_remove("CHIEF_CLAUDE_CONFIG")
+        .env("CLAUDE_CONFIG_DIR", &account);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let dir = project_dir(&home);
+    // Only the new project folder is untrusted; the repos are trusted in the account's file.
+    assert!(
+        text.contains(&format!("cd {} && claude", dir.display())),
+        "{text}"
+    );
+    for repo in [&a, &b] {
+        assert!(
+            !text.contains(&format!("cd {} && claude", repo.display())),
+            "{text}"
+        );
+    }
+    let mcp = read_json(&dir.join("generated/mcp.json"));
+    assert_eq!(
+        mcp["mcpServers"]["chief"]["env"]["CLAUDE_CONFIG_DIR"],
+        account.to_str().unwrap()
+    );
+    let coord = std::fs::read_to_string(dir.join("generated/coordinator-settings.json")).unwrap();
+    assert!(
+        coord.contains(&format!("CLAUDE_CONFIG_DIR={}", account.display())),
+        "{coord}"
+    );
+}
+
 #[test]
 fn init_rejects_bad_input_without_leaving_files() {
     let home = Home::new();
@@ -596,6 +644,40 @@ fn up_adopts_a_coordinator_left_by_an_unclear_spawn() {
     assert_eq!(row.short_id.as_deref(), Some("c0ffee"));
 }
 
+/// §2: the cleanup state comes after the PR, and every thread line ends with how long ago it was
+/// active.
+#[test]
+fn status_lines_show_cleanup_then_end_with_the_age() {
+    use chief::state::Role;
+    let now = 10 * 60 * 1000;
+    let thread = |name: &str| {
+        let mut t = db::SessionRow::new(name, SLUG, Role::Thread, 0);
+        t.resolved = true;
+        t.group_name = "resolved".into();
+        t.branch = Some("worktree-x".into());
+        t.pr_url = Some("https://github.com/o/r/pull/3".into());
+        t.last_activity_at = now - 5 * 60 * 1000;
+        t
+    };
+    let mut cleaned = thread("payments-latency-a-1111");
+    cleaned.cleaned_at = Some(1);
+    let mut blocked = thread("payments-latency-b-2222");
+    blocked.cleanup_blocked = Some("2 unpushed commits".into());
+    let text = chief::project::render_status(SLUG, &[cleaned, blocked], now);
+    let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("    ")).collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for (line, state) in lines
+        .iter()
+        .zip(["cleaned up", "cleanup blocked: 2 unpushed commits"])
+    {
+        assert!(
+            line.contains(&format!("PR https://github.com/o/r/pull/3 · {state} · ")),
+            "{line}"
+        );
+        assert!(line.ends_with(" ago"), "{line}");
+    }
+}
+
 /// A project whose coordinator runs (started by a first `up` that found no Rex).
 fn running_project(home: &Home) -> PathBuf {
     version_ok(home);
@@ -630,7 +712,11 @@ fn running_project(home: &Home) -> PathBuf {
         text.contains("Board, in another terminal: chief board --project payments-latency"),
         "{text}"
     );
-    home.rex.unset("list.exit").unset("list.stderr");
+    home.rex
+        .unset("list.exit")
+        .unset("list.stderr")
+        .unset("new.exit")
+        .unset("new.stderr");
     dir
 }
 
@@ -661,7 +747,8 @@ fn up_opens_then_reuses_the_rex_layout() {
     home.rex
         .set(
             "list.stdout",
-            r#"{"sessions": [{"session_id": "session:theirs", "label": "chief-payments-latency-x"}]}"#,
+            // Labelled like chief's, but chief never created it: not even looked at.
+            r#"{"sessions": [{"session_id": "session:theirs", "label": "chief-payments-latency"}]}"#,
         )
         .set(
             "new.stdout",
@@ -723,9 +810,6 @@ fn up_opens_then_reuses_the_rex_layout() {
     assert_eq!(
         calls,
         [
-            ["list", "--autostart=false", "--json"]
-                .map(String::from)
-                .to_vec(),
             new,
             [
                 "block",
@@ -751,6 +835,10 @@ fn up_opens_then_reuses_the_rex_layout() {
             .map(String::from)
             .to_vec(),
         ]
+    );
+    assert_eq!(
+        db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
+        Some("session:new")
     );
 
     // Open and running: shown again, nothing created. This time no single app takes it.
@@ -795,7 +883,8 @@ fn up_opens_then_reuses_the_rex_layout() {
             "do session.select",
         ]
     );
-    assert_eq!(home.rex.calls_of("new").len(), 1);
+    // The first `up` without a Rex server, then the one that created it.
+    assert_eq!(home.rex.calls_of("new").len(), 2);
     assert_eq!(home.rex.calls_of("run").len(), 1);
 }
 
@@ -815,6 +904,10 @@ fn down_closes_the_layout_and_stops_sessions() {
             db::insert_session(&conn, &t).unwrap();
         }
         db::set_pane_showing(&conn, SLUG, Some("chief-payments-latency")).unwrap();
+        db::set_rex_session(&conn, SLUG, Some("session:7")).unwrap();
+        // The pane showed a thread: the next `chief up` would wake it right after
+        // `--stop-threads` stopped it.
+        db::set_pane_target(&conn, SLUG, Some("payments-latency-a-1111")).unwrap();
     }
     home.fake.set(
         "agents.stdout",
@@ -837,11 +930,17 @@ fn down_closes_the_layout_and_stops_sessions() {
         ])
         .to_string(),
     );
-    home.rex.set(
-        "list.stdout",
-        r#"{"sessions": [{"session_id": "session:theirs", "label": "work"},
-                         {"session_id": "session:7", "label": "chief-payments-latency"}]}"#,
-    );
+    home.rex
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:theirs", "label": "chief-payments-latency"},
+                             {"session_id": "session:7", "label": "chief-payments-latency"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
 
     let out = home.run(&["down", SLUG], "");
     assert!(out.status.success(), "{}", stderr(&out));
@@ -858,6 +957,12 @@ fn down_closes_the_layout_and_stops_sessions() {
     );
     assert_eq!(home.fake.calls_of("stop"), [vec!["stop", "c0ffee"]]);
     assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(db::get_rex_session(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(
+        db::get_pane_target(&home.db(), SLUG).unwrap(),
+        None,
+        "back to the coordinator"
+    );
 
     // With --stop-threads only the live thread is stopped; nothing is ever removed. The layout
     // is gone now.
@@ -887,4 +992,46 @@ fn down_closes_the_layout_and_stops_sessions() {
     );
     assert!(home.fake.calls_of("rm").is_empty());
     assert_eq!(home.rex.calls_of("kill").len(), 1);
+
+    // chief's session now holds a block of the user's too: only main and board close.
+    db::set_rex_session(&home.db(), SLUG, Some("session:7")).unwrap();
+    home.rex
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:7", "label": "chief-payments-latency"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:logs", "label": "logs"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with(
+            "Closed chief's blocks in Rex session chief-payments-latency; it holds other blocks \
+             too, so it stays open.\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(home.rex.calls_of("kill").len(), 1);
+    let closed: Vec<Vec<String>> = home
+        .rex
+        .calls_of("block")
+        .into_iter()
+        .filter(|c| c[1] == "close")
+        .collect();
+    assert_eq!(
+        closed,
+        [
+            vec!["block", "close", "block:main", "--autostart=false"],
+            vec!["block", "close", "block:board", "--autostart=false"]
+        ]
+    );
+    assert_eq!(
+        db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
+        Some("session:7")
+    );
 }
