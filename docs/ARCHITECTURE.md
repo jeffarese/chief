@@ -69,6 +69,12 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   and other folders stay writable. `Write(…)` and `NotebookEdit(…)` deny rules are useless: Claude
   Code prints "Deny rule Write(//…/**) never matches · use Edit(//…/**)" at startup (verified live
   on 2.1.310 with `--settings` and `--permission-mode auto`).
+- Also verified live on 2.1.310 (background, `--permission-mode auto`): with no deny rule a
+  session can write a project's `.claude/settings.json`, and `Edit(//<abs>/.claude/**)` blocks
+  it. A mid-path glob works: `Edit(//<abs>/projects/*/project.toml)` blocks
+  `projects/other/project.toml` while `projects/other/memory/note.md` stays writable. A file glob
+  works: `Edit(//<abs>/settings*.json)` blocks `settings.json` and `settings.local.json` while
+  `other.json` stays writable. So glob characters in a path are read as globs.
 
 Minimum Claude Code version: 2.1.310. `chief` checks `claude --version` on `init` and `up`.
 
@@ -200,13 +206,19 @@ for the default account's folder and config file (§11).
   call with exit 2, which Claude Code treats as a block and shows to the model. The guard's entry
   also sets `"timeout": 30` (seconds; the time budget is in §6). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
   `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
-  and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<dir>/generated/**)`,
-  `Edit(//<dir>/project.toml)` and `Edit(//<root>/chief.db*)` (the database and its -wal/-shm),
-  canonical paths, built in one place (`generated::coordinator_deny_rules`, syntax in
-  `generated::edit_deny_rule` and `edit_deny_files`). Per §1 that blocks Edit and Write there: a
-  routing slip can't edit a real checkout, the coordinator can't edit the files that hold its own
-  and its threads' guard, and settings and state stay the user's and chief's. Memory and
-  `instructions.md` stay editable.
+  and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<root>/projects/*/generated/**)`,
+  `Edit(//<root>/projects/*/project.toml)`, `Edit(//<dir>/.claude/**)` (its cwd's project
+  settings), `Edit(//<account dir>/settings*.json)` (the account's user settings: its
+  `claude_config_dir`, or the real `~/.claude` for the default account, never a test override)
+  and `Edit(//<root>/chief.db*)` (the database and its -wal/-shm), canonical paths, built in one
+  place (`generated::coordinator_deny_rules`, syntax in `generated::edit_deny_rule` and
+  `edit_deny_files`). Per §1 that blocks Edit and Write there: a routing slip can't edit a real
+  checkout; the coordinator can't edit the files that hold its own or its threads' guard, nor the
+  project.toml they are rewritten from, in this project or any other; it can't add hooks or
+  permissions through a project or user settings file; and state stays chief's. Memory and
+  `instructions.md` stay editable (another project's too). Since §1 shows paths in rules are read
+  as globs, `ProjectConfig::validate` (init, settings save, every load) refuses a repo path
+  holding `( ) * ? [ ] { } \` and says to rename or move the folder.
 - `mcp.json`: `{"mcpServers": {"chief": {"type": "stdio", "command": <chief>, "args": ["mcp",
   "--project", <slug>], "env": {...}}}}`.
 
@@ -464,8 +476,9 @@ An allow-list by byte-exact equality. `to` is never trimmed, case-folded or pars
 ref could deliver a message that the bare name would allow to another session. A denied `to` that
 contains `[` gets "Use the bare name, without a `[ref]`: chief matches names exactly, and a ref can
 pick another session." before the reason. Lookalikes (another case, U+FEFF, U+200B, a tab before
-the ref) and sessions the local `claude agents` doesn't list (other machines, cloud sessions,
-Remote Control, teammates, subagents) match nothing and are denied.
+the ref) and sessions the local `claude agents` of the project's account (§3) doesn't list (other
+machines, cloud sessions, other accounts, Remote Control, teammates,
+subagents) match nothing and are denied.
 
 Reachable (the identity check, for a thread under its name and for the coordinator under
 `chief-<slug>`): the snapshot entry for the row's `session_id` (its `short_id` while the
@@ -598,9 +611,10 @@ claude --bg --name chief-<slug> --model <m> --effort <e> --permission-mode auto
 
 Its tools: everything but Bash (disallowed) and ListAgents (the guard, §6). It reads the
 repositories (Read, Grep, Glob; they are `--add-dir`s) but can't edit them: `permissions.deny`
-blocks Edit and Write in every repo and in `generated/` (§3), so it can edit only its own folder
-outside `generated/` (memory, `instructions.md`, `project.toml`). `SendMessage` goes through the
-guard; its chief MCP tools run without prompts.
+(§3) blocks Edit and Write in every repo, in every project's `generated/` and `project.toml`, in
+its own `.claude/`, in the account's `settings*.json` and on the database, so in its own folder it
+can edit only `memory/` and `instructions.md` (settings are the user's: the board's `s` or the
+file itself). `SendMessage` goes through the guard; its chief MCP tools run without prompts.
 
 No prompt: it waits for you. Started when it has no row or no `short_id` (the project folder must be
 trusted, and no other live session may already use the name). A failed spawn is handled as a

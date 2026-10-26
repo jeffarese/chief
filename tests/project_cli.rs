@@ -130,19 +130,22 @@ fn init_creates_the_project() {
     );
     let coord = read_json(&dir.join("generated/coordinator-settings.json"));
     assert_eq!(coord["worktree"]["bgIsolation"], "none");
-    // The coordinator can't edit the repositories or its own generated files; memory and
-    // instructions stay editable.
+    // The coordinator can't edit the repositories, any project's generated files or
+    // project.toml, its own .claude folder, the account's user settings or the database; memory
+    // and instructions stay editable.
+    let root = home.path().canonicalize().unwrap();
+    let user_claude = PathBuf::from(std::env::var("HOME").unwrap()).join(".claude");
+    let user_claude = user_claude.canonicalize().unwrap_or(user_claude);
     assert_eq!(
         coord["permissions"]["deny"],
         json!([
             format!("Edit(/{}/**)", a.display()),
             format!("Edit(/{}/**)", b.display()),
-            format!("Edit(/{}/generated/**)", dir.display()),
-            format!("Edit(/{}/project.toml)", dir.display()),
-            format!(
-                "Edit(/{}/chief.db*)",
-                home.path().canonicalize().unwrap().display()
-            ),
+            format!("Edit(/{}/projects/*/generated/**)", root.display()),
+            format!("Edit(/{}/projects/*/project.toml)", root.display()),
+            format!("Edit(/{}/.claude/**)", dir.display()),
+            format!("Edit(/{}/settings*.json)", user_claude.display()),
+            format!("Edit(/{}/chief.db*)", root.display()),
         ])
     );
     let thread = read_json(&dir.join("generated/thread-settings.json"));
@@ -423,6 +426,14 @@ fn init_rejects_bad_input_without_leaving_files() {
 
     let out = home.run(&["init", "!!!"], "");
     assert!(stderr(&out).contains("letter or digit"), "{}", stderr(&out));
+
+    // A repo path the coordinator's deny rule would read as a glob.
+    let globby = home.path().join("work[1]");
+    std::fs::create_dir_all(&globby).unwrap();
+    let out = home.run(&["init", "Demo", "--repo", globby.to_str().unwrap()], "");
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("rename or move"), "{}", stderr(&out));
+    assert!(!home.path().join("projects/demo").exists());
 
     home.fake.set("version.stdout", "2.1.300 (Claude Code)\n");
     let out = home.run(&["init", "Demo"], "");
@@ -765,7 +776,7 @@ fn respawn_rewrites_the_generated_files_first() {
         v["hooks"]["PreToolUse"][1]["matcher"],
         "SendMessage|ListAgents"
     );
-    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 5);
+    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 7);
 
     // Can't rewrite: no respawn.
     std::fs::remove_dir_all(dir.join("generated")).unwrap();

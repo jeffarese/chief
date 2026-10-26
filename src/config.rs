@@ -71,6 +71,9 @@ impl Default for UiSettings {
 }
 
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// Characters a permission rule reads as glob or syntax: a repo path holding one would widen or
+/// break the coordinator's deny rule for it.
+const RULE_GLOB_CHARS: [char; 9] = ['(', ')', '*', '?', '[', ']', '{', '}', '\\'];
 /// `bypassPermissions` is excluded: messages to such a session are held for approval.
 pub const THREAD_PERMISSION_MODES: [&str; 4] = ["auto", "acceptEdits", "manual", "plan"];
 
@@ -189,6 +192,21 @@ impl ProjectConfig {
         }
         if self.threads.max_parallel == 0 {
             bail!("threads.max_parallel must be at least 1");
+        }
+        for repo in &self.repos {
+            // Each repo becomes a permission-rule glob for the coordinator (§3).
+            if let Some(c) = repo
+                .path
+                .to_string_lossy()
+                .chars()
+                .find(|c| RULE_GLOB_CHARS.contains(c))
+            {
+                bail!(
+                    "the repo path {} contains {c:?}, which chief can't put in a permission rule \
+                     safely; rename or move the folder",
+                    repo.path.display()
+                );
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for repo in &self.repos {
@@ -359,6 +377,48 @@ notify = true
         let mut c = sample();
         c.threads.default_repo = None;
         c.validate().unwrap();
+    }
+
+    /// A repo path becomes a permission-rule glob (§3): these characters would widen or break the
+    /// coordinator's deny rule for it.
+    #[test]
+    fn validate_rejects_repo_paths_a_rule_cant_hold() {
+        for c in ['(', ')', '*', '?', '[', ']', '{', '}', '\\'] {
+            let mut config = sample();
+            config.repos[0].path = PathBuf::from(format!("/Users/me/work{c}space/api"));
+            let err = format!("{:#}", config.validate().unwrap_err());
+            assert!(err.contains("rename or move"), "{c}: {err}");
+            assert!(err.contains(&format!("{c:?}")), "{c}: {err}");
+        }
+        let mut config = sample();
+        config.repos[0].path = PathBuf::from("/Users/me/work space/api-2.0_x");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn claude_config_dir_must_be_absolute_and_reads_alone() {
+        let mut config = sample();
+        config.claude_config_dir = Some("relative/.claude".into());
+        assert!(config.validate().is_err());
+        config.claude_config_dir = Some("/Users/me/.claude-carlos".into());
+        config.validate().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.toml");
+        config.save(&path).unwrap();
+        assert_eq!(
+            ProjectConfig::read_account(&path).unwrap().as_deref(),
+            Some(Path::new("/Users/me/.claude-carlos"))
+        );
+        // Another key broken: the account still reads.
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("effort = \"high\"", "effort = \"ultra\"");
+        std::fs::write(&path, text).unwrap();
+        assert!(ProjectConfig::load(&path).is_err());
+        assert!(ProjectConfig::read_account(&path).unwrap().is_some());
+        std::fs::write(&path, "name = \"x\"\n").unwrap();
+        assert_eq!(ProjectConfig::read_account(&path).unwrap(), None);
     }
 
     #[test]
