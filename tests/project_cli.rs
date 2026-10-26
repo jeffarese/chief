@@ -366,6 +366,18 @@ fn status_takes_one_snapshot_per_account() {
         row.session_id = Some(format!("{short}-sid"));
         db::insert_session(&conn, &row).unwrap();
     }
+    // Threads in accounts of their own (§3): Alpha's in Beta's account, Gamma's in a third.
+    let cpb = common::account(home.path(), "claude-cpb");
+    for (name, slug, short, id, dir) in [
+        ("alpha-far-1111", "alpha", "f1", "carlos", &carlos),
+        ("gamma-far-2222", "gamma", "f2", "cpb", &cpb),
+    ] {
+        let mut row = db::SessionRow::new(name, slug, chief::state::Role::Thread, db::now_ms());
+        row.short_id = Some(short.into());
+        row.session_id = Some(format!("{short}-sid"));
+        common::in_account(&mut row, id, id, Some(dir));
+        db::insert_session(&conn, &row).unwrap();
+    }
     home.fake.set(
         "agents.stdout",
         &json!([
@@ -376,9 +388,17 @@ fn status_takes_one_snapshot_per_account() {
     );
     std::fs::write(
         carlos.join("fake-agents.stdout"),
-        json!([agent("b1", "b1-sid", "chief-beta", "done", Some(2))]).to_string(),
+        json!([
+            agent("b1", "b1-sid", "chief-beta", "done", Some(2)),
+            agent("f1", "f1-sid", "alpha-far-1111", "working", Some(4)),
+        ])
+        .to_string(),
     )
     .unwrap();
+    common::account_agents(
+        &cpb,
+        &[agent("f2", "f2-sid", "gamma-far-2222", "working", Some(5))],
+    );
     let before = home.fake.accounts().len();
     let out = home.run(&["status"], "");
     assert!(out.status.success(), "{}", stderr(&out));
@@ -409,9 +429,14 @@ fn status_takes_one_snapshot_per_account() {
         asked,
         [
             ("agents".to_string(), carlos.to_string_lossy().into_owned()),
+            ("agents".to_string(), cpb.to_string_lossy().into_owned()),
             ("agents".to_string(), "unset".to_string()),
         ]
     );
+    for (name, pid) in [("alpha-far-1111", 4), ("gamma-far-2222", 5)] {
+        let row = db::get_session(&home.db(), name).unwrap().unwrap();
+        assert_eq!(row.pid, Some(pid), "{name}");
+    }
 }
 
 #[test]
@@ -1303,6 +1328,55 @@ fn up_opens_a_tmux_window_and_down_closes_it() {
     let out = home.run(&["down", SLUG], "");
     assert!(stdout(&out).starts_with("No layout of chief's is open.\n"));
     assert_eq!(home.tmux.calls().len(), before);
+}
+
+#[test]
+fn down_stops_a_thread_in_its_own_account() {
+    let home = Home::new();
+    running_project(&home);
+    let cpb = common::account(home.path(), "claude-cpb");
+    {
+        let mut t = db::SessionRow::new(
+            "payments-latency-far-1111",
+            SLUG,
+            chief::state::Role::Thread,
+            db::now_ms(),
+        );
+        t.short_id = Some("f1".into());
+        t.session_id = Some("f1-sid".into());
+        common::in_account(&mut t, "cpb", "PB2", Some(&cpb));
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    common::account_agents(
+        &cpb,
+        &[agent(
+            "f1",
+            "f1-sid",
+            "payments-latency-far-1111",
+            "working",
+            Some(5),
+        )],
+    );
+    let before = home.fake.accounts().len();
+    let out = home.run(&["down", SLUG, "--stop-threads"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Stopped thread payments-latency-far-1111."),
+        "{text}"
+    );
+    let stops: Vec<_> = home.fake.accounts()[before..]
+        .iter()
+        .filter(|(first, _)| first == "stop")
+        .cloned()
+        .collect();
+    assert_eq!(
+        stops,
+        [
+            ("stop".to_string(), "unset".to_string()),
+            ("stop".to_string(), cpb.to_string_lossy().into_owned()),
+        ]
+    );
 }
 
 #[test]

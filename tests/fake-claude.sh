@@ -22,7 +22,10 @@
 # `new-window`) and `agp` (`status --json` has key `status`).
 dir=$(dirname "$0")
 mkdir -p "$dir/calls"
+# Numbers are taken with an exclusive create (noclobber), so calls running at once (chief lists
+# several accounts in parallel) never share one.
 n=$(ls "$dir/calls" | grep -c '^[0-9][0-9]*$')
+while ! (set -C; : > "$dir/calls/$n") 2>/dev/null; do n=$((n + 1)); done
 printf '%s\0' "$@" > "$dir/calls/$n"
 pwd > "$dir/calls/$n.cwd"
 echo $$ > "$dir/calls/$n.pid"
@@ -32,7 +35,9 @@ first=$1
 [ "$1" = "-S" ] && first=$3
 key=$(printf '%s' "$first" | sed 's/^-*//')
 count_file="$dir/$key.count"
-k=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+mkdir -p "$dir/$key.seq"
+k=$(( $(ls "$dir/$key.seq" | wc -l) + 1 ))
+while ! (set -C; : > "$dir/$key.seq/$k") 2>/dev/null; do k=$((k + 1)); done
 echo "$k" > "$count_file"
 
 account_stdout="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/fake-$key.stdout}"

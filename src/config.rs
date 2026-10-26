@@ -41,6 +41,19 @@ pub struct ThreadSettings {
     /// When chief removes a resolved thread's worktree and branch on its own (§12).
     #[serde(default)]
     pub cleanup: Cleanup,
+    /// The agp accounts a new thread may run in (§3, §7): `["auto"]` (the default) is every
+    /// account in agp's pool, else these agp profile ids (only those in the pool count). Empty,
+    /// or without agp, threads run in the project's account.
+    #[serde(default = "auto_accounts")]
+    pub accounts: Vec<String>,
+    /// A pool account whose 5-hour or weekly usage is at or over this percent takes no new
+    /// thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usage: Option<u32>,
+}
+
+fn auto_accounts() -> Vec<String> {
+    vec![crate::agp::AUTO.to_string()]
 }
 
 /// `threads.cleanup`: `merged` cleans a thread once its PR merged (never discarding work);
@@ -97,6 +110,8 @@ impl ProjectConfig {
                 max_parallel: 3,
                 default_repo,
                 cleanup: Cleanup::Merged,
+                accounts: auto_accounts(),
+                max_usage: None,
             },
             repos,
             ui: UiSettings::default(),
@@ -193,6 +208,19 @@ impl ProjectConfig {
         if self.threads.max_parallel == 0 {
             bail!("threads.max_parallel must be at least 1");
         }
+        if let Some(id) = self
+            .threads
+            .accounts
+            .iter()
+            .find(|id| id.trim().is_empty() || id.chars().any(char::is_whitespace))
+        {
+            bail!("threads.accounts entry {id:?} is not an agp account id");
+        }
+        if let Some(max) = self.threads.max_usage
+            && !(1..=100).contains(&max)
+        {
+            bail!("threads.max_usage {max} must be a percent from 1 to 100");
+        }
         for repo in &self.repos {
             // Each repo becomes a permission-rule glob for the coordinator (§3).
             if let Some(c) = repo
@@ -265,6 +293,8 @@ mod tests {
         assert_eq!(c.threads.max_parallel, 3);
         assert_eq!(c.threads.cleanup, Cleanup::Merged);
         assert_eq!(c.threads.default_repo.as_deref(), Some("payments-api"));
+        assert_eq!(c.threads.accounts, ["auto"]);
+        assert_eq!(c.threads.max_usage, None);
         assert!(
             ProjectConfig::new("x", "x", None, vec![])
                 .threads
@@ -325,8 +355,21 @@ notify = true
             PathBuf::from("/Users/me/workspace/payments-api")
         );
         assert!(c.ui.notify);
-        // Files from before `cleanup` existed get the default.
+        // Files from before `cleanup` and `accounts` existed get the defaults.
         assert_eq!(c.threads.cleanup, Cleanup::Merged);
+        assert_eq!(c.threads.accounts, ["auto"]);
+        assert_eq!(c.threads.max_usage, None);
+
+        let pooled = text.replace(
+            "max_parallel = 3\n",
+            "max_parallel = 3\naccounts = [\"cpb\", \"cpe\"]\nmax_usage = 80\n",
+        );
+        std::fs::write(&path, pooled).unwrap();
+        let c = ProjectConfig::load(&path).unwrap();
+        assert_eq!(
+            (c.threads.accounts, c.threads.max_usage),
+            (vec!["cpb".to_string(), "cpe".to_string()], Some(80))
+        );
 
         let manual = text.replace(
             "max_parallel = 3\n",
@@ -349,7 +392,7 @@ notify = true
     #[test]
     fn validate_rejects() {
         type Edit = fn(&mut ProjectConfig);
-        let cases: [(&str, Edit); 10] = [
+        let cases: [(&str, Edit); 14] = [
             ("empty name", |c| c.name = " ".into()),
             ("bad slug", |c| c.slug = "Payments Latency".into()),
             ("empty slug", |c| c.slug = String::new()),
@@ -368,6 +411,12 @@ notify = true
             ("unknown default repo", |c| {
                 c.threads.default_repo = Some("nope".into())
             }),
+            ("blank account", |c| c.threads.accounts = vec![" ".into()]),
+            ("account with a space", |c| {
+                c.threads.accounts = vec!["c pb".into()]
+            }),
+            ("max_usage 0", |c| c.threads.max_usage = Some(0)),
+            ("max_usage 101", |c| c.threads.max_usage = Some(101)),
         ];
         for (name, edit) in cases {
             let mut c = sample();
@@ -376,6 +425,8 @@ notify = true
         }
         let mut c = sample();
         c.threads.default_repo = None;
+        c.threads.accounts = vec![];
+        c.threads.max_usage = Some(100);
         c.validate().unwrap();
     }
 

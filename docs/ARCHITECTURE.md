@@ -148,8 +148,9 @@ syncs `claude agents` (stored rows if it fails), and runs
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
-`chief status [<slug>]` polls `claude agents` once per account among the projects shown (§3;
-stored rows if it fails), syncs each project with its account's snapshot (§5), and prints
+`chief status [<slug>]` polls `claude agents` once per account the projects shown use (their own
+accounts and their threads', §3; stored rows if it fails), syncs each project with those
+snapshots (§5), and prints
 each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
 its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>` (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
@@ -213,6 +214,20 @@ warning. Commands a user types to reach a session (`claude attach <id>`, `claude
 printed with the `CLAUDE_CONFIG_DIR=<dir> ` prefix for a non-default account. The board's settings
 screen shows the account read-only. `CHIEF_CLAUDE_DIR` and `CHIEF_CLAUDE_CONFIG` are test overrides
 for the default account's folder and config file (§11).
+
+**Threads in other accounts.** The coordinator always runs in the project's account; a thread
+may run in another, which `start_thread` picks from agp's pool when it starts (§7) and which
+never changes after. The row stores it (`account_id`, `account_label`, `account_dir`, §4); a row
+without `account_id` runs in the project's account (`SessionRow::account`). Every Claude Code
+call about a thread runs in the thread's account (`Claude::for_row`): its spawn, `attach` in the
+pane, `respawn` (wake, the pane), `stop` (`chief down --stop-threads`), `rm` (cleanup), its job
+state (worktree, branch, PR polling) and its trust check. Syncing takes one `claude agents` per
+account the project uses (the project's, plus the account of every thread not cleaned up;
+`accounts::in_use`), in parallel, and applies each listing only to the rows of its account
+(§5); a listing that fails leaves its account's rows as they were and is reported with the
+account's folder. This holds for the board, `list_threads`, the coordinator's context, `chief
+status`, `chief gc` and `chief down`; a command about one thread (wake, cleanup, the pane)
+lists only that thread's account.
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -328,7 +343,10 @@ CREATE TABLE sessions (                   -- coordinator and threads
   synced_at       INTEGER,                -- taken-at of the newest snapshot applied; older ones are ignored, §5 (migration 6)
   ids_at          INTEGER,                -- when short_id or session_id last changed; db::update_session stamps it (migration 6)
   removed_at      INTEGER,                -- when a sync found the session removed outside chief, §5 (migration 6)
-  cleaning_at     INTEGER                 -- cleanup claim: when a process claimed it, §12 (migration 7; not in SessionRow)
+  cleaning_at     INTEGER,                -- cleanup claim: when a process claimed it, §12 (migration 7; not in SessionRow)
+  account_id      TEXT,                   -- agp account id of a thread's own account, §3 (migration 10); NULL = the project's account
+  account_label   TEXT,                   -- that account's agp label, e.g. 'PB2', for display (migration 10)
+  account_dir     TEXT                    -- that account's config folder; NULL with an account_id = the default account (migration 10)
 );
 
 CREATE TABLE events (
@@ -437,8 +455,10 @@ again automatically; reopening also sets `last_activity_at`): `pr_state = MERGED
 (`merged`); no activity for 7 days and not working or waiting → resolved (`inactive`).
 
 Sync (`src/registry.rs`, run with each `claude agents` snapshot and the time it was taken, read just
-before running the command): match each project session by `session_id`, else by `short_id` = row
-`id`. A row matched by short id under another session id (after `/clear`) takes the new
+before running the command): a snapshot is one account's (§3), and it is applied only to the
+project's sessions that run in that account (`SessionRow::account`); it says nothing about the
+others, which keep their state and watermark. Match each such session by `session_id`, else by
+`short_id` = row `id`. A row matched by short id under another session id (after `/clear`) takes the new
 `session_id`, unless another registered row already has it; a row without a `session_id` stores
 the listed one. Matched rows get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows
 get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. A thread's `branch` is its job
@@ -458,7 +478,9 @@ row was created and after its ids were last set (`ids_at`), and it lists at leas
 registered session of the same project (normally its coordinator). A snapshot that lists none of
 them comes from another account's supervisor (another project of this chief home may live in it,
 §3), or from one that lists nothing for a moment; a wrong verdict would lock the thread out (§12). The coordinator is normally listed, so this only delays the
-verdict. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
+verdict. A thread in another account than the project's is judged only by its own account's
+snapshot, where the coordinator isn't: there, the verdict needs another of the project's
+threads listed in that account, and without one there is none. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
 `resolved_reason = 'removed'`. When its worktree is gone too (job state names none, §12, or the
 folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
 otherwise `cleanup_blocked = 'session removed outside chief; worktree remains at <path>'`, and a
@@ -794,7 +816,8 @@ macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are
 3. Write `pane_showing = <name>`, then read the target again; if it changed, clear
    `pane_showing` and start over (see board switching below).
 4. Drain queued keys (`q` quits), restore the terminal mode the pane started in but with ISIG off,
-   run `claude attach <short_id>` as a child on the same TTY, wait (polling `waitpid(WNOHANG)`
+   run `claude attach <short_id>` as a child on the same TTY, in the target's own account (§3:
+   a thread in another account is attached, polled and respawned there), wait (polling `waitpid(WNOHANG)`
    every 50 ms, so a signal flag set at any moment is seen), take raw mode back, clear
    `pane_showing`.
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
@@ -939,7 +962,8 @@ are tested without a terminal (`TestBackend`).
   the tests' environment unless a test sets it, and `CHIEF_NO_NOTIFY=1` turns off notifications.
   The fake records each call's `CLAUDE_CONFIG_DIR` (`calls/<n>.env`) and serves
   `$CLAUDE_CONFIG_DIR/fake-<key>.stdout[.<k>]` before its own canned output, so each account has
-  its own sessions.
+  its own sessions. It numbers calls with exclusive creates, since chief lists several accounts
+  at once (§3).
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
 
 ## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)
@@ -950,8 +974,9 @@ branch. The row stays, with its reports: `cleaned_at` is set and `cleanup_blocke
 
 The worktree is the one `claude rm` itself deletes: the session's job state,
 `<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is the
-project's account folder (§3: `claude_config_dir`, or for the default account `$CHIEF_CLAUDE_DIR`
-in tests, else `~/.claude`). It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
+thread's account folder (§3: its own account's, else the project's `claude_config_dir`, or for
+the default account `$CHIEF_CLAUDE_DIR` in tests, else `~/.claude`); its refresh (step 1) and
+its `claude rm` run in that account too. It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
 `git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
 answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
 anywhere, another thread's worktree included, and never a name derived from the thread's. No state
@@ -986,7 +1011,7 @@ head is the branch's sha.
    `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
 4. Either mode: when the job state of another session registered in this chief home (read in
-   that session's own project's account folder) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
+   that session's own account folder: its own account's, else its project's) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
    `cleanup_blocked` and stop without calling `claude rm` (it would delete the worktree and its
    branch under that session); `chief gc --dry-run` reports it as blocked, and neither the board
    nor `chief clean` offers a discard for it (they say to finish and clean up the other thread

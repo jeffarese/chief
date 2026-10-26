@@ -26,10 +26,10 @@ use ratatui::crossterm::style::Print;
 use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use rusqlite::Connection;
 
-use crate::claude::Claude;
+use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
-use crate::{names, paths, proc, project, registry};
+use crate::{accounts, names, paths, proc, project};
 
 /// How often a failed attach is retried.
 const RETRY: Duration = Duration::from_millis(500);
@@ -182,7 +182,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
         let name = row.name.clone();
         let short_id = row.short_id.clone().context("target has no short id")?;
         tty.say(&format!("chief · {name} …"))?;
-        if let Err(e) = wake(conn, claude, project, (&dir, &config), &row, tty) {
+        if let Err(e) = wake(conn, claude, (&dir, &config), &row, tty) {
             tty.say(&format!("chief · {name}: {e:#} · retrying · q quits"))?;
             if tty.quit_pressed(RETRY)? {
                 return Ok(());
@@ -212,7 +212,8 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
                     .map(|r| r.map(|r| r.name).as_deref() != Some(name.as_str()))
                     .unwrap_or(true)
         };
-        let attached = attach(claude, &short_id, &switch);
+        // In the session's own account: no other account's supervisor knows it.
+        let attached = attach(&claude.for_row(&row), &short_id, &switch);
         if HUNG_UP.load(Ordering::SeqCst) {
             // Nothing left to draw on; `run` clears `pane_showing`.
             return Ok(());
@@ -244,27 +245,19 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
 }
 
 /// Respawns `row` when `claude agents` shows no process for it and waits for one, from the
-/// project.toml just read. A failing `claude agents` is no reason not to try attaching.
+/// project.toml just read (`claude` is the project's account). A failing `claude agents` is no
+/// reason not to try attaching.
 fn wake(
     conn: &Connection,
     claude: &Claude,
-    project: &str,
     (dir, config): (&Path, &ProjectConfig),
     row: &SessionRow,
     tty: &Tty,
 ) -> Result<()> {
-    let taken_at = db::now_ms();
-    let Ok(snapshot) = claude.agents() else {
+    // Its own account's `claude agents` is the one that can see it.
+    if accounts::refresh_row(conn, claude, row, AGENTS_TIMEOUT, db::now_ms).is_err() {
         return Ok(());
-    };
-    registry::sync_in(
-        conn,
-        project,
-        &snapshot,
-        taken_at,
-        db::now_ms(),
-        &claude.config_dir,
-    )?;
+    }
     let row =
         db::get_session(conn, &row.name)?.with_context(|| format!("{} vanished", row.name))?;
     if row.pid.is_some() {

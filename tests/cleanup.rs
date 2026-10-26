@@ -312,6 +312,41 @@ fn safe_clean_removes_a_thread_with_nothing_to_lose() {
     assert_eq!(env.rm_calls().len(), 1);
 }
 
+/// A thread in another account (§3, §12): its job state, its `claude agents` and its
+/// `claude rm` are all that account's; the project's account knows nothing of it.
+#[test]
+fn a_thread_in_another_account_is_cleaned_there() {
+    let env = Env::new();
+    let cpb = common::account(env._root.path(), "cpb");
+    env.insert(|r| common::in_account(r, "cpb", "PB2", Some(&cpb)));
+    // The project's account lists only its coordinator and has no job state for the thread.
+    env.claude.drop_job(SHORT);
+    env.agents(&[agent("c1", "c-sid", "chief-demo", "done", Some(1))]);
+    common::job_in(&cpb, SHORT, Some(&env.worktree), Some("worktree-add-notes"));
+    common::account_agents(&cpb, &[agent(SHORT, SID, NAME, "done", None)]);
+
+    let ins = env.inspect();
+    assert_eq!(
+        ins.worktree.as_deref(),
+        Some(env.worktree.as_path()),
+        "read from the thread's account"
+    );
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::Cleaned);
+    let cpb_path = cpb.to_string_lossy().into_owned();
+    let calls: Vec<_> = env
+        .claude
+        .accounts()
+        .into_iter()
+        .filter(|(first, _)| first == "rm" || first == "agents")
+        .collect();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(|(_, account)| *account == cpb_path),
+        "{calls:?}"
+    );
+    assert!(env.row().cleaned_at.is_some());
+}
+
 #[test]
 fn safe_clean_never_stops_a_thread_it_would_not_remove() {
     let env = Env::new();

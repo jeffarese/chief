@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::claude::Claude;
+use crate::accounts;
+use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::cleanup::Ctx;
 use crate::config::ProjectConfig;
 use crate::db;
 use crate::pr::{self, Gh};
-use crate::registry;
 
 use super::app::{Msg, PrSummary, Snapshot};
 
@@ -139,17 +139,11 @@ fn open(path: &Path, tx: &Sender<Msg>) -> Option<Connection> {
     }
 }
 
-/// One 2 s refresh: `claude agents`, sync, read. A failing `claude agents` still sends the stored
-/// rows, with the error.
+/// One 2 s refresh: `claude agents` in every account the project uses, sync, read. A failing
+/// `claude agents` still sends the stored rows, with the error.
 pub fn tick(conn: &Connection, claude: &Claude, slug: &str) -> Msg {
-    let taken_at = db::now_ms();
-    let error = match claude.agents() {
-        Ok(snapshot) => {
-            let now = db::now_ms();
-            registry::sync_in(conn, slug, &snapshot, taken_at, now, &claude.config_dir)
-                .err()
-                .map(|e| format!("{e:#}"))
-        }
+    let error = match accounts::refresh(conn, slug, claude, AGENTS_TIMEOUT, db::now_ms) {
+        Ok(listings) => listings.error(),
         Err(e) => Some(format!("{e:#}")),
     };
     read(conn, slug, error).unwrap_or_else(|e| Msg::RefreshFailed(format!("{e:#}")))

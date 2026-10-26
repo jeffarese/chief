@@ -1,6 +1,6 @@
 //! SQLite registry (ARCHITECTURE §4). Migrations run on open, tracked by `PRAGMA user_version`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -119,6 +119,12 @@ CREATE TABLE ui_state (
     "ALTER TABLE ui_state ADD COLUMN pane_pid INTEGER;
      ALTER TABLE ui_state ADD COLUMN pane_started TEXT;
      ALTER TABLE ui_state ADD COLUMN tmux_window TEXT;",
+    // A thread's own Claude Code account, when start_thread put it in another than the project's
+    // (§3): the agp account id and label, and its config folder (NULL with an id: the default
+    // account). Rows without an id run in the project's account.
+    "ALTER TABLE sessions ADD COLUMN account_id TEXT;
+     ALTER TABLE sessions ADD COLUMN account_label TEXT;
+     ALTER TABLE sessions ADD COLUMN account_dir TEXT;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -228,9 +234,34 @@ pub struct SessionRow {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_activity_at: i64,
+    /// The agp account the session runs in, when it has one of its own (§3); None: the
+    /// project's account.
+    pub account_id: Option<String>,
+    /// That account's agp label (`PB2`), for display.
+    pub account_label: Option<String>,
+    /// That account's config folder; None with an `account_id` is the default account.
+    pub account_dir: Option<String>,
 }
 
 impl SessionRow {
+    /// The Claude Code account the session runs in (`CLAUDE_CONFIG_DIR`, None = the default
+    /// account): its own when it has an `account_id`, else the project's.
+    pub fn account(&self, project: Option<&Path>) -> Option<PathBuf> {
+        if self.account_id.is_some() {
+            self.account_dir.as_deref().map(PathBuf::from)
+        } else {
+            project.map(Path::to_path_buf)
+        }
+    }
+
+    /// The account's name for people: its agp label, else its id; None for the project's.
+    pub fn account_shown(&self) -> Option<&str> {
+        self.account_label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+            .or(self.account_id.as_deref())
+    }
+
     /// A row for a session that hasn't been spawned yet.
     pub fn new(name: &str, project_slug: &str, role: Role, now: i64) -> Self {
         SessionRow {
@@ -251,7 +282,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     last_hook, pending_permission, group_name, waiting_reason, resolved, resolved_reason, pr_url, \
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
     last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked, synced_at, ids_at, \
-    removed_at";
+    removed_at, account_id, account_label, account_dir";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -294,6 +325,9 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         synced_at: r.get(36)?,
         ids_at: r.get(37)?,
         removed_at: r.get(38)?,
+        account_id: r.get(39)?,
+        account_label: r.get(40)?,
+        account_dir: r.get(41)?,
     })
 }
 
@@ -328,7 +362,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)"
+         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)"
     );
     let has_ids = s.short_id.is_some() || s.session_id.is_some();
     let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
@@ -374,6 +408,9 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.synced_at,
             ids_at,
             s.removed_at,
+            s.account_id,
+            s.account_label,
+            s.account_dir,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -397,7 +434,7 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            gone_at = ?34, cleaned_at = ?35, cleanup_blocked = ?36, synced_at = ?37,
            ids_at = CASE WHEN short_id IS ?4 AND session_id IS ?5 THEN coalesce(?38, ids_at)
                          ELSE ?31 END,
-           removed_at = ?39
+           removed_at = ?39, account_id = ?40, account_label = ?41, account_dir = ?42
          WHERE name = ?1",
             params![
                 s.name,
@@ -439,6 +476,9 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.synced_at,
                 s.ids_at,
                 s.removed_at,
+                s.account_id,
+                s.account_label,
+                s.account_dir,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -902,6 +942,9 @@ mod tests {
         t.cleanup_blocked = Some("2 unpushed commits".into());
         t.synced_at = Some(15);
         t.removed_at = Some(20);
+        t.account_id = Some("cpb".into());
+        t.account_label = Some("PB2".into());
+        t.account_dir = Some("/Users/me/.claude-cpb".into());
         t.updated_at = 30;
         update_session(&conn, &t).unwrap();
         t.ids_at = Some(30);
@@ -924,6 +967,28 @@ mod tests {
 
         let ghost = SessionRow::new("ghost", "p", Role::Thread, 1);
         assert!(update_session(&conn, &ghost).is_err());
+    }
+
+    /// A row with an agp account id runs in that account (no folder: the default one); without
+    /// one, in the project's.
+    #[test]
+    fn a_rows_account() {
+        let project = Path::new("/Users/me/.claude-carlos");
+        let mut t = SessionRow::new("t", "p", Role::Thread, 0);
+        assert_eq!(t.account(Some(project)), Some(project.to_path_buf()));
+        assert_eq!(t.account(None), None);
+        assert_eq!(t.account_shown(), None);
+        t.account_id = Some("default".into());
+        assert_eq!(t.account(Some(project)), None, "agp's default account");
+        assert_eq!(t.account_shown(), Some("default"));
+        t.account_id = Some("cpb".into());
+        t.account_label = Some("PB2".into());
+        t.account_dir = Some("/Users/me/.claude-cpb".into());
+        assert_eq!(
+            t.account(Some(project)),
+            Some(PathBuf::from("/Users/me/.claude-cpb"))
+        );
+        assert_eq!(t.account_shown(), Some("PB2"));
     }
 
     /// Whoever writes an id (a hook's title match, start_thread, a sync), `ids_at` says when.

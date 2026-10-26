@@ -133,13 +133,15 @@ fn gone(pid: i32) -> bool {
 }
 
 /// The board's switch: the pane SIGTERMs the running attach, reaps it, resets the terminal it
-/// left behind and attaches to the new target. Then a SIGTERM to the pane ends it cleanly and it
-/// forgets its record.
+/// left behind and attaches to the new target, in that target's own account (§3: the thread
+/// runs in another account than the project's). Then a SIGTERM to the pane ends it cleanly and
+/// it forgets its record.
 #[test]
 fn a_switch_ends_attach_and_attaches_to_the_new_target() {
     let home = Home::new();
     let conn = home.db();
     home.register("demo");
+    let cpb = common::account(home.path(), "claude-cpb");
     for (name, role, short) in [
         (COORD, Role::Coordinator, "c0"),
         (THREAD, Role::Thread, "t1"),
@@ -147,18 +149,18 @@ fn a_switch_ends_attach_and_attaches_to_the_new_target() {
         let mut row = SessionRow::new(name, "demo", role, 1);
         row.short_id = Some(short.into());
         row.session_id = Some(format!("{short}-sid"));
+        if role == Role::Thread {
+            common::in_account(&mut row, "cpb", "PB2", Some(&cpb));
+        }
         db::insert_session(&conn, &row).unwrap();
     }
     home.fake
         .set(
             "agents.stdout",
-            &json!([
-                agent("c0", "c0-sid", COORD, "done", Some(4001)),
-                agent("t1", "t1-sid", THREAD, "done", Some(4002)),
-            ])
-            .to_string(),
+            &json!([agent("c0", "c0-sid", COORD, "done", Some(4001))]).to_string(),
         )
         .set("attach.sleep", "30");
+    common::account_agents(&cpb, &[agent("t1", "t1-sid", THREAD, "done", Some(4002))]);
 
     let mut pane = Pane::start(&home);
     wait_for("the coordinator's attach", || {
@@ -192,6 +194,17 @@ fn a_switch_ends_attach_and_attaches_to_the_new_target() {
     );
     // The coordinator's session was left alone: only attach was ended.
     assert!(home.fake.calls_of("stop").is_empty());
+    let accounts = home.fake.accounts();
+    assert_eq!(accounts[attach_call(&home, "c0").unwrap()].1, "unset");
+    assert_eq!(
+        accounts[attach_call(&home, "t1").unwrap()].1,
+        cpb.to_string_lossy(),
+        "attached in the thread's account"
+    );
+    assert!(
+        home.fake.calls_of("respawn").is_empty(),
+        "alive in its own account"
+    );
 
     let second = home.fake.pid(attach_call(&home, "t1").unwrap());
     // SAFETY: our own child.

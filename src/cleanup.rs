@@ -9,12 +9,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use crate::claude::{self, Claude, RmOutcome};
+use crate::claude::{self, AGENTS_TIMEOUT, Claude, RmOutcome};
 use crate::db::{self, SessionRow};
 use crate::pr::{self, Gh};
 use crate::state::{self, Group, Role};
 use crate::text::one_line;
-use crate::{guard, paths, registry, tools};
+use crate::{accounts, guard, paths, registry, tools};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Unpushed commits listed by `inspect`; the count covers all of them.
@@ -126,8 +126,9 @@ pub fn branch_of(claude: &Claude, row: &SessionRow) -> Option<String> {
     own_job(claude, row)?.1
 }
 
+/// `claude` is the project's account; the job state is in the thread's own (`Claude::for_row`).
 fn own_job(claude: &Claude, row: &SessionRow) -> Option<(PathBuf, Option<String>)> {
-    let job = claude.job_state(row.short_id.as_deref()?)?;
+    let job = claude.for_row(row).job_state(row.short_id.as_deref()?)?;
     let path = job.worktree?;
     (worktree_root(&path).as_deref() == Some(path.as_path())).then_some((path, job.branch))
 }
@@ -240,19 +241,8 @@ pub fn cleanable(ctx: &Ctx, name: &str) -> Result<Option<SessionRow>> {
     if row.cleaned_at.is_some() {
         return Ok(None);
     }
-    let taken_at = (ctx.now)();
-    let snapshot = ctx
-        .claude
-        .agents()
+    accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)
         .context("checking whether the thread is still running")?;
-    registry::sync_in(
-        ctx.conn,
-        &row.project_slug,
-        &snapshot,
-        taken_at,
-        (ctx.now)(),
-        &ctx.claude.config_dir,
-    )?;
     let row = thread_row(ctx.conn, name)?;
     if row.cleaned_at.is_some() {
         return Ok(None);
@@ -380,11 +370,13 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         git(wt, &["reset", "--hard", "-q"])?;
         git(wt, &["clean", "-fdq"])?;
     }
-    let mut outcome = ctx.claude.rm(&short_id, None)?;
+    // In the thread's own account: another account's `claude rm` doesn't know the session.
+    let claude = ctx.claude.for_row(&row);
+    let mut outcome = claude.rm(&short_id, None)?;
     if let (Some(confirmed), RmOutcome::Unpushed { token, .. }) = (confirmed, &outcome)
         && discards_only_confirmed(confirmed, token)
     {
-        outcome = ctx.claude.rm(&short_id, Some(token))?;
+        outcome = claude.rm(&short_id, Some(token))?;
     }
     let why = match outcome {
         RmOutcome::Removed => {
@@ -436,26 +428,30 @@ fn shared(ctx: &Ctx, row: &SessionRow, ins: &Inspection) -> Result<Option<String
 pub const SHARED_WORKTREE: &str = "is also the worktree of";
 
 /// Another registered session (any project of this chief home) whose job state names the same
-/// worktree, if any. Each session's job state is in its own project's account folder; one whose
-/// project.toml can't say is looked up in this project's.
+/// worktree, if any. Each session's job state is in its own account's folder: the thread's own
+/// account, else its project's; a project whose project.toml can't say is looked up in this
+/// project's.
 fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<String>> {
     let wt = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
-    let mut folders: Vec<(String, PathBuf)> =
-        vec![(row.project_slug.clone(), ctx.claude.config_dir.clone())];
+    let mut projects: Vec<(String, Claude)> = vec![(row.project_slug.clone(), ctx.claude.clone())];
     for other in db::all_sessions(ctx.conn)? {
         let Some(short) = other.short_id.as_deref().filter(|_| other.name != row.name) else {
             continue;
         };
-        let folder = match folders.iter().find(|(slug, _)| *slug == other.project_slug) {
-            Some((_, folder)) => folder.clone(),
+        let project = match projects
+            .iter()
+            .find(|(slug, _)| *slug == other.project_slug)
+        {
+            Some((_, claude)) => claude.clone(),
             None => {
-                let folder = crate::project::account_of(&other.project_slug)
-                    .map(|account| claude::claude_dir(account.as_deref()))
-                    .unwrap_or_else(|_| ctx.claude.config_dir.clone());
-                folders.push((other.project_slug.clone(), folder.clone()));
-                folder
+                let claude = crate::project::account_of(&other.project_slug)
+                    .map(|account| ctx.claude.in_account(account.as_deref()))
+                    .unwrap_or_else(|_| ctx.claude.clone());
+                projects.push((other.project_slug.clone(), claude.clone()));
+                claude
             }
         };
+        let folder = project.for_row(&other).config_dir;
         let theirs = claude::job_worktree(&folder, short);
         if theirs.is_some_and(|p| p.canonicalize().unwrap_or(p) == wt) {
             return Ok(Some(other.name));
@@ -552,17 +548,13 @@ pub fn gc(ctx: &Ctx, slug: &str, dry_run: bool) -> Result<Gc> {
     Ok(Gc { verdicts, warnings })
 }
 
+/// Every account the project uses; Err names the accounts whose `claude agents` failed.
 fn sync_agents(ctx: &Ctx, slug: &str) -> Result<()> {
-    let taken_at = (ctx.now)();
-    let snapshot = ctx.claude.agents()?;
-    registry::sync_in(
-        ctx.conn,
-        slug,
-        &snapshot,
-        taken_at,
-        (ctx.now)(),
-        &ctx.claude.config_dir,
-    )
+    let listings = accounts::refresh(ctx.conn, slug, ctx.claude, AGENTS_TIMEOUT, ctx.now)?;
+    match listings.error() {
+        Some(e) => bail!("{e}"),
+        None => Ok(()),
+    }
 }
 
 fn dry_verdict(ctx: &Ctx, row: &SessionRow) -> Verdict {

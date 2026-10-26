@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use crate::claude::{self, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT};
+use crate::claude::{
+    self, AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT,
+};
 use crate::config::{ProjectConfig, Repo};
 use crate::db::{self, SessionRow};
 use crate::layout::{self, Closed, Opened};
@@ -16,7 +18,7 @@ use crate::mux::tmux::Tmux;
 use crate::mux::{Mux, SessionRef};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
-use crate::{generated, names, paths, prompts, registry, tools};
+use crate::{accounts, generated, names, paths, prompts, tools};
 
 const SLUG_CHARS: usize = 40;
 const STATUS_PREVIEW_CHARS: usize = 160;
@@ -374,16 +376,7 @@ pub fn ensure_coordinator(
     let name = names::coordinator_name(slug);
     let existing = db::get_coordinator(conn, slug)?;
     if let Some(row) = existing.as_ref().filter(|r| r.short_id.is_some()) {
-        let taken_at = db::now_ms();
-        let snapshot = claude.agents()?;
-        registry::sync_in(
-            conn,
-            slug,
-            &snapshot,
-            taken_at,
-            db::now_ms(),
-            &claude.config_dir,
-        )?;
+        accounts::refresh_row(conn, claude, row, AGENTS_TIMEOUT, db::now_ms)?;
         let row = db::get_session(conn, &row.name)?.context("coordinator row vanished")?;
         if row.pid.is_some() {
             return Ok((row, CoordinatorAction::Running));
@@ -509,8 +502,9 @@ fn store_ids(
     })
 }
 
-/// `claude respawn` for `row`, after rewriting `<dir>/generated/*` from `config` (a respawned
-/// session reads its hooks again, §3), then waits up to `wait` for a pid; returns the row.
+/// `claude respawn` for `row` in its own account (`claude` is the project's), after rewriting
+/// `<dir>/generated/*` from `config` (a respawned session reads its hooks again, §3), then
+/// waits up to `wait` for a pid; returns the row.
 pub fn respawn(
     conn: &Connection,
     claude: &Claude,
@@ -526,31 +520,31 @@ pub fn respawn(
         )
     })?;
     generated::rewrite(dir, config)?;
-    claude.respawn(short_id)?;
-    wait_for_pid(conn, claude, &row.project_slug, &row.name, wait)
+    claude.for_row(row).respawn(short_id)?;
+    wait_for_pid(conn, claude, row, wait)
 }
 
-/// Polls `claude agents` until `name` has a pid or `timeout` passes; returns the row either way.
+/// Polls `claude agents` in `row`'s account until it has a pid or `timeout` passes; returns the
+/// row either way. `claude` is the project's account.
 pub fn wait_for_pid(
     conn: &Connection,
     claude: &Claude,
-    slug: &str,
-    name: &str,
+    row: &SessionRow,
     timeout: Duration,
 ) -> Result<SessionRow> {
     let deadline = Instant::now() + timeout;
+    let name = &row.name;
+    let account = [row.account(claude.account.as_deref())];
     loop {
-        let taken_at = db::now_ms();
-        if let Ok(snapshot) = claude.agents() {
-            registry::sync_in(
-                conn,
-                slug,
-                &snapshot,
-                taken_at,
-                db::now_ms(),
-                &claude.config_dir,
-            )?;
-        }
+        // A failed `claude agents` is retried until the deadline.
+        accounts::refresh_accounts(
+            conn,
+            &row.project_slug,
+            claude,
+            &account,
+            AGENTS_TIMEOUT,
+            db::now_ms,
+        )?;
         let row = db::get_session(conn, name)?.with_context(|| format!("{name} vanished"))?;
         if row.pid.is_some() || Instant::now() >= deadline {
             return Ok(row);
@@ -631,17 +625,9 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
             bail!("chief down {slug} didn't finish cleanly");
         }
     };
-    let taken_at = db::now_ms();
-    match claude.agents() {
-        Ok(snapshot) => registry::sync_in(
-            &conn,
-            slug,
-            &snapshot,
-            taken_at,
-            db::now_ms(),
-            &claude.config_dir,
-        )?,
-        Err(e) => eprintln!("warning: `claude agents` failed, using the last known state: {e:#}"),
+    let listings = accounts::refresh(&conn, slug, &claude, AGENTS_TIMEOUT, db::now_ms)?;
+    if let Some(e) = listings.error() {
+        eprintln!("warning: `claude agents` failed, using the last known state: {e}");
     }
     let mut left_running = 0;
     for row in db::list_sessions(&conn, slug, None)? {
@@ -658,7 +644,7 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
             continue;
         }
         let what = if coordinator { "coordinator" } else { "thread" };
-        match claude.stop(short_id) {
+        match claude.for_row(&row).stop(short_id) {
             Ok(()) => println!("Stopped {what} {}.", row.name),
             Err(e) => {
                 failed += 1;
@@ -697,8 +683,9 @@ pub fn status(slug: Option<&str>) -> Result<()> {
         println!("No projects yet. Create one with chief init <name>.");
         return Ok(());
     }
-    // One `claude agents` per account: each sees only its own supervisor's sessions (§1).
-    let mut snapshots: Vec<(Option<PathBuf>, i64, Option<Vec<AgentRow>>)> = Vec::new();
+    // One `claude agents` per account, shared by the projects that use it: each sees only its
+    // own supervisor's sessions (§1).
+    let mut taken: Vec<accounts::Listing> = Vec::new();
     let mut out = String::new();
     for slug in &projects {
         let account = match account_of(slug) {
@@ -709,26 +696,30 @@ pub fn status(slug: Option<&str>) -> Result<()> {
             }
         };
         if let Some(account) = &account {
-            if !snapshots.iter().any(|(a, ..)| a == account) {
-                let taken_at = db::now_ms();
-                let snapshot = match Claude::for_account(account.clone()).agents() {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        eprintln!(
-                            "warning: `claude agents` failed for the account {}, showing the \
-                             last known state: {e:#}",
-                            claude::account_label(account.as_deref())
-                        );
-                        None
-                    }
-                };
-                snapshots.push((account.clone(), taken_at, snapshot));
+            let rows = db::list_sessions(&conn, slug, None)?;
+            let used = accounts::in_use(account.as_deref(), &rows);
+            let had = |a: &Option<PathBuf>, taken: &[accounts::Listing]| {
+                taken
+                    .iter()
+                    .any(|l| claude::same_account(l.account(), a.as_deref()))
+            };
+            let missing: Vec<_> = used.iter().filter(|a| !had(a, &taken)).cloned().collect();
+            let claude = Claude::for_account(account.clone());
+            for l in accounts::list(&claude, &missing, AGENTS_TIMEOUT, db::now_ms).all {
+                if let Err(e) = &l.agents {
+                    eprintln!(
+                        "warning: `claude agents` failed for the account {}, showing the last \
+                         known state: {e}",
+                        claude::account_label(l.account())
+                    );
+                }
+                taken.push(l);
             }
-            let (_, taken_at, snapshot) = snapshots.iter().find(|(a, ..)| a == account).unwrap();
-            if let Some(snapshot) = snapshot {
-                let claude_dir = claude::claude_dir(account.as_deref());
-                registry::sync_in(&conn, slug, snapshot, *taken_at, db::now_ms(), &claude_dir)?;
-            }
+            let ours = taken.iter().filter(|l| {
+                used.iter()
+                    .any(|a| claude::same_account(l.account(), a.as_deref()))
+            });
+            accounts::sync(&conn, slug, account.as_deref(), ours, db::now_ms())?;
         }
         let rows = db::list_sessions(&conn, slug, None)?;
         let prefix = claude::shell_prefix(account.flatten().as_deref());

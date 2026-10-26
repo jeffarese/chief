@@ -10,7 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::claude::{AgentRow, BgSpawn, Claude, ClaudeError};
+use crate::accounts::{self, Listings};
+use crate::claude::{AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError};
 use crate::config::{EFFORTS, ProjectConfig};
 use crate::db::{self, SessionRow};
 use crate::state::{Group, Role};
@@ -139,19 +140,10 @@ pub fn board_order(rows: &mut [SessionRow]) {
     });
 }
 
-/// Polls `claude agents` and writes it into the project's rows; returns the snapshot.
-pub fn refresh(ctx: &ToolCtx) -> Result<Vec<AgentRow>> {
-    let taken_at = (ctx.now)();
-    let rows = ctx.claude.agents()?;
-    registry::sync_in(
-        ctx.conn,
-        ctx.slug(),
-        &rows,
-        taken_at,
-        (ctx.now)(),
-        &ctx.claude.config_dir,
-    )?;
-    Ok(rows)
+/// Polls `claude agents` in every account the project uses and writes each into its rows. A
+/// failed account leaves its rows as they were (`Listings::error`).
+pub fn refresh(ctx: &ToolCtx) -> Result<Listings> {
+    accounts::refresh(ctx.conn, ctx.slug(), ctx.claude, AGENTS_TIMEOUT, ctx.now)
 }
 
 pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
@@ -375,9 +367,11 @@ fn free_name(ctx: &ToolCtx, title: &str, live: &[AgentRow]) -> Result<String> {
 }
 
 pub fn list_threads(ctx: &ToolCtx, args: &ListThreadsArgs) -> Result<Value> {
-    let warning = refresh(ctx)
-        .err()
-        .map(|e| format!("`claude agents` failed, showing the last known state: {e:#}"));
+    let warning = match refresh(ctx) {
+        Ok(listings) => listings.error(),
+        Err(e) => Some(format!("{e:#}")),
+    }
+    .map(|e| format!("`claude agents` failed, showing the last known state: {e}"));
     let include_resolved = args.include_resolved.unwrap_or(false);
     let mut rows: Vec<_> = db::list_sessions(ctx.conn, ctx.slug(), Some(Role::Thread))?
         .into_iter()
@@ -431,8 +425,9 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     if row.cleaned_at.is_some() {
         bail!(crate::guard::cleaned_message(&name));
     }
+    // Its own account's `claude agents` is the one that can see it.
     let alive = |ctx: &ToolCtx| -> Result<bool> {
-        refresh(ctx)?;
+        accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)?;
         Ok(db::get_session(ctx.conn, &name)?.is_some_and(|r| r.pid.is_some()))
     };
     if alive(ctx)? {
@@ -445,10 +440,11 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     }
     let short_id = row
         .short_id
+        .clone()
         .with_context(|| format!("{name} was never started, so there is nothing to wake"))?;
     // A respawned session reads its hooks again.
     generated::rewrite(ctx.project_dir, ctx.config)?;
-    ctx.claude.respawn(&short_id)?;
+    ctx.claude.for_row(&row).respawn(&short_id)?;
     let deadline = Instant::now() + ctx.wake_timeout;
     loop {
         std::thread::sleep(ctx.poll_interval);

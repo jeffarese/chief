@@ -69,12 +69,13 @@ pub enum ClaudeError {
 }
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
-const AGENTS_TIMEOUT: Duration = Duration::from_secs(15);
+pub const AGENTS_TIMEOUT: Duration = Duration::from_secs(15);
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a freshly spawned session may take to show up in `claude agents` (§7).
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone)]
 pub struct Claude {
     pub bin: PathBuf,
     /// The Claude Code account every call runs in (§1): Some sets `CLAUDE_CONFIG_DIR` to that
@@ -117,6 +118,21 @@ impl Claude {
     /// The account's `.claude.json`, where Claude Code keeps folder trust (`claude_config_path`).
     pub fn trust_config(&self) -> PathBuf {
         claude_config_path(self.account.as_deref())
+    }
+
+    /// The same binary in `account`: this one itself when it is that account already (keeping
+    /// its folder, which tests point elsewhere for the default account).
+    pub fn in_account(&self, account: Option<&Path>) -> Claude {
+        if same_account(self.account.as_deref(), account) {
+            return self.clone();
+        }
+        Claude::with_bin(self.bin.clone(), account.map(Path::to_path_buf))
+    }
+
+    /// `self` is the project's account; the session's own account when it has one (§3), so
+    /// every call about it (attach, respawn, stop, rm, its job state) runs there.
+    pub fn for_row(&self, row: &crate::db::SessionRow) -> Claude {
+        self.in_account(row.account(self.account.as_deref()).as_deref())
     }
 
     /// `claude` in this account; every call chief makes goes through here.
@@ -496,6 +512,16 @@ pub fn env_account() -> Option<PathBuf> {
             .or_else(|_| std::path::absolute(&dir))
             .unwrap_or(dir),
     )
+}
+
+/// Whether two accounts are one: both the default account, or the same folder (compared
+/// canonically).
+pub fn same_account(a: Option<&Path>, b: Option<&Path>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => same_folder(a, b),
+        _ => false,
+    }
 }
 
 /// An account's config folder: the folder itself, or for the default account

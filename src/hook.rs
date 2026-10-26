@@ -241,26 +241,17 @@ fn guard_failed(project: &str, error: &str) -> String {
 /// §8: refreshes the board from `claude agents` (bounded; stored rows if it fails) and returns
 /// the UserPromptSubmit output with the board snapshot and MEMORY.md.
 fn coordinator_context(conn: &Connection, project: &str) -> Result<String> {
-    let taken_at = db::now_ms();
     let claude = project_claude(project);
-    let refreshed = claude
-        .agents_within(CONTEXT_AGENTS_TIMEOUT)
-        .and_then(|snapshot| {
-            registry::sync_in(
-                conn,
-                project,
-                &snapshot,
-                taken_at,
-                db::now_ms(),
-                &claude.config_dir,
-            )
-        });
-    if let Err(e) = refreshed {
+    let refreshed =
+        crate::accounts::refresh(conn, project, &claude, CONTEXT_AGENTS_TIMEOUT, db::now_ms)
+            .map(|listings| listings.error())
+            .unwrap_or_else(|e| Some(format!("{e:#}")));
+    if let Some(e) = refreshed {
         log_error(
             &paths::hook_error_log(),
             "UserPromptSubmit",
             project,
-            &format!("board refresh failed, using stored rows: {e:#}"),
+            &format!("board refresh failed, using stored rows: {e}"),
         );
     }
     let mut threads = db::list_sessions(conn, project, Some(Role::Thread))?;

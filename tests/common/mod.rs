@@ -65,16 +65,7 @@ impl Fake {
 
     /// `job` with the branch given.
     pub fn job_on(&self, short: &str, worktree: Option<&Path>, branch: Option<&str>) -> &Self {
-        let dir = self.config_dir().join("jobs").join(short);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut state = serde_json::json!({"daemonShort": short, "state": "done"});
-        if let Some(wt) = worktree {
-            state["worktreePath"] = wt.to_string_lossy().into_owned().into();
-        }
-        if let Some(branch) = branch {
-            state["worktreeBranch"] = branch.into();
-        }
-        std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+        job_in(&self.config_dir(), short, worktree, branch);
         self
     }
 
@@ -165,6 +156,36 @@ pub fn account(parent: &Path, name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(".claude.json"), "{}").unwrap();
     dir.canonicalize().unwrap()
+}
+
+/// The job state of background session `short` in the account folder `config_dir`.
+pub fn job_in(config_dir: &Path, short: &str, worktree: Option<&Path>, branch: Option<&str>) {
+    let dir = config_dir.join("jobs").join(short);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut state = serde_json::json!({"daemonShort": short, "state": "done"});
+    if let Some(wt) = worktree {
+        state["worktreePath"] = wt.to_string_lossy().into_owned().into();
+    }
+    if let Some(branch) = branch {
+        state["worktreeBranch"] = branch.into();
+    }
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+}
+
+/// `claude agents` in the account folder `account` (the fake serves it there).
+pub fn account_agents(account: &Path, rows: &[serde_json::Value]) {
+    std::fs::write(
+        account.join("fake-agents.stdout"),
+        serde_json::Value::from(rows.to_vec()).to_string(),
+    )
+    .unwrap();
+}
+
+/// Puts a thread row in agp account `id` (folder `dir`; None: the default account).
+pub fn in_account(row: &mut chief::db::SessionRow, id: &str, label: &str, dir: Option<&Path>) {
+    row.account_id = Some(id.into());
+    row.account_label = Some(label.into());
+    row.account_dir = dir.map(|d| d.to_string_lossy().into_owned());
 }
 
 /// `~/.claude.json` stand-in that trusts `folders` (canonical paths).

@@ -661,6 +661,102 @@ fn wake_thread_respawns_and_waits_for_a_pid() {
     assert!(err.to_string().contains("never started"), "{err}");
 }
 
+/// A thread in another account (§3): only that account's `claude agents` lists it, so it is
+/// synced from there, and woken there; the project's listing says nothing about it.
+#[test]
+fn a_thread_in_another_account_is_synced_and_woken_there() {
+    let env = Env::new();
+    let cpb = common::account(env.root.path(), "cpb");
+    env.insert("demo-far-1111", |r| {
+        r.short_id = Some("f1".into());
+        r.session_id = Some("sid-f1".into());
+        common::in_account(r, "cpb", "PB2", Some(&cpb));
+    });
+    env.insert("demo-near-2222", |r| {
+        r.short_id = Some("n2".into());
+        r.session_id = Some("sid-n2".into());
+    });
+    env.agents(&[agent("n2", "sid-n2", "demo-near-2222", "done", None)]);
+    common::account_agents(
+        &cpb,
+        &[agent("f1", "sid-f1", "demo-far-1111", "working", Some(9))],
+    );
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    assert!(out.get("warning").is_none(), "{out}");
+    let far = &out["threads"][0];
+    assert_eq!(
+        (&far["name"], &far["group"], &far["asleep"]),
+        (&json!("demo-far-1111"), &json!("working"), &json!(false))
+    );
+    let mut listed: Vec<String> = env
+        .fake
+        .accounts()
+        .into_iter()
+        .filter(|(first, _)| first == "agents")
+        .map(|(_, account)| account)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, [cpb.to_string_lossy().into_owned(), "unset".into()]);
+
+    // Its account fails: its row keeps what it had, the others are synced, and it says so.
+    std::fs::write(cpb.join("fake-agents.stdout"), "not json").unwrap();
+    env.agents(&[agent("n2", "sid-n2", "demo-near-2222", "working", Some(3))]);
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    let warning = out["warning"].as_str().unwrap();
+    assert!(
+        warning.contains(&format!("in the account {}", cpb.display())),
+        "{warning}"
+    );
+    assert_eq!(env.row("demo-far-1111").unwrap().pid, Some(9));
+    assert_eq!(env.row("demo-near-2222").unwrap().pid, Some(3));
+
+    // Asleep in its account: respawned in that account, and only that account is polled.
+    let calls_before = env.fake.calls().len();
+    common::account_agents(
+        &cpb,
+        &[agent("f1", "sid-f1", "demo-far-1111", "done", None)],
+    );
+    let k = std::fs::read_to_string(env.fake.dir.path().join("agents.count"))
+        .unwrap()
+        .trim()
+        .parse::<usize>()
+        .unwrap();
+    std::fs::write(
+        cpb.join(format!("fake-agents.stdout.{}", k + 2)),
+        json!([agent("f1", "sid-f1", "demo-far-1111", "working", Some(11))]).to_string(),
+    )
+    .unwrap();
+    let out = env
+        .with(|ctx| {
+            tools::wake_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-far-1111".into(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        (&out["alive"], &out["respawned"]),
+        (&json!(true), &json!(true))
+    );
+    let after: Vec<_> = env.fake.accounts()[calls_before..].to_vec();
+    let cpb_path = cpb.to_string_lossy().into_owned();
+    assert!(
+        after.iter().all(|(_, account)| *account == cpb_path),
+        "{after:?}"
+    );
+    assert!(
+        after.iter().any(|(first, _)| first == "respawn"),
+        "{after:?}"
+    );
+    assert_eq!(env.row("demo-far-1111").unwrap().pid, Some(11));
+}
+
 #[test]
 fn resolve_and_reopen() {
     let env = Env::new();

@@ -278,27 +278,43 @@ fn restore_removed(row: &mut SessionRow) {
     }
 }
 
-/// Writes a `claude agents` snapshot taken at `taken_at` into every session of the project (one
-/// transaction). Take `taken_at` just before running `claude agents`, in the project's account;
-/// job state comes from that account's folder, `claude_dir` (`Claude::config_dir`).
+/// One account's `claude agents --json --all`: each account's supervisor lists only its own
+/// sessions (§1).
+pub struct Listing<'a> {
+    /// The account (`CLAUDE_CONFIG_DIR`; None is the default one).
+    pub account: Option<&'a Path>,
+    pub agents: &'a [AgentRow],
+    /// Read just before `claude agents` ran.
+    pub taken_at: i64,
+    /// The account's config folder, where job state lives (`Claude::config_dir`).
+    pub claude_dir: &'a Path,
+}
+
+/// Writes one account's listing into every session of the project that runs in that account
+/// (`SessionRow::account`, with `project_account` the project's), in one transaction. Sessions
+/// in other accounts aren't in it, so it says nothing about them.
 pub fn sync_in(
     conn: &Connection,
     project_slug: &str,
-    snapshot: &[AgentRow],
-    taken_at: i64,
+    project_account: Option<&Path>,
+    listing: &Listing,
     now: i64,
-    claude_dir: &Path,
 ) -> Result<()> {
-    let job = |short: &str| claude::job_state(claude_dir, short);
+    let job = |short: &str| claude::job_state(listing.claude_dir, short);
+    let taken_at = listing.taken_at;
     db::immediate(conn, |conn| {
         let registered = db::all_sessions(conn)?;
         let poll = Poll {
-            agents: snapshot,
+            agents: listing.agents,
             taken_at,
             registered: &registered,
             job: &job,
         };
-        for row in registered.iter().filter(|r| r.project_slug == project_slug) {
+        let ours = |r: &&SessionRow| {
+            r.project_slug == project_slug
+                && claude::same_account(r.account(project_account).as_deref(), listing.account)
+        };
+        for row in registered.iter().filter(ours) {
             let mut row = row.clone();
             let applied = row.synced_at;
             if sync_row(&mut row, &poll, now) {
@@ -384,7 +400,8 @@ mod tests {
         (dir, conn)
     }
 
-    /// `super::sync` without the user's real job state.
+    /// `super::sync_in` for a project in the default account, without the user's real job
+    /// state.
     fn sync(
         conn: &Connection,
         slug: &str,
@@ -392,14 +409,118 @@ mod tests {
         taken_at: i64,
         now: i64,
     ) -> Result<()> {
-        sync_in(
-            conn,
-            slug,
-            snap,
+        sync_account(conn, slug, None, snap, taken_at, now)
+    }
+
+    /// One account's listing for a project in the default account.
+    fn sync_account(
+        conn: &Connection,
+        slug: &str,
+        account: Option<&Path>,
+        snap: &[AgentRow],
+        taken_at: i64,
+        now: i64,
+    ) -> Result<()> {
+        let listing = Listing {
+            account,
+            agents: snap,
             taken_at,
-            now,
-            Path::new("/nonexistent/claude-dir"),
+            claude_dir: Path::new("/nonexistent/claude-dir"),
+        };
+        sync_in(conn, slug, None, &listing, now)
+    }
+
+    /// Threads on other accounts: a listing of one account says nothing about sessions in
+    /// another. Each row takes only its own account's listing, and the removed-outside verdict
+    /// needs another session of the project in that listing.
+    #[test]
+    fn each_account_syncs_only_its_own_rows() {
+        let (_dir, conn) = setup();
+        let cpb = Path::new("/accounts/cpb");
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.short_id = Some("c1".into());
+        coord.session_id = Some("c-sid".into());
+        db::insert_session(&conn, &coord).unwrap();
+        let mut here = thread("demo-here-1111", Some("h1"), Some("h-sid"), 0);
+        here.pid = Some(4);
+        db::insert_session(&conn, &here).unwrap();
+        let elsewhere = |name: &str, short: &str, sid: &str| {
+            let mut t = thread(name, Some(short), Some(sid), 0);
+            t.account_id = Some("cpb".into());
+            t.account_dir = Some(cpb.to_string_lossy().into_owned());
+            t.pid = Some(5);
+            t
+        };
+        db::insert_session(&conn, &elsewhere("demo-there-2222", "t2", "t2-sid")).unwrap();
+        let get = |n: &str| db::get_session(&conn, n).unwrap().unwrap();
+        let listed = |short: &str, sid: &str, name: &str, pid: u32| AgentRow {
+            id: Some(short.into()),
+            session_id: sid.into(),
+            name: Some(name.into()),
+            pid: Some(pid),
+            ..coordinator_agent()
+        };
+
+        // The project's account lists its coordinator and one thread, not the other account's.
+        sync_account(
+            &conn,
+            "demo",
+            None,
+            &[
+                coordinator_agent(),
+                listed("h1", "h-sid", "demo-here-1111", 7),
+            ],
+            100,
+            110,
         )
+        .unwrap();
+        assert_eq!(get("demo-here-1111").pid, Some(7));
+        let there = get("demo-there-2222");
+        assert_eq!(
+            (there.pid, there.removed_at, there.synced_at),
+            (Some(5), None, None),
+            "untouched by another account's listing"
+        );
+
+        // Its own account's listing applies to it, and only to it.
+        sync_account(
+            &conn,
+            "demo",
+            Some(cpb),
+            &[listed("t2", "t2-sid", "demo-there-2222", 9)],
+            200,
+            210,
+        )
+        .unwrap();
+        assert_eq!(get("demo-there-2222").pid, Some(9));
+        assert_eq!(get("demo-here-1111").pid, Some(7));
+        assert_eq!(get("chief-demo").synced_at, Some(100));
+
+        // Missing from its account's listing, with no other session of the project there: no
+        // verdict (the coordinator lives in the other account).
+        sync_account(&conn, "demo", Some(cpb), &[], 300, 310).unwrap();
+        let there = get("demo-there-2222");
+        assert_eq!((there.pid, there.removed_at), (None, None));
+
+        // Another thread of the project listed in that account: now it can tell.
+        db::insert_session(&conn, &elsewhere("demo-other-3333", "t3", "t3-sid")).unwrap();
+        sync_account(
+            &conn,
+            "demo",
+            Some(cpb),
+            &[listed("t3", "t3-sid", "demo-other-3333", 11)],
+            400,
+            410,
+        )
+        .unwrap();
+        let there = get("demo-there-2222");
+        assert_eq!(
+            (there.removed_at, there.resolved_reason.as_deref()),
+            (Some(400), Some("removed"))
+        );
+        assert_eq!(get("demo-other-3333").pid, Some(11));
+        // The project's own threads were never judged by the other account's listings.
+        assert_eq!(get("demo-here-1111").removed_at, None);
     }
 
     /// The rows, minus the watermark every applied poll moves.
