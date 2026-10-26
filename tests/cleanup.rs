@@ -387,6 +387,100 @@ fn clean_refuses_threads_that_are_open_or_busy() {
     assert!(err.to_string().contains("no thread named"), "{err}");
 }
 
+/// The board's 30 s refresh, `chief gc` and the board's `x` can clean the same thread at once.
+#[test]
+fn a_cleanup_another_process_holds_is_skipped() {
+    let env = Env::new();
+    assert_eq!(
+        db::claim_cleanup(&env.conn, NAME, NOW - 60_000).unwrap(),
+        db::Claim::Claimed
+    );
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::InProgress);
+    assert!(env.rm_calls().is_empty());
+    assert_eq!(env.row().cleanup_blocked, None);
+    let gc = env.with(|ctx| cleanup::gc(ctx, "demo", false)).unwrap();
+    assert_eq!(
+        gc.verdicts,
+        [(
+            NAME.to_string(),
+            Verdict::Skipped("another chief process is cleaning it up".into())
+        )]
+    );
+    assert!(env.rm_calls().is_empty());
+
+    // A claim left by a process that died mid-cleanup expires.
+    db::release_cleanup(&env.conn, NAME, NOW - 60_000).unwrap();
+    assert_eq!(
+        db::claim_cleanup(&env.conn, NAME, NOW - 11 * 60_000).unwrap(),
+        db::Claim::Claimed
+    );
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::Cleaned);
+    assert_eq!(env.rm_calls().len(), 1);
+    assert_eq!(
+        db::claim_cleanup(&env.conn, NAME, NOW).unwrap(),
+        db::Claim::Cleaned
+    );
+
+    // Every path releases its claim: a blocked cleanup, a refused one.
+    env.insert(|_| {});
+    std::fs::write(env.worktree.join("draft.txt"), "wip").unwrap();
+    assert!(matches!(
+        env.clean(Mode::Safe).unwrap(),
+        Outcome::Blocked(_)
+    ));
+    assert_eq!(
+        db::claim_cleanup(&env.conn, NAME, NOW).unwrap(),
+        db::Claim::Claimed
+    );
+    db::release_cleanup(&env.conn, NAME, NOW).unwrap();
+    env.insert(|r| r.resolved = false);
+    assert!(env.clean(Mode::Safe).is_err());
+    assert_eq!(
+        db::claim_cleanup(&env.conn, NAME, NOW).unwrap(),
+        db::Claim::Claimed
+    );
+}
+
+/// The thread got a message (or the pane attached to it) after the first check: `claude rm`
+/// would stop it mid-turn, so nothing is removed or reset.
+#[test]
+fn cleanup_checks_again_right_before_claude_rm() {
+    let env = Env::new();
+    std::fs::write(env.worktree.join("draft.txt"), "wip").unwrap();
+    let confirmed = env.inspect();
+    let idle = Value::from(vec![agent(SHORT, SID, NAME, "done", None)]).to_string();
+    let busy = Value::from(vec![agent(SHORT, SID, NAME, "working", Some(42))]).to_string();
+    env.claude.set("agents.stdout.1", &idle);
+    env.claude.set("agents.stdout.2", &busy);
+    let err = env
+        .clean(Mode::Discard(confirmed.clone()))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is working"), "{err}");
+    assert!(env.rm_calls().is_empty());
+    assert!(env.worktree.join("draft.txt").exists(), "nothing reset");
+    assert_eq!(env.row().cleanup_blocked, None);
+
+    // Shown in the pane: the user may be typing into it.
+    env.insert(|_| {});
+    env.agents(&[agent(SHORT, SID, NAME, "done", None)]);
+    db::set_pane_showing(&env.conn, "demo", Some(NAME)).unwrap();
+    let err = env.clean(Mode::Safe).unwrap_err().to_string();
+    assert!(err.contains("is showing in the pane"), "{err}");
+    // Its PR merged: the board's refresh waits too, without an error line every 30 s.
+    env.gh.set("pr.stdout", &merged_pr());
+    let refresh = env
+        .with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Merged)))
+        .unwrap();
+    assert!(refresh.errors.is_empty(), "{:?}", refresh.errors);
+    assert!(env.rm_calls().is_empty());
+    db::set_pane_showing(&env.conn, "demo", None).unwrap();
+    assert_eq!(
+        env.clean(Mode::Discard(confirmed)).unwrap(),
+        Outcome::Cleaned
+    );
+}
+
 #[test]
 fn discard_resets_the_worktree_and_retries_with_the_token() {
     let env = Env::new();

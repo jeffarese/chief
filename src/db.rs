@@ -108,7 +108,13 @@ CREATE TABLE ui_state (
        WHERE short_id IS NOT NULL OR session_id IS NOT NULL;
      UPDATE sessions SET removed_at = cleaned_at
        WHERE resolved_reason = 'removed' AND cleaned_at IS NOT NULL;",
+    // Which process is cleaning a thread up, as when it claimed it (§12). Not in `SessionRow`:
+    // only `claim_cleanup` and `release_cleanup` touch it, so no row write can drop a claim.
+    "ALTER TABLE sessions ADD COLUMN cleaning_at INTEGER;",
 ];
+
+/// A cleanup claim older than this was left by a process that died mid-cleanup.
+pub const CLEANUP_CLAIM_STALE_MS: i64 = 10 * 60 * 1000;
 
 /// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
 /// migrates it to the latest schema.
@@ -437,6 +443,51 @@ pub fn set_synced_at(conn: &Connection, name: &str, taken_at: i64) -> Result<()>
     conn.execute(
         "UPDATE sessions SET synced_at = ?2 WHERE name = ?1 AND (synced_at IS NULL OR synced_at < ?2)",
         params![name, taken_at],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// This process may clean the thread up; `release_cleanup` with the same `now` afterwards.
+    Claimed,
+    Cleaned,
+    /// Another process claimed it less than `CLEANUP_CLAIM_STALE_MS` ago.
+    Held,
+}
+
+/// Claims a thread for cleanup in one `BEGIN IMMEDIATE` transaction, so two processes never
+/// clean the same thread at once. `now` identifies the claim.
+pub fn claim_cleanup(conn: &Connection, name: &str, now: i64) -> Result<Claim> {
+    immediate(conn, |conn| {
+        let (cleaned_at, cleaning_at): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT cleaned_at, cleaning_at FROM sessions WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("no thread named {name}"))?;
+        if cleaned_at.is_some() {
+            return Ok(Claim::Cleaned);
+        }
+        if cleaning_at.is_some_and(|at| now - at < CLEANUP_CLAIM_STALE_MS) {
+            return Ok(Claim::Held);
+        }
+        conn.execute(
+            "UPDATE sessions SET cleaning_at = ?2 WHERE name = ?1",
+            params![name, now],
+        )?;
+        Ok(Claim::Claimed)
+    })
+}
+
+/// Drops the claim `claim_cleanup` made at `claimed_at`, unless another process has taken it over
+/// since (it went stale).
+pub fn release_cleanup(conn: &Connection, name: &str, claimed_at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET cleaning_at = NULL WHERE name = ?1 AND cleaning_at = ?2",
+        params![name, claimed_at],
     )?;
     Ok(())
 }

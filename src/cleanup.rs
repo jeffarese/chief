@@ -43,7 +43,12 @@ pub enum Outcome {
     /// Left in place; the reason is stored in `cleanup_blocked`.
     Blocked(String),
     AlreadyCleaned,
+    /// Another chief process is cleaning it up right now (`db::claim_cleanup`); nothing done.
+    InProgress,
 }
+
+/// How `chief gc` and the CLI say `Outcome::InProgress`.
+pub const IN_PROGRESS: &str = "another chief process is cleaning it up";
 
 /// A thread's worktree as git sees it now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -244,13 +249,27 @@ pub fn cleanable(ctx: &Ctx, name: &str) -> Result<Option<SessionRow>> {
     if !row.resolved {
         bail!("{name} is not resolved; resolve it first (cleanup stops its session)");
     }
-    if active(&row) {
-        let mut facts = registry::facts(&row);
+    ensure_idle(ctx.conn, &row)?;
+    Ok(Some(row))
+}
+
+/// `claude rm` stops the session even when it refuses: never while the thread works, waits on
+/// the user, or shows in the pane (the user may be typing into it; hooks only fire on submit).
+fn ensure_idle(conn: &Connection, row: &SessionRow) -> Result<()> {
+    let name = &row.name;
+    if active(row) {
+        let mut facts = registry::facts(row);
         facts.resolved = false;
         let group = state::derive(&facts).group.label().to_lowercase();
         bail!("{name} is {group}; clean it up once it is idle (cleanup stops its session)");
     }
-    Ok(Some(row))
+    if db::get_pane_showing(conn, &row.project_slug)?.as_deref() == Some(name.as_str()) {
+        bail!(
+            "{name} is showing in the pane; show another session there first (cleanup stops \
+             its session)"
+        );
+    }
+    Ok(())
 }
 
 fn thread_row(conn: &Connection, name: &str) -> Result<SessionRow> {
@@ -265,8 +284,24 @@ fn thread_row(conn: &Connection, name: &str) -> Result<SessionRow> {
 /// first checks the worktree still is what the user confirmed, resets uncommitted changes
 /// (`git clean` without `-x`, so ignored files stay), and retries an unpushed refusal with its
 /// token only when that throws away exactly the confirmed commits. The outcome is stored on the
-/// row; reports are kept.
+/// row; reports are kept. One process at a time: a thread another process is cleaning up is
+/// `InProgress`.
 pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
+    thread_row(ctx.conn, name)?;
+    let claimed_at = (ctx.now)();
+    match db::claim_cleanup(ctx.conn, name, claimed_at)? {
+        db::Claim::Cleaned => return Ok(Outcome::AlreadyCleaned),
+        db::Claim::Held => return Ok(Outcome::InProgress),
+        db::Claim::Claimed => {}
+    }
+    let outcome = clean_claimed(ctx, name, mode);
+    let released = db::release_cleanup(ctx.conn, name, claimed_at);
+    let outcome = outcome?;
+    released?;
+    Ok(outcome)
+}
+
+fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
     let Some(row) = cleanable(ctx, name)? else {
         return Ok(Outcome::AlreadyCleaned);
     };
@@ -275,20 +310,8 @@ pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         record(ctx, name, None)?;
         return Ok(Outcome::Cleaned);
     };
-    // Removed outside chief (§5): `claude rm` has no session left to remove, and the worktree it
-    // left behind is the user's to delete.
     if row.removed_at.is_some() {
-        let Some(wt) = worktree_of(ctx.claude, &row).filter(|p| p.is_dir()) else {
-            record(ctx, name, None)?;
-            return Ok(Outcome::Cleaned);
-        };
-        let why = format!(
-            "{}; worktree remains at {}",
-            registry::REMOVED_OUTSIDE,
-            wt.display()
-        );
-        record(ctx, name, Some(&why))?;
-        return Ok(Outcome::Blocked(why));
+        return removed_outside(ctx, &row);
     }
     let ins = match (inspect(ctx.claude, &row), &mode) {
         (Ok(ins), _) => ins,
@@ -331,17 +354,25 @@ pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
                 record(ctx, name, Some(&why))?;
                 return Ok(Outcome::Blocked(why));
             }
-            if let Some(wt) = ins
-                .worktree
-                .as_deref()
-                .filter(|_| ins.exists && !ins.dirty.is_empty())
-            {
-                git(wt, &["reset", "--hard", "-q"])?;
-                git(wt, &["clean", "-fdq"])?;
-            }
             Some(confirmed)
         }
     };
+    // Again with a fresh `claude agents`, right before anything is reset or stopped: the thread
+    // may have got a message, or the pane may have attached to it, since `cleanable`.
+    let Some(row) = cleanable(ctx, name)? else {
+        return Ok(Outcome::AlreadyCleaned);
+    };
+    if row.removed_at.is_some() {
+        return removed_outside(ctx, &row);
+    }
+    if let Some(wt) = ins
+        .worktree
+        .as_deref()
+        .filter(|_| confirmed.is_some() && ins.exists && !ins.dirty.is_empty())
+    {
+        git(wt, &["reset", "--hard", "-q"])?;
+        git(wt, &["clean", "-fdq"])?;
+    }
     let mut outcome = ctx.claude.rm(&short_id, None)?;
     if let (Some(confirmed), RmOutcome::Unpushed { token, .. }) = (confirmed, &outcome)
         && discards_only_confirmed(confirmed, token)
@@ -398,10 +429,30 @@ fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<Str
     Ok(None)
 }
 
-/// Stores a cleanup result: `blocked` None means cleaned.
+/// Removed outside chief (§5): `claude rm` has no session left to remove, and the worktree it
+/// left behind is the user's to delete.
+fn removed_outside(ctx: &Ctx, row: &SessionRow) -> Result<Outcome> {
+    let Some(wt) = worktree_of(ctx.claude, row).filter(|p| p.is_dir()) else {
+        record(ctx, &row.name, None)?;
+        return Ok(Outcome::Cleaned);
+    };
+    let why = format!(
+        "{}; worktree remains at {}",
+        registry::REMOVED_OUTSIDE,
+        wt.display()
+    );
+    record(ctx, &row.name, Some(&why))?;
+    Ok(Outcome::Blocked(why))
+}
+
+/// Stores a cleanup result: `blocked` None means cleaned. A row that is cleaned already (a sync
+/// found it removed meanwhile) keeps its `cleaned_at` and never gets a `cleanup_blocked`.
 fn record(ctx: &Ctx, name: &str, blocked: Option<&str>) -> Result<()> {
     db::immediate(ctx.conn, |conn| {
         let mut row = thread_row(conn, name)?;
+        if row.cleaned_at.is_some() {
+            return Ok(());
+        }
         let now = (ctx.now)();
         match blocked {
             None => {
@@ -457,6 +508,7 @@ pub fn gc(ctx: &Ctx, slug: &str, dry_run: bool) -> Result<Gc> {
             match clean(ctx, &row.name, Mode::Safe) {
                 Ok(Outcome::Cleaned | Outcome::AlreadyCleaned) => Verdict::Cleaned,
                 Ok(Outcome::Blocked(why)) => Verdict::Blocked(why),
+                Ok(Outcome::InProgress) => Verdict::Skipped(IN_PROGRESS.to_string()),
                 Err(e) => Verdict::Skipped(format!("{e:#}")),
             }
         };
@@ -638,6 +690,7 @@ pub fn run_clean(slug: &str, thread: &str, discard: bool, yes: bool) -> Result<(
     match clean(&ctx, name, mode)? {
         Outcome::Cleaned => println!("Cleaned up {name}."),
         Outcome::AlreadyCleaned => println!("{name} is already cleaned up."),
+        Outcome::InProgress => bail!("{name} wasn't cleaned up here: {IN_PROGRESS}"),
         Outcome::Blocked(why) => {
             let listed = db::get_session(&conn, name)?
                 .and_then(|row| inspect(&claude, &row).ok())
@@ -680,6 +733,29 @@ fn confirm(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sync (another process) found the thread removed while this cleanup ran.
+    #[test]
+    fn a_cleaned_row_keeps_its_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("chief.db")).unwrap();
+        db::register_project(&conn, "p", dir.path(), 0).unwrap();
+        let mut t = SessionRow::new("t", "p", Role::Thread, 0);
+        t.cleaned_at = Some(5);
+        db::insert_session(&conn, &t).unwrap();
+        let claude = Claude::new("/nonexistent/claude".into());
+        let gh = Gh::new("/nonexistent/gh".into());
+        let ctx = Ctx {
+            conn: &conn,
+            claude: &claude,
+            gh: &gh,
+            now: || 9,
+        };
+        record(&ctx, "t", Some("claude rm: no such session")).unwrap();
+        record(&ctx, "t", None).unwrap();
+        let row = db::get_session(&conn, "t").unwrap().unwrap();
+        assert_eq!((row.cleaned_at, row.cleanup_blocked), (Some(5), None));
+    }
 
     #[test]
     fn worktree_roots() {

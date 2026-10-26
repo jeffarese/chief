@@ -146,6 +146,7 @@ fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
     Ok(match (cleanup::clean(&ctx, name, mode)?, discarding) {
         (Outcome::Cleaned, _) => Msg::Done(format!("Cleaned up {name}.")),
         (Outcome::AlreadyCleaned, _) => Msg::Done(format!("{name} is already cleaned up.")),
+        (Outcome::InProgress, _) => Msg::Done(format!("{name}: {}.", cleanup::IN_PROGRESS)),
         (Outcome::Blocked(why), false) => {
             let (loss, confirmed) = loss(&conn, &claude, name, &why)?;
             Msg::CleanBlocked {

@@ -227,7 +227,8 @@ CREATE TABLE sessions (                   -- coordinator and threads
   cleanup_blocked TEXT,                   -- why the last cleanup kept it, e.g. '2 unpushed commits' (migration 4)
   synced_at       INTEGER,                -- taken-at of the newest snapshot applied; older ones are ignored, §5 (migration 6)
   ids_at          INTEGER,                -- when short_id or session_id last changed; db::update_session stamps it (migration 6)
-  removed_at      INTEGER                 -- when a sync found the session removed outside chief, §5 (migration 6)
+  removed_at      INTEGER,                -- when a sync found the session removed outside chief, §5 (migration 6)
+  cleaning_at     INTEGER                 -- cleanup claim: when a process claimed it, §12 (migration 7; not in SessionRow)
 );
 
 CREATE TABLE events (
@@ -711,13 +712,21 @@ head is the branch's sha.
 
 `clean(ctx, name, mode)`:
 
+0. Claim the thread (`db::claim_cleanup`, one `BEGIN IMMEDIATE` transaction on
+   `sessions.cleaning_at`, migration 7): already cleaned → `AlreadyCleaned`; claimed by another
+   process less than 10 minutes ago → `InProgress`, nothing run (the board's refresh skips it,
+   `chief gc` says `skipped  another chief process is cleaning it up`, the board's `x` and
+   `chief clean` say so too); an older claim was left by a process that died and is taken over.
+   Every path below releases the claim (`db::release_cleanup`, only if it is still this one's).
 1. Refresh from `claude agents` and sync (§5); if that finds the session removed with its
    worktree, it is already clean. Removed outside chief with the worktree still there
    (`removed_at` set, not cleaned): no `claude rm` (it has no session to remove); cleaned when the
    job state's worktree is gone, otherwise blocked with `session removed outside chief; worktree
    remains at <path>` (the folder is the user's to delete).
 2. Refuse (error, nothing run) unless the thread is resolved and, derived as if it weren't
-   resolved, neither working nor waiting: `claude rm` stops the session even when it refuses.
+   resolved, neither working nor waiting, and isn't the session `chief pane` shows
+   (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
+   `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
 4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
    in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
@@ -726,14 +735,19 @@ head is the branch's sha.
    (stored in `cleanup_blocked`, nothing run) when a fresh `inspect` differs from it ("the
    worktree changed after you confirmed …") or when the job state of another session registered
    in this chief home names the same worktree; otherwise in a dirty worktree run
-   `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`: ignored files stay).
-5. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
+   `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`: ignored files stay),
+   in step 5.
+5. Steps 1 and 2 again, with a fresh `claude agents`, right before anything is reset or
+   stopped (the thread may have got a message, or the pane attached to it, meanwhile); then the
+   `Discard` reset from step 4.
+6. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
    `--discard-unpushed <token>` only when the confirmed inspection itself listed unpushed commits
    and the token's head sha (`<sha>@<worktree-id>`) equals the head it saw (`git rev-parse HEAD`
    in the worktree, else the branch's sha). Otherwise `claude rm` counts work nobody was shown,
    and no destructive flag is ever passed. Removed → cleaned. Unpushed → `N unpushed commits`;
    dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in
-   `cleanup_blocked`.
+   `cleanup_blocked`. A row that is cleaned by then (a sync found it removed) keeps its
+   `cleaned_at` and never gets a `cleanup_blocked`.
 
 `claude rm` output (`claude::parse_rm`): a `removed <id>` line is removed (exit status alone isn't:
 a stale token printed usage and exited 0); `kept <id> — …` with a `--discard-unpushed <hex>@<hex>`
@@ -752,7 +766,8 @@ have a branch and aren't cleaned: every unresolved one, and resolved ones whose 
 closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
 auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
 `cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is
-neither working nor waiting and has no `cleanup_blocked`: a blocked thread waits for the user, a
+neither working nor waiting nor showing in the pane and has no `cleanup_blocked`: a blocked
+thread waits for the user, a
 working one is tried again on the next refresh. `cleanup = "manual"` never cleans on its own.
 
 `chief gc [<slug>] [--dry-run]` per project: `poll_project`, sync `claude agents`, then

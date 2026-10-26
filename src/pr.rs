@@ -228,26 +228,29 @@ pub fn poll_project(ctx: &Ctx, slug: &str) -> Result<Refresh> {
 }
 
 /// The board's 30 s refresh: `poll_project`, then with `cleanup = "merged"` a safe cleanup of
-/// every resolved thread whose PR merged, that isn't working or waiting, and that no earlier
-/// attempt found blocked (those wait for `chief gc`, `chief clean` or the board's `x`).
+/// every resolved thread whose PR merged, that isn't working, waiting or showing in the pane, and
+/// that no earlier attempt found blocked (those wait for `chief gc`, `chief clean` or the board's
+/// `x`).
 pub fn refresh_project(ctx: &Ctx, config: &ProjectConfig) -> Result<Refresh> {
     let mut refresh = poll_project(ctx, &config.slug)?;
     if config.threads.cleanup != Cleanup::Merged {
         return Ok(refresh);
     }
+    let showing = db::get_pane_showing(ctx.conn, &config.slug)?;
     for row in db::list_sessions(ctx.conn, &config.slug, Some(Role::Thread))? {
         let due = row.resolved
             && row.cleaned_at.is_none()
             && row.cleanup_blocked.is_none()
             && row.pr_state.as_deref() == Some("MERGED")
-            && !cleanup::active(&row);
+            && !cleanup::active(&row)
+            && showing.as_deref() != Some(row.name.as_str());
         if !due {
             continue;
         }
         match cleanup::clean(ctx, &row.name, Mode::Safe) {
             Ok(Outcome::Cleaned) => refresh.cleaned.push(row.name),
             Ok(Outcome::Blocked(why)) => refresh.blocked.push((row.name, why)),
-            Ok(Outcome::AlreadyCleaned) => {}
+            Ok(Outcome::AlreadyCleaned | Outcome::InProgress) => {}
             Err(e) => refresh.errors.push(format!("{}: {e:#}", row.name)),
         }
     }
