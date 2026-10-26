@@ -102,6 +102,24 @@ notifications. It also opens `instructions.md` (a standing brief for the coordin
 thread) and `memory/MEMORY.md` (the project memory index) in `$EDITOR`. New threads pick up changes
 at once; the coordinator's model and effort apply on its next start.
 
+## Accounts
+
+A project belongs to the Claude Code account you ran `chief init` from (its `CLAUDE_CONFIG_DIR`,
+recorded as `claude_config_dir` in `project.toml`). The coordinator always runs there, and every
+chief command for the project uses that account, whatever terminal you type it in.
+
+With agp (agent-prism) installed, threads can spread over your other accounts: each new thread
+starts in the account of agp's pool with the most room (`agp status`), skipping limited ones.
+`[threads] accounts` in `project.toml` narrows the pool (`["auto"]`, the default, is the whole
+pool; `[]` keeps threads on the project's account) and `max_usage` skips accounts at or over a
+5-hour or weekly percentage. Ask the coordinator for a specific account and it pins the thread
+there. A thread stays in the account it started in; the board tags it with the account's label.
+
+Each account trusts folders separately, so `chief init` and the settings screen ("Account trust")
+check every repo in every pool account and offer to open Claude there to accept the prompt. A
+thread never starts in an account that doesn't trust its repo. Without agp, threads use the
+project's account.
+
 ## Cleanup
 
 Each thread works in its own worktree, `<repo>/.claude/worktrees/…`, on its own branch. chief
