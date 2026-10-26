@@ -129,11 +129,11 @@ each project's coordinator and threads grouped in board order. A thread's line e
 right before every spawn and respawn (`start_thread`, `wake_thread`, the pane's respawn, `chief up`):
 Claude Code reads hooks and permissions when a session starts, so an edit to these files (one that
 drops the guard, say) never reaches a later start. A rewrite that fails stops the spawn or
-respawn. Commands inside them use the
-canonical absolute path of the `chief` binary (`std::env::current_exe()`), so install with
-`cargo install --path .`: `chief up` prints a one-line warning when that path is inside a cargo
-`target/` folder (an ancestor named `target` beside a `Cargo.toml`), since `cargo clean` would
-disable chief's hooks and guard. Every word of a hook command is shell-quoted.
+respawn. Commands inside them use the canonical absolute path of the `chief` binary
+(`std::env::current_exe()`), so install with `cargo install --path .`: `chief up` prints a
+one-line warning when that path is inside a cargo `target/` folder (an ancestor named `target`
+beside a `Cargo.toml`), since `cargo clean` would disable chief's hooks and guard. Every word of a
+hook command is shell-quoted.
 
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
 `CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
@@ -141,9 +141,8 @@ Sessions are started by Claude Code's supervisor and don't inherit chief's envir
 `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY` are
 written when set at generation time: as `K='v'` prefixes on every hook command and in the MCP
 server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or
-`CHIEF_REX_BIN` without a slash is kept for PATH lookup).
-Rex blocks start from the login shell's environment, so the layout's commands carry the same
-variables (§9).
+`CHIEF_REX_BIN` without a slash is kept for PATH lookup). Rex blocks start from the login shell's
+environment, so the layout's commands carry the same variables (§9).
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -154,13 +153,12 @@ variables (§9).
   UserPromptSubmit, the end of the turn for Stop), so a `chief hook` whose arguments clap rejects
   logs `bad arguments: …` to the hook error log and exits 0 with empty stdout, unless one of its
   words (not the `--project` or `--role` value) is `guard`: then it exits 2 with the reason on
-  stderr. Other subcommands keep clap's usual exit 2. The guard's
-  command fails closed: `<chief> hook guard --project <slug> --role <role> || { echo "chief's
-  message guard could not run (<chief path>); message blocked. Run chief up again." >&2; exit 2; }`
-  (the message is one shell-quoted word), so a missing or broken binary (exit 127 or any non-zero
-  exit) blocks the call with exit 2, which Claude Code treats as a block and shows to the model.
-  The guard's entry also sets `"timeout": 30` (seconds; the time budget is in §6).
-  The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
+  stderr. Other subcommands keep clap's usual exit 2. The guard's command fails closed:
+  `<chief> hook guard --project <slug> --role <role> || { echo "chief's message guard could not
+  run (<chief path>); message blocked. Run chief up again." >&2; exit 2; }` (the message is one
+  shell-quoted word), so a missing or broken binary (exit 127 or any non-zero exit) blocks the
+  call with exit 2, which Claude Code treats as a block and shows to the model. The guard's entry
+  also sets `"timeout": 30` (seconds; the time budget is in §6). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
   `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
   and `"deny"`: `Edit(//<repo path>/**)` for every repo and `Edit(//<dir>/generated/**)`, canonical
   paths, built in one place (`generated::coordinator_deny_rules`, syntax in
