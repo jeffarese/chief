@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::accounts::{self, Listings};
-use crate::claude::{AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError};
+use crate::agp::Agp;
+use crate::claude::{AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError, same_account};
 use crate::config::{EFFORTS, ProjectConfig};
 use crate::db::{self, SessionRow};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
-use crate::{generated, names, prompts, registry};
+use crate::{generated, names, placement, prompts, registry};
 
 /// Preview length in `list_threads` (§7).
 pub const LIST_PREVIEW_CHARS: usize = 300;
@@ -27,7 +28,10 @@ const MAX_HISTORY: usize = 20;
 pub struct ToolCtx<'a> {
     pub conn: &'a Connection,
     pub config: &'a ProjectConfig,
+    /// `claude` in the project's account.
     pub claude: &'a Claude,
+    /// Where `start_thread` finds the accounts a thread may run in (§7).
+    pub agp: &'a Agp,
     pub project_dir: &'a Path,
     /// Where trust is read: `~/.claude.json`, or `$CHIEF_CLAUDE_CONFIG`.
     pub trust_config: &'a Path,
@@ -62,6 +66,11 @@ pub struct StartThreadArgs {
     /// Effort override: low, medium, high, xhigh or max. Default: the project's thread effort.
     #[serde(default)]
     pub effort: Option<String>,
+    /// The Claude account to run it in, by agp id or label (e.g. "PB2"), only when the user
+    /// asks for one; it must be in the project's pool. Default: the pool account with the most
+    /// room now.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -110,9 +119,21 @@ pub struct ThreadView {
     pub last_activity: String,
     /// Its session, worktree and branch were removed; only its reports remain.
     pub cleaned: bool,
+    /// The agp account `start_thread` put it in (its label); null: the project's account.
+    pub account: Option<String>,
+    /// Where to SendMessage it: its name, or for a thread in another account its socket
+    /// address (it changes when the thread is woken). Null while that thread has no process,
+    /// and once it is cleaned up.
+    pub address: Option<String>,
 }
 
-pub fn thread_view(row: &SessionRow, preview_chars: usize, now: i64) -> ThreadView {
+/// `address` is `tools::address` for the row.
+pub fn thread_view(
+    row: &SessionRow,
+    preview_chars: usize,
+    now: i64,
+    address: Option<String>,
+) -> ThreadView {
     ThreadView {
         name: row.name.clone(),
         title: row.title.clone(),
@@ -127,6 +148,8 @@ pub fn thread_view(row: &SessionRow, preview_chars: usize, now: i64) -> ThreadVi
             .map(|r| one_line(r, preview_chars)),
         last_activity: ago(now, row.last_activity_at),
         cleaned: row.cleaned_at.is_some(),
+        account: row.account_shown().map(str::to_string),
+        address,
     }
 }
 
@@ -155,20 +178,42 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         bail!("task is empty: it is the thread's whole brief");
     }
     let (repo_name, repo_path) = resolve_repo(ctx.config, args.repo.as_deref())?;
-    if !crate::claude::is_trusted_in(ctx.trust_config, &repo_path)? {
-        return Err(ClaudeError::NotTrusted(repo_path).into());
-    }
     let model = pick(args.model.as_deref(), &ctx.config.threads.model);
     let effort = pick(args.effort.as_deref(), &ctx.config.threads.effort);
     if !EFFORTS.contains(&effort.as_str()) {
         bail!("effort {effort:?} is not one of {}", EFFORTS.join(", "));
     }
+    let inputs = placement::Inputs {
+        threads: &ctx.config.threads,
+        agp: ctx.agp,
+        project: ctx.claude,
+        project_trust: ctx.trust_config,
+    };
+    let placed = placement::place(&inputs, &repo_path, args.account.as_deref())?;
+    let account = placed.account(ctx.claude.account.as_deref());
+    // Every call about the new session runs in its account (§3).
+    let claude = ctx.claude.in_account(account.as_deref());
 
-    let live = ctx
-        .claude
-        .agents()
-        .context("checking `claude agents` for a free thread name")?;
-    let name = free_name(ctx, title, &live)?;
+    // Free in the thread's account, where it runs, and in the project's, where the coordinator
+    // messages same-account threads by name.
+    let mut where_ = vec![ctx.claude.account.clone()];
+    if !same_account(account.as_deref(), ctx.claude.account.as_deref()) {
+        where_.push(account.clone());
+    }
+    let listings = accounts::list(ctx.claude, &where_, AGENTS_TIMEOUT, ctx.now);
+    let mut taken = Vec::new();
+    for l in &listings.all {
+        taken.extend_from_slice(
+            l.agents()
+                .context("checking `claude agents` for a free thread name")?,
+        );
+    }
+    let live = listings
+        .of(account.as_deref())
+        .context("the thread's account was listed")?
+        .agents()?
+        .to_vec();
+    let name = free_name(ctx, title, &taken)?;
     // From the settings, not whatever is on disk: the session reads these hooks at start.
     generated::rewrite(ctx.project_dir, ctx.config)?;
     let now = (ctx.now)();
@@ -180,6 +225,11 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
     row.cwd = row.repo_path.clone();
     row.model = Some(model.clone());
     row.effort = Some(effort.clone());
+    if let Some(c) = &placed.chosen {
+        row.account_id = Some(c.id.clone());
+        row.account_label = Some(c.label.clone());
+        row.account_dir = c.dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+    }
     db::insert_session(ctx.conn, &row)?;
 
     let coordinator = names::coordinator_name(ctx.slug());
@@ -202,10 +252,10 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         ),
         prompt: Some(task_prompt(&args.task)),
     };
-    let (short_id, adopted, warning) = match ctx.claude.spawn_bg(&spec) {
+    let (short_id, adopted, warning) = match claude.spawn_bg(&spec) {
         Ok(id) => (id, None, None),
         Err(e) => {
-            let (agent, warning) = after_failed_spawn(ctx, &name, &live, &spec.cwd, e)?;
+            let (agent, warning) = after_failed_spawn(ctx, &claude, &name, &live, &spec.cwd, e)?;
             let id = agent
                 .id
                 .clone()
@@ -229,30 +279,87 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
             db::update_session(conn, &row)
         })
     };
-    if let Some(agent) = &adopted {
-        set_ids(Some(agent))?;
+    let started = if let Some(agent) = adopted {
+        set_ids(Some(&agent))?;
+        Some(agent)
     } else {
         set_ids(None)?;
         // Not fatal: hooks match the session by title and sync matches it by short id.
-        match ctx.claude.resolve_session(&short_id, ctx.resolve_timeout) {
-            Ok(agent) => set_ids(Some(&agent))?,
-            Err(e) => eprintln!("chief mcp: {e:#}"),
+        match claude.resolve_session(&short_id, ctx.resolve_timeout) {
+            Ok(agent) => {
+                set_ids(Some(&agent))?;
+                Some(agent)
+            }
+            Err(e) => {
+                eprintln!("chief mcp: {e:#}");
+                None
+            }
         }
-    }
+    };
+    let row = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
+    let address = address(ctx, &row, started.as_slice());
     let mut out = json!({
         "name": name,
         "short_id": short_id,
         "repo": repo_name,
         "model": model,
         "effort": effort,
-        "next": format!(
-            "Subscribe now: call SendMessage with exactly {{\"to\": \"{name}\", \"notify_when_idle\": true}} and no message key at all."
-        ),
+        "account": row.account_shown(),
+        "address": address,
+        "next": subscribe("Subscribe now", &row, address.as_deref()),
     });
+    if let Some(note) = placed.note {
+        out["account_note"] = json!(note);
+    }
     if let Some(w) = warning {
         out["warning"] = json!(w);
     }
     Ok(out)
+}
+
+/// Where the coordinator sends `row`'s messages (§6, §7): its name when it runs in the
+/// project's account; else, since names don't reach across accounts (§1), the socket address of
+/// its live process in `agents` (its own account's fresh listing), which changes whenever it is
+/// respawned and so is never stored. None for a thread with no session left or no live
+/// process listed.
+pub fn address(ctx: &ToolCtx, row: &SessionRow, agents: &[AgentRow]) -> Option<String> {
+    if row.cleaned_at.is_some() || row.removed_at.is_some() {
+        return None;
+    }
+    let project = ctx.claude.account.as_deref();
+    if same_account(row.account(project).as_deref(), project) {
+        return Some(row.name.clone());
+    }
+    let own = agents.iter().find(|a| match &row.session_id {
+        Some(sid) => &a.session_id == sid,
+        None => a.id.is_some() && a.id == row.short_id,
+    })?;
+    own.pid.map(crate::guard::uds_address)
+}
+
+/// The `next` line: subscribe to `row`'s idle notices at its address.
+fn subscribe(lead: &str, row: &SessionRow, address: Option<&str>) -> String {
+    let Some(address) = address else {
+        return format!(
+            "{} runs in another Claude account and isn't listed there with a process yet; call \
+             list_threads shortly for its address, then subscribe: SendMessage with exactly \
+             {{\"to\": \"<address>\", \"notify_when_idle\": true}} and no message key at all.",
+            row.name
+        );
+    };
+    let line = format!(
+        "{lead}: call SendMessage with exactly {{\"to\": \"{address}\", \"notify_when_idle\": \
+         true}} and no message key at all."
+    );
+    if address == row.name {
+        return line;
+    }
+    let account = row.account_shown().unwrap_or("another account");
+    format!(
+        "{line} {} runs in another Claude account ({account}), where names don't reach: \
+         message it at this address, not by name. The address changes when it is woken.",
+        row.name
+    )
 }
 
 /// A `claude --bg` in `cwd` that failed (a timeout, output chief doesn't recognise) may have
@@ -262,6 +369,7 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
 /// can't tell, keep the row (its hooks match it by title if it did start) and say so.
 fn after_failed_spawn(
     ctx: &ToolCtx,
+    claude: &Claude,
     name: &str,
     before: &[AgentRow],
     cwd: &Path,
@@ -270,9 +378,7 @@ fn after_failed_spawn(
     // An untrusted folder starts nothing.
     let found = match err.downcast_ref::<ClaudeError>() {
         Some(ClaudeError::NotTrusted(_)) => Ok(None),
-        None => ctx
-            .claude
-            .find_started(name, before, cwd, ctx.resolve_timeout),
+        None => claude.find_started(name, before, cwd, ctx.resolve_timeout),
     };
     match found {
         Ok(Some(agent)) => {
@@ -367,11 +473,21 @@ fn free_name(ctx: &ToolCtx, title: &str, live: &[AgentRow]) -> Result<String> {
 }
 
 pub fn list_threads(ctx: &ToolCtx, args: &ListThreadsArgs) -> Result<Value> {
-    let warning = match refresh(ctx) {
+    let refreshed = refresh(ctx);
+    let warning = match &refreshed {
         Ok(listings) => listings.error(),
         Err(e) => Some(format!("{e:#}")),
     }
     .map(|e| format!("`claude agents` failed, showing the last known state: {e}"));
+    let listings = refreshed.ok();
+    let address_of = |row: &SessionRow| {
+        let agents = listings
+            .as_ref()
+            .and_then(|l| l.of_row(row))
+            .and_then(|l| l.agents.as_deref().ok())
+            .unwrap_or_default();
+        address(ctx, row, agents)
+    };
     let include_resolved = args.include_resolved.unwrap_or(false);
     let mut rows: Vec<_> = db::list_sessions(ctx.conn, ctx.slug(), Some(Role::Thread))?
         .into_iter()
@@ -381,7 +497,7 @@ pub fn list_threads(ctx: &ToolCtx, args: &ListThreadsArgs) -> Result<Value> {
     let now = (ctx.now)();
     let threads: Vec<_> = rows
         .iter()
-        .map(|r| thread_view(r, LIST_PREVIEW_CHARS, now))
+        .map(|r| thread_view(r, LIST_PREVIEW_CHARS, now, address_of(r)))
         .collect();
     let mut out = json!({"threads": threads});
     if let Some(w) = warning {
@@ -425,13 +541,19 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     if row.cleaned_at.is_some() {
         bail!(crate::guard::cleaned_message(&name));
     }
-    // Its own account's `claude agents` is the one that can see it.
-    let alive = |ctx: &ToolCtx| -> Result<bool> {
-        accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)?;
-        Ok(db::get_session(ctx.conn, &name)?.is_some_and(|r| r.pid.is_some()))
+    // Its own account's `claude agents` is the one that can see it; Some(row) once it has a
+    // process, with its address from that fresh listing (§7).
+    let alive = |ctx: &ToolCtx| -> Result<Option<(SessionRow, Option<String>)>> {
+        let listing = accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)?;
+        let now = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
+        if now.pid.is_none() {
+            return Ok(None);
+        }
+        let address = address(ctx, &now, listing.agents()?);
+        Ok(Some((now, address)))
     };
-    if alive(ctx)? {
-        return Ok(json!({"name": name, "alive": true, "respawned": false}));
+    if let Some((_, address)) = alive(ctx)? {
+        return Ok(json!({"name": name, "alive": true, "respawned": false, "address": address}));
     }
     // After the refresh, which undoes a removal verdict for a session that is listed again.
     let row = project_thread(ctx, &name)?;
@@ -449,8 +571,14 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     loop {
         std::thread::sleep(ctx.poll_interval);
         // A failed poll is retried until the deadline.
-        if alive(ctx).unwrap_or(false) {
-            return Ok(json!({"name": name, "alive": true, "respawned": true}));
+        if let Some((now, address)) = alive(ctx).unwrap_or(None) {
+            let mut out =
+                json!({"name": name, "alive": true, "respawned": true, "address": address});
+            // A socket address names the old process: the subscription must follow.
+            if address.as_deref() != Some(name.as_str()) {
+                out["next"] = json!(subscribe("Subscribe again", &now, address.as_deref()));
+            }
+            return Ok(out);
         }
         if Instant::now() >= deadline {
             return Ok(json!({

@@ -17,6 +17,7 @@ pub mod mux;
 pub mod names;
 pub mod pane;
 pub mod paths;
+pub mod placement;
 pub mod pr;
 pub mod proc;
 pub mod project;

@@ -94,10 +94,13 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
     let claude = src.claude();
     let trust_config = claude.trust_config();
+    // Waking never picks an account; only start_thread reads agp.
+    let agp = crate::agp::Agp::from_env();
     let ctx = ToolCtx {
         conn: &conn,
         config: &config,
         claude: &claude,
+        agp: &agp,
         project_dir: &src.dir,
         trust_config: &trust_config,
         now: db::now_ms,

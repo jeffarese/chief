@@ -55,14 +55,14 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "Start a thread: a background Claude Code session that owns one task on its own branch. Returns its name; then subscribe with SendMessage(to=name, notify_when_idle=true) and no message."
+        description = "Start a thread: a background Claude Code session that owns one task on its own branch, in the Claude account with the most room. Returns its name and address; then subscribe with SendMessage(to=address, notify_when_idle=true) and no message, as `next` says."
     )]
     async fn start_thread(&self, Parameters(args): Parameters<StartThreadArgs>) -> CallToolResult {
         self.call(move |ctx| tools::start_thread(ctx, &args)).await
     }
 
     #[tool(
-        description = "List this project's threads with their board group, waiting reason, whether asleep, branch, PR and a preview of the last report."
+        description = "List this project's threads with their board group, waiting reason, whether asleep, branch, PR, account, the address to message them at, and a preview of the last report."
     )]
     async fn list_threads(&self, Parameters(args): Parameters<ListThreadsArgs>) -> CallToolResult {
         self.call(move |ctx| tools::list_threads(ctx, &args)).await
@@ -76,7 +76,7 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "Bring an asleep thread back (respawn its process) so it can receive messages. Returns whether it is alive."
+        description = "Bring an asleep thread back (respawn its process) so it can receive messages. Returns whether it is alive and its address, which changes for a thread in another account."
     )]
     async fn wake_thread(&self, Parameters(args): Parameters<NameArgs>) -> CallToolResult {
         self.call(move |ctx| tools::wake_thread(ctx, &args)).await
@@ -128,10 +128,12 @@ fn with_ctx<T>(project: &str, f: impl FnOnce(&ToolCtx) -> Result<T>) -> Result<T
     // The project's account, whatever the server's environment names (§3).
     let claude = Claude::for_account(config.claude_config_dir.clone());
     let trust_config = claude.trust_config();
+    let agp = crate::agp::Agp::from_env();
     let ctx = ToolCtx {
         conn: &conn,
         config: &config,
         claude: &claude,
+        agp: &agp,
         project_dir: &dir,
         trust_config: &trust_config,
         now: db::now_ms,

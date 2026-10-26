@@ -26,6 +26,7 @@ struct Env {
     conn: Connection,
     config: ProjectConfig,
     fake: Fake,
+    agp: Fake,
     dir: PathBuf,
     repo: PathBuf,
     trust: PathBuf,
@@ -52,23 +53,41 @@ impl Env {
         );
         let trust = root.path().join("claude.json");
         trust_file(&trust, &[&repo]);
+        // Not installed until a test installs it: threads stay in the project's account.
+        let agp = Fake::named("agp");
+        std::fs::remove_file(agp.bin()).unwrap();
         Env {
             root,
             conn,
             config,
             fake: Fake::new(),
+            agp,
             dir,
             repo,
             trust,
         }
     }
 
+    /// The fake `agp` with these pool accounts (`common::agp_view`) and folders.
+    fn pool(&self, views: &[Value], dirs: &[(&str, Option<&Path>)]) {
+        if !self.agp.bin().exists() {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-claude.sh");
+            std::os::unix::fs::symlink(script, self.agp.bin()).unwrap();
+        }
+        common::agp_accounts(&self.agp, views, dirs);
+    }
+
     fn with<T>(&self, f: impl FnOnce(&ToolCtx) -> T) -> T {
-        let claude = self.fake.claude();
+        self.with_claude(&self.fake.claude(), f)
+    }
+
+    fn with_claude<T>(&self, claude: &chief::claude::Claude, f: impl FnOnce(&ToolCtx) -> T) -> T {
+        let agp = chief::agp::Agp::new(self.agp.bin());
         let ctx = ToolCtx {
             conn: &self.conn,
             config: &self.config,
-            claude: &claude,
+            claude,
+            agp: &agp,
             project_dir: &self.dir,
             trust_config: &self.trust,
             now,
@@ -104,6 +123,7 @@ fn start_args(title: &str, task: &str) -> StartThreadArgs {
         repo: None,
         model: None,
         effort: None,
+        account: None,
     }
 }
 
@@ -149,6 +169,12 @@ fn start_thread_spawns_and_resolves() {
             "Subscribe now: call SendMessage with exactly {{\"to\": \"{name}\", \"notify_when_idle\": true}} and no message key at all."
         )
     );
+    // No agp: the project's account, as before, and messaged by name.
+    assert_eq!(
+        (&out["account"], &out["address"]),
+        (&Value::Null, &json!(name))
+    );
+    assert!(out.get("account_note").is_none());
 
     let row = env.row(&name).unwrap();
     assert_eq!(row.short_id.as_deref(), Some("abc123"));
@@ -188,6 +214,310 @@ fn start_thread_spawns_and_resolves() {
         ["agents", "--json", "--all"],
         "names are checked first"
     );
+}
+
+/// Pool accounts for these tests: PB5 is limited, PB2 scores best but doesn't trust the repo,
+/// PB3 trusts it; Main (the default account) isn't in the pool.
+struct Pool {
+    cpb: PathBuf,
+    cpe: PathBuf,
+    pb5: PathBuf,
+}
+
+fn pool(env: &Env) -> Pool {
+    let cpb = common::account(env.root.path(), "claude-cpb");
+    let cpe = common::account(env.root.path(), "claude-cpe");
+    let pb5 = common::account(env.root.path(), "claude-pb5");
+    trust_file(&cpe.join(".claude.json"), &[&env.repo]);
+    trust_file(&pb5.join(".claude.json"), &[&env.repo]);
+    let mut limited = common::agp_view("pb5", "PB5", true, 0.99);
+    limited["limited"] = json!({"until": 1});
+    env.pool(
+        &[
+            common::agp_view("default", "Main", false, 0.0),
+            common::agp_view("cpe", "PB3", true, 0.6),
+            common::agp_view("cpb", "PB2", true, 0.9),
+            limited,
+        ],
+        &[
+            ("default", None),
+            ("cpb", Some(&cpb)),
+            ("cpe", Some(&cpe)),
+            ("pb5", Some(&pb5)),
+        ],
+    );
+    Pool { cpb, cpe, pb5 }
+}
+
+/// §7 "Thread account": the best usable pool account that trusts the repo, with the skipped
+/// ones in a note; the thread is messaged at its socket address there, and every call about it
+/// runs in that account.
+#[test]
+fn start_thread_runs_in_the_best_pool_account_that_trusts_the_repo() {
+    let env = Env::new();
+    let pool = pool(&env);
+    env.fake
+        .set("bg.stdout", "backgrounded · abc123 · whatever\n")
+        .set("agents.stdout", "[]");
+    common::account_agents(
+        &pool.cpe,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-anything-xxxx",
+            "working",
+            Some(77),
+        )],
+    );
+    let out = env
+        .with(|ctx| tools::start_thread(ctx, &start_args("Fix login bug", "Fix it")))
+        .unwrap();
+    let name = out["name"].as_str().unwrap().to_string();
+    assert_eq!(out["account"], "PB3");
+    assert_eq!(out["address"], "uds:/tmp/cc-socks/77.sock");
+    let next = out["next"].as_str().unwrap();
+    assert!(
+        next.starts_with(
+            "Subscribe now: call SendMessage with exactly {\"to\": \"uds:/tmp/cc-socks/77.sock\", \
+             \"notify_when_idle\": true}"
+        ),
+        "{next}"
+    );
+    assert!(next.contains("not by name"), "{next}");
+    let note = out["account_note"].as_str().unwrap();
+    assert!(
+        note.starts_with("It runs in PB3; skipped: PB2 doesn't trust"),
+        "{note}"
+    );
+    assert!(
+        note.contains(&format!(
+            "cd {} && agp exec cpb -- claude",
+            env.repo.display()
+        )),
+        "{note}"
+    );
+
+    let row = env.row(&name).unwrap();
+    assert_eq!(
+        (
+            row.account_id.as_deref(),
+            row.account_label.as_deref(),
+            row.account_dir.as_deref()
+        ),
+        (Some("cpe"), Some("PB3"), Some(pool.cpe.to_str().unwrap()))
+    );
+    assert_eq!(
+        (row.session_id.as_deref(), row.pid),
+        (Some("sid-abc"), Some(77))
+    );
+    let cpe = pool.cpe.to_string_lossy().into_owned();
+    let accounts = env.fake.accounts();
+    let bg: Vec<_> = accounts.iter().filter(|(f, _)| f == "--bg").collect();
+    assert_eq!(bg.len(), 1);
+    assert_eq!(bg[0].1, cpe, "spawned in PB3");
+    // Free-name check in both accounts, then resolving in PB3 only.
+    let mut listed: Vec<_> = accounts
+        .iter()
+        .filter(|(f, _)| f == "agents")
+        .map(|(_, a)| a.clone())
+        .collect();
+    listed.dedup();
+    assert!(
+        listed.contains(&"unset".to_string()) && listed.contains(&cpe),
+        "{listed:?}"
+    );
+    // agp: its status, then the folders of the accounts tried (never the limited one's).
+    let agp: Vec<_> = env
+        .agp
+        .calls()
+        .into_iter()
+        .map(|c| c[..2].join(" "))
+        .collect();
+    assert_eq!(agp, ["status --json", "exec cpb", "exec cpe"]);
+    let _ = pool.pb5;
+
+    // list_threads gives the same address and the account.
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    let t = &out["threads"][0];
+    assert_eq!(
+        (&t["account"], &t["address"]),
+        (&json!("PB3"), &json!("uds:/tmp/cc-socks/77.sock"))
+    );
+}
+
+/// The project's account, as before agp, whenever the pool can't take the thread: nothing
+/// allowed, everything limited or over `max_usage`, nothing that trusts the repo, agp failing.
+#[test]
+fn start_thread_falls_back_to_the_project_account() {
+    let run = |env: &Env| {
+        env.fake
+            .set("bg.stdout", "backgrounded · abc123 · whatever\n")
+            .set(
+                "agents.stdout",
+                &json!([agent(
+                    "abc123",
+                    "sid-abc",
+                    "demo-x-xxxx",
+                    "working",
+                    Some(7)
+                )])
+                .to_string(),
+            );
+        let out = env
+            .with(|ctx| tools::start_thread(ctx, &start_args("Fix login bug", "Fix it")))
+            .unwrap();
+        let name = out["name"].as_str().unwrap();
+        assert_eq!(
+            (&out["account"], &out["address"]),
+            (&Value::Null, &json!(name))
+        );
+        let row = env.row(name).unwrap();
+        assert_eq!(row.account_id, None);
+        assert!(
+            env.fake
+                .accounts()
+                .iter()
+                .all(|(_, account)| account == "unset")
+        );
+        out.get("account_note")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+
+    // `accounts = []`: agp isn't even asked.
+    let mut env = Env::new();
+    pool(&env);
+    env.config.threads.accounts = vec![];
+    assert_eq!(run(&env), None);
+    assert!(env.agp.calls().is_empty());
+
+    // Only accounts outside the pool (or unknown) allowed: silently the project's.
+    let mut env = Env::new();
+    pool(&env);
+    env.config.threads.accounts = vec!["default".into(), "nope".into()];
+    assert_eq!(run(&env), None);
+
+    // Only PB2 allowed, which doesn't trust the repo.
+    let mut env = Env::new();
+    pool(&env);
+    env.config.threads.accounts = vec!["cpb".into()];
+    let note = run(&env).unwrap();
+    assert!(
+        note.starts_with("No pool account could take it (PB2 doesn't trust"),
+        "{note}"
+    );
+    assert!(
+        note.ends_with("it runs in the project's account."),
+        "{note}"
+    );
+
+    // Everything usable is at or over max_usage (10% of the 5-hour window here).
+    let mut env = Env::new();
+    pool(&env);
+    env.config.threads.max_usage = Some(10);
+    let note = run(&env).unwrap();
+    assert!(
+        note.starts_with("Every pool account (cpe (PB3), cpb (PB2), pb5 (PB5)) is limited or at 10% usage or more"),
+        "{note}"
+    );
+
+    // agp fails.
+    let env = Env::new();
+    pool(&env);
+    env.agp
+        .set("status.exit", "1")
+        .set("status.stderr", "agp: broken config");
+    let note = run(&env).unwrap();
+    assert!(note.contains("agp: broken config"), "{note}");
+    assert!(note.ends_with("it runs in the project's account"), "{note}");
+
+    // The project's account must trust the repo then, as before.
+    let mut env = Env::new();
+    pool(&env);
+    env.config.threads.accounts = vec![];
+    trust_file(&env.trust, &[]);
+    let err = env
+        .with(|ctx| tools::start_thread(ctx, &start_args("Fix login bug", "Fix it")))
+        .unwrap_err();
+    assert!(err.to_string().contains("doesn't trust"), "{err}");
+}
+
+/// A pool account trusting the repo is enough: the project's account needn't.
+#[test]
+fn start_thread_needs_trust_only_in_the_thread_account() {
+    let env = Env::new();
+    let pool = pool(&env);
+    trust_file(&env.trust, &[]);
+    env.fake
+        .set("bg.stdout", "backgrounded · abc123 · whatever\n")
+        .set("agents.stdout", "[]");
+    common::account_agents(
+        &pool.cpe,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-x-xxxx",
+            "working",
+            Some(7),
+        )],
+    );
+    let out = env
+        .with(|ctx| tools::start_thread(ctx, &start_args("Fix login bug", "Fix it")))
+        .unwrap();
+    assert_eq!(out["account"], "PB3");
+    let _ = pool.cpb;
+}
+
+/// `account` pins one when the user asks: by id or label, from the pool only, trusting the
+/// repo; a limited one is allowed with a note.
+#[test]
+fn start_thread_runs_where_asked() {
+    let pinned = |env: &Env, account: &str| {
+        let mut args = start_args("Fix login bug", "Fix it");
+        args.account = Some(account.into());
+        env.with(|ctx| tools::start_thread(ctx, &args))
+    };
+    let env = Env::new();
+    let pool = pool(&env);
+    env.fake
+        .set("bg.stdout", "backgrounded · abc123 · whatever\n")
+        .set("agents.stdout", "[]");
+    common::account_agents(
+        &pool.pb5,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-x-xxxx",
+            "working",
+            Some(7),
+        )],
+    );
+    let out = pinned(&env, "PB5").unwrap();
+    assert_eq!(out["account"], "PB5");
+    assert_eq!(
+        out["account_note"],
+        "PB5 is limited right now; the thread waits for its limit to reset."
+    );
+
+    let err = pinned(&env, "default").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "default is not an account in this project's pool (pool: cpe (PB3), cpb (PB2), pb5 (PB5))"
+    );
+    let err = pinned(&env, "cpb").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("can't run it in PB2: PB2 doesn't trust"),
+        "{err}"
+    );
+    let _ = pool.cpe;
+
+    // Without agp nothing can be pinned.
+    let env = Env::new();
+    let err = pinned(&env, "PB3").unwrap_err();
+    assert!(err.to_string().contains("agp isn't installed"), "{err}");
 }
 
 #[test]
@@ -388,21 +718,11 @@ fn start_thread_adopts_a_session_that_started_anyway() {
     for bg_exit in [0, 1] {
         let env = Env::new();
         let claude = started_anyway(env.fake.dir.path(), bg_exit);
-        let out = tools::start_thread(
-            &ToolCtx {
-                conn: &env.conn,
-                config: &env.config,
-                claude: &claude,
-                project_dir: &env.dir,
-                trust_config: &env.trust,
-                now,
-                resolve_timeout: Duration::from_millis(300),
-                wake_timeout: Duration::from_millis(300),
-                poll_interval: Duration::from_millis(10),
-            },
-            &start_args("Fix login bug", "Fix it"),
-        )
-        .unwrap();
+        let out = env
+            .with_claude(&claude, |ctx| {
+                tools::start_thread(ctx, &start_args("Fix login bug", "Fix it"))
+            })
+            .unwrap();
         let name = out["name"].as_str().unwrap();
         assert_eq!(out["short_id"], "ad0pt");
         let warning = out["warning"].as_str().unwrap();
@@ -423,21 +743,11 @@ fn start_thread_adopts_only_a_session_in_the_repo() {
     let env = Env::new();
     let elsewhere = env.root.path().canonicalize().unwrap();
     let claude = started_anyway_in(env.fake.dir.path(), 1, Some(&elsewhere));
-    let err = tools::start_thread(
-        &ToolCtx {
-            conn: &env.conn,
-            config: &env.config,
-            claude: &claude,
-            project_dir: &env.dir,
-            trust_config: &env.trust,
-            now,
-            resolve_timeout: Duration::from_millis(300),
-            wake_timeout: Duration::from_millis(300),
-            poll_interval: Duration::from_millis(10),
-        },
-        &start_args("Fix login bug", "Fix it"),
-    )
-    .unwrap_err();
+    let err = env
+        .with_claude(&claude, |ctx| {
+            tools::start_thread(ctx, &start_args("Fix login bug", "Fix it"))
+        })
+        .unwrap_err();
     assert!(
         format!("{err:#}").contains("printed no session id"),
         "{err:#}"
@@ -630,7 +940,7 @@ fn wake_thread_respawns_and_waits_for_a_pid() {
     env.agents(std::slice::from_ref(&awake));
     assert_eq!(
         wake().unwrap(),
-        json!({"name": "demo-w-1111", "alive": true, "respawned": true})
+        json!({"name": "demo-w-1111", "alive": true, "respawned": true, "address": "demo-w-1111"})
     );
     assert_eq!(env.fake.calls_of("respawn"), [vec!["respawn", "w1"]]);
     assert_eq!(env.row("demo-w-1111").unwrap().pid, Some(9));
@@ -690,6 +1000,16 @@ fn a_thread_in_another_account_is_synced_and_woken_there() {
         (&far["name"], &far["group"], &far["asleep"]),
         (&json!("demo-far-1111"), &json!("working"), &json!(false))
     );
+    // Names don't reach across accounts: its address is its live socket there.
+    assert_eq!(
+        (&far["account"], &far["address"]),
+        (&json!("PB2"), &json!("uds:/tmp/cc-socks/9.sock"))
+    );
+    let near = &out["threads"][1];
+    assert_eq!(
+        (&near["account"], &near["address"]),
+        (&Value::Null, &json!("demo-near-2222"))
+    );
     let mut listed: Vec<String> = env
         .fake
         .accounts()
@@ -713,6 +1033,17 @@ fn a_thread_in_another_account_is_synced_and_woken_there() {
     );
     assert_eq!(env.row("demo-far-1111").unwrap().pid, Some(9));
     assert_eq!(env.row("demo-near-2222").unwrap().pid, Some(3));
+    let far = out["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "demo-far-1111")
+        .unwrap();
+    assert_eq!(
+        far["address"],
+        Value::Null,
+        "never a stored, maybe stale pid"
+    );
 
     // Asleep in its account: respawned in that account, and only that account is polled.
     let calls_before = env.fake.calls().len();
@@ -755,6 +1086,16 @@ fn a_thread_in_another_account_is_synced_and_woken_there() {
         "{after:?}"
     );
     assert_eq!(env.row("demo-far-1111").unwrap().pid, Some(11));
+    // A new process, a new address: subscribe again there.
+    assert_eq!(out["address"], "uds:/tmp/cc-socks/11.sock");
+    let next = out["next"].as_str().unwrap();
+    assert!(
+        next.starts_with(
+            "Subscribe again: call SendMessage with exactly {\"to\": \
+             \"uds:/tmp/cc-socks/11.sock\", \"notify_when_idle\": true}"
+        ),
+        "{next}"
+    );
 }
 
 #[test]

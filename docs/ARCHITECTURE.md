@@ -285,6 +285,11 @@ permission_mode = "auto"           # must not be bypassPermissions (messages wou
 max_parallel = 3                   # soft; told to the coordinator, not enforced
 default_repo = "payments-api"      # a repos[].name
 cleanup = "merged"                 # merged | manual (default merged), see §12
+accounts = ["auto"]                # agp accounts new threads may run in (§7 "Thread account"):
+                                   # "auto" (the default) = every account in agp's pool, or agp
+                                   # profile ids; [] = always the project's account
+max_usage = 80                     # optional: a pool account at or over this % (5-hour or
+                                   # weekly) takes no new thread
 
 [[repos]]
 name = "payments-api"
@@ -572,10 +577,10 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 
 | Tool | Input | Does |
 | --- | --- | --- |
-| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}`, plus `warning` when it adopted a session whose spawn reported a failure |
-| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`. Resolved and cleaned threads are left out unless `include_resolved` |
+| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?`, `account?` (an agp id or label from the pool, only when the user asks) | Picks the thread's account (below), which also checks trust of the repo path there, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread in that account, resolves its ids. Returns `{name, short_id, repo, model, effort, account, address, next}` (`account` the agp label, null for the project's account), plus `account_note` when the choice skipped accounts or fell back, and `warning` when it adopted a session whose spawn reported a failure |
+| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` in every account the project uses (stored rows plus a `warning` naming what failed), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`, `account`, `address`. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text |
-| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
+| `wake_thread` | `name` | Refreshes from its own account; if no live pid: `claude respawn <short_id>` there, poll its account's `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there). A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
@@ -583,10 +588,11 @@ There is no cleanup tool: removing a worktree and branch is the user's call (§1
 Names may carry a trailing ` [ref]`; it is ignored. Only this project's threads are accepted.
 
 `start_thread` details: `repo` falls back to `threads.default_repo` (error if neither); an absolute
-path must be a folder and maps back to a repos[] name when it is one. Trust is checked before
-anything else and an untrusted repo returns the `NotTrusted` message. The name must not be in the
-registry nor among `claude agents` names (a few suffixes are tried; if `claude agents` fails,
-nothing starts). A task that starts with `-` is sent as `Task: <task>` so the CLI can't read it as
+path must be a folder and maps back to a repos[] name when it is one. The account is chosen
+before anything starts (below); falling back to the project's account checks trust there and an
+untrusted repo returns the `NotTrusted` message. The name must not be in the registry nor among
+the `claude agents` names of the thread's account and the project's (a few suffixes are tried; if
+either `claude agents` fails, nothing starts). A task that starts with `-` is sent as `Task: <task>` so the CLI can't read it as
 a flag. If the spawn fails, the session may have started anyway (a timeout, an output without
 the `backgrounded` line), and a deleted row would leave it working unseen and unreachable through
 the guard. So unless the error is `NotTrusted`, chief first looks for it in `claude agents` (polled
@@ -599,16 +605,45 @@ succeed without it, the row is deleted and the error returned. When every listin
 can't tell: the row is kept without a short id (hooks attach it by title if the session did start)
 and the error says so. Failing to resolve the session id is not an error (hooks match by title,
 sync by short id). `next` is
-a literal SendMessage input with no `message` key, `{"to": "<name>", "notify_when_idle": true}`
+a literal SendMessage input with no `message` key, `{"to": "<address>", "notify_when_idle": true}`
 (verified: omitting `message` is a valid pure subscription): the coordinator subscribes right after
 starting a thread, which is how it hears the thread finished. (M5 live run: told "with no message",
-and again told to pass `""`, Haiku emitted `"message": ,`, which is invalid JSON.)
+and again told to pass `""`, Haiku emitted `"message": ,`, which is invalid JSON.) For a thread in
+another account `next` adds that names don't reach it there and the address changes when it is
+woken; when its process isn't listed yet, `next` says to get the address from `list_threads`.
 
-The coordinator sends work to existing threads itself with `SendMessage` (`to` = name,
-`notify_when_idle: true`); the guard enforces scope.
+A thread's `address` (`tools::address`) is where the coordinator's `SendMessage` reaches it:
+its name when it runs in the project's account; otherwise, since names don't reach across
+accounts (§1), `uds:/tmp/cc-socks/<pid>.sock` with the pid of its own session in a fresh listing
+of its account (matched by session id, else short id). The pid changes with every respawn, so the
+address is computed from the listing each time and never stored; it is null when that listing
+failed or shows no process, and for a cleaned or removed thread.
+
+The coordinator sends work to existing threads itself with `SendMessage` (`to` = the thread's
+address, `notify_when_idle: true`); the guard enforces scope.
+
+### Thread account
+
+Without agp (`agp` not on PATH or `CHIEF_AGP_BIN` missing), or with `[threads] accounts = []`,
+every thread runs in the project's account, as before. Otherwise `start_thread` reads
+`agp status --json` (bounded, 15 s) and takes the pool: the Claude accounts agp has `in_pool`
+that `accounts` allows (`"auto"`: all of them; else the listed profile ids). The coordinator's
+own account needn't be in it. No pool account allowed: the project's account, silently. Of the
+pool, the usable accounts are those not `limited`, with 5-hour and weekly utilization below
+`max_usage` when it is set, best agp `score` first (`agp pick` ignores `--accounts`/`--exclude`,
+§1, so chief never asks it). For each in turn chief asks agp for its folder (`agp exec <id> --
+sh -c 'printf %s "${CLAUDE_CONFIG_DIR-}"'`; empty = the default account) and checks the repo's
+trust in that account's `.claude.json`; the first that trusts it gets the thread, and the ones
+skipped (untrusted, with the `cd <repo> && agp exec <id> -- claude` that fixes it; agp failing)
+are listed in `account_note`. When none is usable or none trusts the repo, or `agp status`
+fails, the thread runs in the project's account and `account_note` says why. `account?` pins
+one: it must be in the pool (by id, else label) and trust the repo, or the call fails; limited
+or over `max_usage` only adds a note (the thread waits for the reset). The account is chosen
+once: a thread whose account later hits a limit waits there and is never moved.
 
 The tool logic lives in `src/tools.rs` as plain functions over a context (connection, config,
-`Claude`, project dir, trust file, clock, timeouts); `src/mcp.rs` adapts them to `rmcp` and runs
+`Claude` in the project's account, `Agp`, project dir, trust file, clock, timeouts; the account
+choice is `src/placement.rs`); `src/mcp.rs` adapts them to `rmcp` and runs
 each call on the blocking pool with a freshly loaded `project.toml`. stdout is the protocol; logs go
 to stderr.
 
@@ -641,9 +676,9 @@ process group.
 
 Trust (`claude::is_trusted_in`) walks up both the path as given and its canonical form (macOS
 `/tmp` is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on
-the way counts. It reads the project's account's config file (§3, `Claude::trust_config`):
-`<claude_config_dir>/.claude.json`, or for the default account `$CHIEF_CLAUDE_CONFIG` (tests) else
-`~/.claude.json`.
+the way counts. It reads the config file of the account the session runs in (§3,
+`Claude::trust_config`): `<account folder>/.claude.json`, or for the default account
+`$CHIEF_CLAUDE_CONFIG` (tests) else `~/.claude.json`.
 
 ### Coordinator spawn (`chief up`)
 
