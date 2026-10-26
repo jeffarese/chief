@@ -142,6 +142,7 @@ variables (§9).
   message guard could not run (<chief path>); message blocked. Run chief up again." >&2; exit 2; }`
   (the message is one shell-quoted word), so a missing or broken binary (exit 127 or any non-zero
   exit) blocks the call with exit 2, which Claude Code treats as a block and shows to the model.
+  The guard's entry also sets `"timeout": 30` (seconds; the time budget is in §6).
   The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and
   `"permissions": {"allow": ["mcp__chief"]}` (nobody watches its background session for prompts
   on its own tools).
@@ -400,6 +401,16 @@ SendMessage with a `to`.
 
 The guard process itself always exits 0 (deny JSON or empty stdout); its generated command turns
 any other exit, including a chief binary that can't start, into exit 2 (§3), which blocks the call.
+
+Time budget. When Claude Code's hook timeout fires it cancels the command and the call proceeds
+(the `|| exit 2` never runs), so the guard must answer first. Its entry sets `"timeout": 30`
+explicitly (§3). Inside, `claude agents` is bounded at 10 s (a real bound, §7), and a watchdog
+denies at 20 s whatever the guard is still doing: "chief's message guard didn't decide within 20s,
+so the message is blocked. Try again; if it keeps happening, check <hook error log>." That covers
+SQLite busy waits, which are bounded only per statement (5 s, §4; the guard opens the database,
+which runs the migration check, reads the rows, and inserts at most one denial). The watchdog's
+denial is logged to the hook error log, not to `guard_denials`: the database may be what is stuck.
+`CHIEF_GUARD_DEADLINE_MS` shortens the deadline for tests (it can only deny sooner).
 
 Every deny writes a `guard_denials` row (caller matched by `session_id`, `target` = raw `to`) and
 returns the PreToolUse deny JSON above; an allow prints nothing. If the guard itself fails (bad

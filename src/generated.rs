@@ -34,6 +34,9 @@ const EVENTS: [(&str, Option<&str>); 8] = [
     ("SessionEnd", None),
 ];
 const GUARD_MATCHER: &str = "SendMessage|ListAgents";
+/// The guard entry's `timeout`. When Claude Code's hook timeout fires, the `|| exit 2` never runs
+/// and the call proceeds, so the guard denies on its own at `hook::GUARD_DEADLINE`, well before.
+pub const GUARD_HOOK_TIMEOUT_SECS: u64 = 30;
 /// Permission rule for every tool of the `chief` MCP server.
 const MCP_TOOLS_RULE: &str = "mcp__chief";
 
@@ -113,6 +116,7 @@ pub fn hook_settings(exe: &Path, slug: &str, role: Role, env: &[(String, String)
             let guard = json!({
                 "type": "command",
                 "command": guard_command(exe, slug, role, env),
+                "timeout": GUARD_HOOK_TIMEOUT_SECS,
             });
             entries.push(json!({"matcher": GUARD_MATCHER, "hooks": [guard]}));
         }
@@ -246,6 +250,13 @@ mod tests {
              'chief'\\''s message guard could not run (/opt/my tools/chief); message blocked. Run \
              chief up again.' >&2; exit 2; }"
         );
+        // Claude Code lets the call through when its hook timeout fires, so the guard's entry
+        // says how long it may take, and the guard answers well before that.
+        assert_eq!(pre[1]["hooks"][0]["timeout"], GUARD_HOOK_TIMEOUT_SECS);
+        assert!(pre[0]["hooks"][0].get("timeout").is_none());
+        let deadline = crate::hook::GUARD_DEADLINE.as_secs();
+        assert!(crate::hook::GUARD_AGENTS_TIMEOUT.as_secs() < deadline);
+        assert!(deadline + 5 <= GUARD_HOOK_TIMEOUT_SECS);
         assert_eq!(hooks["PostToolUse"][0]["matcher"], "*");
         assert!(hooks["Notification"][0].get("matcher").is_none());
         assert!(

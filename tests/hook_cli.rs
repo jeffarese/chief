@@ -168,6 +168,39 @@ fn guard_fails_closed() {
     );
 }
 
+/// A guard that can't finish (here the database stays locked) still denies before Claude Code's
+/// hook timeout would let the call through.
+#[test]
+fn guard_denies_at_its_deadline() {
+    let home = guarded_home();
+    let lock = home.db();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let start = std::time::Instant::now();
+    let mut cmd = home.command(&[
+        "hook",
+        "guard",
+        "--project",
+        "demo",
+        "--role",
+        "coordinator",
+    ]);
+    cmd.env("CHIEF_GUARD_DEADLINE_MS", "1000");
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(send("demo-a-1111").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let took = start.elapsed();
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert!(took < std::time::Duration::from_secs(4), "took {took:?}");
+    let reason = deny_reason(&out).unwrap();
+    assert!(reason.contains("didn't decide within 1s"), "{reason}");
+    assert!(error_log(home.path()).contains("didn't decide within 1s"));
+}
+
 fn send(to: &str) -> String {
     serde_json::json!({
         "session_id": "coord-sid",

@@ -19,16 +19,30 @@ use crate::{context, guard, names, paths, registry, tools};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The guard holds up a tool call and the context a turn; neither may hang on the supervisor.
-const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
+pub const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTEXT_AGENTS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The guard answers within this, or a watchdog denies (§6). Claude Code's own hook timeout
+/// (`generated::GUARD_HOOK_TIMEOUT_SECS`) would let the call through, and SQLite busy waits (5 s
+/// per statement) have no overall bound, so this is what bounds the guard.
+pub const GUARD_DEADLINE: Duration = Duration::from_secs(20);
+/// Shortens `GUARD_DEADLINE` (tests only; a shorter deadline can only deny sooner).
+const GUARD_DEADLINE_ENV: &str = "CHIEF_GUARD_DEADLINE_MS";
 const SUMMARY_CHARS: usize = 120;
+
+/// Set once stdout has its answer (or the decision to print nothing), so the guard's watchdog
+/// and the guard itself never both answer.
+static ANSWERED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Entry point. Reads the payload from stdin, never panics, never returns an error: failures are
 /// appended to the hook error log. Prints only the guard decision or the coordinator's
-/// UserPromptSubmit context. The guard fails closed: any error or panic in it denies.
+/// UserPromptSubmit context. The guard fails closed: any error or panic in it denies, and so
+/// does running past its deadline.
 pub fn run(event: &str, project: &str, role: Role) {
     // The default panic hook writes to stderr, which Claude Code may show in the session.
     std::panic::set_hook(Box::new(|_| {}));
+    if event == "guard" {
+        start_guard_watchdog(project, guard_deadline());
+    }
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| dispatch(event, project, role)));
     let (out, error) = match result {
         Ok(Ok(out)) => (out, None),
@@ -39,14 +53,53 @@ pub fn run(event: &str, project: &str, role: Role) {
         (Some(error), "guard") => Some(guard_failed(project, error)),
         _ => out,
     };
+    answer(out.as_deref());
+    if let Some(error) = error {
+        log_error(&paths::hook_error_log(), event, project, &error);
+    }
+}
+
+/// Writes `out` (None: nothing) unless something already answered; false if it had.
+fn answer(out: Option<&str>) -> bool {
+    let mut answered = ANSWERED.lock().unwrap_or_else(|e| e.into_inner());
+    if *answered {
+        return false;
+    }
+    *answered = true;
     if let Some(out) = out {
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(out.as_bytes());
         let _ = stdout.flush();
     }
-    if let Some(error) = error {
-        log_error(&paths::hook_error_log(), event, project, &error);
-    }
+    true
+}
+
+fn guard_deadline() -> Duration {
+    std::env::var(GUARD_DEADLINE_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .filter(|d| *d < GUARD_DEADLINE)
+        .unwrap_or(GUARD_DEADLINE)
+}
+
+/// Denies and exits at `deadline` unless the guard answered first. It touches no database (that
+/// may be what is stuck), so the denial is only logged.
+fn start_guard_watchdog(project: &str, deadline: Duration) {
+    let project = project.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        let reason = format!(
+            "chief's message guard didn't decide within {}s, so the message is blocked. Try \
+             again; if it keeps happening, check {}.",
+            deadline.as_secs(),
+            paths::hook_error_log().display()
+        );
+        if answer(Some(&guard::deny_json(&reason))) {
+            log_error(&paths::hook_error_log(), "guard", &project, &reason);
+            std::process::exit(0);
+        }
+    });
 }
 
 /// Routes an event; the returned text goes to stdout.
