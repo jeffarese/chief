@@ -82,8 +82,8 @@ pub enum Decision {
 pub const LIST_AGENTS_DENIED: &str =
     "Use the chief list_threads tool; it lists only this project's threads.";
 /// Threads have no list_threads tool, so they get a different pointer.
-pub const THREAD_LIST_AGENTS_DENIED: &str =
-    "ListAgents is blocked in chief threads: you can message only your coordinator.";
+pub const THREAD_LIST_AGENTS_DENIED: &str = "ListAgents is blocked in chief threads: you can message only your coordinator and your own \
+     subagents.";
 pub const ASLEEP: &str = "Thread is asleep: call wake_thread first.";
 pub const RESOLVED: &str = "Thread is resolved; reopen it first.";
 /// Prefixed to a denial whose `to` contains `[`.

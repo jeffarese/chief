@@ -581,7 +581,7 @@ below; the rows here decide everything else.
 | Caller | Tool | Rule |
 | --- | --- | --- |
 | any | `Agent` | deny a `name` that another session answers to ("Subagents" below); allow every other call |
-| any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
+| any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator and your own subagents." |
 | coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not removed outside chief, not cleaned, not resolved, and reachable (below). Removed outside chief (`removed_at`, §5) → deny: "<name>'s session was removed outside chief, so it can't be woken, reopened or messaged; start a new thread (its reports are still readable with read_report)". Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
 | thread | `SendMessage` | allow only if `to` is exactly `chief-<slug>` or exactly the coordinator's socket address, and the coordinator is reachable. Coordinator not running (or never started) → deny: "Your coordinator chief-<slug> isn't running, so the message can't be delivered. Just finish your turn: your final message is recorded as your report when you stop anyway, and the coordinator reads it there." Renamed or ambiguous → deny with the same advice. Everything else → deny ("Threads may message only their coordinator, by its exact name chief-<slug>."): siblings, other projects, subagents chief has no record of, and any session the local `claude agents` doesn't list |
 
@@ -852,13 +852,15 @@ a pid. Otherwise it is left alone.
   to `memory/` and update `memory/MEMORY.md`, read full reports with `read_report` when an idle
   notice arrives. Removing worktrees and branches is the user's call (board `x`, `chief clean`,
   `chief gc`), so it never offers to; it names no branch in a thread's brief unless the user did
-  (threads create their own).
+  (threads create their own). One line says it can message its own subagents by the name or agent
+  id the Agent tool gave them, and that they report to it (§6 "Subagents").
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
-  instructions follow; work on your own branch; message only the coordinator, by its exact name
-  (the report needs no message), or, for a thread spawned in another account than the
-  coordinator's (§3), reply only to the `from="uds:…"` address of the coordinator's message; end
-  every turn with a short report (what changed, branch, PR URL if any, what you need); if
-  something is missing, say exactly what and stop.
+  instructions follow; work on your own branch; of other sessions message only the coordinator,
+  by its exact name (the report needs no message), or, for a thread spawned in another account
+  than the coordinator's (§3), reply only to the `from="uds:…"` address of the coordinator's
+  message; you can message your own subagents by the name or agent id the Agent tool gave them,
+  and they report to you (§6 "Subagents"); end every turn with a short report (what changed,
+  branch, PR URL if any, what you need); if something is missing, say exactly what and stop.
 
 Placeholders (`{{name}}` replaced verbatim): coordinator `name`, `goal_line` (` Goal: …` or empty),
 `project_dir`, `max_parallel`; thread `name`, `coordinator_name`, `project_dir`, `messaging` (the

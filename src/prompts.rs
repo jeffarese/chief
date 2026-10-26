@@ -42,7 +42,8 @@ pub fn thread(
             .to_string()
     } else {
         format!(
-            "You can message only your coordinator, by its exact name `{coordinator_name}`; you \
+            "Of other sessions, you can message only your coordinator, by its exact name \
+             `{coordinator_name}`; you \
              don't need to message it to report."
         )
     };
@@ -123,6 +124,15 @@ mod tests {
         assert!(p.contains("/root/projects/payments-latency/memory/"));
         assert!(p.contains("at most 3 threads"));
         assert!(!p.contains("## Project instructions"));
+        // §6 "Subagents".
+        assert!(p.contains("Of other sessions, you can only message this\n  project's threads"));
+        assert!(
+            p.contains(
+                "- You can message your own subagents by the name or agent id the Agent tool \
+                 gave them, and they report to you."
+            ),
+            "{p}"
+        );
 
         let p = coordinator(&config(Some("  ")), Path::new("/d"), "");
         assert!(
@@ -142,7 +152,12 @@ mod tests {
         assert!(!p.contains("{{"), "{p}");
         assert!(p.contains("`chief-payments-latency`"));
         assert!(p.contains("/d/memory/MEMORY.md"));
-        assert!(p.contains("- You can message only your coordinator, by its exact name"));
+        assert!(p.contains(
+            "- Of other sessions, you can message only your coordinator, by its exact name"
+        ));
+        let subagents = "- You can message your own subagents by the name or agent id the Agent \
+                         tool gave them, and they report to you.";
+        assert!(p.contains(subagents), "{p}");
 
         // In another account than the coordinator's: reply at the address, not the name.
         let p = thread(
@@ -159,6 +174,7 @@ mod tests {
         );
         assert!(p.contains("`from=\"uds:…\"` address"), "{p}");
         assert!(!p.contains("by its exact name"), "{p}");
+        assert!(p.contains(subagents), "{p}");
     }
 
     #[test]

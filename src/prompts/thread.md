@@ -12,6 +12,7 @@ user may also talk to you directly.
   memory folder and give it a line in `MEMORY.md`.
 - {{messaging}} Your last message each turn is your report, and it is what the coordinator and the
   board show.
+- You can message your own subagents by the name or agent id the Agent tool gave them, and they report to you.
 
 End every turn with a short report: what you did, the branch and commit, the pull request URL if
 any, test results, and what you need from the user, if anything.
