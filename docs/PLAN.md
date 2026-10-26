@@ -169,6 +169,17 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | Guard: an Agent named like the coordinator or a project thread denied at spawn; a free name allowed; a thread messaging the coordinator's subagent, the coordinator messaging a thread's subagent, a lead messaging `team-lead` all denied; the thread's own subagent allowed by name and by agent id | Pass (the thread's catch-all denial reworded: it now names subagents, and the reply address for a thread in another account) |
 | `claude respawn` of the thread: SessionStart `resume` forgets its subagents; the old name is denied | Pass |
 
+## Background work: live run (mbp-m5max, coordinator Opus low, threads Sonnet medium, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| A thread's subagent told to run `./slow-test.sh` (45 s) with `run_in_background` | Denied by the PreToolUse hook; the subagent reran it in the foreground (timeout 600000) and handed back "3 passed" |
+| What the Agent tool starts on this Mac | An async agent (`async_launched`, ends with `SubagentHandback`), not the teammate the first Mac got |
+| Coordinator subscribed while the subagent worked | No early idle notice: async agents keep the thread busy. One update after the real finish, no early "done" |
+| Board count while the async agent worked | First run failed: the early Stop listed the agent as `subagent`, not `teammate`, and chief cleared it. Fixed (82830c5: any task but `shell` counts); re-run held `1 subagent` in Working from the early Stop to the hand-back |
+| Spike, polled every 2 s: an async agent, and a lead's own background command | Both keep the lead `busy` until done, so the final-report request now fires only after a busy teammate made the thread look idle (not seen live here: this Mac makes no teammates) |
+| Auto mode's own agent (a PreToolUse and a SubagentStop under unknown agent ids) | Counted as nothing, and never denied: the denial now needs a recorded subagent |
+
 ## Threads that wait on subagents or background commands (built)
 
 Problem (side-agent note after the subagents run): a thread that hands work to a subagent ends its
