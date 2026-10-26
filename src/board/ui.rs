@@ -231,7 +231,12 @@ fn header(app: &App, width: usize, room: u16) -> Vec<Line<'static>> {
     };
     let mut coord = format!("{mark}coordinator: {}", coordinator_state(app));
     if app.denials > 0 {
-        coord.push_str(&format!(" · {} guard denials", app.denials));
+        let noun = if app.denials == 1 {
+            "denial"
+        } else {
+            "denials"
+        };
+        coord.push_str(&format!(" · {} guard {noun}", app.denials));
     }
     lines.push(Line::raw(truncate(&coord, width)));
     // On a tiny terminal keep the name and the coordinator line.
