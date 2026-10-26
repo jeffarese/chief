@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use crate::claude::{self, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT};
+use crate::claude::{self, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT};
 use crate::config::{ProjectConfig, Repo};
 use crate::db::{self, SessionRow};
 use crate::layout::{self, Opened};
@@ -288,7 +288,8 @@ pub fn up(slug: &str) -> Result<()> {
 }
 
 /// §7 "Coordinator spawn": start it when it has no row or no short id, `claude respawn` it
-/// when it has no live process, otherwise leave it alone.
+/// when it has no live process, otherwise leave it alone. A spawn that failed but started the
+/// session anyway is adopted, now or (when chief couldn't tell) on the next call.
 pub fn ensure_coordinator(
     conn: &Connection,
     claude: &Claude,
@@ -315,6 +316,19 @@ pub fn ensure_coordinator(
         return Err(ClaudeError::NotTrusted(dir.to_path_buf()).into());
     }
     let live = claude.agents()?;
+    // A row without a short id is left by a spawn chief couldn't confirm: adopt its session.
+    let leftover = existing.as_ref().and_then(|row| match &row.session_id {
+        Some(sid) => live.iter().find(|a| &a.session_id == sid && a.id.is_some()),
+        None => claude::started_session(&live, &name, &[]),
+    });
+    if let Some(agent) = leftover {
+        eprintln!(
+            "warning: adopting {name} ({}), which an earlier chief up started without confirming",
+            agent.id.as_deref().unwrap_or_default()
+        );
+        store_ids(conn, &name, agent.id.as_deref(), Some(agent))?;
+        return ensure_coordinator(conn, claude, config, dir, trust_config);
+    }
     if live
         .iter()
         .any(|a| a.name.as_deref() == Some(name.as_str()) && a.pid.is_some())
@@ -346,23 +360,63 @@ pub fn ensure_coordinator(
         append_system_prompt: prompts::coordinator(config, dir, &prompts::read_instructions(dir)),
         prompt: None,
     };
-    let short_id = match claude.spawn_bg(&spec) {
-        Ok(id) => id,
-        Err(e) => {
+    let (short_id, agent) = match claude.spawn_bg(&spec) {
+        Ok(short_id) => {
+            let resolved = claude.resolve_session(&short_id, RESOLVE_TIMEOUT);
+            if let Err(e) = &resolved {
+                eprintln!("warning: {e:#}");
+            }
+            (Some(short_id), resolved.ok())
+        }
+        // An untrusted folder starts nothing.
+        Err(e) if e.downcast_ref::<ClaudeError>().is_some() => {
             if inserted {
                 let _ = db::delete_session(conn, &name);
             }
             return Err(e);
         }
+        // It may have started anyway (a timeout, output chief doesn't recognise); deleting the
+        // row would make the next `up` refuse the name as taken.
+        Err(e) => match claude.find_started(&name, &live, RESOLVE_TIMEOUT) {
+            Ok(Some(agent)) => {
+                eprintln!(
+                    "warning: `claude --bg` reported a failure, but {name} started anyway, so \
+                     chief kept it. The failure: {e:#}"
+                );
+                (agent.id.clone(), Some(agent))
+            }
+            Ok(None) => {
+                if inserted {
+                    let _ = db::delete_session(conn, &name);
+                }
+                return Err(e);
+            }
+            Err(lookup) => {
+                return Err(e.context(format!(
+                    "chief couldn't check whether {name} started anyway ({lookup:#}), so its row \
+                     is kept: run chief up again, and it adopts the session if it did start"
+                )));
+            }
+        },
     };
-    let resolved = claude.resolve_session(&short_id, RESOLVE_TIMEOUT);
-    if let Err(e) = &resolved {
-        eprintln!("warning: {e:#}");
-    }
-    let row = db::immediate(conn, |conn| {
-        let mut row = db::get_session(conn, &name)?.context("coordinator row vanished")?;
-        row.short_id = Some(short_id.clone());
-        if let Ok(agent) = &resolved
+    let row = store_ids(conn, &name, short_id.as_deref(), agent.as_ref())?;
+    Ok((row, CoordinatorAction::Started))
+}
+
+/// Stores a spawned session's short id and, unless the row already has one, its session id and
+/// pid, in one transaction (its hooks may be writing the row).
+fn store_ids(
+    conn: &Connection,
+    name: &str,
+    short_id: Option<&str>,
+    agent: Option<&AgentRow>,
+) -> Result<SessionRow> {
+    db::immediate(conn, |conn| {
+        let mut row = db::get_session(conn, name)?.context("coordinator row vanished")?;
+        if let Some(id) = short_id {
+            row.short_id = Some(id.to_string());
+        }
+        if let Some(agent) = agent
             && row.session_id.is_none()
         {
             row.session_id = Some(agent.session_id.clone());
@@ -371,8 +425,7 @@ pub fn ensure_coordinator(
         row.updated_at = db::now_ms();
         db::update_session(conn, &row)?;
         Ok(row)
-    })?;
-    Ok((row, CoordinatorAction::Started))
+    })
 }
 
 /// `claude respawn` for `row`, after rewriting `<dir>/generated/*` from `config` (a respawned

@@ -439,7 +439,7 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 
 | Tool | Input | Does |
 | --- | --- | --- |
-| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}` |
+| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}`, plus `warning` when it adopted a session whose spawn reported a failure |
 | `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text |
 | `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)" |
@@ -454,8 +454,16 @@ path must be a folder and maps back to a repos[] name when it is one. Trust is c
 anything else and an untrusted repo returns the `NotTrusted` message. The name must not be in the
 registry nor among `claude agents` names (a few suffixes are tried; if `claude agents` fails,
 nothing starts). A task that starts with `-` is sent as `Task: <task>` so the CLI can't read it as
-a flag. If the spawn fails, the inserted row is deleted and the error returned. Failing to resolve
-the session id is not an error (hooks match by title, sync by short id). `next` is
+a flag. If the spawn fails, the session may have started anyway (a timeout, an output without
+the `backgrounded` line), and a deleted row would leave it working unseen and unreachable through
+the guard. So unless the error is `NotTrusted`, chief first looks for it in `claude agents` (polled
+up to the 5 s resolve timeout, each call bounded): a background session (it has an `id`) named
+exactly the new name that the pre-spawn snapshot didn't list is adopted (its short id, session id
+and pid are stored) and the call succeeds with a `warning` that quotes the failure. When listings
+succeed without it, the row is deleted and the error returned. When every listing fails, chief
+can't tell: the row is kept without a short id (hooks attach it by title if the session did start)
+and the error says so. Failing to resolve the session id is not an error (hooks match by title,
+sync by short id). `next` is
 a literal SendMessage input with no `message` key, `{"to": "<name>", "notify_when_idle": true}`
 (verified: omitting `message` is a valid pure subscription): the coordinator subscribes right after
 starting a thread, which is how it hears the thread finished. (M5 live run: told "with no message",
@@ -517,8 +525,12 @@ outside `generated/` (memory, `instructions.md`, `project.toml`). `SendMessage` 
 guard; its chief MCP tools run without prompts.
 
 No prompt: it waits for you. Started when it has no row or no `short_id` (the project folder must be
-trusted, and no other live session may already use the name; a failed spawn removes a row it
-inserted). If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
+trusted, and no other live session may already use the name). A failed spawn is handled as a
+thread's is (above): a session that started anyway is adopted, with a warning on stderr; a row it
+inserted is removed only when listings show no such session, and kept when chief can't tell. A
+kept row (no `short_id`) is adopted by the next `up` when `claude agents` lists its session (by
+`session_id` if a hook stored one, else a background session with exactly the name), instead of
+refusing the name as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
 a pid. Otherwise it is left alone.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)

@@ -155,6 +155,53 @@ fn resolve_session_gives_up() {
 }
 
 #[test]
+fn find_started_looks_for_a_new_background_session_by_exact_name() {
+    let row = |id: Option<&str>, sid: &str, name: &str| {
+        let mut v = serde_json::json!({"sessionId": sid, "name": name});
+        if let Some(id) = id {
+            v["id"] = id.into();
+        }
+        v
+    };
+    let fake = Fake::new();
+    let before = chief::claude::parse_agents(
+        &serde_json::json!([row(Some("01d"), "old", "demo-x-1111")]).to_string(),
+    )
+    .unwrap();
+    fake.set(
+        "agents.stdout",
+        &serde_json::json!([
+            row(Some("01d"), "old", "demo-x-1111"),
+            row(None, "interactive", "demo-x-1111"),
+            row(Some("n0pe"), "lookalike", "demo-x-1111 "),
+            row(Some("n3w"), "new", "demo-x-1111"),
+        ])
+        .to_string(),
+    );
+    let claude = fake.claude();
+    let found = claude
+        .find_started("demo-x-1111", &before, Duration::from_millis(100))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.session_id, "new");
+
+    // Listed, but not there: none.
+    fake.set("agents.stdout", "[]");
+    assert_eq!(
+        claude
+            .find_started("demo-x-1111", &before, Duration::from_millis(100))
+            .unwrap(),
+        None
+    );
+    // Never listed: chief can't tell.
+    fake.set("agents.exit", "1").set("agents.stderr", "down");
+    let err = claude
+        .find_started("demo-x-1111", &before, Duration::from_millis(100))
+        .unwrap_err();
+    assert!(err.to_string().contains("down"), "{err}");
+}
+
+#[test]
 fn version_check() {
     let fake = Fake::new();
     fake.set("version.stdout", "2.1.310 (Claude Code)\n");

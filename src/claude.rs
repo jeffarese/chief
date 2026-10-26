@@ -199,6 +199,39 @@ impl Claude {
         }
     }
 
+    /// After a `claude --bg` that failed or printed no id, which may have started the session
+    /// anyway (a timeout, output chief doesn't recognise): `claude agents` until `timeout`, for
+    /// `started_session`. Ok(None) once a listing succeeded without it; the last error when every
+    /// listing failed (chief can't tell).
+    pub fn find_started(
+        &self,
+        name: &str,
+        before: &[AgentRow],
+        timeout: Duration,
+    ) -> Result<Option<AgentRow>> {
+        let deadline = Instant::now() + timeout;
+        let mut listed = false;
+        loop {
+            let error = match self.agents() {
+                Ok(rows) => {
+                    if let Some(row) = started_session(&rows, name, before) {
+                        return Ok(Some(row.clone()));
+                    }
+                    listed = true;
+                    None
+                }
+                Err(e) => Some(e),
+            };
+            if Instant::now() >= deadline {
+                return match error {
+                    Some(e) if !listed => Err(e),
+                    _ => Ok(None),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
     /// Runs the binary; fails only if it can't start or outlives `timeout`.
     fn run(&self, args: &[OsString], cwd: Option<&Path>, timeout: Duration) -> Result<Output> {
         let mut cmd = Command::new(&self.bin);
@@ -270,6 +303,20 @@ pub fn bg_args(spec: &BgSpawn) -> Vec<OsString> {
         args.push(prompt.into());
     }
     args
+}
+
+/// The background session (it has a short id) named exactly `name` that `before` didn't list:
+/// the one a spawn of `name` just started.
+pub fn started_session<'a>(
+    rows: &'a [AgentRow],
+    name: &str,
+    before: &[AgentRow],
+) -> Option<&'a AgentRow> {
+    rows.iter().find(|r| {
+        r.id.is_some()
+            && r.name.as_deref() == Some(name)
+            && !before.iter().any(|b| b.session_id == r.session_id)
+    })
 }
 
 /// Parses `2.1.310 (Claude Code)`.

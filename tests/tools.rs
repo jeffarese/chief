@@ -73,7 +73,8 @@ impl Env {
             trust_config: &self.trust,
             now,
             resolve_timeout: Duration::from_millis(300),
-            wake_timeout: Duration::from_millis(300),
+            // Room for a few calls of the shell fake on a loaded machine.
+            wake_timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(10),
         };
         f(&ctx)
@@ -332,6 +333,94 @@ fn spawns_and_respawns_rewrite_the_generated_files_first() {
         db::list_sessions(&env.conn, "demo", None).unwrap().len(),
         rows
     );
+}
+
+/// A `claude` whose `--bg` prints no id (`bg_exit` as its exit code) and whose `agents` lists the
+/// session that `--bg` named, as if it had started anyway.
+fn started_anyway(dir: &Path, bg_exit: u8) -> chief::claude::Claude {
+    let bin = dir.join("claude-started-anyway");
+    let script = format!(
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+case "$1" in
+  --bg)
+    while [ $# -gt 1 ]; do
+      [ "$1" = "--name" ] && printf '%s' "$2" > "$dir/started-name"
+      shift
+    done
+    echo "something chief can't read"
+    exit {bg_exit} ;;
+  agents)
+    if [ -f "$dir/started-name" ]; then
+      printf '[{{"id":"ad0pt","sessionId":"sid-adopt","name":"%s","state":"working","status":"busy","pid":42}}]' "$(cat "$dir/started-name")"
+    else
+      echo '[]'
+    fi ;;
+esac
+"#
+    );
+    std::fs::write(&bin, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    chief::claude::Claude { bin }
+}
+
+/// A `claude --bg` that timed out or printed no id may still have started the session: chief
+/// adopts it instead of deleting the row, which would leave it working unseen and unreachable.
+#[test]
+fn start_thread_adopts_a_session_that_started_anyway() {
+    for bg_exit in [0, 1] {
+        let env = Env::new();
+        let claude = started_anyway(env.fake.dir.path(), bg_exit);
+        let out = tools::start_thread(
+            &ToolCtx {
+                conn: &env.conn,
+                config: &env.config,
+                claude: &claude,
+                project_dir: &env.dir,
+                trust_config: &env.trust,
+                now,
+                resolve_timeout: Duration::from_millis(300),
+                wake_timeout: Duration::from_millis(300),
+                poll_interval: Duration::from_millis(10),
+            },
+            &start_args("Fix login bug", "Fix it"),
+        )
+        .unwrap();
+        let name = out["name"].as_str().unwrap();
+        assert_eq!(out["short_id"], "ad0pt");
+        let warning = out["warning"].as_str().unwrap();
+        assert!(warning.contains("started anyway"), "{warning}");
+        assert!(warning.contains("something chief can't read"), "{warning}");
+        let row = env.row(name).unwrap();
+        assert_eq!(
+            (row.short_id.as_deref(), row.session_id.as_deref(), row.pid),
+            (Some("ad0pt"), Some("sid-adopt"), Some(42))
+        );
+    }
+}
+
+/// When `claude agents` can't say whether the session started, the row stays: hooks match it by
+/// title if it did.
+#[test]
+fn start_thread_keeps_the_row_when_it_cannot_tell() {
+    let env = Env::new();
+    env.fake
+        .set("agents.stdout.1", "[]")
+        .set("agents.exit", "1")
+        .set("agents.exit.1", "0")
+        .set("agents.stderr", "supervisor down")
+        .set("bg.stdout", "oops\n")
+        .set("bg.exit", "1");
+    let err = env
+        .with(|ctx| tools::start_thread(ctx, &start_args("Fix", "Fix it")))
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("couldn't check whether"), "{msg}");
+    assert!(msg.contains("supervisor down"), "{msg}");
+    let rows = db::list_sessions(&env.conn, "demo", None).unwrap();
+    assert_eq!(rows.len(), 1, "kept");
+    assert_eq!(rows[0].short_id, None);
 }
 
 #[test]

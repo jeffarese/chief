@@ -203,13 +203,15 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         ),
         prompt: Some(task_prompt(&args.task)),
     };
-    let short_id = match ctx.claude.spawn_bg(&spec) {
-        Ok(id) => id,
+    let (short_id, adopted, warning) = match ctx.claude.spawn_bg(&spec) {
+        Ok(id) => (id, None, None),
         Err(e) => {
-            if let Err(del) = db::delete_session(ctx.conn, &name) {
-                eprintln!("chief mcp: could not remove {name} after a failed spawn: {del:#}");
-            }
-            return Err(e);
+            let (agent, warning) = after_failed_spawn(ctx, &name, &live, e)?;
+            let id = agent
+                .id
+                .clone()
+                .context("an adopted session has a short id")?;
+            (id, Some(agent), Some(warning))
         }
     };
     // Hooks from the new session may already be writing this row: read-modify-write in one
@@ -228,13 +230,17 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
             db::update_session(conn, &row)
         })
     };
-    set_ids(None)?;
-    // Not fatal: hooks match the session by title and sync matches it by short id.
-    match ctx.claude.resolve_session(&short_id, ctx.resolve_timeout) {
-        Ok(agent) => set_ids(Some(&agent))?,
-        Err(e) => eprintln!("chief mcp: {e:#}"),
+    if let Some(agent) = &adopted {
+        set_ids(Some(agent))?;
+    } else {
+        set_ids(None)?;
+        // Not fatal: hooks match the session by title and sync matches it by short id.
+        match ctx.claude.resolve_session(&short_id, ctx.resolve_timeout) {
+            Ok(agent) => set_ids(Some(&agent))?,
+            Err(e) => eprintln!("chief mcp: {e:#}"),
+        }
     }
-    Ok(json!({
+    let mut out = json!({
         "name": name,
         "short_id": short_id,
         "repo": repo_name,
@@ -243,7 +249,50 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         "next": format!(
             "Subscribe now: call SendMessage with exactly {{\"to\": \"{name}\", \"notify_when_idle\": true}} and no message key at all."
         ),
-    }))
+    });
+    if let Some(w) = warning {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
+}
+
+/// A `claude --bg` that failed (a timeout, output chief doesn't recognise) may have started the
+/// session anyway; deleting its row would leave it working unseen, and the guard would refuse
+/// it. So: when `claude agents` lists it, return it with a warning to adopt; when it doesn't,
+/// delete the row and return the spawn's error; when chief can't tell, keep the row (its hooks
+/// match it by title if it did start) and say so.
+fn after_failed_spawn(
+    ctx: &ToolCtx,
+    name: &str,
+    before: &[AgentRow],
+    err: anyhow::Error,
+) -> Result<(AgentRow, String)> {
+    // An untrusted folder starts nothing.
+    let found = match err.downcast_ref::<ClaudeError>() {
+        Some(ClaudeError::NotTrusted(_)) => Ok(None),
+        None => ctx.claude.find_started(name, before, ctx.resolve_timeout),
+    };
+    match found {
+        Ok(Some(agent)) => {
+            let warning = format!(
+                "`claude --bg` reported a failure, but {name} started anyway, so chief kept it. \
+                 The failure: {err:#}"
+            );
+            eprintln!("chief mcp: {warning}");
+            Ok((agent, warning))
+        }
+        Ok(None) => {
+            if let Err(del) = db::delete_session(ctx.conn, name) {
+                eprintln!("chief mcp: could not remove {name} after a failed spawn: {del:#}");
+            }
+            Err(err)
+        }
+        Err(lookup) => Err(err.context(format!(
+            "chief couldn't check whether {name} started anyway ({lookup:#}), so its row is \
+             kept: if it started, its hooks attach it; if it never shows up in list_threads, \
+             resolve it"
+        ))),
+    }
 }
 
 fn pick(arg: Option<&str>, default: &str) -> String {

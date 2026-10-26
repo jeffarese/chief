@@ -524,6 +524,73 @@ fn respawn_rewrites_the_generated_files_first() {
     assert_eq!(home.fake.calls_of("respawn").len(), 1);
 }
 
+/// A coordinator spawn that printed no id may have started the session anyway: `up` adopts it
+/// rather than deleting the row (the next `up` would then refuse the name as taken).
+#[test]
+fn up_adopts_a_coordinator_that_started_anyway() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    assert!(init(&home, &a, &b).status.success());
+    trust_file(&home.trust, &[&project_dir(&home)]);
+    let name = "chief-payments-latency";
+    // An old, stopped session with the same name is not the new one.
+    let old = agent("01d", "old-sid", name, "stopped", None);
+    let new = agent("c0ffee", "coord-sid", name, "done", Some(74112));
+    home.fake
+        .set(
+            &format!("agents.stdout.{}", next_agents_call(&home)),
+            &json!([old]).to_string(),
+        )
+        .set("bg.stdout", "Something new happened\n")
+        .set("agents.stdout", &json!([old, new]).to_string());
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("started anyway"), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("claude attach c0ffee"),
+        "{}",
+        stdout(&out)
+    );
+    let row = db::get_coordinator(&home.db(), SLUG).unwrap().unwrap();
+    assert_eq!(
+        (row.short_id.as_deref(), row.session_id.as_deref(), row.pid),
+        (Some("c0ffee"), Some("coord-sid"), Some(74112))
+    );
+    assert_eq!(home.fake.calls_of("--bg").len(), 1);
+}
+
+/// A coordinator row that a failed spawn left without a short id (chief couldn't tell whether
+/// it started) is adopted by the next `up` when its session is listed, instead of refusing the
+/// name as taken.
+#[test]
+fn up_adopts_a_coordinator_left_by_an_unclear_spawn() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    assert!(init(&home, &a, &b).status.success());
+    trust_file(&home.trust, &[&project_dir(&home)]);
+    let name = "chief-payments-latency";
+    {
+        let row = db::SessionRow::new(name, SLUG, chief::state::Role::Coordinator, db::now_ms());
+        db::insert_session(&home.db(), &row).unwrap();
+    }
+    home.fake.set(
+        "agents.stdout",
+        &json!([agent("c0ffee", "coord-sid", name, "done", Some(74112))]).to_string(),
+    );
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("Coordinator chief-payments-latency already running."),
+        "{}",
+        stdout(&out)
+    );
+    assert!(home.fake.calls_of("--bg").is_empty());
+    let row = db::get_coordinator(&home.db(), SLUG).unwrap().unwrap();
+    assert_eq!(row.short_id.as_deref(), Some("c0ffee"));
+}
+
 /// A project whose coordinator runs (started by a first `up` that found no Rex).
 fn running_project(home: &Home) -> PathBuf {
     version_ok(home);
