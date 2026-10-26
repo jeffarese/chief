@@ -224,7 +224,7 @@ impl SettingsForm {
                     format!("trusted in {}", found.checked.join(", "))
                 }
                 TrustCheck::Done(found) => format!(
-                    "{} untrusted in {}",
+                    "{} untrusted · checked {}",
                     found.untrusted.len(),
                     found.checked.join(", ")
                 ),
@@ -631,7 +631,7 @@ mod tests {
             untrusted: vec![pair("PB2", "/r/web"), pair("PB3", "/elsewhere")],
             errors: vec!["PB5: agp exec failed".into()],
         }));
-        assert_eq!(f.value(Field::PoolTrust), "2 untrusted in PB2, PB3");
+        assert_eq!(f.value(Field::PoolTrust), "2 untrusted · checked PB2, PB3");
         assert!(
             f.message
                 .as_deref()

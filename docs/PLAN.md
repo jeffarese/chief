@@ -143,3 +143,18 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | `chief pane` / `chief board` started by hand without `CLAUDE_CONFIG_DIR`: pane attaches through cpb; a thread starts on cpb; Enter / Esc switch | Pass |
 | Thread branch taken from cpb's job state (`worktreeBranch`) | Pass |
 | `chief status` from the default account: nothing marked removed; the attach hint carries `CLAUDE_CONFIG_DIR` | Pass |
+
+## Threads across agp accounts: live run (coordinator on the default account, threads on cpe and laura, Haiku, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| `chief init`: offers trust per pool account; yes runs `agp exec <id> -- claude`, no lists the fix command; each account's `.claude.json` updated only where accepted | Pass |
+| `start_thread` without `account`: best-scoring allowed account (cpe); limited carlos never considered | Pass |
+| `start_thread` with `account: laura`: thread on laura | Pass |
+| Idle notice by `uds:` address wakes the idle coordinator, which posts the update | Pass (prompt fixed: it no longer warns the user it may not hear back) |
+| Follow-up from the coordinator to a thread on cpe by address; thread's reply to the `from=` address reaches the coordinator | Pass (prompt fixed: the coordinator now asks for a reply instead of dropping the request) |
+| Stop the laura thread, follow-up: `wake_thread`, new address (new pid), message and idle notice delivered | Pass |
+| Guard with real listings: by-name to another account's thread denied with its address; exact address allowed; an outside socket denied; thread → coordinator by name denied with the `from=` hint; denials counted on the board | Pass |
+| Board tags (PB3, PB4), detail and `chief status` show the account; Enter attaches through the thread's account | Pass |
+| Settings: "Account trust" check; an untrusted pair's Enter opens Claude in that account on the board's terminal, then re-checks | Pass (summary reworded: `N untrusted · checked <labels>`) |
+| `chief clean --discard --yes` removes each thread in its own account; worktrees gone | Pass |

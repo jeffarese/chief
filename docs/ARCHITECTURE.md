@@ -999,7 +999,7 @@ are tested without a terminal (`TestBackend`).
   or ←/→ there only says it can't be changed (§3). "Account trust" checks, on a worker, every
   repo of the draft in every pool account (`placement::pool_trust`, as `init` does, the project's
   own account included when it is in the pool): its value says `checking…`, `trusted in <labels>`,
-  `N untrusted in <labels>`, "no agp pool: threads use the project's account", or why the check
+  `N untrusted · checked <labels>`, "no agp pool: threads use the project's account", or why the check
   failed (accounts it couldn't check go in the message). Each untrusted pair gets a line
   (`untrusted  <label> · <repo>`); on it the message shows the fix and Enter runs `agp exec <id> --
   claude` in that repo on the board's terminal (as for the editor, below), then says whether it
