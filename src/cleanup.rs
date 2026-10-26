@@ -229,12 +229,13 @@ pub fn cleanable(ctx: &Ctx, name: &str) -> Result<Option<SessionRow>> {
         .claude
         .agents()
         .context("checking whether the thread is still running")?;
-    registry::sync(
+    registry::sync_in(
         ctx.conn,
         &row.project_slug,
         &snapshot,
         taken_at,
         (ctx.now)(),
+        &ctx.claude.config_dir,
     )?;
     let row = thread_row(ctx.conn, name)?;
     if row.cleaned_at.is_some() {
@@ -274,6 +275,21 @@ pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         record(ctx, name, None)?;
         return Ok(Outcome::Cleaned);
     };
+    // Removed outside chief (§5): `claude rm` has no session left to remove, and the worktree it
+    // left behind is the user's to delete.
+    if row.removed_at.is_some() {
+        let Some(wt) = worktree_of(ctx.claude, &row).filter(|p| p.is_dir()) else {
+            record(ctx, name, None)?;
+            return Ok(Outcome::Cleaned);
+        };
+        let why = format!(
+            "{}; worktree remains at {}",
+            registry::REMOVED_OUTSIDE,
+            wt.display()
+        );
+        record(ctx, name, Some(&why))?;
+        return Ok(Outcome::Blocked(why));
+    }
     let ins = match (inspect(ctx.claude, &row), &mode) {
         (Ok(ins), _) => ins,
         (Err(e), Mode::Safe) => {
@@ -452,7 +468,14 @@ pub fn gc(ctx: &Ctx, slug: &str, dry_run: bool) -> Result<Gc> {
 fn sync_agents(ctx: &Ctx, slug: &str) -> Result<()> {
     let taken_at = (ctx.now)();
     let snapshot = ctx.claude.agents()?;
-    registry::sync(ctx.conn, slug, &snapshot, taken_at, (ctx.now)())
+    registry::sync_in(
+        ctx.conn,
+        slug,
+        &snapshot,
+        taken_at,
+        (ctx.now)(),
+        &ctx.claude.config_dir,
+    )
 }
 
 fn dry_verdict(claude: &Claude, row: &SessionRow) -> Verdict {

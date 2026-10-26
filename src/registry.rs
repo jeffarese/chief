@@ -1,15 +1,32 @@
 //! Keeps `sessions` in step with `claude agents` and PR status (ARCHITECTURE §5): stores the
 //! snapshot, re-derives groups and applies auto-resolve. Callers fetch the inputs; this module
-//! only touches the database.
+//! only touches the database, plus, for a session found removed, the job state that says whether
+//! its worktree is still there.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::claude::AgentRow;
+use crate::claude::{self, AgentRow};
 use crate::db::{self, SessionRow};
 use crate::state::{self, Facts, Group, HookKind, Role};
 
 const INACTIVE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// How `cleanup_blocked` starts for a session removed outside chief whose worktree remains.
+pub const REMOVED_OUTSIDE: &str = "session removed outside chief";
+
+/// One `claude agents` snapshot and what judging it needs.
+pub struct Poll<'a> {
+    pub agents: &'a [AgentRow],
+    /// When it was taken: read just before running `claude agents`.
+    pub taken_at: i64,
+    /// Every session registered in this chief home (all projects). A snapshot that lists none of
+    /// them but the row itself comes from another Claude config or supervisor.
+    pub registered: &'a [SessionRow],
+    /// A short id's worktree while it is still on disk (job state, `claude::job_worktree`).
+    pub worktree: &'a dyn Fn(&str) -> Option<PathBuf>,
+}
 
 /// The derivation inputs a row carries. The stored `claude agents` state only counts while it is
 /// newer than the last hook; otherwise the last hook gives the provisional group.
@@ -78,30 +95,44 @@ pub fn auto_resolve(row: &mut SessionRow, now: i64) {
     rederive(row);
 }
 
-/// Applies one `claude agents` snapshot, taken at `taken_at`, to a row. Returns whether the row
-/// changed. A hook that ran after the snapshot was taken knows better than the snapshot, so the
-/// row keeps that hook's provisional state (`cc_fresh = 0`, `cc_state`/`cc_status` untouched);
-/// only the ids and a listed pid are taken from it.
-pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now: i64) -> bool {
+/// Applies one `claude agents` snapshot to a row. Returns whether the row changed, apart from its
+/// watermark (`synced_at`, moved forward by every snapshot applied). A snapshot older than one
+/// already applied is ignored: another process's poll may commit after a newer one. A hook that
+/// ran after the snapshot was taken knows better than the snapshot, so the row keeps that hook's
+/// provisional state (`cc_fresh = 0`, `cc_state`/`cc_status` untouched); only the ids and a
+/// listed pid are taken from it.
+pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
     // Not spawned yet: nothing in the snapshot can be this session.
     if row.short_id.is_none() && row.session_id.is_none() {
         return false;
     }
+    let taken_at = poll.taken_at;
+    if row.synced_at.is_some_and(|applied| taken_at < applied) {
+        return false;
+    }
+    row.synced_at = Some(taken_at);
     let before = row.clone();
     let stale = row.last_hook_at.is_some_and(|at| at > taken_at);
-    let found = match (&row.session_id, &row.short_id) {
-        (Some(sid), _) => snapshot.iter().find(|a| &a.session_id == sid),
-        (None, Some(short)) => snapshot.iter().find(|a| a.id.as_ref() == Some(short)),
-        (None, None) => None,
-    };
+    let by_session = row
+        .session_id
+        .as_ref()
+        .and_then(|sid| poll.agents.iter().find(|a| &a.session_id == sid));
+    // After `/clear` the same background session (short id) runs under a new session id.
+    let found = by_session.or_else(|| {
+        let short = row.short_id.as_ref()?;
+        poll.agents.iter().find(|a| a.id.as_ref() == Some(short))
+    });
     match found {
         Some(a) => {
-            if row.session_id.is_none() {
+            if row.session_id.as_deref() != Some(a.session_id.as_str())
+                && !session_id_taken(row, &a.session_id, poll.registered)
+            {
                 row.session_id = Some(a.session_id.clone());
             }
             if row.short_id.is_none() {
                 row.short_id = a.id.clone();
             }
+            restore_removed(row);
             row.pid = a.pid;
             if !stale {
                 row.cc_state = a.state.clone();
@@ -115,15 +146,21 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now:
             // Gone from the supervisor: asleep, last cc_state kept for display.
             row.pid = None;
             row.cc_fresh = false;
-            if removed_outside(row, snapshot) {
+            if removed_outside(row, poll) {
+                mark_removed(row, poll);
+            } else if row.removed_at.is_some()
+                && row.cleaned_at.is_none()
+                && worktree_gone(row, poll)
+            {
+                // The worktree it left behind has been deleted since.
                 row.cleaned_at = Some(taken_at);
                 row.cleanup_blocked = None;
-                if !row.resolved {
-                    row.resolved = true;
-                    row.resolved_reason = Some("removed".to_string());
-                }
             }
         }
+    }
+    if row.short_id != before.short_id || row.session_id != before.session_id {
+        // What `db::update_session` stamps, so the row in hand agrees.
+        row.ids_at = Some(now);
     }
     // Only when the verdict flips, so repeated polls of an asleep row don't rewrite it. A
     // permission prompt dies with the process and a respawn doesn't bring it back.
@@ -141,20 +178,92 @@ pub fn sync_row(row: &mut SessionRow, snapshot: &[AgentRow], taken_at: i64, now:
 }
 
 /// A stopped session stays listed in `claude agents --all`; only `claude rm` (here, or from
-/// `claude agents` itself) takes it off. So a thread whose session id was seen once and that a
-/// non-stale snapshot no longer lists has been removed. An empty snapshot proves nothing: chief
-/// can't tell "every session was removed" from a supervisor that lists nothing for a moment, and
-/// a wrong verdict would block the thread for good. Its coordinator is normally listed, so this
-/// only delays the verdict until some session shows up again.
-fn removed_outside(row: &SessionRow, snapshot: &[AgentRow]) -> bool {
+/// `claude agents` itself) takes it off. So a thread missing from a non-stale snapshot (neither
+/// its session id nor its short id listed) was removed, but only when the snapshot can know: it
+/// was taken after the row was created and got its ids, and it lists another session registered
+/// in this chief home. A snapshot listing none of them comes from another Claude config or
+/// supervisor, or a supervisor that lists nothing for a moment. The coordinator is normally
+/// listed, so this only delays the verdict.
+fn removed_outside(row: &SessionRow, poll: &Poll) -> bool {
     row.role == Role::Thread.as_str()
         && row.session_id.is_some()
         && row.cleaned_at.is_none()
-        && !snapshot.is_empty()
+        && row.removed_at.is_none()
+        && poll.taken_at > row.created_at
+        && row.ids_at.is_none_or(|at| poll.taken_at > at)
+        && lists_another_registered(row, poll)
+}
+
+fn lists_another_registered(row: &SessionRow, poll: &Poll) -> bool {
+    poll.agents.iter().any(|a| {
+        poll.registered.iter().any(|r| {
+            r.name != row.name
+                && (r.session_id.as_deref() == Some(a.session_id.as_str())
+                    || (r.short_id.is_some() && r.short_id == a.id))
+        })
+    })
+}
+
+/// Another registered row already holds `sid` (`session_id` is unique).
+fn session_id_taken(row: &SessionRow, sid: &str, registered: &[SessionRow]) -> bool {
+    registered
+        .iter()
+        .any(|r| r.name != row.name && r.session_id.as_deref() == Some(sid))
+}
+
+/// Removed outside chief: resolved (`removed`, unless it already was). Cleaned only when its
+/// worktree is gone too; otherwise `cleanup_blocked` says where the worktree remains.
+fn mark_removed(row: &mut SessionRow, poll: &Poll) {
+    row.removed_at = Some(poll.taken_at);
+    if !row.resolved {
+        row.resolved = true;
+        row.resolved_reason = Some("removed".to_string());
+    }
+    match row.short_id.as_deref().and_then(|s| (poll.worktree)(s)) {
+        Some(wt) => {
+            row.cleanup_blocked = Some(format!(
+                "{REMOVED_OUTSIDE}; worktree remains at {}",
+                wt.display()
+            ));
+        }
+        None => {
+            row.cleaned_at = Some(poll.taken_at);
+            row.cleanup_blocked = None;
+        }
+    }
+}
+
+fn worktree_gone(row: &SessionRow, poll: &Poll) -> bool {
+    row.short_id
+        .as_deref()
+        .and_then(|s| (poll.worktree)(s))
+        .is_none()
+}
+
+/// The session is listed again: undo what `mark_removed` did, and only that.
+fn restore_removed(row: &mut SessionRow) {
+    let Some(removed_at) = row.removed_at.take() else {
+        return;
+    };
+    if row.cleaned_at == Some(removed_at) {
+        row.cleaned_at = None;
+    }
+    if row.resolved_reason.as_deref() == Some("removed") {
+        row.resolved = false;
+        row.resolved_reason = None;
+    }
+    if row
+        .cleanup_blocked
+        .as_deref()
+        .is_some_and(|b| b.starts_with(REMOVED_OUTSIDE))
+    {
+        row.cleanup_blocked = None;
+    }
 }
 
 /// Writes a `claude agents` snapshot taken at `taken_at` into every session of the project (one
-/// transaction). Take `taken_at` just before running `claude agents`.
+/// transaction). Take `taken_at` just before running `claude agents`. Job state comes from
+/// `claude::claude_dir()`.
 pub fn sync(
     conn: &Connection,
     project_slug: &str,
@@ -162,10 +271,41 @@ pub fn sync(
     taken_at: i64,
     now: i64,
 ) -> Result<()> {
+    sync_in(
+        conn,
+        project_slug,
+        snapshot,
+        taken_at,
+        now,
+        &claude::claude_dir(),
+    )
+}
+
+/// `sync` with job state read from `claude_dir`.
+pub fn sync_in(
+    conn: &Connection,
+    project_slug: &str,
+    snapshot: &[AgentRow],
+    taken_at: i64,
+    now: i64,
+    claude_dir: &Path,
+) -> Result<()> {
+    let worktree = |short: &str| claude::job_worktree(claude_dir, short).filter(|p| p.is_dir());
     db::immediate(conn, |conn| {
-        for mut row in db::list_sessions(conn, project_slug, None)? {
-            if sync_row(&mut row, snapshot, taken_at, now) {
+        let registered = db::all_sessions(conn)?;
+        let poll = Poll {
+            agents: snapshot,
+            taken_at,
+            registered: &registered,
+            worktree: &worktree,
+        };
+        for row in registered.iter().filter(|r| r.project_slug == project_slug) {
+            let mut row = row.clone();
+            let applied = row.synced_at;
+            if sync_row(&mut row, &poll, now) {
                 db::update_session(conn, &row)?;
+            } else if row.synced_at != applied {
+                db::set_synced_at(conn, &row.name, taken_at)?;
             }
         }
         Ok(())
@@ -241,6 +381,36 @@ mod tests {
         (dir, conn)
     }
 
+    /// `super::sync` without the user's real job state.
+    fn sync(
+        conn: &Connection,
+        slug: &str,
+        snap: &[AgentRow],
+        taken_at: i64,
+        now: i64,
+    ) -> Result<()> {
+        sync_in(
+            conn,
+            slug,
+            snap,
+            taken_at,
+            now,
+            Path::new("/nonexistent/claude-dir"),
+        )
+    }
+
+    /// The rows, minus the watermark every applied poll moves.
+    fn rows_but_watermark(conn: &Connection) -> Vec<SessionRow> {
+        db::list_sessions(conn, "demo", None)
+            .unwrap()
+            .into_iter()
+            .map(|mut r| {
+                r.synced_at = None;
+                r
+            })
+            .collect()
+    }
+
     fn snapshot() -> Vec<AgentRow> {
         let json = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -255,6 +425,239 @@ mod tests {
         r.short_id = short.map(str::to_string);
         r.session_id = sid.map(str::to_string);
         r
+    }
+
+    fn no_worktree(_: &str) -> Option<PathBuf> {
+        None
+    }
+
+    /// Every session the snapshot lists counts as registered in this chief home.
+    fn listed_registered(agents: &[AgentRow]) -> Vec<SessionRow> {
+        agents
+            .iter()
+            .map(|a| {
+                thread(
+                    a.name.as_deref().unwrap_or("?"),
+                    a.id.as_deref(),
+                    Some(&a.session_id),
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    /// `sync_row` with a poll whose listed sessions are all registered, and no worktrees.
+    fn sync_one(row: &mut SessionRow, agents: &[AgentRow], taken_at: i64, now: i64) -> bool {
+        let registered = listed_registered(agents);
+        let poll = Poll {
+            agents,
+            taken_at,
+            registered: &registered,
+            worktree: &no_worktree,
+        };
+        sync_row(row, &poll, now)
+    }
+
+    fn coordinator_agent() -> AgentRow {
+        AgentRow {
+            id: Some("c1".into()),
+            session_id: "c-sid".into(),
+            name: Some("chief-demo".into()),
+            cwd: None,
+            kind: None,
+            started_at: None,
+            state: Some("done".into()),
+            status: Some("idle".into()),
+            pid: Some(1),
+        }
+    }
+
+    /// The reviewer's probe3: `start_thread` inserted the row at 1000 and stored its ids; a board
+    /// poll whose `claude agents` started at 900 commits afterwards.
+    #[test]
+    fn a_snapshot_from_before_the_row_or_its_ids_removes_nothing() {
+        let mut t = thread("demo-new-1111", Some("n1"), Some("n-sid"), 1000);
+        t.pid = Some(42);
+        sync_one(&mut t, &[coordinator_agent()], 900, 1100);
+        assert_eq!(
+            (t.cleaned_at, t.removed_at, t.resolved),
+            (None, None, false)
+        );
+
+        // Created at 1000, ids stored at 1050: a poll that started at 1020 can't know it either.
+        let mut t = thread("demo-new-1111", Some("n1"), Some("n-sid"), 1000);
+        t.ids_at = Some(1050);
+        sync_one(&mut t, &[coordinator_agent()], 1020, 1100);
+        assert_eq!((t.cleaned_at, t.resolved), (None, false));
+        sync_one(&mut t, &[coordinator_agent()], 1060, 1100);
+        assert_eq!(
+            (t.removed_at, t.cleaned_at, t.resolved_reason.as_deref()),
+            (Some(1060), Some(1060), Some("removed"))
+        );
+    }
+
+    /// After `/clear` the same short id is listed with a new session id: the row follows it.
+    #[test]
+    fn a_short_id_listed_with_a_new_session_id_moves_the_row_along() {
+        let mut t = thread("demo-t-1111", Some("t1"), Some("old-sid"), 0);
+        let mut listed = coordinator_agent();
+        listed.id = Some("t1".into());
+        listed.session_id = "new-sid".into();
+        listed.name = Some("demo-t-1111".into());
+        listed.pid = Some(7);
+        assert!(sync_one(
+            &mut t,
+            &[coordinator_agent(), listed.clone()],
+            100,
+            110
+        ));
+        assert_eq!(
+            (t.session_id.as_deref(), t.pid, t.ids_at, t.cleaned_at),
+            (Some("new-sid"), Some(7), Some(110), None)
+        );
+
+        // Not when another registered row already has that session id.
+        let mut t = thread("demo-t-1111", Some("t1"), Some("old-sid"), 0);
+        let mut registered = listed_registered(&[coordinator_agent()]);
+        registered.push(thread("demo-u-2222", Some("u2"), Some("new-sid"), 0));
+        let agents = [coordinator_agent(), listed];
+        let poll = Poll {
+            agents: &agents,
+            taken_at: 100,
+            registered: &registered,
+            worktree: &no_worktree,
+        };
+        sync_row(&mut t, &poll, 110);
+        assert_eq!(
+            (t.session_id.as_deref(), t.pid, t.cleaned_at),
+            (Some("old-sid"), Some(7), None)
+        );
+    }
+
+    /// `claude agents` run under another Claude config lists none of this home's sessions: it
+    /// proves nothing about them.
+    #[test]
+    fn a_snapshot_of_another_config_removes_nothing() {
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        let stranger = AgentRow {
+            id: Some("zz".into()),
+            session_id: "zz-sid".into(),
+            name: Some("someone-else".into()),
+            ..coordinator_agent()
+        };
+        let registered = vec![
+            t.clone(),
+            thread("chief-demo", Some("c1"), Some("c-sid"), 0),
+        ];
+        let agents = [stranger];
+        let poll = Poll {
+            agents: &agents,
+            taken_at: 100,
+            registered: &registered,
+            worktree: &no_worktree,
+        };
+        sync_row(&mut t, &poll, 110);
+        assert_eq!((t.cleaned_at, t.resolved), (None, false));
+    }
+
+    /// A poll from another process that started before one already applied is ignored.
+    #[test]
+    fn an_older_snapshot_never_overwrites_a_newer_one() {
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        let mut busy = coordinator_agent();
+        busy.id = Some("t1".into());
+        busy.session_id = "t-sid".into();
+        busy.state = Some("working".into());
+        busy.status = Some("busy".into());
+        busy.pid = Some(9);
+        sync_one(&mut t, &[coordinator_agent(), busy], 300, 310);
+        assert_eq!((t.synced_at, t.group_name.as_str()), (Some(300), "working"));
+        let before = t.clone();
+        assert!(!sync_one(&mut t, &[coordinator_agent()], 250, 320));
+        assert_eq!(t, before, "older poll ignored");
+        // The same poll again is fine (idempotent), and a newer one applies.
+        sync_one(&mut t, &[coordinator_agent()], 330, 340);
+        assert_eq!(
+            (t.synced_at, t.removed_at, t.cleaned_at),
+            (Some(330), Some(330), Some(330))
+        );
+    }
+
+    /// Removed outside chief while its worktree is still on disk: resolved, not cleaned, and the
+    /// worktree named. Showing up again undoes what the sync did.
+    #[test]
+    fn a_removed_session_keeps_its_worktree_and_can_come_back() {
+        let wt = |_: &str| Some(PathBuf::from("/r/.claude/worktrees/fix"));
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        t.pid = Some(3);
+        let registered = listed_registered(&[coordinator_agent()]);
+        let agents = [coordinator_agent()];
+        let poll = Poll {
+            agents: &agents,
+            taken_at: 100,
+            registered: &registered,
+            worktree: &wt,
+        };
+        assert!(sync_row(&mut t, &poll, 110));
+        assert_eq!(
+            (
+                t.cleaned_at,
+                t.removed_at,
+                t.resolved,
+                t.resolved_reason.as_deref(),
+                t.cleanup_blocked.as_deref()
+            ),
+            (
+                None,
+                Some(100),
+                true,
+                Some("removed"),
+                Some("session removed outside chief; worktree remains at /r/.claude/worktrees/fix")
+            )
+        );
+
+        let mut back = coordinator_agent();
+        back.id = Some("t1".into());
+        back.session_id = "t-sid".into();
+        back.pid = Some(4);
+        sync_one(&mut t, &[coordinator_agent(), back.clone()], 200, 210);
+        assert_eq!(
+            (
+                t.removed_at,
+                t.resolved,
+                t.resolved_reason,
+                t.cleanup_blocked,
+                t.pid
+            ),
+            (None, false, None, None, Some(4))
+        );
+
+        // A thread the user had resolved keeps that; a sync-made cleaned_at is undone.
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        t.resolved = true;
+        t.resolved_reason = Some("user".into());
+        sync_one(&mut t, &[coordinator_agent()], 100, 110);
+        assert_eq!(t.cleaned_at, Some(100));
+        sync_one(&mut t, &[coordinator_agent(), back], 200, 210);
+        assert_eq!(
+            (
+                t.cleaned_at,
+                t.removed_at,
+                t.resolved,
+                t.resolved_reason.as_deref()
+            ),
+            (None, None, true, Some("user"))
+        );
+
+        // A thread chief cleaned itself is never "restored".
+        let mut c = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        c.cleaned_at = Some(50);
+        c.resolved = true;
+        let mut listed = coordinator_agent();
+        listed.id = Some("t1".into());
+        listed.session_id = "t-sid".into();
+        sync_one(&mut c, &[coordinator_agent(), listed], 200, 210);
+        assert_eq!(c.cleaned_at, Some(50));
     }
 
     #[test]
@@ -350,10 +753,12 @@ mod tests {
         let p = get("demo-pending-1111");
         assert_eq!(p, rows[4], "unspawned rows are untouched");
 
-        // A second identical sync changes nothing.
-        let before = db::list_sessions(&conn, "demo", None).unwrap();
+        // A second identical sync changes nothing but the watermark.
+        let before = rows_but_watermark(&conn);
         sync(&conn, "demo", &snapshot(), now + 2, now + 2).unwrap();
-        assert_eq!(db::list_sessions(&conn, "demo", None).unwrap(), before);
+        assert_eq!(rows_but_watermark(&conn), before);
+        assert_eq!(get("demo-hello-txt-1a2b").synced_at, Some(now + 2));
+        assert_eq!(get("demo-pending-1111").synced_at, None, "not spawned");
     }
 
     #[test]
@@ -374,7 +779,7 @@ mod tests {
         assert_eq!(row.group_name, "working");
 
         let mut stale = row.clone();
-        sync_row(&mut stale, &snap, 90, 110);
+        sync_one(&mut stale, &snap, 90, 110);
         assert_eq!(
             (stale.cc_fresh, stale.group_name.as_str()),
             (false, "working")
@@ -384,7 +789,7 @@ mod tests {
 
         // Not listed at all: the newer hook proves the process ran, so the pid stays.
         let mut unlisted = row.clone();
-        sync_row(&mut unlisted, &[], 90, 110);
+        sync_one(&mut unlisted, &[], 90, 110);
         assert_eq!(
             (
                 unlisted.pid,
@@ -400,13 +805,13 @@ mod tests {
         busy[3].state = Some("working".into());
         busy[3].status = Some("busy".into());
         busy[3].pid = Some(5);
-        sync_row(&mut fresh, &busy, 100, 110);
+        sync_one(&mut fresh, &busy, 100, 110);
         assert_eq!(
             (fresh.cc_fresh, fresh.cc_state.as_deref(), fresh.pid),
             (true, Some("working"), Some(5))
         );
         let mut done = row.clone();
-        sync_row(&mut done, &snap, 101, 110);
+        sync_one(&mut done, &snap, 101, 110);
         assert_eq!((done.cc_fresh, done.group_name.as_str()), (true, "idle"));
     }
 
@@ -433,9 +838,13 @@ mod tests {
             (r.group_name.as_str(), r.pid, r.gone_at),
             ("idle", None, Some(150))
         );
-        let before = get();
+        let before = rows_but_watermark(&conn);
         sync(&conn, "demo", &[], 170, 180).unwrap();
-        assert_eq!(get(), before, "repeated polls change nothing");
+        assert_eq!(
+            rows_but_watermark(&conn),
+            before,
+            "repeated polls change nothing"
+        );
 
         // Listed without a pid while its stale state still says working: also gone.
         let mut listed = snapshot()[3].clone();
@@ -498,14 +907,14 @@ mod tests {
 
         // An empty list proves nothing, nor does a snapshot older than the last hook.
         let mut empty = row.clone();
-        sync_row(&mut empty, &[], 200, 210);
+        sync_one(&mut empty, &[], 200, 210);
         assert_eq!((empty.cleaned_at, empty.resolved), (None, false));
         let mut stale = row.clone();
-        sync_row(&mut stale, &snap, 90, 210);
+        sync_one(&mut stale, &snap, 90, 210);
         assert_eq!(stale.cleaned_at, None);
 
         let mut gone = row.clone();
-        assert!(sync_row(&mut gone, &snap, 200, 210));
+        assert!(sync_one(&mut gone, &snap, 200, 210));
         assert_eq!(
             (
                 gone.cleaned_at,
@@ -515,8 +924,9 @@ mod tests {
             ),
             (Some(200), true, Some("removed"), "resolved")
         );
-        let before = gone.clone();
-        sync_row(&mut gone, &snap, 300, 310);
+        let mut before = gone.clone();
+        assert!(!sync_one(&mut gone, &snap, 300, 310));
+        before.synced_at = Some(300);
         assert_eq!(gone, before, "the verdict is kept, not rewritten");
 
         // An already resolved thread keeps its reason; a blocked cleanup is cleared.
@@ -524,7 +934,7 @@ mod tests {
         resolved.resolved = true;
         resolved.resolved_reason = Some("user".into());
         resolved.cleanup_blocked = Some("2 unpushed commits".into());
-        sync_row(&mut resolved, &snap, 200, 210);
+        sync_one(&mut resolved, &snap, 200, 210);
         assert_eq!(
             (
                 resolved.cleaned_at,
@@ -536,11 +946,11 @@ mod tests {
 
         // Never seen in `claude agents` (just spawned), or the coordinator: not removed.
         let mut fresh = thread("demo-new-2222", Some("n2"), None, 0);
-        sync_row(&mut fresh, &snap, 200, 210);
+        sync_one(&mut fresh, &snap, 200, 210);
         assert_eq!(fresh.cleaned_at, None);
         let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
         coord.session_id = Some("coord-gone".into());
-        sync_row(&mut coord, &snap, 200, 210);
+        sync_one(&mut coord, &snap, 200, 210);
         assert_eq!((coord.cleaned_at, coord.resolved), (None, false));
 
         // Listed without a pid (stopped): asleep, not removed.
@@ -550,7 +960,7 @@ mod tests {
             Some("0a1b2c3d-1111-4222-8333-944455556666"),
             0,
         );
-        sync_row(&mut stopped, &snap, 200, 210);
+        sync_one(&mut stopped, &snap, 200, 210);
         assert_eq!((stopped.cleaned_at, stopped.pid), (None, None));
     }
 

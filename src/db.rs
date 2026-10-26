@@ -97,6 +97,17 @@ CREATE TABLE ui_state (
     // The session `chief pane` is attached to right now, so the board skips a needless switch
     // (§9).
     "ALTER TABLE ui_state ADD COLUMN pane_showing TEXT;",
+    // Judging "removed outside chief" (§5): the newest snapshot applied to the row (older ones are
+    // ignored), when its ids were last set (a snapshot taken before can't know the session), and
+    // when a sync found it removed (so a session that shows up again is restored). Rows that sync
+    // already marked removed get `removed_at`, so a wrong old verdict can still be undone.
+    "ALTER TABLE sessions ADD COLUMN synced_at INTEGER;
+     ALTER TABLE sessions ADD COLUMN ids_at INTEGER;
+     ALTER TABLE sessions ADD COLUMN removed_at INTEGER;
+     UPDATE sessions SET ids_at = updated_at
+       WHERE short_id IS NOT NULL OR session_id IS NOT NULL;
+     UPDATE sessions SET removed_at = cleaned_at
+       WHERE resolved_reason = 'removed' AND cleaned_at IS NOT NULL;",
 ];
 
 /// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
@@ -180,6 +191,15 @@ pub struct SessionRow {
     pub cleaned_at: Option<i64>,
     /// Why the last cleanup attempt left it in place, e.g. "2 unpushed commits".
     pub cleanup_blocked: Option<String>,
+    /// When the newest `claude agents` snapshot applied to the row was taken; older ones are
+    /// ignored.
+    pub synced_at: Option<i64>,
+    /// When `short_id` or `session_id` last changed. `update_session` keeps it: a write that
+    /// changes either id stamps it with the row's `updated_at`; other writes keep it (None
+    /// leaves the stored value).
+    pub ids_at: Option<i64>,
+    /// When a sync found the session removed outside chief (§5).
+    pub removed_at: Option<i64>,
     pub pending_permission: bool,
     pub group_name: String,
     pub waiting_reason: Option<String>,
@@ -216,7 +236,8 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     repo_name, repo_path, cwd, branch, model, effort, cc_state, cc_status, cc_fresh, pid, \
     last_hook, pending_permission, group_name, waiting_reason, resolved, resolved_reason, pr_url, \
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
-    last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked";
+    last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked, synced_at, ids_at, \
+    removed_at";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -256,6 +277,9 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         gone_at: r.get(33)?,
         cleaned_at: r.get(34)?,
         cleanup_blocked: r.get(35)?,
+        synced_at: r.get(36)?,
+        ids_at: r.get(37)?,
+        removed_at: r.get(38)?,
     })
 }
 
@@ -290,8 +314,10 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)"
+         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)"
     );
+    let has_ids = s.short_id.is_some() || s.session_id.is_some();
+    let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
     conn.execute(
         &sql,
         params![
@@ -331,6 +357,9 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.gone_at,
             s.cleaned_at,
             s.cleanup_blocked,
+            s.synced_at,
+            ids_at,
+            s.removed_at,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -339,6 +368,8 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
 
 /// Writes every column of `s` (keyed by name). Read the row and write it back inside one
 /// `BEGIN IMMEDIATE` transaction so a concurrent hook or board poll can't be overwritten.
+/// `ids_at` is the exception: a write that changes `short_id` or `session_id` stamps it with
+/// `updated_at` (SET reads the old values), so every writer of ids keeps it without knowing.
 pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let n = conn
         .execute(
@@ -349,7 +380,10 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            resolved = ?22, resolved_reason = ?23, pr_url = ?24, pr_state = ?25, pr_draft = ?26,
            pr_review = ?27, last_report = ?28, last_report_at = ?29, created_at = ?30,
            updated_at = ?31, last_activity_at = ?32, last_hook_at = ?33,
-           gone_at = ?34, cleaned_at = ?35, cleanup_blocked = ?36
+           gone_at = ?34, cleaned_at = ?35, cleanup_blocked = ?36, synced_at = ?37,
+           ids_at = CASE WHEN short_id IS ?4 AND session_id IS ?5 THEN coalesce(?38, ids_at)
+                         ELSE ?31 END,
+           removed_at = ?39
          WHERE name = ?1",
             params![
                 s.name,
@@ -388,10 +422,22 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.gone_at,
                 s.cleaned_at,
                 s.cleanup_blocked,
+                s.synced_at,
+                s.ids_at,
+                s.removed_at,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
     anyhow::ensure!(n == 1, "no session named {}", s.name);
+    Ok(())
+}
+
+/// Moves a row's snapshot watermark forward without rewriting it (a poll that changed nothing).
+pub fn set_synced_at(conn: &Connection, name: &str, taken_at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET synced_at = ?2 WHERE name = ?1 AND (synced_at IS NULL OR synced_at < ?2)",
+        params![name, taken_at],
+    )?;
     Ok(())
 }
 
@@ -714,7 +760,11 @@ mod tests {
         t.last_report = Some("done".into());
         t.cleaned_at = Some(20);
         t.cleanup_blocked = Some("2 unpushed commits".into());
+        t.synced_at = Some(15);
+        t.removed_at = Some(20);
+        t.updated_at = 30;
         update_session(&conn, &t).unwrap();
+        t.ids_at = Some(30);
         assert_eq!(
             get_session_by_session_id(&conn, "uuid-1").unwrap().unwrap(),
             t
@@ -734,6 +784,36 @@ mod tests {
 
         let ghost = SessionRow::new("ghost", "p", Role::Thread, 1);
         assert!(update_session(&conn, &ghost).is_err());
+    }
+
+    /// Whoever writes an id (a hook's title match, start_thread, a sync), `ids_at` says when.
+    #[test]
+    fn ids_at_follows_id_changes() {
+        let (_dir, conn) = fresh();
+        register_project(&conn, "p", Path::new("/p"), 1).unwrap();
+        let ids_at = |conn: &Connection| get_session(conn, "t").unwrap().unwrap().ids_at;
+        let mut t = SessionRow::new("t", "p", Role::Thread, 10);
+        insert_session(&conn, &t).unwrap();
+        assert_eq!(ids_at(&conn), None, "not spawned");
+        t.short_id = Some("s1".into());
+        t.updated_at = 20;
+        update_session(&conn, &t).unwrap();
+        assert_eq!(ids_at(&conn), Some(20));
+        // Other changes keep it, even from a row read before it was stamped.
+        t.updated_at = 30;
+        t.title = Some("x".into());
+        update_session(&conn, &t).unwrap();
+        assert_eq!(ids_at(&conn), Some(20));
+        t.session_id = Some("sid".into());
+        t.updated_at = 50;
+        update_session(&conn, &t).unwrap();
+        assert_eq!(ids_at(&conn), Some(50));
+
+        // A row inserted with ids has them since it was written.
+        let mut u = SessionRow::new("u", "p", Role::Thread, 60);
+        u.session_id = Some("sid-u".into());
+        insert_session(&conn, &u).unwrap();
+        assert_eq!(get_session(&conn, "u").unwrap().unwrap().ids_at, Some(60));
     }
 
     #[test]

@@ -224,7 +224,10 @@ CREATE TABLE sessions (                   -- coordinator and threads
   last_hook_at    INTEGER,                -- when last_hook ran (migration 2); see §5 sync
   gone_at         INTEGER,                -- when a snapshot no older than the last hook showed no process (migration 3)
   cleaned_at      INTEGER,                -- when the session, worktree and local branch were removed, §12 (migration 4)
-  cleanup_blocked TEXT                    -- why the last cleanup kept it, e.g. '2 unpushed commits' (migration 4)
+  cleanup_blocked TEXT,                   -- why the last cleanup kept it, e.g. '2 unpushed commits' (migration 4)
+  synced_at       INTEGER,                -- taken-at of the newest snapshot applied; older ones are ignored, §5 (migration 6)
+  ids_at          INTEGER,                -- when short_id or session_id last changed; db::update_session stamps it (migration 6)
+  removed_at      INTEGER                 -- when a sync found the session removed outside chief, §5 (migration 6)
 );
 
 CREATE TABLE events (
@@ -330,19 +333,32 @@ again automatically; reopening also sets `last_activity_at`): `pr_state = MERGED
 (`merged`); no activity for 7 days and not working or waiting → resolved (`inactive`).
 
 Sync (`src/registry.rs`, run with each `claude agents` snapshot and the time it was taken, read just
-before running the command): match each project session by `session_id`, or by `short_id` = row
-`id` while `session_id` is NULL (then store it). Matched rows get `cc_state`, `cc_status`, `pid` and
-`cc_fresh = 1`; unmatched rows get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`.
-Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve.
+before running the command): match each project session by `session_id`, else by `short_id` = row
+`id`. A row matched by short id under another session id (after `/clear`) takes the new
+`session_id`, unless another registered row already has it; a row without a `session_id` stores
+the listed one. Matched rows get `cc_state`, `cc_status`, `pid` and `cc_fresh = 1`; unmatched rows
+get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. Rows with neither id (not
+spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
+`synced_at` = taken-at of the newest snapshot applied to it: a snapshot older than that is ignored
+for the row (polls from the board, hooks and the CLI run in separate processes and may commit out
+of order). A poll that changes nothing else moves only the watermark (`updated_at` stays).
 
 Removed outside chief: a stopped session stays listed in `claude agents --all`, and only
-`claude rm` takes one off. So a thread row that has a `session_id`, isn't cleaned, and is missing
-from a non-stale snapshot that lists at least one session was removed: it gets `cleaned_at` =
-taken-at, `cleanup_blocked = NULL`, and, if it wasn't resolved, `resolved = 1` with
-`resolved_reason = 'removed'`. An empty list never counts: chief can't tell "every session was
-removed" from a supervisor that lists nothing for a moment, and a wrong verdict would lock the
-thread out for good (§12). The coordinator is normally listed, so this only delays the verdict.
-The coordinator row is never marked.
+`claude rm` takes one off. So a thread row that has a `session_id`, isn't cleaned or already
+marked removed, and is missing from a non-stale snapshot (neither its `session_id` nor its
+`short_id` listed) was removed, but only when the snapshot can know that: it was taken after the
+row was created and after its ids were last set (`ids_at`), and it lists at least one other
+session registered in this chief home (any project). A snapshot that lists none of them comes from
+another Claude config or supervisor, or from one that lists nothing for a moment; a wrong verdict
+would lock the thread out (§12). The coordinator is normally listed, so this only delays the
+verdict. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
+`resolved_reason = 'removed'`. When its worktree is gone too (job state names none, §12, or the
+folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
+otherwise `cleanup_blocked = 'session removed outside chief; worktree remains at <path>'`, and a
+later sync that finds that folder gone sets `cleaned_at`. The coordinator row is never marked.
+If a later snapshot lists the session again, the sync undoes only what it did: `removed_at`
+cleared, `cleaned_at` cleared when it equals `removed_at`, `resolved`/`resolved_reason` cleared when
+the reason is `removed`, and the `session removed outside chief…` `cleanup_blocked` cleared.
 
 A snapshot taken before a row's last hook (`last_hook_at` > taken-at) is stale for that row: it keeps
 `cc_fresh = 0` and its `cc_state`/`cc_status`, so the hook's provisional group stands. Ids are still
@@ -694,8 +710,11 @@ head is the branch's sha.
 
 `clean(ctx, name, mode)`:
 
-1. Refresh from `claude agents` and sync (§5); if that finds the session removed, it is already
-   clean.
+1. Refresh from `claude agents` and sync (§5); if that finds the session removed with its
+   worktree, it is already clean. Removed outside chief with the worktree still there
+   (`removed_at` set, not cleaned): no `claude rm` (it has no session to remove); cleaned when the
+   job state's worktree is gone, otherwise blocked with `session removed outside chief; worktree
+   remains at <path>` (the folder is the user's to delete).
 2. Refuse (error, nothing run) unless the thread is resolved and, derived as if it weren't
    resolved, neither working nor waiting: `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.

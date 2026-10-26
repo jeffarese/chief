@@ -536,11 +536,47 @@ fn a_thread_that_never_started_is_cleaned_without_rm() {
 #[test]
 fn a_thread_removed_outside_chief_is_marked_cleaned() {
     let env = Env::new();
+    let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+    coord.short_id = Some("c0ffee".into());
+    coord.session_id = Some("coord".into());
+    db::insert_session(&env.conn, &coord).unwrap();
     env.insert(|r| {
         r.resolved = false;
         r.resolved_reason = None;
     });
     env.agents(&[agent("c0ffee", "coord", "chief-demo", "done", Some(1))]);
+
+    // `claude rm` elsewhere left the worktree (its job state still names it): resolved, kept.
+    let Outcome::Blocked(why) = env.clean(Mode::Safe).unwrap() else {
+        panic!("want blocked");
+    };
+    let remains = format!(
+        "session removed outside chief; worktree remains at {}",
+        env.worktree.display()
+    );
+    assert_eq!(why, remains);
+    let row = env.row();
+    assert_eq!(
+        (
+            row.cleaned_at,
+            row.resolved_reason.as_deref(),
+            row.cleanup_blocked.as_deref()
+        ),
+        (None, Some("removed"), Some(remains.as_str()))
+    );
+    assert!(env.rm_calls().is_empty());
+
+    // The worktree is gone: cleaned, still without `claude rm`.
+    env.claude.drop_job(SHORT);
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::AlreadyCleaned);
+    assert_eq!(env.row().cleaned_at, Some(NOW));
+    assert!(env.rm_calls().is_empty());
+
+    // Removed with its worktree in one go: cleaned at once.
+    env.insert(|r| {
+        r.resolved = false;
+        r.resolved_reason = None;
+    });
     assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::AlreadyCleaned);
     let row = env.row();
     assert_eq!(

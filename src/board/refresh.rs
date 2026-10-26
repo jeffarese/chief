@@ -143,9 +143,12 @@ fn open(path: &Path, tx: &Sender<Msg>) -> Option<Connection> {
 pub fn tick(conn: &Connection, claude: &Claude, slug: &str) -> Msg {
     let taken_at = db::now_ms();
     let error = match claude.agents() {
-        Ok(snapshot) => registry::sync(conn, slug, &snapshot, taken_at, db::now_ms())
-            .err()
-            .map(|e| format!("{e:#}")),
+        Ok(snapshot) => {
+            let now = db::now_ms();
+            registry::sync_in(conn, slug, &snapshot, taken_at, now, &claude.config_dir)
+                .err()
+                .map(|e| format!("{e:#}"))
+        }
         Err(e) => Some(format!("{e:#}")),
     };
     read(conn, slug, error).unwrap_or_else(|e| Msg::RefreshFailed(format!("{e:#}")))
