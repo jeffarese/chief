@@ -97,3 +97,18 @@ valid folders); "working" now means a busy process (a finished thread stayed in 
 For prompt tuning (M5): the coordinator offers to remove worktrees (it can't; cleanup is the
 user's); a coordinator brief said "the branch this thread was created with", which confused the
 thread; the coordinator correctly refused to relay a request that would route around its own guard.
+
+## Milestone 4–5 live results (real Rex, real Claude Code 2.1.310, Haiku sessions, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| `chief up` opens the Rex layout: coordinator via real `claude attach` on the left, board on the right | Pass |
+| Enter on a thread switches the left pane to that thread; Esc returns to the coordinator; the board marker follows | Pass |
+| Enter on a stopped thread respawns it, then attaches | Pass |
+| Guard with the chief binary missing: the coordinator's SendMessage is blocked with chief's message; state hooks fail open | Pass |
+| Board cleanup: `x` on a resolved thread with an unpushed commit stops and lists the commit; the session keeps running; typing the name discards and removes worktree, branch and session | Pass |
+| `chief down` / `--stop-threads` | Pass |
+
+Fixed during the run: the coordinator never subscribed to its threads (told "with no message", then
+`""`, Haiku emitted `"message": ,`; the literal now omits the key, verified with a fresh
+coordinator); `chief … | head` panicked on a closed pipe.
