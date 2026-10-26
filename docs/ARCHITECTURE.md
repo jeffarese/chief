@@ -670,10 +670,15 @@ Resolving a thread keeps its session, worktree and branch. Cleanup removes them 
 `claude rm <short_id>` (§1), which deletes the worktree and the local branch and keeps any remote
 branch. The row stays, with its reports: `cleaned_at` is set and `cleanup_blocked` cleared.
 
-The worktree is the stored `cwd` (hooks report the latest; the worktree once the thread moved):
-`<repo>/.claude/worktrees/<name>` at or above it, confirmed with
-`git -C <cwd> rev-parse --show-toplevel` while it exists. Never a name derived from the thread's.
-A thread whose `cwd` never entered `.claude/worktrees/` has nothing of its own to lose.
+The worktree is the one `claude rm` itself deletes: the session's job state,
+`<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is
+`$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (as Claude Code reads it), else
+`~/.claude`. It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
+`git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
+answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
+anywhere, another thread's worktree included, and never a name derived from the thread's. No state
+file or no `worktreePath` means the thread has no worktree of its own: nothing to lose, and nothing
+is reset or cleaned.
 
 `inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s): whether the worktree
 exists, its branch (`git branch --show-current`, else `sessions.branch`),
@@ -693,8 +698,10 @@ if the branch still exists there.
 4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
    in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
    `, `) and stop without calling `claude rm`.
-   `Discard` (the user confirmed): in a dirty worktree run `git -C <wt> reset --hard -q` and
-   `git -C <wt> clean -fdq` (never `-x`: ignored files stay).
+   `Discard` (the user confirmed): refused (stored in `cleanup_blocked`, nothing run) when the job
+   state of another session registered in this chief home names the same worktree; otherwise in
+   a dirty worktree run `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`:
+   ignored files stay).
 5. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
    `--discard-unpushed <token>` from the refusal. Removed → cleaned. Unpushed → `N unpushed
    commits`; dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in

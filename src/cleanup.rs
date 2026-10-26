@@ -104,22 +104,20 @@ pub fn active(row: &SessionRow) -> bool {
     matches!(state::derive(&facts).group, Group::Working | Group::Waiting)
 }
 
-/// Reads the thread's worktree (the stored cwd, never a name derived from the thread's).
-pub fn inspect(row: &SessionRow) -> Result<Inspection> {
-    let Some(cwd) = row.cwd.as_deref().map(Path::new) else {
+/// The thread's own worktree: what its job state names (`Claude::job_worktree`), the folder
+/// `claude rm` deletes, and only when that is a `<repo>/.claude/worktrees/<name>` folder. Never
+/// the hooks' cwd: it follows the thread's shell anywhere, into another thread's worktree too.
+pub fn worktree_of(claude: &Claude, row: &SessionRow) -> Option<PathBuf> {
+    let path = claude.job_worktree(row.short_id.as_deref()?)?;
+    (worktree_root(&path).as_deref() == Some(path.as_path())).then_some(path)
+}
+
+/// Reads the thread's worktree (`worktree_of`). A thread without one has nothing of its own to
+/// lose.
+pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
+    let Some(root) = worktree_of(claude, row) else {
         return Ok(Inspection::default());
     };
-    let Some(mut root) = worktree_root(cwd) else {
-        return Ok(Inspection::default());
-    };
-    if cwd.is_dir()
-        && let Ok(top) = git_line(cwd, &["rev-parse", "--show-toplevel"])
-        && let Some(top) = top
-            .map(PathBuf::from)
-            .filter(|t| worktree_root(t).is_some())
-    {
-        root = top;
-    }
     let mut ins = Inspection {
         exists: root.is_dir(),
         worktree: Some(root.clone()),
@@ -128,6 +126,12 @@ pub fn inspect(row: &SessionRow) -> Result<Inspection> {
     };
     // Where to ask about commits: the worktree, or the repository if the worktree is gone.
     let dir = if ins.exists {
+        // A leftover folder that isn't a worktree would make git answer for the checkout around
+        // it, and a discard would reset that.
+        let top = git_line(&root, &["rev-parse", "--show-toplevel"])?.map(PathBuf::from);
+        if top.and_then(|t| t.canonicalize().ok()) != root.canonicalize().ok() {
+            bail!("{} is not a git worktree", root.display());
+        }
         if let Some(branch) = git_line(&root, &["branch", "--show-current"])? {
             ins.branch = Some(branch);
         }
@@ -270,7 +274,7 @@ pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         record(ctx, name, None)?;
         return Ok(Outcome::Cleaned);
     };
-    let ins = match (inspect(&row), mode) {
+    let ins = match (inspect(ctx.claude, &row), mode) {
         (Ok(ins), _) => ins,
         (Err(e), Mode::Safe) => {
             let why = format!(
@@ -290,6 +294,16 @@ pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
             }
         }
         Mode::Discard => {
+            if let Some(wt) = &ins.worktree
+                && let Some(other) = sharing_worktree(ctx, &row, wt)?
+            {
+                let why = format!(
+                    "{} is also the worktree of {other}; not discarding anything there",
+                    wt.display()
+                );
+                record(ctx, name, Some(&why))?;
+                return Ok(Outcome::Blocked(why));
+            }
             if let Some(wt) = ins
                 .worktree
                 .as_deref()
@@ -321,6 +335,25 @@ pub fn clean(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
     };
     record(ctx, name, Some(&why))?;
     Ok(Outcome::Blocked(why))
+}
+
+/// Another registered session (any project of this chief home) whose job state names the same
+/// worktree, if any.
+fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<String>> {
+    let wt = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
+    for other in db::all_sessions(ctx.conn)? {
+        if other.name == row.name {
+            continue;
+        }
+        let theirs = other
+            .short_id
+            .as_deref()
+            .and_then(|s| ctx.claude.job_worktree(s));
+        if theirs.is_some_and(|p| p.canonicalize().unwrap_or(p) == wt) {
+            return Ok(Some(other.name));
+        }
+    }
+    Ok(None)
 }
 
 /// Stores a cleanup result: `blocked` None means cleaned.
@@ -377,7 +410,7 @@ pub fn gc(ctx: &Ctx, slug: &str, dry_run: bool) -> Result<Gc> {
     let mut verdicts = Vec::new();
     for row in rows {
         let verdict = if dry_run {
-            dry_verdict(&row)
+            dry_verdict(ctx.claude, &row)
         } else {
             match clean(ctx, &row.name, Mode::Safe) {
                 Ok(Outcome::Cleaned | Outcome::AlreadyCleaned) => Verdict::Cleaned,
@@ -396,14 +429,14 @@ fn sync_agents(ctx: &Ctx, slug: &str) -> Result<()> {
     registry::sync(ctx.conn, slug, &snapshot, taken_at, (ctx.now)())
 }
 
-fn dry_verdict(row: &SessionRow) -> Verdict {
+fn dry_verdict(claude: &Claude, row: &SessionRow) -> Verdict {
     if active(row) {
         return Verdict::Skipped("still working or waiting".to_string());
     }
     if row.short_id.is_none() {
         return Verdict::WouldClean;
     }
-    match inspect(row) {
+    match inspect(claude, row) {
         Ok(ins) => match ins.blocker() {
             Some(why) => Verdict::Blocked(why),
             None => Verdict::WouldClean,
@@ -543,7 +576,7 @@ pub fn run_clean(slug: &str, thread: &str, discard: bool, yes: bool) -> Result<(
             println!("{name} is already cleaned up.");
             return Ok(());
         };
-        let ins = inspect(&row)?;
+        let ins = inspect(&claude, &row)?;
         print!("{}", render_loss(name, &ins));
         if ins.blocker().is_some() && !yes {
             confirm(name)?;

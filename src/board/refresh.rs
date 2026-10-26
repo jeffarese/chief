@@ -30,9 +30,20 @@ pub struct Sources {
     pub dir: PathBuf,
     pub db: PathBuf,
     pub claude_bin: PathBuf,
+    /// Claude Code's config folder, for job state (`claude::claude_dir`).
+    pub claude_dir: PathBuf,
     pub gh_bin: PathBuf,
     /// `rex`, for switching the layout's main pane.
     pub rex_bin: PathBuf,
+}
+
+impl Sources {
+    pub fn claude(&self) -> Claude {
+        Claude {
+            bin: self.claude_bin.clone(),
+            config_dir: self.claude_dir.clone(),
+        }
+    }
 }
 
 /// Handles to the refresh threads. Dropping it stops them at their next wait.
@@ -62,9 +73,7 @@ pub fn spawn(src: Sources, tx: Sender<Msg>) -> Refresher {
         if let Err(e) = db::prune_events(&conn, db::now_ms() - EVENTS_KEPT_MS) {
             let _ = agents_tx.send(Msg::RefreshFailed(format!("pruning old events: {e:#}")));
         }
-        let claude = Claude {
-            bin: agents_src.claude_bin.clone(),
-        };
+        let claude = agents_src.claude();
         loop {
             if agents_tx
                 .send(tick(&conn, &claude, &agents_src.slug))
@@ -94,9 +103,7 @@ pub fn spawn(src: Sources, tx: Sender<Msg>) -> Refresher {
         let Some(conn) = open(&src.db, &tx) else {
             return;
         };
-        let claude = Claude {
-            bin: src.claude_bin.clone(),
-        };
+        let claude = src.claude();
         // One `Gh` for the board's lifetime: its "no gh / not logged in" hint comes once.
         let gh = Gh::new(src.gh_bin.clone());
         loop {

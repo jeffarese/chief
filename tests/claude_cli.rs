@@ -171,8 +171,6 @@ fn version_check() {
 
 #[test]
 fn missing_binary_is_an_error() {
-    let claude = Claude {
-        bin: "/nonexistent/claude".into(),
-    };
+    let claude = Claude::new("/nonexistent/claude".into());
     assert!(claude.agents().is_err());
 }

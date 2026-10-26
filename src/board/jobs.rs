@@ -101,9 +101,7 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
 fn wake(src: &Sources, name: &str) -> Result<Msg> {
     let conn = db::open(&src.db)?;
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
-    let claude = Claude {
-        bin: src.claude_bin.clone(),
-    };
+    let claude = src.claude();
     let trust_config = claude::claude_config_path();
     let ctx = ToolCtx {
         conn: &conn,
@@ -136,9 +134,7 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
 
 fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
     let conn = db::open(&src.db)?;
-    let claude = Claude {
-        bin: src.claude_bin.clone(),
-    };
+    let claude = src.claude();
     let gh = Gh::new(src.gh_bin.clone());
     let ctx = Ctx {
         conn: &conn,
@@ -151,7 +147,7 @@ fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
         (Outcome::AlreadyCleaned, _) => Msg::Done(format!("{name} is already cleaned up.")),
         (Outcome::Blocked(why), Mode::Safe) => Msg::CleanBlocked {
             name: name.to_string(),
-            loss: loss(&conn, name, &why)?,
+            loss: loss(&conn, &claude, name, &why)?,
         },
         (Outcome::Blocked(why), Mode::Discard) => {
             Msg::Done(format!("{name} is still not cleaned up: {why}"))
@@ -160,9 +156,9 @@ fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
 }
 
 /// What the confirmation shows: why the safe cleanup stopped and what discarding would lose.
-fn loss(conn: &Connection, name: &str, why: &str) -> Result<String> {
+fn loss(conn: &Connection, claude: &Claude, name: &str, why: &str) -> Result<String> {
     let row = db::get_session(conn, name)?.with_context(|| format!("no thread named {name}"))?;
-    let detail = match cleanup::inspect(&row) {
+    let detail = match cleanup::inspect(claude, &row) {
         Ok(ins) => cleanup::render_loss(name, &ins),
         Err(e) => format!("Could not inspect the worktree: {e:#}\n"),
     };

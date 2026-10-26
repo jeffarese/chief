@@ -67,6 +67,7 @@ impl Env {
             dir,
             db: db_path,
             claude_bin: claude.bin(),
+            claude_dir: claude.config_dir(),
             gh_bin: gh.bin(),
             rex_bin: rex.bin(),
         };
@@ -96,6 +97,7 @@ impl Env {
         row.resolved_reason = Some("user".into());
         row.group_name = "resolved".into();
         db::insert_session(&env.conn, &row).unwrap();
+        env.claude.job(SHORT, Some(&env.worktree));
         env.agents(&[
             agent("c0", "sid-c0", "chief-demo", "working", Some(11)),
             agent(SHORT, SID, NAME, "done", None),

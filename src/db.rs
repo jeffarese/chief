@@ -439,6 +439,16 @@ pub fn list_sessions(
     Ok(rows)
 }
 
+/// Every session of every project in this chief home, oldest first.
+pub fn all_sessions(conn: &Connection) -> Result<Vec<SessionRow>> {
+    let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY created_at, name");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], session_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// The project's coordinator row, if any.
 pub fn get_coordinator(conn: &Connection, project_slug: &str) -> Result<Option<SessionRow>> {
     Ok(list_sessions(conn, project_slug, Some(Role::Coordinator))?

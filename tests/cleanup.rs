@@ -59,6 +59,7 @@ impl Env {
             worktree,
         };
         env.insert(|_| {});
+        env.claude.job(SHORT, Some(&env.worktree));
         // Listed without a pid: stopped, so neither working nor removed.
         env.agents(&[agent(SHORT, SID, NAME, "done", None)]);
         env.claude.set("rm.stdout", &format!("removed {SHORT}\n"));
@@ -132,10 +133,11 @@ fn ignore(git: &GitRepo, pattern: &str) {
 }
 
 #[test]
-fn inspect_reads_the_worktree_the_hooks_reported() {
+fn inspect_reads_the_worktree_from_the_job_state() {
     let env = Env::new();
+    let claude = env.claude.claude();
     let row = env.row();
-    let ins = cleanup::inspect(&row).unwrap();
+    let ins = cleanup::inspect(&claude, &row).unwrap();
     assert_eq!(ins.worktree.as_deref(), Some(env.worktree.as_path()));
     assert!(ins.exists);
     assert_eq!(ins.branch.as_deref(), Some("worktree-add-notes"));
@@ -149,11 +151,11 @@ fn inspect_reads_the_worktree_the_hooks_reported() {
     std::fs::write(env.worktree.join("todo.txt"), "new\n").unwrap();
     env.git.commit(&env.worktree, "a.txt", "Second");
     env.git.commit(&env.worktree, "b.txt", "Third");
-    // A cwd below the worktree root finds the same worktree.
-    std::fs::create_dir(env.worktree.join("sub")).unwrap();
-    let mut deeper = row.clone();
-    deeper.cwd = Some(env.worktree.join("sub").to_string_lossy().into_owned());
-    let ins = cleanup::inspect(&deeper).unwrap();
+    // The hooks' cwd follows the thread's shell anywhere; it never picks the worktree.
+    let elsewhere = env.git.worktree("elsewhere");
+    let mut wandered = row.clone();
+    wandered.cwd = Some(elsewhere.join("src").to_string_lossy().into_owned());
+    let ins = cleanup::inspect(&claude, &wandered).unwrap();
     assert_eq!(ins.worktree.as_deref(), Some(env.worktree.as_path()));
     let mut dirty = ins.dirty.clone();
     dirty.sort();
@@ -176,20 +178,77 @@ fn inspect_reads_the_worktree_the_hooks_reported() {
             env.worktree.to_str().unwrap(),
         ],
     );
-    let ins = cleanup::inspect(&row).unwrap();
+    let ins = cleanup::inspect(&claude, &row).unwrap();
     assert!(!ins.exists);
     assert_eq!((ins.dirty.len(), ins.unpushed_count), (0, 2));
 
-    // A thread that never left the checkout has nothing of its own to lose, even on a main with
-    // unpushed commits.
+    // A folder there that isn't a worktree would let git answer for the checkout around it.
+    std::fs::create_dir_all(&env.worktree).unwrap();
+    let err = cleanup::inspect(&claude, &row).unwrap_err();
+    assert!(err.to_string().contains("is not a git worktree"), "{err:#}");
+
+    // A job without a worktree (it never left the checkout) has nothing of its own to lose, even
+    // on a main with unpushed commits; nor does one whose worktree isn't under .claude/worktrees.
     env.git.commit(&env.git.repo, "local.txt", "Local only");
     let mut plain = row.clone();
     plain.cwd = plain.repo_path.clone();
     plain.branch = Some("main".into());
+    for job in [None, Some(env.git.repo.as_path())] {
+        env.claude.job(SHORT, job);
+        assert_eq!(
+            cleanup::inspect(&claude, &plain).unwrap(),
+            cleanup::Inspection::default(),
+            "{job:?}"
+        );
+    }
+    env.claude.drop_job(SHORT);
     assert_eq!(
-        cleanup::inspect(&plain).unwrap(),
+        cleanup::inspect(&claude, &row).unwrap(),
         cleanup::Inspection::default()
     );
+}
+
+/// The reviewer's probe: thread A's last hook ran in thread B's worktree (`cd ../b`). A Discard
+/// of A must never reset B.
+#[test]
+fn discard_resets_only_the_threads_own_worktree() {
+    let env = Env::new();
+    let b = env.git.worktree("b");
+    std::fs::write(b.join("precious.txt"), "B's work\n").unwrap();
+    std::fs::write(b.join("README.md"), "B edited\n").unwrap();
+    let mut row_b = SessionRow::new("demo-b-2222", "demo", Role::Thread, NOW);
+    row_b.short_id = Some("bb22".into());
+    row_b.session_id = Some("sid-bb22".into());
+    row_b.cwd = Some(b.to_string_lossy().into_owned());
+    db::insert_session(&env.conn, &row_b).unwrap();
+    env.claude.job("bb22", Some(&b));
+    let b_intact = || {
+        assert_eq!(
+            std::fs::read_to_string(b.join("precious.txt")).unwrap(),
+            "B's work\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.join("README.md")).unwrap(),
+            "B edited\n"
+        );
+    };
+
+    // A never got a worktree of its own: nothing is reset, wherever its cwd was.
+    env.insert(|r| r.cwd = Some(b.join("src").to_string_lossy().into_owned()));
+    env.claude.job(SHORT, None);
+    assert_eq!(env.clean(Mode::Discard).unwrap(), Outcome::Cleaned);
+    b_intact();
+
+    // A's job names B's worktree: another registered session works there, so no reset and no rm.
+    env.insert(|_| {});
+    env.claude.job(SHORT, Some(&b));
+    let rm_before = env.rm_calls().len();
+    let Outcome::Blocked(why) = env.clean(Mode::Discard).unwrap() else {
+        panic!("want blocked");
+    };
+    assert!(why.contains("demo-b-2222"), "{why}");
+    b_intact();
+    assert_eq!(env.rm_calls().len(), rm_before);
 }
 
 #[test]
@@ -537,6 +596,7 @@ fn gc_dry_run_then_clean() {
     other.branch = Some("worktree-other".into());
     other.resolved = true;
     db::insert_session(&env.conn, &other).unwrap();
+    env.claude.job("o2", Some(&wt));
     let mut open = SessionRow::new("demo-open-3333", "demo", Role::Thread, NOW);
     open.short_id = Some("o3".into());
     db::insert_session(&env.conn, &open).unwrap();
@@ -595,6 +655,7 @@ fn cli_gc_and_clean() {
         db::insert_session(&conn, &row).unwrap();
     }
     home.fake
+        .job("cli1", Some(&wt))
         .set(
             "agents.stdout",
             &json!([agent("cli1", "sid-cli1", "demo-cli-1111", "done", None)]).to_string(),
