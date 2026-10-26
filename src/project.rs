@@ -432,6 +432,9 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
         }
     }
     db::set_pane_showing(&conn, slug, None)?;
+    // The next `chief up` starts on the coordinator: a pane that went back to the thread it last
+    // showed would wake it right after `--stop-threads` stopped it.
+    db::set_pane_target(&conn, slug, None)?;
 
     let claude = Claude::from_env();
     let taken_at = db::now_ms();

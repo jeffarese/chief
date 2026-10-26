@@ -95,7 +95,9 @@ terminal.
 
 `chief down <slug> [--stop-threads]` closes the Rex layout (§9 `close`: kills the session `chief up`
 created when it holds only chief's blocks, else closes just `main` and `board`), clears
-`ui_state.pane_showing`, syncs `claude agents` (stored rows if it fails), and runs
+`ui_state.pane_showing` and `ui_state.pane_target` (the next `chief up` shows the coordinator; a
+pane back on the thread it last showed would respawn it right after `--stop-threads` stopped it),
+syncs `claude agents` (stored rows if it fails), and runs
 `claude stop` on the coordinator when it has a process; with `--stop-threads` also on every
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.

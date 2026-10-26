@@ -632,6 +632,9 @@ fn down_closes_the_layout_and_stops_sessions() {
         }
         db::set_pane_showing(&conn, SLUG, Some("chief-payments-latency")).unwrap();
         db::set_rex_session(&conn, SLUG, Some("session:7")).unwrap();
+        // The pane showed a thread: the next `chief up` would wake it right after
+        // `--stop-threads` stopped it.
+        db::set_pane_target(&conn, SLUG, Some("payments-latency-a-1111")).unwrap();
     }
     home.fake.set(
         "agents.stdout",
@@ -682,6 +685,11 @@ fn down_closes_the_layout_and_stops_sessions() {
     assert_eq!(home.fake.calls_of("stop"), [vec!["stop", "c0ffee"]]);
     assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
     assert_eq!(db::get_rex_session(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(
+        db::get_pane_target(&home.db(), SLUG).unwrap(),
+        None,
+        "back to the coordinator"
+    );
 
     // With --stop-threads only the live thread is stopped; nothing is ever removed. The layout
     // is gone now.
