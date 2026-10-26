@@ -20,9 +20,10 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
+use crate::agp::Agp;
 use crate::config::ProjectConfig;
 use crate::text::shell_quote;
-use crate::{db, paths};
+use crate::{db, paths, placement};
 
 use app::{Action, App, Msg};
 use refresh::Sources;
@@ -49,6 +50,7 @@ pub fn run(project: &str) -> Result<()> {
         claude_account: config.claude_config_dir.clone(),
         claude_dir: crate::claude::claude_dir(config.claude_config_dir.as_deref()),
         gh_bin: crate::pr::Gh::from_env().bin,
+        agp_bin: crate::agp::Agp::from_env().bin,
     };
     let (tx, rx) = mpsc::channel();
     let refresher = refresh::spawn(src.clone(), tx.clone());
@@ -57,7 +59,7 @@ pub fn run(project: &str) -> Result<()> {
     // `init` enters the alternate screen and raw mode and installs a panic hook that restores
     // the terminal before the panic message prints.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &rx, |action| {
+    let result = event_loop(&mut terminal, &mut app, &rx, &src, |action| {
         jobs::spawn(src.clone(), action, tx.clone(), refresher.kicker())
     });
     ratatui::restore();
@@ -68,6 +70,7 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     rx: &mpsc::Receiver<Msg>,
+    src: &Sources,
     spawn: impl Fn(Action),
 ) -> Result<()> {
     loop {
@@ -83,6 +86,12 @@ fn event_loop(
                             let msg = edit(terminal, &path);
                             app.status = Some(msg);
                         }
+                        Action::Trust(pair) => {
+                            let msg = trust(terminal, src, &pair);
+                            if let Some(again) = app.trust_ran(msg) {
+                                spawn(again);
+                            }
+                        }
                         other => spawn(other),
                     }
                 }
@@ -91,6 +100,37 @@ fn event_loop(
         while let Ok(msg) = rx.try_recv() {
             app.apply(msg);
         }
+    }
+}
+
+/// Runs `cmd` on this terminal: leaves the alternate screen and raw mode, waits, takes the
+/// terminal back.
+fn on_terminal(
+    terminal: &mut DefaultTerminal,
+    cmd: &mut Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let status = cmd.status();
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    let _ = terminal.clear();
+    status
+}
+
+/// Claude's trust prompt for a pool account and folder (`agp exec <id> -- claude` there), then
+/// whether it took. Returns a status line.
+fn trust(terminal: &mut DefaultTerminal, src: &Sources, pair: &placement::Untrusted) -> String {
+    let mut cmd =
+        Agp::new(src.agp_bin.clone()).interactive(&pair.id, &src.claude_bin, &pair.folder);
+    let shown = format!("{} in {}", pair.label, pair.folder.display());
+    match on_terminal(terminal, &mut cmd) {
+        Err(e) => format!("Could not run agp exec {}: {e}", pair.id),
+        Ok(_) => match pair.trusted() {
+            Ok(true) => format!("Trusted: {shown}."),
+            Ok(false) => format!("Still not trusted: {shown}."),
+            Err(e) => format!("Couldn't read the trust of {shown}: {e:#}"),
+        },
     }
 }
 
@@ -103,16 +143,13 @@ fn edit(terminal: &mut DefaultTerminal, path: &Path) -> String {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     // Through sh so an EDITOR with arguments (`code -w`) works.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} {}", shell_quote(&path.to_string_lossy())))
-        .status();
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
-    let _ = enable_raw_mode();
-    let _ = terminal.clear();
+    let status = on_terminal(
+        terminal,
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} {}", shell_quote(&path.to_string_lossy()))),
+    );
     match status {
         Ok(s) if s.success() => format!("Edited {}.", file_label(path)),
         Ok(s) => format!("{editor} exited with {s}."),

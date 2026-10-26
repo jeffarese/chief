@@ -35,6 +35,7 @@ pub struct Sources {
     /// Its config folder, for job state (`claude::claude_dir`).
     pub claude_dir: PathBuf,
     pub gh_bin: PathBuf,
+    pub agp_bin: PathBuf,
 }
 
 impl Sources {

@@ -168,6 +168,67 @@ fn init_creates_the_project() {
     );
 }
 
+/// With agp, threads may run in any pool account, each with its own trust (§3): `init` lists
+/// every (account, repo) pair that isn't trusted yet with the command that fixes it, leaving out
+/// the project's own account (listed as before) and accounts outside the pool.
+#[test]
+fn init_checks_trust_in_every_pool_account() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    trust_file(&home.trust, &[&a, &b]);
+    let cpb = common::account(home.path(), "claude-cpb");
+    let cpe = common::account(home.path(), "claude-cpe");
+    trust_file(&cpb.join(".claude.json"), &[&a]);
+    trust_file(&cpe.join(".claude.json"), &[&a, &b]);
+    let agp = home.install_agp();
+    common::agp_accounts(
+        agp,
+        &[
+            common::agp_view("default", "Main", true, 0.9),
+            common::agp_view("cpb", "PB2", true, 0.8),
+            common::agp_view("cpe", "PB3", true, 0.7),
+            common::agp_view("laura", "PB4", false, 0.0),
+        ],
+        &[("default", None), ("cpb", Some(&cpb)), ("cpe", Some(&cpe))],
+    );
+    let out = init(&home, &a, &b);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Threads can also run in these agp accounts: Main, PB2, PB3."),
+        "{text}"
+    );
+    let fix = format!("cd {} && agp exec cpb -- claude", b.display());
+    assert!(
+        text.contains(&format!("PB2 doesn't trust {}", b.display())),
+        "{text}"
+    );
+    assert!(text.contains(&format!("  {fix}")), "{text}");
+    assert!(
+        !text.contains(&format!("PB2 doesn't trust {}\n", a.display())),
+        "{text}"
+    );
+    assert!(!text.contains("PB3 doesn't trust"), "{text}");
+    assert!(!text.contains("PB4"), "not in the pool: {text}");
+    assert!(
+        !text.contains("Main doesn't trust"),
+        "the project's own account: {text}"
+    );
+    assert!(
+        text.ends_with("Next: chief up payments-latency\n"),
+        "{text}"
+    );
+
+    // Without agp, nothing changes.
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    trust_file(&home.trust, &[&a, &b]);
+    let text = stdout(&init(&home, &a, &b));
+    assert!(!text.contains("agp"), "{text}");
+}
+
 /// With `CLAUDE_CONFIG_DIR` set (one folder per account), the project belongs to that account:
 /// project.toml records it, trust comes from that folder's `.claude.json`, and every generated
 /// command carries the folder: each account has its own supervisor, sessions and job state.

@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::cleanup::{Inspection, Mode};
 use crate::config::ProjectConfig;
 use crate::db::SessionRow;
+use crate::placement::{PoolTrust, Untrusted};
 use crate::state::{Group, Role};
 use crate::tools;
 
@@ -33,6 +34,10 @@ pub enum Action {
     SaveSettings(Box<ProjectConfig>),
     /// Open a file in `$EDITOR` on this terminal.
     Edit(PathBuf),
+    /// Check which repos of this draft the pool's accounts trust (§3).
+    CheckTrust(Box<ProjectConfig>),
+    /// Run Claude's trust prompt for this pair on this terminal, through agp.
+    Trust(Box<Untrusted>),
 }
 
 /// What the refresher and the workers send back.
@@ -56,6 +61,8 @@ pub enum Msg {
     },
     Saved(Box<ProjectConfig>),
     SaveFailed(String),
+    /// The pool's trust check, or why it failed.
+    Trust(Result<PoolTrust, String>),
 }
 
 /// One refresh: every session of the project plus what the header needs.
@@ -221,6 +228,23 @@ impl App {
                 Screen::Settings(form) => form.message = Some(e),
                 _ => self.status = Some(e),
             },
+            Msg::Trust(result) => {
+                if let Screen::Settings(form) = &mut self.screen {
+                    form.trust_checked(result);
+                }
+            }
+        }
+    }
+
+    /// A trust fix ran on the terminal; `text` says how it went. Returns the check to run again
+    /// when the settings screen is still open.
+    pub fn trust_ran(&mut self, text: String) -> Option<Action> {
+        match &mut self.screen {
+            Screen::Settings(form) => Some(form.trust_ran(text)),
+            _ => {
+                self.status = Some(text);
+                None
+            }
         }
     }
 

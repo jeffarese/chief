@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
+use crate::agp::Agp;
 use crate::claude::{
     self, AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT,
 };
@@ -18,7 +19,7 @@ use crate::mux::tmux::Tmux;
 use crate::mux::{Mux, SessionRef};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
-use crate::{accounts, generated, names, paths, prompts, tools};
+use crate::{accounts, generated, names, paths, placement, prompts, tools};
 
 const SLUG_CHARS: usize = 40;
 const STATUS_PREVIEW_CHARS: usize = 160;
@@ -118,8 +119,97 @@ pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: boo
             );
         }
     }
+    check_pool_trust(&config, &claude, interactive)?;
     println!("\nNext: chief up {}", config.slug);
     Ok(())
+}
+
+/// Threads may run in any account of agp's pool (§7 "Thread account"), and each account trusts
+/// folders on its own: lists the repos a pool account doesn't trust yet, leaving out the
+/// project's own account (checked above), and on a terminal offers to fix each. Without agp,
+/// nothing.
+fn check_pool_trust(config: &ProjectConfig, claude: &Claude, interactive: bool) -> Result<()> {
+    let agp = Agp::from_env();
+    let repos: Vec<PathBuf> = config.repos.iter().map(|r| r.path.clone()).collect();
+    let found = match placement::pool_trust(&config.threads, &agp, &repos) {
+        Ok(found) => found,
+        Err(e) => {
+            println!("\nchief couldn't check which repos agp's accounts trust: {e:#}");
+            return Ok(());
+        }
+    };
+    if !found.checked.is_empty() {
+        println!(
+            "\nThreads can also run in these agp accounts: {}.",
+            found.checked.join(", ")
+        );
+    }
+    for e in &found.errors {
+        println!("chief couldn't check the account {e}");
+    }
+    let project = config.claude_config_dir.as_deref();
+    let untrusted: Vec<_> = found
+        .untrusted
+        .into_iter()
+        .filter(|u| !claude::same_account(u.dir.as_deref(), project))
+        .collect();
+    if untrusted.is_empty() {
+        return Ok(());
+    }
+    println!("These don't trust a repo yet, so threads there skip them:");
+    for u in &untrusted {
+        println!("  {} doesn't trust {}", u.label, u.folder.display());
+    }
+    let mut still = Vec::new();
+    for u in untrusted {
+        if interactive && offer_pool_trust(&agp, claude, &u)? {
+            continue;
+        }
+        still.push(u);
+    }
+    if !still.is_empty() {
+        println!(
+            "\nTo trust a repo in an account, run Claude there once through agp, accept the \
+             trust prompt, then quit:"
+        );
+        for u in &still {
+            println!("  {}", u.command());
+        }
+    }
+    Ok(())
+}
+
+/// Asks to open Claude in the account and folder; returns whether it is trusted afterwards.
+fn offer_pool_trust(agp: &Agp, claude: &Claude, u: &placement::Untrusted) -> Result<bool> {
+    let question = format!(
+        "\nOpen Claude in {} in {} now to trust it? [Y/n] ",
+        u.folder.display(),
+        u.label
+    );
+    if !ask(&question)? {
+        return Ok(false);
+    }
+    println!("Accept the trust prompt, then quit with /exit or Ctrl+C twice.");
+    agp.run_interactive(&u.id, &claude.bin, &u.folder)?;
+    let trusted = u.trusted()?;
+    if trusted {
+        println!("{} trusts {} now.", u.label, u.folder.display());
+    } else {
+        println!("{} still doesn't trust {}.", u.label, u.folder.display());
+    }
+    Ok(trusted)
+}
+
+/// Prints `question` and reads a yes (the default) or no.
+fn ask(question: &str) -> Result<bool> {
+    print!("{question}");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_lowercase().as_str(),
+        "" | "y" | "yes"
+    ))
 }
 
 /// Writes the project files and registers the project; nothing is left behind on failure.
@@ -241,14 +331,11 @@ pub fn untrusted_folders(
 
 /// Asks to open Claude in `folder`; returns whether it is trusted afterwards.
 fn offer_trust(claude: &Claude, folder: &Path, trust_config: &Path) -> Result<bool> {
-    print!(
+    let question = format!(
         "\nOpen Claude in {} now to trust it? [Y/n] ",
         folder.display()
     );
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    if !matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes") {
+    if !ask(&question)? {
         return Ok(false);
     }
     println!("Accept the trust prompt, then quit with /exit or Ctrl+C twice.");

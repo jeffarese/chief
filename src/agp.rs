@@ -216,12 +216,16 @@ impl Agp {
 
     /// `agp exec <id> -- <claude>` in `cwd` on this terminal, for the trust prompt.
     pub fn run_interactive(&self, id: &str, claude: &Path, cwd: &Path) -> Result<ExitStatus> {
-        Command::new(&self.bin)
-            .args(["exec", id, "--"])
-            .arg(claude)
-            .current_dir(cwd)
+        self.interactive(id, claude, cwd)
             .status()
             .with_context(|| format!("running agp exec {id} in {}", cwd.display()))
+    }
+
+    /// The command `run_interactive` runs, for a caller that hands over the terminal itself.
+    pub fn interactive(&self, id: &str, claude: &Path, cwd: &Path) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(["exec", id, "--"]).arg(claude).current_dir(cwd);
+        cmd
     }
 
     /// Runs agp, bounded; None when the binary isn't there, an error on a timeout or a failure.

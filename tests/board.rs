@@ -11,6 +11,7 @@ use chief::board::refresh::{self, Sources};
 use chief::cleanup::Mode;
 use chief::config::{ProjectConfig, Repo};
 use chief::db::{self, SessionRow};
+use chief::placement::{PoolTrust, Untrusted};
 use chief::pr::Gh;
 use chief::state::Role;
 use common::{Fake, GitRepo, agent};
@@ -67,6 +68,8 @@ impl Env {
             claude_account: None,
             claude_dir: claude.config_dir(),
             gh_bin: gh.bin(),
+            // Missing: agp counts as not installed unless a test installs it.
+            agp_bin: root.path().join("no-agp/agp"),
         };
         let env = Env {
             _root: root,
@@ -405,4 +408,49 @@ fn save_writes_settings_and_regenerates() {
         panic!("invalid settings aren't saved")
     };
     assert!(text.contains("max_parallel"), "{text}");
+}
+
+/// The settings screen's trust check (§10): every pool account against the draft's repos, on a
+/// worker; without agp there is no pool to check, and an agp that fails says why.
+#[test]
+fn checks_which_repos_the_pool_trusts() {
+    let mut env = Env::new();
+    let config = ProjectConfig::load(&env.src.dir.join("project.toml")).unwrap();
+    let check = |src: &Sources| jobs::run(src, Action::CheckTrust(Box::new(config.clone())));
+    assert_eq!(check(&env.src), Msg::Trust(Ok(PoolTrust::default())));
+
+    let agp = Fake::named("agp");
+    let cpb = common::account(env._root.path(), "claude-cpb");
+    let cpe = common::account(env._root.path(), "claude-cpe");
+    common::trust_file(&cpe.join(".claude.json"), &[&env.git.repo]);
+    common::agp_accounts(
+        &agp,
+        &[
+            common::agp_view("cpb", "PB2", true, 0.8),
+            common::agp_view("cpe", "PB3", true, 0.7),
+            common::agp_view("laura", "PB4", false, 0.0),
+        ],
+        &[("cpb", Some(&cpb)), ("cpe", Some(&cpe))],
+    );
+    env.src.agp_bin = agp.bin();
+    let Msg::Trust(Ok(found)) = check(&env.src) else {
+        panic!("checked")
+    };
+    assert_eq!(found.checked, ["PB2", "PB3"]);
+    assert_eq!(
+        found.untrusted,
+        [Untrusted {
+            id: "cpb".into(),
+            label: "PB2".into(),
+            dir: Some(cpb.clone()),
+            folder: env.git.repo.clone(),
+        }]
+    );
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+
+    agp.set("status.exit", "1");
+    let Msg::Trust(Err(e)) = check(&env.src) else {
+        panic!("failed")
+    };
+    assert!(e.contains("`agp status --json` failed"), "{e}");
 }

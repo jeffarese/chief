@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{Cleanup, EFFORTS, ProjectConfig, THREAD_PERMISSION_MODES};
+use crate::placement::{PoolTrust, Untrusted};
 
 use super::app::Action;
 
@@ -27,9 +28,16 @@ pub enum Field {
     ThreadEffort,
     PermissionMode,
     MaxParallel,
+    /// `[threads] accounts`: the agp accounts threads may run in (§3).
+    ThreadAccounts,
+    MaxUsage,
     DefaultRepo,
     Cleanup,
     Notify,
+    /// Checks every pool account's trust of the repos.
+    PoolTrust,
+    /// A (pool account, repo) pair the last check found untrusted.
+    Untrusted(usize),
     Repo(usize),
     AddRepo,
     EditInstructions,
@@ -48,9 +56,13 @@ impl Field {
             Field::ThreadEffort => "Thread effort",
             Field::PermissionMode => "Permission mode",
             Field::MaxParallel => "Max parallel",
+            Field::ThreadAccounts => "Thread accounts",
+            Field::MaxUsage => "Max usage",
             Field::DefaultRepo => "Default repo",
             Field::Cleanup => "Cleanup",
             Field::Notify => "Notifications",
+            Field::PoolTrust => "Account trust",
+            Field::Untrusted(_) => "Untrusted",
             Field::Repo(_) => "Repo",
             Field::AddRepo => "+ Add repo (path)",
             Field::EditInstructions => "Edit instructions.md",
@@ -66,6 +78,8 @@ impl Field {
                 | Field::CoordinatorModel
                 | Field::ThreadModel
                 | Field::MaxParallel
+                | Field::ThreadAccounts
+                | Field::MaxUsage
                 | Field::AddRepo
         )
     }
@@ -89,6 +103,16 @@ pub struct SettingsForm {
     pub message: Option<String>,
     /// Esc was pressed once with unsaved changes.
     leaving: bool,
+    pub trust: TrustCheck,
+}
+
+/// Where the pool's trust check stands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrustCheck {
+    NotChecked,
+    Checking,
+    Done(PoolTrust),
+    Failed(String),
 }
 
 impl SettingsForm {
@@ -101,7 +125,35 @@ impl SettingsForm {
             editing: None,
             message: None,
             leaving: false,
+            trust: TrustCheck::NotChecked,
         }
+    }
+
+    fn untrusted(&self) -> &[Untrusted] {
+        match &self.trust {
+            TrustCheck::Done(found) => &found.untrusted,
+            _ => &[],
+        }
+    }
+
+    /// The pool's trust check finished.
+    pub fn trust_checked(&mut self, result: Result<PoolTrust, String>) {
+        self.trust = match result {
+            Ok(found) => {
+                self.message = (!found.errors.is_empty())
+                    .then(|| format!("Couldn't check {}.", found.errors.join("; ")));
+                TrustCheck::Done(found)
+            }
+            Err(e) => TrustCheck::Failed(e),
+        };
+        self.cursor = self.cursor.min(self.fields().len() - 1);
+    }
+
+    /// A trust fix ran on the terminal (`text` says how it went): check again.
+    pub fn trust_ran(&mut self, text: String) -> Action {
+        self.message = Some(text);
+        self.trust = TrustCheck::Checking;
+        Action::CheckTrust(Box::new(self.draft.clone()))
     }
 
     pub fn fields(&self) -> Vec<Field> {
@@ -113,11 +165,15 @@ impl SettingsForm {
             Field::ThreadEffort,
             Field::PermissionMode,
             Field::MaxParallel,
+            Field::ThreadAccounts,
+            Field::MaxUsage,
             Field::DefaultRepo,
             Field::Cleanup,
             Field::Notify,
             Field::Account,
+            Field::PoolTrust,
         ];
+        fields.extend((0..self.untrusted().len()).map(Field::Untrusted));
         fields.extend((0..self.draft.repos.len()).map(Field::Repo));
         fields.extend([
             Field::AddRepo,
@@ -149,6 +205,41 @@ impl SettingsForm {
             Field::ThreadEffort => c.threads.effort.clone(),
             Field::PermissionMode => c.threads.permission_mode.clone(),
             Field::MaxParallel => c.threads.max_parallel.to_string(),
+            Field::ThreadAccounts if c.threads.accounts.is_empty() => {
+                "(none: the project's account)".to_string()
+            }
+            Field::ThreadAccounts => c.threads.accounts.join(", "),
+            Field::MaxUsage => match c.threads.max_usage {
+                Some(max) => format!("{max}%"),
+                None => "(none)".to_string(),
+            },
+            Field::PoolTrust => match &self.trust {
+                TrustCheck::NotChecked => "Enter checks the pool".to_string(),
+                TrustCheck::Checking => "checking…".to_string(),
+                TrustCheck::Failed(e) => format!("check failed: {e}"),
+                TrustCheck::Done(found) if found.checked.is_empty() => {
+                    "no agp pool: threads use the project's account".to_string()
+                }
+                TrustCheck::Done(found) if found.untrusted.is_empty() => {
+                    format!("trusted in {}", found.checked.join(", "))
+                }
+                TrustCheck::Done(found) => format!(
+                    "{} untrusted in {}",
+                    found.untrusted.len(),
+                    found.checked.join(", ")
+                ),
+            },
+            Field::Untrusted(i) => self
+                .untrusted()
+                .get(i)
+                .map(|u| {
+                    let repo = c.repos.iter().find(|r| r.path == u.folder);
+                    match repo {
+                        Some(r) => format!("{} · {}", u.label, r.name),
+                        None => format!("{} · {}", u.label, u.folder.display()),
+                    }
+                })
+                .unwrap_or_default(),
             Field::DefaultRepo => c
                 .threads
                 .default_repo
@@ -198,9 +289,13 @@ impl SettingsForm {
                     return Outcome::Close;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.show_fix();
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(self.fields().len() - 1)
+                self.cursor = (self.cursor + 1).min(self.fields().len() - 1);
+                self.show_fix();
             }
             KeyCode::Left | KeyCode::Char('h') => self.cycle(field, -1),
             KeyCode::Right | KeyCode::Char('l') => self.cycle(field, 1),
@@ -215,18 +310,44 @@ impl SettingsForm {
         Outcome::Stay
     }
 
+    /// On an untrusted pair, the message says what Enter runs.
+    fn show_fix(&mut self) {
+        if let Field::Untrusted(i) = self.current()
+            && let Some(u) = self.untrusted().get(i)
+        {
+            self.message = Some(format!(
+                "Enter opens Claude there to trust it: {}",
+                u.command()
+            ));
+        }
+    }
+
     fn activate(&mut self, field: Field) -> Outcome {
         self.message = None;
         if field.is_text() {
-            let start = if field == Field::AddRepo {
-                String::new()
-            } else {
-                self.value(field)
+            let start = match field {
+                Field::AddRepo => String::new(),
+                Field::ThreadAccounts => self.draft.threads.accounts.join(", "),
+                Field::MaxUsage => self
+                    .draft
+                    .threads
+                    .max_usage
+                    .map(|m| m.to_string())
+                    .unwrap_or_default(),
+                _ => self.value(field),
             };
             self.editing = Some(start);
             return Outcome::Stay;
         }
         match field {
+            Field::PoolTrust => {
+                self.trust = TrustCheck::Checking;
+                Outcome::Run(Action::CheckTrust(Box::new(self.draft.clone())))
+            }
+            Field::Untrusted(i) => match self.untrusted().get(i) {
+                Some(u) => Outcome::Run(Action::Trust(Box::new(u.clone()))),
+                None => Outcome::Stay,
+            },
             Field::EditInstructions => Outcome::Run(Action::Edit(self.dir.join("instructions.md"))),
             Field::EditMemory => Outcome::Run(Action::Edit(self.dir.join("memory/MEMORY.md"))),
             Field::Save => match self.draft.validate() {
@@ -280,6 +401,25 @@ impl SettingsForm {
                 c.threads.max_parallel = text.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
                     format!("Max parallel must be a whole number ≥ 1, not {text:?}.")
                 })?
+            }
+            Field::ThreadAccounts => {
+                c.threads.accounts = text
+                    .split(|ch: char| ch == ',' || ch.is_whitespace())
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+            Field::MaxUsage if text.is_empty() => c.threads.max_usage = None,
+            Field::MaxUsage => {
+                let max = text.trim_end_matches('%').trim();
+                c.threads.max_usage = Some(
+                    max.parse()
+                        .ok()
+                        .filter(|n| (1..=100).contains(n))
+                        .ok_or_else(|| {
+                            format!("Max usage must be a percent from 1 to 100, not {text:?}.")
+                        })?,
+                )
             }
             Field::AddRepo => {
                 if text.is_empty() {
@@ -430,6 +570,116 @@ mod tests {
         config.claude_config_dir = Some("/Users/me/.claude-carlos".into());
         let f = SettingsForm::new(&config, PathBuf::from("/p/demo"));
         assert_eq!(f.value(Field::Account), "/Users/me/.claude-carlos");
+    }
+
+    /// The thread accounts and max usage are free text (§3 project.toml); "Account trust"
+    /// checks every pool account against the draft's repos, lists each pair not trusted yet,
+    /// and Enter on one runs its fix on this terminal.
+    #[test]
+    fn thread_accounts_and_their_trust() {
+        let mut f = form();
+        assert_eq!(f.value(Field::ThreadAccounts), "auto");
+        assert_eq!(f.value(Field::MaxUsage), "(none)");
+        goto(&mut f, Field::ThreadAccounts);
+        f.on_key(key(KeyCode::Enter));
+        assert_eq!(f.editing.as_deref(), Some("auto"));
+        f.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut f, "cpb, cpe pb5");
+        f.on_key(key(KeyCode::Enter));
+        assert_eq!(f.draft.threads.accounts, ["cpb", "cpe", "pb5"]);
+        f.on_key(key(KeyCode::Enter));
+        f.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        f.on_key(key(KeyCode::Enter));
+        assert!(f.draft.threads.accounts.is_empty());
+        assert_eq!(
+            f.value(Field::ThreadAccounts),
+            "(none: the project's account)"
+        );
+        f.on_key(key(KeyCode::Enter));
+        assert_eq!(f.editing.as_deref(), Some(""));
+        type_text(&mut f, "auto");
+        f.on_key(key(KeyCode::Enter));
+
+        goto(&mut f, Field::MaxUsage);
+        f.on_key(key(KeyCode::Enter));
+        assert_eq!(f.editing.as_deref(), Some(""));
+        type_text(&mut f, "101");
+        f.on_key(key(KeyCode::Enter));
+        assert!(f.message.as_deref().unwrap().contains("1 to 100"));
+        f.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut f, "80");
+        f.on_key(key(KeyCode::Enter));
+        assert_eq!(f.draft.threads.max_usage, Some(80));
+        assert_eq!(f.value(Field::MaxUsage), "80%");
+
+        goto(&mut f, Field::PoolTrust);
+        assert_eq!(f.value(Field::PoolTrust), "Enter checks the pool");
+        let Outcome::Run(Action::CheckTrust(draft)) = f.on_key(key(KeyCode::Enter)) else {
+            panic!("checks")
+        };
+        assert_eq!(*draft, f.draft, "the draft's repos and accounts");
+        assert_eq!(f.value(Field::PoolTrust), "checking…");
+
+        let pair = |label: &str, folder: &str| Untrusted {
+            id: label.to_lowercase(),
+            label: label.into(),
+            dir: Some(format!("/acc/{label}").into()),
+            folder: folder.into(),
+        };
+        f.trust_checked(Ok(PoolTrust {
+            checked: vec!["PB2".into(), "PB3".into()],
+            untrusted: vec![pair("PB2", "/r/web"), pair("PB3", "/elsewhere")],
+            errors: vec!["PB5: agp exec failed".into()],
+        }));
+        assert_eq!(f.value(Field::PoolTrust), "2 untrusted in PB2, PB3");
+        assert!(
+            f.message
+                .as_deref()
+                .unwrap()
+                .contains("PB5: agp exec failed")
+        );
+        let at = f
+            .fields()
+            .iter()
+            .position(|x| *x == Field::PoolTrust)
+            .unwrap();
+        assert_eq!(
+            f.fields()[at + 1..at + 3],
+            [Field::Untrusted(0), Field::Untrusted(1)]
+        );
+        assert_eq!(f.value(Field::Untrusted(0)), "PB2 · web");
+        assert_eq!(f.value(Field::Untrusted(1)), "PB3 · /elsewhere");
+        f.on_key(key(KeyCode::Down));
+        assert_eq!(f.current(), Field::Untrusted(0));
+        assert_eq!(
+            f.message.as_deref(),
+            Some("Enter opens Claude there to trust it: cd /r/web && agp exec pb2 -- claude")
+        );
+        assert_eq!(
+            f.on_key(key(KeyCode::Enter)),
+            Outcome::Run(Action::Trust(Box::new(pair("PB2", "/r/web"))))
+        );
+
+        // After the fix runs, the check runs again.
+        assert_eq!(
+            f.trust_ran("PB2 trusts /r/web now.".into()),
+            Action::CheckTrust(Box::new(f.draft.clone()))
+        );
+        assert_eq!(f.value(Field::PoolTrust), "checking…");
+        f.trust_checked(Ok(PoolTrust {
+            checked: vec!["PB2".into()],
+            ..PoolTrust::default()
+        }));
+        assert_eq!(f.value(Field::PoolTrust), "trusted in PB2");
+        assert!(!f.fields().contains(&Field::Untrusted(0)));
+        assert!(f.cursor < f.fields().len());
+        f.trust_checked(Ok(PoolTrust::default()));
+        assert_eq!(
+            f.value(Field::PoolTrust),
+            "no agp pool: threads use the project's account"
+        );
+        f.trust_checked(Err("agp status failed".into()));
+        assert_eq!(f.value(Field::PoolTrust), "check failed: agp status failed");
     }
 
     #[test]

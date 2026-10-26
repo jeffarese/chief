@@ -8,12 +8,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::agp::Agp;
 use crate::claude::{Claude, RESOLVE_TIMEOUT};
 use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
 use crate::config::ProjectConfig;
 use crate::pr::Gh;
 use crate::tools::{self, NameArgs, ToolCtx};
-use crate::{db, generated, pane, registry};
+use crate::{db, generated, pane, placement, registry};
 
 use super::app::{Action, Msg};
 use super::refresh::Sources;
@@ -32,9 +33,11 @@ pub fn spawn(src: Sources, action: Action, tx: Sender<Msg>, kick: Sender<()>) {
 pub fn run(src: &Sources, action: Action) -> Msg {
     let busy = matches!(action, Action::Wake(_) | Action::Clean { .. });
     let save = matches!(action, Action::SaveSettings(_));
+    let trust = matches!(action, Action::CheckTrust(_));
     match try_run(src, action) {
         Ok(msg) => msg,
         Err(e) if save => Msg::SaveFailed(format!("Not saved: {e:#}")),
+        Err(e) if trust => Msg::Trust(Err(format!("{e:#}"))),
         Err(e) if busy => Msg::Done(format!("{e:#}")),
         Err(e) => Msg::Notice(format!("{e:#}")),
     }
@@ -84,8 +87,17 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
             generated::rewrite(&src.dir, &config)?;
             Ok(Msg::Saved(config))
         }
-        // The runner handles these itself.
-        Action::Quit | Action::Edit(_) => Ok(Msg::Notice(String::new())),
+        Action::CheckTrust(config) => {
+            let repos: Vec<_> = config.repos.iter().map(|r| r.path.clone()).collect();
+            let agp = Agp::new(src.agp_bin.clone());
+            Ok(Msg::Trust(Ok(placement::pool_trust(
+                &config.threads,
+                &agp,
+                &repos,
+            )?)))
+        }
+        // The runner handles these itself: they need the terminal.
+        Action::Quit | Action::Edit(_) | Action::Trust(_) => Ok(Msg::Notice(String::new())),
     }
 }
 
@@ -95,7 +107,7 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
     let claude = src.claude();
     let trust_config = claude.trust_config();
     // Waking never picks an account; only start_thread reads agp.
-    let agp = crate::agp::Agp::from_env();
+    let agp = Agp::new(src.agp_bin.clone());
     let ctx = ToolCtx {
         conn: &conn,
         config: &config,

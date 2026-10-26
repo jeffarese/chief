@@ -215,3 +215,76 @@ fn chosen(account: &agp::Account, dir: Option<PathBuf>) -> Chosen {
         dir,
     }
 }
+
+/// A pool account that doesn't trust a repository yet, so `start_thread` skips it there (§3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Untrusted {
+    pub id: String,
+    pub label: String,
+    /// Its config folder; None is the default account.
+    pub dir: Option<PathBuf>,
+    pub folder: PathBuf,
+}
+
+impl Untrusted {
+    /// What the user runs to trust it: Claude's trust prompt, in that account and folder.
+    pub fn command(&self) -> String {
+        agp::trust_command(&self.id, &self.folder)
+    }
+
+    /// Whether the account trusts the folder now.
+    pub fn trusted(&self) -> Result<bool> {
+        claude::is_trusted_in(
+            &claude::claude_config_path(self.dir.as_deref()),
+            &self.folder,
+        )
+    }
+}
+
+/// What checking the pool's trust found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolTrust {
+    /// The pool accounts checked, by label; empty without agp or with no pool account allowed.
+    pub checked: Vec<String>,
+    pub untrusted: Vec<Untrusted>,
+    /// Accounts chief couldn't check, with why.
+    pub errors: Vec<String>,
+}
+
+/// Every pool account `threads` allows, against every repository: the (account, folder) pairs
+/// where `start_thread` would skip the account for want of trust. Limited accounts count: their
+/// limits reset. An error only when `agp status` fails.
+pub fn pool_trust(threads: &ThreadSettings, agp: &Agp, repos: &[PathBuf]) -> Result<PoolTrust> {
+    let mut out = PoolTrust::default();
+    if threads.accounts.is_empty() || repos.is_empty() {
+        return Ok(out);
+    }
+    let Some(all) = agp.status()? else {
+        return Ok(out);
+    };
+    for account in agp::pool(&all, &threads.accounts) {
+        let label = account.shown().to_string();
+        let dir = match agp.config_dir(&account.id) {
+            Ok(dir) => dir,
+            Err(e) => {
+                out.errors.push(format!("{label}: {e:#}"));
+                continue;
+            }
+        };
+        let trust = claude::claude_config_path(dir.as_deref());
+        for folder in repos {
+            match claude::is_trusted_in(&trust, folder) {
+                Ok(true) => {}
+                Ok(false) => out.untrusted.push(Untrusted {
+                    id: account.id.clone(),
+                    label: label.clone(),
+                    dir: dir.clone(),
+                    folder: folder.clone(),
+                }),
+                Err(e) => out.errors.push(format!("{label}: {e:#}")),
+            }
+        }
+        out.checked.push(label);
+    }
+    Ok(out)
+}

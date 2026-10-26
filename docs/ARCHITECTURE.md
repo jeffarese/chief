@@ -127,7 +127,15 @@ trust yet: the project folder always, plus untrusted repos. When stdin and stdou
 runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twice), then re-checks;
 otherwise it prints `cd <folder> && claude` for each (`cd <folder> && CLAUDE_CONFIG_DIR=<dir>
 claude` for a non-default account). The project belongs to the account `CLAUDE_CONFIG_DIR` names
-when `init` runs (§3); `init` says so for a non-default one.
+when `init` runs (§3); `init` says so for a non-default one. With agp (§7 "Thread account"), it
+then checks every repo in every account of the pool (`placement::pool_trust`: the accounts
+`[threads] accounts` allows that agp has `in_pool`, limited ones included), says "Threads can also
+run in these agp accounts: <labels>.", and lists each pair not trusted yet ("<label> doesn't
+trust <repo>"), leaving out the project's own account (listed above); on a terminal it asks
+"Open Claude in <repo> in <label> now to trust it? [Y/n]" and runs `agp exec <id> -- claude`
+there, then re-checks that account's `.claude.json`; otherwise it prints `cd <repo> && agp exec
+<id> -- claude` for each. An account agp can't name a folder for is listed as not checked; a
+failing `agp status` is one line, and `init` still succeeds.
 
 `chief up` loads project.toml, checks the version in the project's account (§3), rewrites
 `generated/*`, runs the coordinator step (§7), then opens the layout (§9): with Rex when it is
@@ -656,7 +664,9 @@ are listed in `account_note`. When none is usable or none trusts the repo, or `a
 fails, the thread runs in the project's account and `account_note` says why. `account?` pins
 one: it must be in the pool (by id, else label) and trust the repo, or the call fails; limited
 or over `max_usage` only adds a note (the thread waits for the reset). The account is chosen
-once: a thread whose account later hits a limit waits there and is never moved.
+once: a thread whose account later hits a limit waits there and is never moved. `chief init`
+(§2) and the board's settings screen (§10) check every pool account's trust of every repo ahead
+of time and offer the fix for each pair, so `start_thread` rarely has to skip one.
 
 The tool logic lives in `src/tools.rs` as plain functions over a context (connection, config,
 `Claude` in the project's account, `Agp`, project dir, trust file, clock, timeouts; the account
@@ -975,13 +985,22 @@ are tested without a terminal (`TestBackend`).
   `pane::request_switch`, which signals the running `chief pane` unless it already shows the
   target or no pane runs (§9).
 - Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
-  model, effort, permission mode, max_parallel, default repo, cleanup (merged/manual),
+  model, effort, permission mode, max_parallel, thread accounts (`[threads] accounts`, ids split
+  on commas or spaces, empty = `[]`, shown "(none: the project's account)"), max usage (a percent
+  1–100, empty = none), default repo, cleanup (merged/manual),
   `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
   in `init`; `d` removes one, moving the default repo to the first remaining). It also shows the
   project's Claude Code account (`claude_config_dir`, or `default (~/.claude)`) read-only: Enter
-  or ←/→ there only says it can't be changed (§3). Efforts, modes,
-  default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal and max_parallel are
-  free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
+  or ←/→ there only says it can't be changed (§3). "Account trust" checks, on a worker, every
+  repo of the draft in every pool account (`placement::pool_trust`, as `init` does, the project's
+  own account included when it is in the pool): its value says `checking…`, `trusted in <labels>`,
+  `N untrusted in <labels>`, "no agp pool: threads use the project's account", or why the check
+  failed (accounts it couldn't check go in the message). Each untrusted pair gets a line
+  (`untrusted  <label> · <repo>`); on it the message shows the fix and Enter runs `agp exec <id> --
+  claude` in that repo on the board's terminal (as for the editor, below), then says whether it
+  took and checks again. Efforts, modes,
+  default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal, max_parallel, thread
+  accounts and max usage are free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
   errors shown in the form), writes with `save`, regenerates `generated/*`, and says "Saved. New
   threads use these settings; the coordinator's model and effort apply on its next start." Esc
   with unsaved changes asks for a second Esc. Two entries open `instructions.md` and

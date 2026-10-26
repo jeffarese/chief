@@ -599,6 +599,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
             };
             let label = match field {
                 Field::Repo(_) => "  repo",
+                Field::Untrusted(_) => "  untrusted",
                 other => other.label(),
             };
             let text = if value.is_empty() {
@@ -644,6 +645,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
     } else {
         match form.current() {
             Field::Repo(_) => "d remove · ↑↓ move · Esc back",
+            Field::Untrusted(_) => "⏎ open Claude there to trust it · ↑↓ move · Esc back",
             _ => "↑↓ move · ←→ change · ⏎ edit/run · Esc back",
         }
     };
