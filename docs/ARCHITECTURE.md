@@ -536,7 +536,10 @@ Every external command chief waits on (`claude`, `git`, `gh`, `rex`) runs throug
 `proc::output_with_timeout`, and its timeout is a real bound: the child leads its own process
 group, and the call must see the child exit *and* both pipes close before the deadline. Otherwise
 the whole group gets SIGKILL and the call fails as a timeout, without waiting for readers still
-stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it open).
+stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it open). The pipes
+are awaited before the child is reaped, and the group is signalled only while the child is still
+unreaped: until then its pid, the group's id, can't be reused, so the kill can't reach another
+process group.
 
 Trust (`claude::is_trusted`) walks up both the path as given and its canonical form (macOS `/tmp`
 is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on the way
