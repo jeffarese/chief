@@ -160,11 +160,13 @@ environment, so the layout's commands carry the same variables (§9).
   call with exit 2, which Claude Code treats as a block and shows to the model. The guard's entry
   also sets `"timeout": 30` (seconds; the time budget is in §6). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
   `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
-  and `"deny"`: `Edit(//<repo path>/**)` for every repo and `Edit(//<dir>/generated/**)`, canonical
-  paths, built in one place (`generated::coordinator_deny_rules`, syntax in
-  `generated::edit_deny_rule`). Per §1 that blocks Edit and Write there: a routing slip can't edit
-  a real checkout, and the coordinator can't edit the files that hold its own and its threads'
-  guard. Memory, `instructions.md` and `project.toml` stay editable.
+  and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<dir>/generated/**)`,
+  `Edit(//<dir>/project.toml)` and `Edit(//<root>/chief.db*)` (the database and its -wal/-shm),
+  canonical paths, built in one place (`generated::coordinator_deny_rules`, syntax in
+  `generated::edit_deny_rule` and `edit_deny_files`). Per §1 that blocks Edit and Write there: a
+  routing slip can't edit a real checkout, the coordinator can't edit the files that hold its own
+  and its threads' guard, and settings and state stay the user's and chief's. Memory and
+  `instructions.md` stay editable.
 - `mcp.json`: `{"mcpServers": {"chief": {"type": "stdio", "command": <chief>, "args": ["mcp",
   "--project", <slug>], "env": {...}}}}`.
 

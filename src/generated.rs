@@ -101,7 +101,12 @@ pub fn write_all(
     let repos: Vec<&Path> = config.repos.iter().map(|r| r.path.as_path()).collect();
     write_json(
         &coordinator_settings_path(dir),
-        &coordinator_settings(exe, slug, env, &coordinator_deny_rules(dir, &repos)),
+        &coordinator_settings(
+            exe,
+            slug,
+            env,
+            &coordinator_deny_rules(dir, &repos, &crate::paths::db()),
+        ),
     )?;
     write_json(
         &thread_settings_path(dir),
@@ -131,18 +136,27 @@ pub fn coordinator_settings(
     settings
 }
 
-/// Edit deny rules for the coordinator, one per repository and one for the project's
-/// `generated/` folder: a routing slip must not edit a real checkout, and an edit to
-/// `generated/*-settings.json` could drop the guard for later spawns. Memory and instructions in
-/// the project folder stay editable. Paths are canonical. This is the one place that builds
-/// them; the rule syntax itself is in `edit_deny_rule`.
-pub fn coordinator_deny_rules(dir: &Path, repos: &[&Path]) -> Vec<String> {
+/// Edit deny rules for the coordinator: one per repository, the project's `generated/` folder,
+/// its `project.toml`, and chief's database. A routing slip must not edit a real checkout; an
+/// edit to `generated/*-settings.json` could drop the guard for later spawns; settings and state
+/// are the user's and chief's. Memory and instructions in the project folder stay editable.
+/// Paths are canonical. This is the one place that builds them; the rule syntax itself is in
+/// `edit_deny_rule` and `edit_deny_files`.
+pub fn coordinator_deny_rules(dir: &Path, repos: &[&Path], db: &Path) -> Vec<String> {
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let dir = canonical(dir);
+    let db_dir = db.parent().map(canonical).unwrap_or_default();
+    let db_name = db.file_name().unwrap_or_default().to_string_lossy();
     repos
         .iter()
         .map(|repo| canonical(repo))
-        .chain([canonical(dir).join("generated")])
+        .chain([dir.join("generated")])
         .map(|path| edit_deny_rule(&path))
+        .chain([
+            edit_deny_files(&dir.join("project.toml")),
+            // `chief.db*` also covers the -wal and -shm files.
+            edit_deny_files(&db_dir.join(format!("{db_name}*"))),
+        ])
         .collect()
 }
 
@@ -152,6 +166,12 @@ pub fn coordinator_deny_rules(dir: &Path, repos: &[&Path]) -> Vec<String> {
 /// never match (Claude Code says so at startup), so only `Edit` rules are written.
 pub fn edit_deny_rule(abs: &Path) -> String {
     format!("Edit(/{}/**)", abs.display())
+}
+
+/// `Edit(//<absolute path or file glob>)`: the same rule for one file, or a glob of files in one
+/// folder.
+pub fn edit_deny_files(abs: &Path) -> String {
+    format!("Edit(/{})", abs.display())
 }
 
 /// Claude Code `--settings` JSON with every chief hook. The coordinator also stays in its
@@ -408,6 +428,12 @@ mod tests {
         // Canonical: macOS temp dirs live under /private.
         let repo = repo.canonicalize().unwrap();
         let dir = dir.canonicalize().unwrap();
+        let db = crate::paths::db();
+        let db_dir = db.parent().unwrap();
+        let db_glob = db_dir
+            .canonicalize()
+            .unwrap_or_else(|_| db_dir.to_path_buf())
+            .join("chief.db*");
         assert_eq!(
             coord["permissions"],
             json!({
@@ -415,6 +441,8 @@ mod tests {
                 "deny": [
                     format!("Edit(/{}/**)", repo.display()),
                     format!("Edit(/{}/generated/**)", dir.display()),
+                    format!("Edit(/{}/project.toml)", dir.display()),
+                    edit_deny_files(&db_glob),
                 ],
             })
         );
@@ -427,6 +455,10 @@ mod tests {
         assert_eq!(
             edit_deny_rule(Path::new("/Users/me/repo")),
             "Edit(//Users/me/repo/**)"
+        );
+        assert_eq!(
+            edit_deny_files(Path::new("/Users/me/chief/chief.db*")),
+            "Edit(//Users/me/chief/chief.db*)"
         );
     }
 

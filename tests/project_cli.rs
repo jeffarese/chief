@@ -131,6 +131,11 @@ fn init_creates_the_project() {
             format!("Edit(/{}/**)", a.display()),
             format!("Edit(/{}/**)", b.display()),
             format!("Edit(/{}/generated/**)", dir.display()),
+            format!("Edit(/{}/project.toml)", dir.display()),
+            format!(
+                "Edit(/{}/chief.db*)",
+                home.path().canonicalize().unwrap().display()
+            ),
         ])
     );
     let thread = read_json(&dir.join("generated/thread-settings.json"));
@@ -506,7 +511,7 @@ fn respawn_rewrites_the_generated_files_first() {
         v["hooks"]["PreToolUse"][1]["matcher"],
         "SendMessage|ListAgents"
     );
-    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 3);
+    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 5);
 
     // Can't rewrite: no respawn.
     std::fs::remove_dir_all(dir.join("generated")).unwrap();
