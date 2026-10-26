@@ -43,7 +43,9 @@ const EVENTS: [(&str, Option<&str>); 9] = [
     ("SubagentStop", None),
     ("SessionEnd", None),
 ];
-const GUARD_MATCHER: &str = "SendMessage|ListAgents";
+/// The guard's tools. `Agent`: a subagent must not take the name of a session it would then
+/// get the messages of (§6 "Subagents").
+const GUARD_MATCHER: &str = "SendMessage|ListAgents|Agent";
 /// The guard entry's `timeout`. When Claude Code's hook timeout fires, the `|| exit 2` never runs
 /// and the call proceeds, so the guard denies on its own at `hook::GUARD_DEADLINE`, well before.
 pub const GUARD_HOOK_TIMEOUT_SECS: u64 = 30;
@@ -373,7 +375,7 @@ mod tests {
         let pre = hooks["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["matcher"], "*");
-        assert_eq!(pre[1]["matcher"], "SendMessage|ListAgents");
+        assert_eq!(pre[1]["matcher"], "SendMessage|ListAgents|Agent");
         assert_eq!(
             pre[1]["hooks"][0]["command"],
             "'/opt/my tools/chief' hook guard --project demo --role thread || { echo \

@@ -913,7 +913,7 @@ fn respawn_rewrites_the_generated_files_first() {
     let v = read_json(&settings);
     assert_eq!(
         v["hooks"]["PreToolUse"][1]["matcher"],
-        "SendMessage|ListAgents"
+        "SendMessage|ListAgents|Agent"
     );
     assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 7);
 

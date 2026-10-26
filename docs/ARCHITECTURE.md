@@ -266,7 +266,7 @@ lists only that thread's account.
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
-  `SendMessage|ListAgents`, `chief hook guard`), PostToolUse (matcher `*`), Notification, Stop,
+  `SendMessage|ListAgents|Agent`, `chief hook guard`), PostToolUse (matcher `*`), Notification, Stop,
   SubagentStart, SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`. The
   state and context hooks fail open (a missing binary is a non-blocking hook error). So do bad
   arguments: clap's exit 2 would block (every tool for the `*` PreToolUse, the prompt for
@@ -574,13 +574,16 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 
 ## 6. Message guard
 
-`chief hook guard` runs on PreToolUse with matcher `SendMessage|ListAgents` for every chief session.
+`chief hook guard` runs on PreToolUse with matcher `SendMessage|ListAgents|Agent` for every chief
+session. A SendMessage between a session and its own subagents is decided first, by "Subagents"
+below; the rows here decide everything else.
 
 | Caller | Tool | Rule |
 | --- | --- | --- |
+| any | `Agent` | deny a `name` that another session answers to ("Subagents" below); allow every other call |
 | any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
 | coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not removed outside chief, not cleaned, not resolved, and reachable (below). Removed outside chief (`removed_at`, §5) → deny: "<name>'s session was removed outside chief, so it can't be woken, reopened or messaged; start a new thread (its reports are still readable with read_report)". Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
-| thread | `SendMessage` | allow only if `to` is exactly `chief-<slug>` or exactly the coordinator's socket address, and the coordinator is reachable. Coordinator not running (or never started) → deny: "Your coordinator chief-<slug> isn't running, so the message can't be delivered. Just finish your turn: your final message is recorded as your report when you stop anyway, and the coordinator reads it there." Renamed or ambiguous → deny with the same advice. Everything else → deny ("Threads may message only their coordinator, by its exact name chief-<slug>."): siblings, other projects, the thread's own subagents, and any session the local `claude agents` doesn't list |
+| thread | `SendMessage` | allow only if `to` is exactly `chief-<slug>` or exactly the coordinator's socket address, and the coordinator is reachable. Coordinator not running (or never started) → deny: "Your coordinator chief-<slug> isn't running, so the message can't be delivered. Just finish your turn: your final message is recorded as your report when you stop anyway, and the coordinator reads it there." Renamed or ambiguous → deny with the same advice. Everything else → deny ("Threads may message only their coordinator, by its exact name chief-<slug>."): siblings, other projects, subagents chief has no record of, and any session the local `claude agents` doesn't list |
 
 An allow-list by byte-exact equality. `to` is never trimmed, case-folded or parsed, and a trailing
 ` [ref]` is not removed: Claude Code's refs (`[2c7859]`, a short hex id) pick one session, so a
@@ -588,8 +591,9 @@ ref could deliver a message that the bare name would allow to another session. A
 contains `[` gets "Use the bare name, without a `[ref]`: chief matches names exactly, and a ref can
 pick another session." before the reason. Lookalikes (another case, U+FEFF, U+200B, a tab before
 the ref) and sessions the local `claude agents` of the project's account (§3) doesn't list (other
-machines, cloud sessions, other accounts, Remote Control, teammates,
-subagents) match nothing and are denied.
+machines, cloud sessions, other accounts, Remote Control, other sessions' teammates and
+subagents) match nothing and are denied. A session's own subagents are the one exception
+("Subagents" below).
 
 Reachable (the identity check, for a thread under its name and for the coordinator under
 `chief-<slug>`): the snapshot entry for the row's `session_id` (its `short_id` while the
@@ -624,7 +628,53 @@ closed) and the sessions fall back to names.
 
 `to` is read from `tool_input.to`; a SendMessage whose `tool_input` isn't an object, or has no
 string `to` or a blank one, is denied. Other tools are allowed. `claude agents` is only run for a
-SendMessage with a `to`.
+SendMessage with a `to` and for an Agent call with a `name`.
+
+### Subagents
+
+In a background session the Agent tool spawns in-process teammates that the session and they
+reach by name or agent id, and that report to it as `team-lead` or `main` (§1). The hooks record
+each session's (§5, `teammates`); the guard reads the caller's: the rows recorded for the session
+whose `session_id` is the payload's, under that same session id. A call comes from one of its
+subagents when the payload has a non-empty `agent_id`, which Claude Code sets, not the model.
+
+- From a subagent: `to` exactly `team-lead` or `main` → allow.
+- From the session or one of its subagents: `to` exactly the agent id of one of the caller's
+  recorded subagents → allow (no session answers to an agent id). `to` exactly a recorded name →
+  allow, unless another session answers to that name: the coordinator (`chief-<slug>`), any
+  thread of the project (any state), or a session in the guard's fresh `claude agents` of the
+  project's account and of the caller's own (a thread in another account, §3) → deny: "<to> is
+  also the name of another Claude session, so a message to <to> could reach it instead of your
+  subagent. Message the subagent by its agent id <id>." A listing that couldn't be taken → deny,
+  saying so, with the same advice (the project's account failing is a guard failure, as always).
+  In-process names win only while the subagent lives in this process (§1), so a name another
+  session has could reach that session.
+- A name or id that isn't plain (letters, digits, `-`, `_`, `.`), and the names `team-lead` and
+  `main`, are never taken as a subagent's address: Claude Code could read `uds:…`, a ` [ref]` or
+  the lead's own names as something else. Deny, saying to use the agent id.
+- Anything else follows the caller's role (the table above): a subagent's message goes out under
+  its session's address, so a thread's subagents may message its coordinator and the
+  coordinator's its threads. `team-lead` and `main` from the session itself are denied there.
+- Never another session's subagents: only the caller's own records are read. A `[ref]` matches no
+  record and stays denied, with the bare-name advice.
+
+At spawn, an `Agent` call whose `tool_input.name` exactly equals the coordinator's name, the name
+of any thread of the project (any state, from the database), or a session in the fresh listings
+of the project's account and the caller's own is denied: "A Claude session is already named
+<name>, and a subagent named <name> would get the messages meant for it. Pick another name for the
+subagent." In-process names win (§1), so that subagent would silently take the other session's
+messages. An Agent call without a `name`, with an empty one, or with a free one is allowed. When a
+listing can't be taken, only the database's names are checked and the call is otherwise allowed
+(a broken listing shouldn't stop sessions from using subagents), and the hook error log says so.
+The deadline and every other guard failure (bad payload, database, panic) deny an Agent call too,
+as any call. A denial's `target` is the name it asked for.
+
+Residual risk: the records are forgotten by the SessionStart hook of the next process (§5). If
+that hook fails to run after a respawn, the old records stay, and a stale name could reach a
+remote or cloud session of that name, which no local listing shows; the listing check covers the
+local ones, a `[ref]` is denied, and a stale agent id reaches nothing. A thread started after one
+of the coordinator's subagents took its name can't be messaged by that name until the
+coordinator's process starts again (its `uds:` address still works).
 
 The guard process itself exits 0 (deny JSON or empty stdout), except on arguments it can't read,
 where it exits 2 with the reason on stderr (§3); its generated command turns any other exit,
@@ -640,7 +690,8 @@ which runs the migration check, reads the rows, and inserts at most one denial).
 denial is logged to the hook error log, not to `guard_denials`: the database may be what is stuck.
 `CHIEF_GUARD_DEADLINE_MS` shortens the deadline for tests (it can only deny sooner).
 
-Every deny writes a `guard_denials` row (caller matched by `session_id`, `target` = raw `to`) and
+Every deny writes a `guard_denials` row (caller matched by `session_id`, `target` = raw `to`, or
+an Agent call's `name`) and
 returns the PreToolUse deny JSON above; an allow prints nothing. If the guard itself fails (bad
 payload, DB or `claude agents` error, or a panic), it denies with the error as the reason (fail
 closed), logs the error, and records the denial if the DB opens.

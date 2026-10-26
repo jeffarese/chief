@@ -129,48 +129,73 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// §6: gathers the registry rows and a fresh `claude agents` snapshot, decides, and records a
-/// denial. Returns the deny JSON, or None to allow.
+/// §6: gathers the registry rows, the caller's subagents and fresh `claude agents` listings,
+/// decides, and records a denial. Returns the deny JSON, or None to allow.
 fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     let payload: Value = serde_json::from_str(input).context("parsing the hook payload")?;
-    let tool = payload
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .context("the payload has no tool_name")?;
-    let to = payload
-        .get("tool_input")
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("to"))
-        .and_then(Value::as_str);
+    let call = Call::from_payload(&payload)?;
     let conn = db::open(&paths::db())?;
     let rows = db::list_sessions(&conn, project, None)?;
     let caller_sid = payload.get("session_id").and_then(Value::as_str);
+    let teammates = match call.tool {
+        "SendMessage" => caller_teammates(&conn, &rows, caller_sid)?,
+        _ => Vec::new(),
+    };
     let claude = project_claude(project);
     let project_account = claude.account.clone();
+    let send_to = call.to.filter(|_| call.tool == "SendMessage");
+    let spawn_name = call.name.filter(|n| call.tool == "Agent" && !n.is_empty());
     // Only a SendMessage with an address needs to know who is alive: in the coordinator's
-    // account, and in the accounts of the threads the message could be for (§3).
-    let (snapshot, others) = if tool == "SendMessage"
-        && let Some(to) = to
-    {
+    // account, and in the accounts of the threads the message could be for (§3). A subagent's
+    // name, sent or given at spawn, also needs who else answers to it in the caller's own account.
+    let (snapshot, others) = if send_to.is_some() || spawn_name.is_some() {
         let mut wanted = vec![project_account.clone()];
-        if role == Role::Coordinator {
+        let mut want = |account: Option<std::path::PathBuf>| {
+            if !wanted
+                .iter()
+                .any(|a| claude::same_account(a.as_deref(), account.as_deref()))
+            {
+                wanted.push(account);
+            }
+        };
+        let mate_named = |to: &str| teammates.iter().any(|t| t.name.as_deref() == Some(to));
+        if spawn_name.is_some() || send_to.is_some_and(mate_named) {
+            want(caller_account(
+                &rows,
+                caller_sid,
+                project_account.as_deref(),
+            ));
+        }
+        if role == Role::Coordinator
+            && let Some(to) = send_to
+        {
             for r in rows.iter().filter(|r| reachable_elsewhere(r, to)) {
-                let account = r.account(project_account.as_deref());
-                if !wanted
-                    .iter()
-                    .any(|a| claude::same_account(a.as_deref(), account.as_deref()))
-                {
-                    wanted.push(account);
-                }
+                want(r.account(project_account.as_deref()));
             }
         }
         let listings = accounts::list(&claude, &wanted, GUARD_AGENTS_TIMEOUT, db::now_ms);
-        // Without the coordinator's account chief can check nothing: fail closed.
-        let snapshot = listings
-            .project()
-            .context("the project's account was listed")?
-            .agents()?
-            .to_vec();
+        let snapshot = if send_to.is_some() {
+            // Without the coordinator's account chief can check no message: fail closed.
+            listings
+                .project()
+                .context("the project's account was listed")?
+                .agents()?
+                .to_vec()
+        } else {
+            // An Agent call reads only who else has the name, and goes on without a listing.
+            if let Some(e) = listings.error() {
+                log_error(
+                    &paths::hook_error_log(),
+                    "guard",
+                    project,
+                    &format!(
+                        "couldn't list the Claude sessions for an Agent call ({e}); checked the \
+                         name against chief's sessions only"
+                    ),
+                );
+            }
+            Vec::new()
+        };
         (snapshot, listings.all)
     } else {
         (Vec::new(), Vec::new())
@@ -178,8 +203,7 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     let decision = guard_decision_in(
         project,
         role,
-        tool,
-        to,
+        &call,
         &rows,
         &Accounts {
             project: project_account.as_deref(),
@@ -187,6 +211,7 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
             others: &others,
             caller: caller_sid,
         },
+        &teammates,
     );
     let guard::Decision::Deny(reason) = decision else {
         return Ok(None);
@@ -194,18 +219,84 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     let caller = caller_sid
         .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
         .map(|r| r.name.clone());
+    let target = match call.tool {
+        "Agent" => call.name,
+        _ => call.to,
+    };
     db::insert_guard_denial(
         &conn,
         &db::GuardDenial {
             project_slug: project.to_string(),
             session_name: caller,
-            tool: tool.to_string(),
-            target: to.map(str::to_string),
+            tool: call.tool.to_string(),
+            target: target.map(str::to_string),
             reason: reason.clone(),
             ts: db::now_ms(),
         },
     )?;
     Ok(Some(guard::deny_json(&reason)))
+}
+
+/// The tool call the guard decides on, from a PreToolUse payload (§6).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Call<'a> {
+    pub tool: &'a str,
+    /// `tool_input.to` (SendMessage).
+    pub to: Option<&'a str>,
+    /// `tool_input.name` (Agent).
+    pub name: Option<&'a str>,
+    /// The payload has an `agent_id`: one of the caller's subagents made the call (§1).
+    pub from_subagent: bool,
+}
+
+impl<'a> Call<'a> {
+    pub fn from_payload(payload: &'a Value) -> Result<Self> {
+        let tool = payload
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .context("the payload has no tool_name")?;
+        let input = payload.get("tool_input").and_then(Value::as_object);
+        let text = |k: &str| input.and_then(|o| o.get(k)).and_then(Value::as_str);
+        Ok(Call {
+            tool,
+            to: text("to"),
+            name: text("name"),
+            from_subagent: payload
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .is_some_and(|a| !a.is_empty()),
+        })
+    }
+}
+
+/// The subagents the calling session recorded in its current process, under the session id it
+/// calls with (§5); none for a caller chief doesn't know.
+pub fn caller_teammates(
+    conn: &Connection,
+    rows: &[SessionRow],
+    caller: Option<&str>,
+) -> Result<Vec<guard::Teammate>> {
+    let Some(sid) = caller else {
+        return Ok(Vec::new());
+    };
+    match rows.iter().find(|r| r.session_id.as_deref() == Some(sid)) {
+        Some(row) => db::teammates(conn, &row.name, sid),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The account where a name the caller sends reaches sessions (§1): a thread's own, else the
+/// project's.
+fn caller_account(
+    rows: &[SessionRow],
+    caller: Option<&str>,
+    project: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    caller
+        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
+        .filter(|r| r.role == Role::Thread.as_str())
+        .map(|r| r.account(project))
+        .unwrap_or_else(|| project.map(Path::to_path_buf))
 }
 
 /// `claude` in the project's account (project.toml → `claude_config_dir`), whatever account the
@@ -243,7 +334,12 @@ pub fn guard_decision(
         others: &[],
         caller: None,
     };
-    guard_decision_in(project, role, tool, to, rows, &accounts)
+    let call = Call {
+        tool,
+        to,
+        ..Call::default()
+    };
+    guard_decision_in(project, role, &call, rows, &accounts, &[])
 }
 
 /// The listings the guard decides on (§3, §6).
@@ -258,15 +354,17 @@ pub struct Accounts<'a> {
     pub caller: Option<&'a str>,
 }
 
-/// `guard_decision` with threads in other accounts: each is checked in its own account's
-/// listing, and a thread calling from another account than its coordinator's is told so.
+/// `guard_decision` with threads in other accounts and the caller's subagents: each thread is
+/// checked in its own account's listing, a thread calling from another account than its
+/// coordinator's is told so, and a subagent's name is checked against the listings of the
+/// project's account and the caller's own.
 pub fn guard_decision_in(
     project: &str,
     role: Role,
-    tool: &str,
-    to: Option<&str>,
+    call: &Call,
     rows: &[SessionRow],
     accounts: &Accounts,
+    teammates: &[guard::Teammate],
 ) -> guard::Decision {
     let elsewhere = |r: &SessionRow| -> Option<guard::Elsewhere> {
         let account = r.account(accounts.project);
@@ -319,16 +417,40 @@ pub fn guard_decision_in(
                     .unwrap_or_else(|| claude::account_label(account.as_deref()))
             })
         });
+    // Where a name from the caller can reach someone (§1): its own account, and the project's.
+    let own = caller_account(rows, accounts.caller, accounts.project);
+    let names = |agents: &[AgentRow]| -> Vec<String> {
+        agents.iter().filter_map(|a| a.name.clone()).collect()
+    };
+    let mut listed = guard::Listed {
+        names: names(accounts.snapshot),
+        missing: None,
+    };
+    let mut missing = Vec::new();
+    for l in accounts.others.iter().filter(|l| {
+        claude::same_account(l.account(), accounts.project)
+            || claude::same_account(l.account(), own.as_deref())
+    }) {
+        match &l.agents {
+            Ok(agents) => listed.names.extend(names(agents)),
+            Err(e) => missing.push(e.clone()),
+        }
+    }
+    listed.missing = (!missing.is_empty()).then(|| missing.join("; "));
     let coordinator_name = names::coordinator_name(project);
     guard::evaluate(&guard::GuardInput {
         role,
-        tool,
-        to,
+        tool: call.tool,
+        to: call.to,
+        agent_name: call.name,
         coordinator_name: &coordinator_name,
         coordinator: coordinator.as_ref(),
         threads: &threads,
         snapshot: accounts.snapshot,
         caller_elsewhere: caller_elsewhere.as_deref(),
+        from_subagent: call.from_subagent,
+        teammates,
+        listed: &listed,
     })
 }
 
@@ -1079,6 +1201,148 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// §6 "Subagents" from the database: the fixture's lead (a thread) and its teammates, as the
+    /// hooks record them, decided as the guard would for the fixture's own PreToolUse payloads.
+    #[test]
+    fn guard_lets_a_session_and_its_own_subagents_talk() {
+        let (_dir, conn) = lead_setup();
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.session_id = Some("c-sid".into());
+        db::insert_session(&conn, &coord).unwrap();
+        let mut other = SessionRow::new("demo-other-2222", "demo", Role::Thread, 0);
+        other.session_id = Some("o-sid".into());
+        db::insert_session(&conn, &other).unwrap();
+        db::record_teammate(
+            &conn,
+            "demo-other-2222",
+            "o-sid",
+            "aresearcher-1",
+            Some("researcher"),
+            1,
+        )
+        .unwrap();
+        let snapshot = [
+            agent_row("c1", "c-sid", "chief-demo", Some(100)),
+            agent_row("l1", LEAD, "spike-main", Some(201)),
+            agent_row("o1", "o-sid", "demo-other-2222", Some(202)),
+            // An outside session with the name of one of the lead's teammates (§1 F5).
+            agent_row("x1", "x-sid", "spike-other", Some(300)),
+        ];
+        let lines = teammate_fixture();
+        let decide = |payload: &Value, role: Role| {
+            let rows = db::list_sessions(&conn, "demo", None).unwrap();
+            let sid = payload["session_id"].as_str();
+            let teammates = caller_teammates(&conn, &rows, sid).unwrap();
+            let accounts = Accounts {
+                project: None,
+                snapshot: &snapshot,
+                others: &[],
+                caller: sid,
+            };
+            let call = Call::from_payload(payload).unwrap();
+            guard_decision_in("demo", role, &call, &rows, &accounts, &teammates)
+        };
+        let lead = |payload: &Value| decide(payload, Role::Thread);
+        let with = |i: usize, to: &str| {
+            let mut p = lines[i].clone();
+            p["tool_input"]["to"] = to.into();
+            p
+        };
+        use guard::Decision::Allow;
+        // The fixture's lead messages: to helper by name (7) and by agent id (9), to spike-other
+        // (11); spike-other's report to team-lead (5); the Agent call (1).
+        let (to_helper, to_helper_id, to_spike, report) =
+            (&lines[7], &lines[9], &lines[11], &lines[5]);
+        assert_eq!(to_helper["tool_input"]["to"], "helper");
+        assert_eq!(to_helper_id["tool_input"]["to"], HELPER);
+        assert_eq!(report["tool_input"]["to"], "team-lead");
+        assert!(report["agent_id"].is_string() && to_helper.get("agent_id").is_none());
+
+        replay(&conn, &lines[0], 1);
+        // Before anything is recorded the guard knows no subagent.
+        assert!(denied(&lead(to_helper_id), "only their coordinator"));
+        // SubagentStart alone: the id works; `agent_type` ("helper") is never a name.
+        replay(&conn, &lines[3], 2);
+        assert_eq!(lead(to_helper_id), Allow);
+        assert!(denied(&lead(to_helper), "only their coordinator"));
+        // The Agent call's PostToolUse gives the name.
+        replay(&conn, &lines[2], 3);
+        assert_eq!(lead(to_helper), Allow);
+        assert!(denied(
+            &lead(&with(7, "helper [807e0b]")),
+            "without a `[ref]`"
+        ));
+        // A teammate reports to its lead, and reaches its siblings.
+        assert_eq!(lead(report), Allow);
+        let mut sibling = report.clone();
+        sibling["tool_input"]["to"] = "helper".into();
+        assert_eq!(lead(&sibling), Allow);
+        // The lead's own names are for its subagents only.
+        assert!(denied(
+            &lead(&with(7, "team-lead")),
+            "only their coordinator"
+        ));
+        // A name an outside session has too: only by agent id.
+        let mut spawned = lines[2].clone();
+        spawned["tool_input"]["name"] = "spike-other".into();
+        spawned["tool_response"]["name"] = "spike-other".into();
+        spawned["tool_response"]["agentId"] = SPIKE_OTHER.into();
+        replay(&conn, &spawned, 4);
+        assert!(denied(&lead(to_spike), SPIKE_OTHER));
+        assert_eq!(lead(&with(9, SPIKE_OTHER)), Allow);
+
+        // Never another session's subagents, in either direction.
+        assert!(denied(
+            &lead(&with(7, "researcher")),
+            "only their coordinator"
+        ));
+        assert!(denied(
+            &lead(&with(7, "aresearcher-1")),
+            "only their coordinator"
+        ));
+        let mut from_coord = with(7, "helper");
+        from_coord["session_id"] = "c-sid".into();
+        assert!(denied(
+            &decide(&from_coord, Role::Coordinator),
+            "not a thread"
+        ));
+        let mut from_other = with(7, HELPER);
+        from_other["session_id"] = "o-sid".into();
+        assert!(denied(&lead(&from_other), "only their coordinator"));
+        from_other["tool_input"]["to"] = "researcher".into();
+        assert_eq!(lead(&from_other), Allow);
+
+        // A compaction keeps the process and its subagents.
+        let mut compact = lines[17].clone();
+        compact["source"] = "compact".into();
+        replay(&conn, &compact, 5);
+        assert_eq!(lead(to_helper), Allow);
+        // After a respawn (SessionStart resume) the records are stale: helper is gone, and
+        // spike-other now names the outside session (§1 F6).
+        replay(&conn, &lines[17], 6);
+        assert!(denied(&lead(to_helper), "only their coordinator"));
+        assert!(denied(&lead(to_helper_id), "only their coordinator"));
+        assert!(denied(&lead(to_spike), "only their coordinator"));
+        // The other session's subagents stay its own.
+        assert_eq!(lead(&from_other), Allow);
+
+        // At spawn: a free name, or a name another session answers to.
+        let spawn = &lines[1];
+        assert_eq!(spawn["tool_name"], "Agent");
+        assert_eq!(lead(spawn), Allow);
+        for taken in ["chief-demo", "demo-other-2222", "spike-other"] {
+            let mut p = spawn.clone();
+            p["tool_input"]["name"] = taken.into();
+            assert!(denied(&lead(&p), "Pick another name"), "{taken}");
+        }
+        let mut unnamed = spawn.clone();
+        unnamed["tool_input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert_eq!(lead(&unnamed), Allow);
     }
 
     #[test]

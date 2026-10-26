@@ -164,6 +164,118 @@ fn hooks_record_and_forget_subagents() {
     assert_eq!(error_log(home.path()), "");
 }
 
+/// §6 "Subagents" end to end: the hooks record a thread's teammates from the fixture's own
+/// payloads, the guard lets the thread and its teammates message each other, checks names at
+/// spawn, and forgets them when the process starts again.
+#[test]
+fn the_guard_lets_a_session_reach_its_own_subagents() {
+    let home = Home::new();
+    {
+        let conn = home.db();
+        db::register_project(&conn, "demo", &home.path().join("projects/demo"), 0).unwrap();
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.session_id = Some("coord-sid".into());
+        db::insert_session(&conn, &coord).unwrap();
+        let mut lead = SessionRow::new("demo-lead-1111", "demo", Role::Thread, db::now_ms());
+        lead.session_id = Some(LEAD.into());
+        db::insert_session(&conn, &lead).unwrap();
+    }
+    let listing = serde_json::json!([
+        agent("c1", "coord-sid", "chief-demo", "done", Some(100)),
+        agent("l1", LEAD, "demo-lead-1111", "working", Some(201)),
+        // An outside session with a teammate's name (§1).
+        agent("x1", "x-sid", "spike-other", "working", Some(300)),
+    ])
+    .to_string();
+    home.fake.set("agents.stdout", &listing);
+    let lines = teammate_fixture();
+    let record = |payload: &Value| {
+        let event = payload["hook_event_name"].as_str().unwrap();
+        let out = home.run(
+            &["hook", event, "--project", "demo", "--role", "thread"],
+            &payload.to_string(),
+        );
+        assert!(out.status.success() && out.stdout.is_empty(), "{out:?}");
+    };
+    let guard = |payload: &Value| {
+        deny_reason(&home.run(
+            &["hook", "guard", "--project", "demo", "--role", "thread"],
+            &payload.to_string(),
+        ))
+    };
+    let with = |i: usize, key: &str, value: &str| {
+        let mut p = lines[i].clone();
+        p["tool_input"][key] = value.into();
+        p
+    };
+
+    record(&lines[2]); // PostToolUse Agent: ahelper-…, "helper"
+    record(&lines[3]); // SubagentStart
+    assert_eq!(guard(&lines[7]), None, "the lead to helper by name");
+    assert_eq!(guard(&lines[9]), None, "the lead to helper by agent id");
+    assert_eq!(guard(&lines[5]), None, "a teammate to team-lead");
+    let reason = guard(&with(7, "to", "helper [807e0b]")).unwrap();
+    assert!(reason.contains("without a `[ref]`"), "{reason}");
+    assert!(guard(&with(7, "to", "team-lead")).is_some());
+
+    // A teammate named like an outside session: only by its agent id.
+    let mut spawned = lines[2].clone();
+    spawned["tool_input"]["name"] = "spike-other".into();
+    spawned["tool_response"]["name"] = "spike-other".into();
+    spawned["tool_response"]["agentId"] = "aspike-other-ba38036fce05d0d2".into();
+    record(&spawned);
+    let reason = guard(&lines[11]).unwrap();
+    assert!(
+        reason.contains("by its agent id aspike-other-ba38036fce05d0d2"),
+        "{reason}"
+    );
+    assert_eq!(guard(&with(9, "to", "aspike-other-ba38036fce05d0d2")), None);
+
+    // At spawn (the fixture's Agent call names its teammate helper).
+    assert_eq!(lines[1]["tool_name"], "Agent");
+    assert_eq!(guard(&lines[1]), None);
+    for taken in ["spike-other", "chief-demo", "demo-lead-1111"] {
+        let reason = guard(&with(1, "name", taken)).unwrap();
+        assert!(reason.contains("Pick another name"), "{taken}: {reason}");
+    }
+    // No listing: an Agent call is checked against the database only; a message fails closed.
+    home.fake
+        .set("agents.exit", "1")
+        .set("agents.stderr", "supervisor down");
+    assert_eq!(guard(&with(1, "name", "spike-other")), None);
+    assert!(guard(&with(1, "name", "chief-demo")).is_some());
+    let reason = guard(&lines[9]).unwrap();
+    assert!(reason.contains("supervisor down"), "{reason}");
+    home.fake.unset("agents.exit").unset("agents.stderr");
+
+    // `claude respawn`: a new process, without the teammates.
+    record(&lines[17]);
+    for i in [7, 9] {
+        let reason = guard(&lines[i]).unwrap();
+        assert!(reason.contains("only their coordinator"), "{i}: {reason}");
+    }
+
+    // Denials are recorded, an Agent call's with the name it asked for.
+    let conn = home.db();
+    let target: Option<String> = conn
+        .query_row(
+            "SELECT target FROM guard_denials WHERE tool = 'Agent' ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(target.as_deref(), Some("spike-other"));
+    // Both Agent calls without a listing say so, and the message's failure is logged too.
+    let log = error_log(home.path());
+    assert_eq!(log.lines().count(), 3, "{log}");
+    assert_eq!(
+        log.matches("checked the name against chief's sessions only")
+            .count(),
+        2,
+        "{log}"
+    );
+}
+
 /// Claude Code reads exit 2 as "block" (every tool for the `*` PreToolUse, the prompt erased,
 /// the turn forced on), so a hook whose arguments clap rejects logs it and exits 0, silently.
 #[test]
@@ -578,7 +690,7 @@ fn guard_keeps_threads_to_their_coordinator() {
     };
     assert_eq!(deny_reason(&guard("chief-demo")), None);
     assert_eq!(deny_reason(&guard("uds:/tmp/cc-socks/100.sock")), None);
-    // Only the coordinator: not even the thread's own subagents or a ref'd coordinator name.
+    // Only the coordinator: not a subagent chief has no record of, nor a ref'd coordinator name.
     assert!(deny_reason(&guard("my-subagent")).is_some());
     assert!(deny_reason(&guard("chief-demo [c1]")).is_some());
     assert!(deny_reason(&guard("uds:100.sock")).is_some());

@@ -616,7 +616,7 @@ fn start_thread_removes_the_row_when_spawn_fails() {
 
 fn has_guard(settings: &Path) -> bool {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(settings).unwrap()).unwrap();
-    v["hooks"]["PreToolUse"][1]["matcher"] == "SendMessage|ListAgents"
+    v["hooks"]["PreToolUse"][1]["matcher"] == "SendMessage|ListAgents|Agent"
 }
 
 /// Claude Code reads hooks when a session starts, so chief rewrites `generated/*` from the

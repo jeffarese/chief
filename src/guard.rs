@@ -3,9 +3,11 @@
 //! An allow-list by byte-exact equality: `to` is never trimmed or parsed. A `[ref]` after a name
 //! picks one session in Claude Code, so it could redirect a message that the name alone would
 //! allow; lookalike names (case, zero-width characters) and sessions the local `claude agents`
-//! doesn't list (other machines, the cloud, teammates, subagents) match nothing and are denied.
+//! doesn't list (other machines, the cloud, other sessions' subagents) match nothing and are
+//! denied. A session's own subagents are the exception (§6 "Subagents").
 
 use crate::claude::AgentRow;
+pub use crate::db::Teammate;
 use crate::state::Role;
 
 /// A registry row of this project, as the guard needs it.
@@ -39,16 +41,36 @@ pub struct GuardInput<'a> {
     pub tool: &'a str,
     /// `SendMessage.to`, verbatim.
     pub to: Option<&'a str>,
+    /// `Agent.name`, verbatim.
+    pub agent_name: Option<&'a str>,
     /// `chief-<slug>`.
     pub coordinator_name: &'a str,
     /// The coordinator's row; None before `chief up` first started it.
     pub coordinator: Option<&'a Member>,
+    /// Every thread registered to the project, in any state.
     pub threads: &'a [Member],
     /// A fresh `claude agents --json --all` snapshot (every state) of the coordinator's account,
-    /// the project's (§3).
+    /// the project's (§3). Empty for the Agent tool, which reads `listed`.
     pub snapshot: &'a [AgentRow],
     /// For a thread's call: the label of its own account when that isn't its coordinator's.
     pub caller_elsewhere: Option<&'a str>,
+    /// One of the caller's subagents made the call: the payload has an `agent_id`, which Claude
+    /// Code sets, not the model (§1).
+    pub from_subagent: bool,
+    /// The caller's own subagents, recorded since its process started (§5).
+    pub teammates: &'a [Teammate],
+    /// Who else a name could reach.
+    pub listed: &'a Listed,
+}
+
+/// The sessions in the guard's fresh listings of the project's account and the caller's own
+/// (§6 "Subagents"): a name the caller sends reaches one of them when none of its subagents has
+/// it any more.
+#[derive(Debug, Clone, Default)]
+pub struct Listed {
+    pub names: Vec<String>,
+    /// Why a listing couldn't be taken, when one couldn't.
+    pub missing: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +115,11 @@ pub fn removed_message(name: &str) -> String {
     )
 }
 
-/// ARCHITECTURE §6. Tools other than `SendMessage` and `ListAgents` are allowed: the hook's
-/// matcher never sends them here.
+/// What a subagent calls its lead (§1); from the lead itself they name nobody chief knows.
+const LEAD_NAMES: [&str; 2] = ["team-lead", "main"];
+
+/// ARCHITECTURE §6. Tools other than `SendMessage`, `ListAgents` and `Agent` are allowed: the
+/// hook's matcher never sends them here.
 pub fn evaluate(input: &GuardInput) -> Decision {
     match input.tool {
         "ListAgents" => {
@@ -104,6 +129,7 @@ pub fn evaluate(input: &GuardInput) -> Decision {
             };
             return Decision::Deny(reason.to_string());
         }
+        "Agent" => return agent_spawn(input),
         "SendMessage" => {}
         _ => return Decision::Allow,
     }
@@ -111,16 +137,93 @@ pub fn evaluate(input: &GuardInput) -> Decision {
     let Some(to) = input.to.filter(|t| !t.trim().is_empty()) else {
         return Decision::Deny("SendMessage has no `to`; chief can't check where it goes.".into());
     };
-    let decision = match input.role {
+    let decision = subagent_send(input, to).unwrap_or_else(|| match input.role {
         Role::Coordinator => coordinator_send(input, to),
         Role::Thread => thread_send(input, to),
-    };
+    });
     match decision {
         Decision::Deny(reason) if to.contains('[') => {
             Decision::Deny(format!("{BARE_NAME} {reason}"))
         }
         d => d,
     }
+}
+
+/// §6 "Subagents": a message between the caller and its own subagents, which never leaves its
+/// process. None when `to` is neither one of them nor, from one of them, its lead: the role's
+/// rules decide (a subagent's message goes out under its session's address).
+fn subagent_send(input: &GuardInput, to: &str) -> Option<Decision> {
+    if input.from_subagent && LEAD_NAMES.contains(&to) {
+        return Some(Decision::Allow);
+    }
+    let by_id = input.teammates.iter().find(|t| t.agent_id == to);
+    let by_name = || {
+        input
+            .teammates
+            .iter()
+            .find(|t| t.name.as_deref() == Some(to))
+    };
+    let agent = by_id.or_else(by_name)?;
+    let id = &agent.agent_id;
+    let by_its_id = format!("Message the subagent by its agent id {id}.");
+    // Claude Code may read these as an address, a ref or the lead, not as the subagent's name.
+    if !plain_address(to) || LEAD_NAMES.contains(&to) {
+        return Some(Decision::Deny(format!(
+            "chief takes a subagent's name only when it is plain (letters, digits, `-`, `_`, \
+             `.`) and not team-lead or main: {to} could be read as another address. {by_its_id}"
+        )));
+    }
+    // Claude Code makes agent ids; no session answers to one.
+    if by_id.is_some() {
+        return Some(Decision::Allow);
+    }
+    // In-process names win only while the subagent lives in this process (§1).
+    if name_taken(input, to) {
+        return Some(Decision::Deny(format!(
+            "{to} is also the name of another Claude session, so a message to {to} could reach \
+             it instead of your subagent. {by_its_id}"
+        )));
+    }
+    if let Some(why) = &input.listed.missing {
+        return Some(Decision::Deny(format!(
+            "chief couldn't list the Claude sessions to check that the name {to} reaches only \
+             your subagent ({why}). {by_its_id}"
+        )));
+    }
+    Some(Decision::Allow)
+}
+
+/// §6 "Subagents" at spawn: a subagent named like another session would take, in its process,
+/// the messages meant for that session (§1). Without a name, or with a free one, allowed. The
+/// coordinator and the project's threads come from the database, so they are checked even when
+/// no listing could be taken; a broken listing doesn't stop subagents.
+fn agent_spawn(input: &GuardInput) -> Decision {
+    let Some(name) = input.agent_name.filter(|n| !n.is_empty()) else {
+        return Decision::Allow;
+    };
+    if name_taken(input, name) {
+        return Decision::Deny(format!(
+            "A Claude session is already named {name}, and a subagent named {name} would get \
+             the messages meant for it. Pick another name for the subagent."
+        ));
+    }
+    Decision::Allow
+}
+
+/// Whether a session other than the caller's subagents answers to `name`: the coordinator, a
+/// thread of the project (any state), or a session in the listings.
+fn name_taken(input: &GuardInput, name: &str) -> bool {
+    name == input.coordinator_name
+        || input.threads.iter().any(|t| t.name == name)
+        || input.listed.names.iter().any(|n| n == name)
+}
+
+/// Letters, digits, `-`, `_` and `.` only: no `uds:` or other scheme, no ref, no whitespace.
+fn plain_address(to: &str) -> bool {
+    !to.is_empty()
+        && to
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Allowed: the exact name of one of this project's threads in the coordinator's account, or
@@ -432,15 +535,20 @@ mod tests {
         let threads = threads();
         let snapshot = snapshot(coord_pid);
         let coordinator = member("chief-p", "coord");
+        let listed = listed(&snapshot, &[]);
         let input = GuardInput {
             role,
             tool,
             to,
+            agent_name: None,
             coordinator_name: "chief-p",
             coordinator: Some(&coordinator),
             threads: &threads,
             snapshot: &snapshot,
             caller_elsewhere: None,
+            from_subagent: false,
+            teammates: &[],
+            listed: &listed,
         };
         let got = evaluate(&input);
         let case = format!("{role:?} {tool} {to:?}");
@@ -754,16 +862,21 @@ mod tests {
                 ..member("p-unlisted-5555", "unlisted")
             },
         ];
+        let listed = Listed::default();
         let decide = |role: Role, to: &str, caller: Option<&str>| {
             evaluate(&GuardInput {
                 role,
                 tool: "SendMessage",
                 to: Some(to),
+                agent_name: None,
                 coordinator_name: "chief-p",
                 coordinator: Some(&coordinator),
                 threads: &threads,
                 snapshot: &here,
                 caller_elsewhere: caller,
+                from_subagent: false,
+                teammates: &[],
+                listed: &listed,
             })
         };
         let denied = |d: Decision, part: &str| match d {
@@ -826,6 +939,265 @@ mod tests {
             "only their coordinator",
         );
         assert_eq!(decide(T, "chief-p", None), Decision::Allow);
+    }
+
+    fn mate(agent_id: &str, name: Option<&str>) -> Teammate {
+        Teammate {
+            agent_id: agent_id.into(),
+            name: name.map(String::from),
+        }
+    }
+
+    /// The caller's own subagents, as `teammates` recorded them.
+    fn mates() -> Vec<Teammate> {
+        vec![
+            mate("ahelper-1111", Some("helper")),
+            // An outside session is named spike-other too (`listed`).
+            mate("aspike-other-2222", Some("spike-other")),
+            mate("anoname-3333", None),
+            // Named like a cleaned thread of the project, which no listing shows.
+            mate("acleaned-4444", Some("p-cleaned-9c0d")),
+            // Names that read as other kinds of address.
+            mate("auds-5555", Some("uds:/tmp/cc-socks/201.sock")),
+            mate("aref-6666", Some("helper [abc]")),
+            mate("alead-7777", Some("team-lead")),
+        ]
+    }
+
+    fn listed(snapshot: &[AgentRow], extra: &[&str]) -> Listed {
+        Listed {
+            names: snapshot
+                .iter()
+                .filter_map(|a| a.name.clone())
+                .chain(extra.iter().map(|n| n.to_string()))
+                .collect(),
+            missing: None,
+        }
+    }
+
+    /// role, from one of its subagents, `to`, expected decision.
+    type SubCase = (Role, bool, &'static str, Want);
+
+    /// §6 "Subagents": a session and its own subagents message each other by the agent id or the
+    /// exact recorded name, unless another session answers to that name too; a subagent's other
+    /// messages follow its session's rules; nobody else's subagents, no refs, no lookalikes.
+    #[test]
+    fn subagents() {
+        use Role::{Coordinator as C, Thread as T};
+        use Want::{Allow, Deny};
+        let threads = threads();
+        let snapshot = snapshot(Some(COORD_PID));
+        let coordinator = member("chief-p", "coord");
+        let mates = mates();
+        let decide = |role: Role, from_subagent: bool, to: &str, listed: &Listed| {
+            evaluate(&GuardInput {
+                role,
+                tool: "SendMessage",
+                to: Some(to),
+                agent_name: None,
+                coordinator_name: "chief-p",
+                coordinator: Some(&coordinator),
+                threads: &threads,
+                snapshot: &snapshot,
+                caller_elsewhere: None,
+                from_subagent,
+                teammates: &mates,
+                listed,
+            })
+        };
+        let all = listed(&snapshot, &["spike-other"]);
+        let cases: Vec<SubCase> = vec![
+            // The lead to its own subagents: by agent id, or by the exact name.
+            (C, false, "helper", Allow),
+            (T, false, "helper", Allow),
+            (C, false, "ahelper-1111", Allow),
+            (T, false, "anoname-3333", Allow),
+            (T, false, "aspike-other-2222", Allow),
+            // Another session answers to the name: in-process names win only while the
+            // subagent lives, so the name could reach it (§1).
+            (
+                C,
+                false,
+                "spike-other",
+                Deny("by its agent id aspike-other-2222"),
+            ),
+            (
+                T,
+                false,
+                "spike-other",
+                Deny("also the name of another Claude session"),
+            ),
+            // So does a thread of the project, listed or not.
+            (
+                C,
+                false,
+                "p-cleaned-9c0d",
+                Deny("by its agent id acleaned-4444"),
+            ),
+            // Names that read as an address or a ref: never as a name.
+            (
+                C,
+                false,
+                "uds:/tmp/cc-socks/201.sock",
+                Deny("agent id auds-5555"),
+            ),
+            (T, false, "helper [abc]", Deny(BARE_NAME)),
+            (T, false, "helper [abc]", Deny("agent id aref-6666")),
+            // The lead's own names are for its subagents only.
+            (C, false, "team-lead", Deny("agent id alead-7777")),
+            (C, false, "main", Deny("not a thread")),
+            (T, false, "main", Deny("only their coordinator")),
+            // Exact matches only.
+            (C, false, "helper [a1b2c3]", Deny(BARE_NAME)),
+            (C, false, "ahelper-1111 [a1b2c3]", Deny(BARE_NAME)),
+            (C, false, "Helper", Deny("not a thread")),
+            (T, false, "helper ", Deny("only their coordinator")),
+            (T, false, "\u{200b}helper", Deny("only their coordinator")),
+            (
+                T,
+                false,
+                "ahelper-1111\u{feff}",
+                Deny("only their coordinator"),
+            ),
+            // Anything else follows the role's rules, as before.
+            (C, false, "p-live-1a2b", Allow),
+            (T, false, "chief-p", Allow),
+            (C, false, "someone-elses-helper", Deny("not a thread")),
+            (T, false, "researcher", Deny("only their coordinator")),
+            // A subagent to its lead, by the names Claude Code gives it (§1).
+            (C, true, "team-lead", Allow),
+            (T, true, "team-lead", Allow),
+            (C, true, "main", Allow),
+            (T, true, "main", Allow),
+            (T, true, "team-lead [ab12]", Deny(BARE_NAME)),
+            (T, true, "Team-Lead", Deny("only their coordinator")),
+            (T, true, "team-lead\u{200b}", Deny("only their coordinator")),
+            // To its siblings, the same as the lead.
+            (T, true, "helper", Allow),
+            (C, true, "anoname-3333", Allow),
+            (
+                T,
+                true,
+                "spike-other",
+                Deny("by its agent id aspike-other-2222"),
+            ),
+            // Its other messages go out under its session's address, with its session's rules.
+            (T, true, "chief-p", Allow),
+            (T, true, "p-live-1a2b", Deny("only their coordinator")),
+            (C, true, "p-live-1a2b", Allow),
+            (C, true, "p-asleep-3c4d", Deny(ASLEEP)),
+            (C, true, "other-project-thread", Deny("not a thread")),
+        ];
+        for (role, from_subagent, to, want) in cases {
+            let got = decide(role, from_subagent, to, &all);
+            let case = format!("{role:?} from_subagent={from_subagent} {to:?}");
+            match want {
+                Want::Allow => assert_eq!(got, Decision::Allow, "{case}"),
+                Want::Deny(part) => match got {
+                    Decision::Deny(reason) => {
+                        assert!(reason.contains(part), "{case}: {reason:?} lacks {part:?}")
+                    }
+                    Decision::Allow => panic!("{case}: allowed, want deny"),
+                },
+            }
+        }
+
+        // Without a listing chief can't tell who else answers to a name; an agent id needs none.
+        let unlisted = Listed {
+            names: vec![],
+            missing: Some("timed out".into()),
+        };
+        let d = decide(T, false, "helper", &unlisted);
+        assert!(
+            matches!(&d, Decision::Deny(r) if r.contains("couldn't list") && r.contains("timed out") && r.contains("ahelper-1111")),
+            "{d:?}"
+        );
+        assert_eq!(decide(T, false, "ahelper-1111", &unlisted), Decision::Allow);
+        assert_eq!(decide(T, true, "team-lead", &unlisted), Decision::Allow);
+
+        // Nobody else's subagents: with none recorded for the caller, every name is the role's.
+        let none = GuardInput {
+            role: T,
+            tool: "SendMessage",
+            to: Some("helper"),
+            agent_name: None,
+            coordinator_name: "chief-p",
+            coordinator: Some(&coordinator),
+            threads: &threads,
+            snapshot: &snapshot,
+            caller_elsewhere: None,
+            from_subagent: false,
+            teammates: &[],
+            listed: &all,
+        };
+        assert!(
+            matches!(evaluate(&none), Decision::Deny(r) if r.contains("only their coordinator"))
+        );
+        for to in ["ahelper-1111", "team-lead", "main"] {
+            let d = evaluate(&GuardInput {
+                to: Some(to),
+                ..none.clone()
+            });
+            assert!(matches!(d, Decision::Deny(_)), "{to}: {d:?}");
+        }
+    }
+
+    /// §6 "Subagents" at spawn: a subagent may not take a name another session answers to, or
+    /// messages meant for that session would reach it instead (§1). The database's names are
+    /// checked even when no listing could be taken; the listing's only when it was.
+    #[test]
+    fn agent_names_at_spawn() {
+        use Role::{Coordinator as C, Thread as T};
+        let threads = threads();
+        let snapshot = snapshot(Some(COORD_PID));
+        let coordinator = member("chief-p", "coord");
+        let all = listed(&snapshot, &["spike-other"]);
+        let unlisted = Listed {
+            names: vec![],
+            missing: Some("supervisor down".into()),
+        };
+        let decide = |role: Role, from_subagent: bool, name: Option<&str>, listed: &Listed| {
+            evaluate(&GuardInput {
+                role,
+                tool: "Agent",
+                to: None,
+                agent_name: name,
+                coordinator_name: "chief-p",
+                coordinator: Some(&coordinator),
+                threads: &threads,
+                snapshot: &snapshot,
+                caller_elsewhere: None,
+                from_subagent,
+                teammates: &[],
+                listed,
+            })
+        };
+        let taken = |d: Decision| matches!(&d, Decision::Deny(r) if r.contains("Pick another name for the subagent"));
+        for listed in [&all, &unlisted] {
+            // No name, or a free one.
+            assert_eq!(decide(T, false, None, listed), Decision::Allow);
+            assert_eq!(decide(C, false, Some(""), listed), Decision::Allow);
+            assert_eq!(decide(T, false, Some("helper"), listed), Decision::Allow);
+            assert_eq!(decide(C, false, Some("Chief-P"), listed), Decision::Allow);
+            // The coordinator and every thread of the project, from the database.
+            assert!(taken(decide(T, false, Some("chief-p"), listed)));
+            assert!(taken(decide(T, true, Some("chief-p"), listed)));
+            assert!(taken(decide(C, false, Some("p-live-1a2b"), listed)));
+            assert!(taken(decide(C, false, Some("p-cleaned-9c0d"), listed)));
+        }
+        // Every listed session.
+        assert!(taken(decide(T, false, Some("other-project-thread"), &all)));
+        assert!(taken(decide(C, false, Some("spike-other"), &all)));
+        // Without a listing those are allowed: a broken listing doesn't stop subagents.
+        assert_eq!(
+            decide(T, false, Some("other-project-thread"), &unlisted),
+            Decision::Allow
+        );
+        let d = decide(C, false, Some("p-renamed-now"), &all);
+        assert!(
+            matches!(&d, Decision::Deny(r) if r.contains("p-renamed-now")),
+            "{d:?}"
+        );
     }
 
     #[test]
