@@ -102,6 +102,14 @@ impl From<RoleArg> for Role {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Rust ignores SIGPIPE, so `chief status | head` panicked in println!. Commands people pipe get
+    // the usual quiet exit; hooks and the MCP server keep the error path they already handle.
+    if !matches!(cli.command, Command::Hook { .. } | Command::Mcp { .. }) {
+        // SAFETY: called before any thread starts; restores the default disposition.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     match cli.command {
         Command::Init {
             name,
