@@ -339,7 +339,7 @@ pub fn set_resolved(
     })
 }
 
-/// A PR as `gh pr list --json url,state,isDraft,reviewDecision` reports it.
+/// A PR as `gh pr list --json url,state,isDraft,reviewDecision,…` reports it (`pr::parse_pr_list`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrInfo {
     pub url: String,

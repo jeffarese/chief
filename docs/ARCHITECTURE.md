@@ -612,8 +612,9 @@ are tested without a terminal (`TestBackend`).
   the status line; a failing database read keeps the last rows. After each action the worker asks
   for an immediate re-read (database only). Every 30 s (first at start): `pr::refresh_project` with
   one `Gh` kept for the board's lifetime and `project.toml` re-read each time (§12), which runs
-  `gh pr list --head <branch> --state all --json url,state,isDraft,reviewDecision --limit 1`
-  in `repo_path` and, with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
+  `gh pr list --head <branch> --state all --json
+  url,state,isDraft,reviewDecision,createdAt,isCrossRepository --limit 10` in `repo_path` and,
+  with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
   (no `gh`, not logged in, no GitHub remote) stays in the status line; blocked and error counts
   prefix it (`PR 1 blocked, 2 errors · …`). At start the board deletes `events` older than 30 days
   (`db::prune_events`).
@@ -739,7 +740,12 @@ a stale token printed usage and exited 0); `kept <id> — …` with a `--discard
 line is unpushed (its `unpushed commit` summary lines kept); `kept` with "uncommitted changes" is
 dirty; anything else is `Other` with the text.
 
-PR status (`pr.rs`): `Gh::poll(repo_path, branch)` runs the §10 `gh pr list` (10 s). A missing `gh`,
+PR status (`pr.rs`): `Gh::poll(repo_path, branch, since)` runs the §10 `gh pr list` (10 s) and
+takes the thread's PR: the newest listed one that isn't cross-repository (a fork's branch can share
+the name) and whose `createdAt` is no earlier than the thread row's `created_at` minus 5 minutes of
+clock skew. Worktree branches are named after threads, so a new thread can reuse the branch of an
+old one whose PR merged long ago; that PR must not resolve and clean the new thread. A PR without a
+readable `createdAt` is ignored. A missing `gh`,
 a `gh` that isn't logged in, or a repository without a GitHub remote is no PR plus a hint returned
 once per `Gh`; other failures are errors. `poll_project` polls threads that work in a worktree,
 have a branch and aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or

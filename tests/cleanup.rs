@@ -586,10 +586,51 @@ fn a_thread_removed_outside_chief_is_marked_cleaned() {
     assert!(env.rm_calls().is_empty());
 }
 
+/// Opened 30 s after the thread row (NOW - 60 s, 2027-01-15T07:59:00Z).
 fn merged_pr() -> String {
     json!([{"url": "https://github.com/o/r/pull/3", "state": "MERGED", "isDraft": false,
-            "reviewDecision": "APPROVED"}])
+            "reviewDecision": "APPROVED", "createdAt": "2027-01-15T07:59:30Z",
+            "isCrossRepository": false}])
     .to_string()
+}
+
+/// A new thread whose worktree reuses an old branch name sees the old thread's merged PR, and a
+/// fork's PR from a branch of the same name: neither is its own.
+#[test]
+fn a_reused_branch_name_ignores_older_and_cross_repository_prs() {
+    let env = Env::new();
+    env.insert(|r| {
+        r.resolved = false;
+        r.resolved_reason = None;
+        r.group_name = "idle".into();
+    });
+    env.gh.set(
+        "pr.stdout",
+        &json!([
+            {"url": "https://github.com/fork/r/pull/9", "state": "MERGED", "isDraft": false,
+             "reviewDecision": "", "createdAt": "2027-01-15T07:59:40Z",
+             "isCrossRepository": true},
+            {"url": "https://github.com/o/r/pull/1", "state": "MERGED", "isDraft": false,
+             "reviewDecision": "APPROVED", "createdAt": "2026-03-02T10:00:00Z",
+             "isCrossRepository": false}
+        ])
+        .to_string(),
+    );
+    let refresh = env
+        .with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Merged)))
+        .unwrap();
+    assert_eq!((refresh.polled, refresh.cleaned.len()), (1, 0));
+    let row = env.row();
+    assert_eq!(
+        (
+            row.pr_url,
+            row.resolved,
+            row.cleaned_at,
+            row.resolved_reason
+        ),
+        (None, false, None, None)
+    );
+    assert!(env.rm_calls().is_empty());
 }
 
 #[test]
@@ -621,9 +662,9 @@ fn a_merged_pr_resolves_and_cleans_the_thread() {
             "--state",
             "all",
             "--json",
-            "url,state,isDraft,reviewDecision",
+            "url,state,isDraft,reviewDecision,createdAt,isCrossRepository",
             "--limit",
-            "1"
+            "10"
         ]
     );
     assert_eq!(env.gh.cwd(0), env.git.repo);
@@ -726,7 +767,10 @@ fn gh_trouble_is_a_hint_or_an_error() {
         .set("pr.stderr", "no git remotes found\n")
         .set("pr.exit", "1");
     let gh = env.gh.gh();
-    assert_eq!(gh.poll(&env.git.repo, "worktree-add-notes").unwrap(), None);
+    assert_eq!(
+        gh.poll(&env.git.repo, "worktree-add-notes", NOW).unwrap(),
+        None
+    );
     assert!(gh.take_hint().unwrap().contains("has no GitHub remote"));
 
     env.gh.set("pr.stderr", "HTTP 502\n");
