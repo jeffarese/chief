@@ -940,6 +940,7 @@ fn up_opens_a_tmux_window_and_down_closes_it() {
         ("TMUX_PANE", "%9"),
     ];
     home.tmux
+        .set("display-message.stdout", "@1\n")
         .set("new-window.stdout", "%5 @3 4242\n")
         .set("split-window.stdout", "%6\n");
     let out = home.run_env(&["up", SLUG], &tmux_env, "");
@@ -957,7 +958,7 @@ fn up_opens_a_tmux_window_and_down_closes_it() {
         "chief-payments-latency",
         "-a",
         "-t",
-        "%9",
+        "@1",
         "-P",
         "-F",
         "#{pane_id} #{window_id} #{pid}",
@@ -1002,6 +1003,8 @@ fn up_opens_a_tmux_window_and_down_closes_it() {
     assert_eq!(
         tmux_calls(&home, sock),
         [
+            // $TMUX_PANE's window: new-window -t takes a window, not a pane.
+            strings(&["display-message", "-p", "-t", "%9", "#{window_id}"]),
             new,
             mark("%5", "main"),
             split,

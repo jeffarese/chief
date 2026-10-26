@@ -175,9 +175,17 @@ impl Mux for Tmux {
             .as_ref()
             .map(|c| c.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // `new-window -t` takes a window, not a pane ("can't specify pane here"): open after the
+        // window holding the pane chief up runs in.
+        let after = match &self.after {
+            Some(pane) => {
+                Some(self.stdout(&["display-message", "-p", "-t", pane, "#{window_id}"])?)
+            }
+            None => None,
+        };
         let mut args = vec!["new-window", "-n", label];
-        if let Some(pane) = &self.after {
-            args.extend(["-a", "-t", pane]);
+        if let Some(window) = &after {
+            args.extend(["-a", "-t", window]);
         }
         if !first.focus {
             args.push("-d");
@@ -464,6 +472,36 @@ mod tests {
             Closed::Killed(layout.session.clone())
         );
         assert!(!tmux.has_session(&layout.session).unwrap());
+    }
+
+    /// `chief up` inside tmux opens its window next to the one it runs in, found from
+    /// `$TMUX_PANE` (a pane id, which `new-window -t` doesn't accept).
+    #[test]
+    fn opens_after_the_window_of_the_pane_it_runs_in() {
+        let Some(server) = Server::start() else {
+            return;
+        };
+        let pane = server
+            .tmux()
+            .stdout(&["display-message", "-p", "-t", "t:0", "#{pane_id}"])
+            .unwrap();
+        let tmux = Tmux {
+            after: Some(pane),
+            ..server.tmux()
+        };
+        let dir = server.dir.path().canonicalize().unwrap();
+        let layout = layout::open(&tmux, "demo", &dir, &server.exe(), &[], None).unwrap();
+        assert_eq!(layout.opened, Opened::Created);
+        let index = tmux
+            .stdout(&[
+                "display-message",
+                "-p",
+                "-t",
+                &window(&layout.session),
+                "#{window_index}",
+            ])
+            .unwrap();
+        assert_eq!(index, "1", "right after window 0");
     }
 
     /// Window ids restart with every server: an id stored for another server, or another
