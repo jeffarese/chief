@@ -423,7 +423,10 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             Item::Empty => Line::styled(truncate("No threads yet", width), dim()),
         })
         .collect();
-    let h = area.height as usize;
+    // When the list overflows, the last line says what is below, so a collapsed Resolved header
+    // past the fold is not invisible.
+    let overflow = lines.len() > area.height as usize && area.height > 1;
+    let h = area.height as usize - usize::from(overflow);
     let mut top = app.scroll.get().min(lines.len().saturating_sub(h));
     if let Some(s) = sel_index {
         if s < top {
@@ -434,8 +437,39 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     app.scroll.set(top);
-    let shown: Vec<Line> = lines.into_iter().skip(top).take(h).collect();
+    let below = items.get(top + h..).unwrap_or_default();
+    let mut shown: Vec<Line> = lines.into_iter().skip(top).take(h).collect();
+    if overflow {
+        shown.push(more_line(below, width));
+    }
     f.render_widget(Paragraph::new(shown), area);
+}
+
+/// `↓ 3 more · Resolved 2 · R shows` for the items under the fold.
+fn more_line(below: &[Item], width: usize) -> Line<'static> {
+    let threads = below
+        .iter()
+        .filter(|i| matches!(i, Item::Thread(_)))
+        .count();
+    let mut text = if threads > 0 {
+        format!("↓ {threads} more")
+    } else {
+        "↓ more".to_string()
+    };
+    for item in below {
+        if let Item::Header {
+            group,
+            count,
+            collapsed: true,
+        } = item
+        {
+            text.push_str(&format!(" · {} {count} · R shows", group.label()));
+        }
+    }
+    if below.is_empty() {
+        text = "↑ more above".to_string();
+    }
+    Line::styled(truncate(&text, width), dim())
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
@@ -679,6 +713,17 @@ mod tests {
         assert!(long.ends_with('…'), "{long:?}");
         assert!(cols(long) <= 40);
         assert!(!out.contains("honestly"));
+        for line in out.lines() {
+            assert!(cols(line) <= 40, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn short_board_says_what_is_below_the_fold() {
+        let app = busy_board();
+        let out = render(&app, 40, 8);
+        assert!(out.contains("↓ 1 more · Resolved 1 · R shows"), "{out}");
+        assert!(!out.contains("Old work"), "{out}");
         for line in out.lines() {
             assert!(cols(line) <= 40, "{line:?}");
         }

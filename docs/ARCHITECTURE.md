@@ -604,7 +604,9 @@ are tested without a terminal (`TestBackend`).
 - Layout, designed for a 40–70 column pane and usable down to 30: header (project name, goal,
   `coordinator: <state>` with the guard denial count when > 0); the groups in §5 order with counts,
   empty groups hidden, "No threads yet" when there are none, Resolved collapsed by default
-  (`Resolved N · R shows`). A row is `<target mark><glyph> <title or name>  <tags>`, cut to the
+  (`Resolved N · R shows`). When the list doesn't fit, its last line says what is below
+  (`↓ N more`, plus `· Resolved N · R shows` for a collapsed header under the fold; `↑ more above` at
+  the bottom). A row is `<target mark><glyph> <title or name>  <tags>`, cut to the
   width with an ellipsis and never wrapped; the title gives way first so tags stay readable. Tags:
   waiting reason, `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`),
   `cleanup blocked`, `cleaned up`. Detail panel for the selection (title, name, group and reason or
