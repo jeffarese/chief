@@ -239,7 +239,7 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         "model": model,
         "effort": effort,
         "next": format!(
-            "Subscribe now with exactly this input: {{\"to\": \"{name}\", \"message\": \"\", \"notify_when_idle\": true}}. The empty message only subscribes."
+            "Subscribe now: call SendMessage with exactly {{\"to\": \"{name}\", \"notify_when_idle\": true}} and no message key at all."
         ),
     }))
 }
