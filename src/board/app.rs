@@ -366,6 +366,12 @@ impl App {
     }
 
     fn show(&mut self, row: SessionRow) -> Vec<Action> {
+        if row.removed_at.is_some() {
+            return self.refuse(format!(
+                "{}'s session was removed outside chief: there is no session to show.",
+                row.name
+            ));
+        }
         if row.cleaned_at.is_some() {
             return self.refuse(format!(
                 "{} was cleaned up: there is no session to show.",
@@ -377,6 +383,9 @@ impl App {
     }
 
     fn wake(&mut self, row: SessionRow) -> Vec<Action> {
+        if row.removed_at.is_some() {
+            return self.refuse(crate::guard::removed_message(&row.name));
+        }
         if row.cleaned_at.is_some() {
             return self.refuse(crate::guard::cleaned_message(&row.name));
         }
@@ -388,6 +397,9 @@ impl App {
     }
 
     fn resolve(&mut self, row: SessionRow) -> Vec<Action> {
+        if row.resolved && row.removed_at.is_some() {
+            return self.refuse(crate::guard::removed_message(&row.name));
+        }
         if row.resolved && row.cleaned_at.is_some() {
             return self.refuse(crate::guard::cleaned_message(&row.name));
         }
@@ -685,6 +697,42 @@ pub(crate) mod tests {
         assert!(app.on_key(ch('r')).is_empty());
         assert!(app.status.as_deref().unwrap().contains("was cleaned up"));
         assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+    }
+
+    /// Removed outside chief with its worktree left: no session to wake, reopen or show, but x
+    /// still runs (the cleanup reports where the worktree remains).
+    #[test]
+    fn a_thread_removed_outside_chief_cannot_be_woken_reopened_or_shown() {
+        let mut removed = thread("gone-1", Group::Resolved, 1);
+        removed.removed_at = Some(2);
+        let mut app = app_with(vec![removed]);
+        app.on_key(ch('R'));
+        assert_eq!(app.selected.as_deref(), Some("gone-1"));
+        for c in ['w', 'r'] {
+            assert!(app.on_key(ch(c)).is_empty(), "{c}");
+            assert!(
+                app.status
+                    .as_deref()
+                    .unwrap()
+                    .contains("removed outside chief"),
+                "{c}: {:?}",
+                app.status
+            );
+        }
+        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("removed outside chief")
+        );
+        assert_eq!(
+            app.on_key(ch('x')),
+            [Action::Clean {
+                name: "gone-1".into(),
+                mode: Mode::Safe
+            }]
+        );
     }
 
     #[test]

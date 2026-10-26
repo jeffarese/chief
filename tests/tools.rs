@@ -643,6 +643,48 @@ fn resolve_and_reopen() {
     assert_ne!(out["group"], "resolved");
 }
 
+/// Removed outside chief while its worktree remains: resolved, not cleaned. Its session is gone,
+/// so it can't be reopened or woken (`claude respawn` would fail), with a message that says so.
+#[test]
+fn removed_threads_cannot_be_reopened_or_woken() {
+    let env = Env::new();
+    env.insert("demo-gone-1111", |r| {
+        r.short_id = Some("g1".into());
+        r.session_id = Some("sid-g1".into());
+        r.resolved = true;
+        r.resolved_reason = Some("removed".into());
+        r.group_name = "resolved".into();
+        r.removed_at = Some(NOW - 1000);
+        r.cleanup_blocked = Some("session removed outside chief; worktree remains at /r".into());
+    });
+    // The coordinator is listed; the thread isn't.
+    env.agents(&[agent("c1", "sid-c1", "chief-demo", "done", Some(1))]);
+    let want = "demo-gone-1111's session was removed outside chief, so it can't be woken, \
+                reopened or messaged; start a new thread (its reports are still readable with \
+                read_report)";
+    let reopen = env.with(|ctx| {
+        tools::resolve_thread(
+            ctx,
+            &ResolveThreadArgs {
+                name: "demo-gone-1111".into(),
+                reopen: Some(true),
+            },
+        )
+    });
+    assert_eq!(reopen.unwrap_err().to_string(), want);
+    assert!(env.row("demo-gone-1111").unwrap().resolved);
+    let wake = env.with(|ctx| {
+        tools::wake_thread(
+            ctx,
+            &NameArgs {
+                name: "demo-gone-1111".into(),
+            },
+        )
+    });
+    assert_eq!(wake.unwrap_err().to_string(), want);
+    assert!(env.fake.calls_of("respawn").is_empty());
+}
+
 #[test]
 fn cleaned_threads_keep_their_reports_but_nothing_else() {
     let env = Env::new();

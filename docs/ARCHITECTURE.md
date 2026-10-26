@@ -393,6 +393,9 @@ verdict. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resol
 folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
 otherwise `cleanup_blocked = 'session removed outside chief; worktree remains at <path>'`, and a
 later sync that finds that folder gone sets `cleaned_at`. The coordinator row is never marked.
+A row with `removed_at` has no session left (`claude respawn` would fail), so it can't be woken,
+reopened, messaged or shown in the pane (§6, §7, §9, §10), cleaned or not; the refusal says the
+session was removed outside chief and to start a new thread.
 If a later snapshot lists the session again, the sync undoes only what it did: `removed_at`
 cleared, `cleaned_at` cleared when it equals `removed_at`, `resolved`/`resolved_reason` cleared when
 the reason is `removed`, and the `session removed outside chief…` `cleanup_blocked` cleared.
@@ -422,7 +425,7 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 | Caller | Tool | Rule |
 | --- | --- | --- |
 | any | `ListAgents` | deny. Coordinator: "Use the chief list_threads tool; it lists only this project's threads." Thread: "ListAgents is blocked in chief threads: you can message only your coordinator." |
-| coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not cleaned, not resolved, and reachable (below). Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
+| coordinator | `SendMessage` | allow only if `to` is exactly the name of a thread registered to this project, or exactly the socket address of one (a reply, form below), and that thread is not removed outside chief, not cleaned, not resolved, and reachable (below). Removed outside chief (`removed_at`, §5) → deny: "<name>'s session was removed outside chief, so it can't be woken, reopened or messaged; start a new thread (its reports are still readable with read_report)". Cleaned → deny: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)". Resolved → deny: "Thread is resolved; reopen it first." Not live → deny: "Thread is asleep: call wake_thread first." Renamed or ambiguous → deny, saying which. Everything else → deny ("… is not a thread of this project", "… is not the address of a live thread of this project") |
 | thread | `SendMessage` | allow only if `to` is exactly `chief-<slug>` or exactly the coordinator's socket address, and the coordinator is reachable. Coordinator not running (or never started) → deny: "Your coordinator chief-<slug> isn't running, so the message can't be delivered. Just finish your turn: your final message is recorded as your report when you stop anyway, and the coordinator reads it there." Renamed or ambiguous → deny with the same advice. Everything else → deny ("Threads may message only their coordinator, by its exact name chief-<slug>."): siblings, other projects, the thread's own subagents, and any session the local `claude agents` doesn't list |
 
 An allow-list by byte-exact equality. `to` is never trimmed, case-folded or parsed, and a trailing
@@ -479,8 +482,8 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?` | Checks trust of the repo path, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread, resolves its ids. Returns `{name, short_id, repo, model, effort, next}`, plus `warning` when it adopted a session whose spawn reported a failure |
 | `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` (stored rows plus a `warning` if that fails), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text |
-| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)" |
-| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
+| `wake_thread` | `name` | If no live pid: `claude respawn <short_id>`, poll `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
+| `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
@@ -667,8 +670,9 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
 
 `chief pane` loop (`src/pane.rs`):
 
-1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned
-   (removed counts) or never started (no short id), means the coordinator, and a stale target is
+1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned,
+   removed outside chief (`removed_at`, worktree left or not) or never started (no short id),
+   means the coordinator, and a stale target is
    cleared (only while it still holds that name, so a newer board write survives). No coordinator
    with a short id yet: print `chief · no coordinator yet: run chief up <slug>` and look again
    every 500 ms.
@@ -748,9 +752,10 @@ are tested without a terminal (`TestBackend`).
   Working green `●`, Review blue `◆`, Landing magenta `▲`, Idle default `○`, Failed red `✗`,
   Resolved dim `✓`). `▸` marks what the main pane shows: a thread row, or the coordinator line.
 - Keys: ↑/↓ or j/k move over threads (headers skipped; g/G first/last); Enter shows the selected
-  thread in the main pane (refused for a cleaned one); Esc or c shows the coordinator; w wake
-  (`tools::wake_thread`, refused for cleaned); r resolve or reopen (`registry::set_resolved`,
-  reason `user`; reopening a cleaned thread is refused with its message); o open the PR URL
+  thread in the main pane (refused for a cleaned one or one removed outside chief); Esc or c
+  shows the coordinator; w wake (`tools::wake_thread`, refused for cleaned or removed); r resolve
+  or reopen (`registry::set_resolved`, reason `user`; reopening a cleaned or removed thread is
+  refused with its message); o open the PR URL
   (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
   uncleaned thread: `cleanup::clean(Safe)`. When blocked, a fresh `cleanup::inspect` decides the
   modal: if it lists the loss, "Discard unsaved work?" shows why plus `cleanup::render_loss` and
@@ -779,7 +784,8 @@ are tested without a terminal (`TestBackend`).
   restored on quit and on error; input is polled every 100 ms, results are drained between frames,
   and resizes take effect on the next frame.
 - A thread with `cleanup_blocked` shows a "cleanup blocked" tag (the reason in the detail); a
-  cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread.
+  cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread
+  and for one removed outside chief.
 
 ## 11. Testing
 
@@ -898,6 +904,6 @@ won't discard it. With `--discard` it checks step 2 first, prints what would be 
 runs `clean(Discard(<that inspection>))`, so "Nothing unsaved will be lost" never discards a
 commit `claude rm` reports.
 
-A cleaned thread can't be woken, reopened or messaged (§6, §7) and is hidden from `list_threads`
-unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
+A cleaned thread, or one removed outside chief, can't be woken, reopened or messaged (§6, §7); a
+cleaned one is hidden from `list_threads` unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
 user's call (§8).

@@ -313,7 +313,8 @@ pub fn sync_in(
 }
 
 /// Resolves (`reason` = user | coordinator) or reopens a session. Reopening counts as activity so
-/// the inactivity rule doesn't fire again right away.
+/// the inactivity rule doesn't fire again right away. A session removed outside chief, or cleaned
+/// up, can't be reopened: there is no session left to run.
 pub fn set_resolved(
     conn: &Connection,
     name: &str,
@@ -323,6 +324,9 @@ pub fn set_resolved(
 ) -> Result<SessionRow> {
     db::immediate(conn, |conn| {
         let mut row = db::get_session(conn, name)?.with_context(|| format!("no session {name}"))?;
+        if !resolved && row.removed_at.is_some() {
+            anyhow::bail!(crate::guard::removed_message(name));
+        }
         if !resolved && row.cleaned_at.is_some() {
             anyhow::bail!(crate::guard::cleaned_message(name));
         }

@@ -190,6 +190,7 @@ pub fn guard_decision(
         short_id: r.short_id.clone(),
         resolved: r.resolved,
         cleaned: r.cleaned_at.is_some(),
+        removed: r.removed_at.is_some(),
     };
     let threads: Vec<_> = rows
         .iter()

@@ -78,14 +78,16 @@ pub fn run(project: &str) -> Result<()> {
 }
 
 /// The session the pane should show: `pane_target`, or the coordinator when it is NULL or names
-/// a session that is unknown, of another project, cleaned or removed, or never started (the
-/// stale target is cleared). None when the coordinator hasn't been started either.
+/// a session that is unknown, of another project, cleaned, removed outside chief (its worktree
+/// may remain, its session doesn't), or never started (the stale target is cleared). None when
+/// the coordinator hasn't been started either.
 pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<SessionRow>> {
     if let Some(name) = db::get_pane_target(conn, project)? {
         match db::get_session(conn, &name)? {
             Some(row)
                 if row.project_slug == project
                     && row.cleaned_at.is_none()
+                    && row.removed_at.is_none()
                     && row.short_id.is_some() =>
             {
                 return Ok(Some(row));
@@ -432,6 +434,16 @@ mod tests {
         db::update_session(&conn, &row).unwrap();
         assert_eq!(target(&conn).as_deref(), Some("chief-demo"));
         assert_eq!(db::get_pane_target(&conn, "demo").unwrap(), None, "cleared");
+
+        // Removed outside chief, its worktree still there: no session to attach to either.
+        insert(&conn, "demo-r-4444", "demo", Role::Thread, Some("t4"));
+        let mut removed = db::get_session(&conn, "demo-r-4444").unwrap().unwrap();
+        removed.removed_at = Some(5);
+        removed.resolved = true;
+        db::update_session(&conn, &removed).unwrap();
+        db::set_pane_target(&conn, "demo", Some("demo-r-4444")).unwrap();
+        assert_eq!(target(&conn).as_deref(), Some("chief-demo"));
+        assert_eq!(db::get_pane_target(&conn, "demo").unwrap(), None);
 
         // Unknown, another project's, never started: the coordinator, and the target cleared.
         insert(&conn, "other-b-2222", "other", Role::Thread, Some("t2"));

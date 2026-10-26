@@ -428,6 +428,11 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     if alive(ctx)? {
         return Ok(json!({"name": name, "alive": true, "respawned": false}));
     }
+    // After the refresh, which undoes a removal verdict for a session that is listed again.
+    let row = project_thread(ctx, &name)?;
+    if row.removed_at.is_some() {
+        bail!(crate::guard::removed_message(&name));
+    }
     let short_id = row
         .short_id
         .with_context(|| format!("{name} was never started, so there is nothing to wake"))?;
