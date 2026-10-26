@@ -158,3 +158,13 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | Board tags (PB3, PB4), detail and `chief status` show the account; Enter attaches through the thread's account | Pass |
 | Settings: "Account trust" check; an untrusted pair's Enter opens Claude in that account on the board's terminal, then re-checks | Pass (summary reworded: `N untrusted · checked <labels>`) |
 | `chief clean --discard --yes` removes each thread in its own account; worktrees gone | Pass |
+
+## Subagents: live run (coordinator on the default account, thread on cpe, Haiku, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| A thread starts a named subagent; the subagent reports to `team-lead`; the thread sends it a follow-up by name and gets the answer | Pass, 0 guard denials |
+| The coordinator starts its own subagent and hears its report | Pass, 0 guard denials |
+| Each subagent recorded under its own session (`teammates`) | Pass |
+| Guard: an Agent named like the coordinator or a project thread denied at spawn; a free name allowed; a thread messaging the coordinator's subagent, the coordinator messaging a thread's subagent, a lead messaging `team-lead` all denied; the thread's own subagent allowed by name and by agent id | Pass (the thread's catch-all denial reworded: it now names subagents, and the reply address for a thread in another account) |
+| `claude respawn` of the thread: SessionStart `resume` forgets its subagents; the old name is denied | Pass |

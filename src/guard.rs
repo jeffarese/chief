@@ -285,8 +285,15 @@ fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
 fn thread_send(input: &GuardInput, to: &str) -> Decision {
     let coordinator = input.coordinator_name;
     let only = || {
+        let how = match input.caller_elsewhere {
+            Some(_) => {
+                "by replying to the exact `from=\"uds:…\"` address of its message".to_string()
+            }
+            None => format!("by its exact name {coordinator}"),
+        };
         Decision::Deny(format!(
-            "Threads may message only their coordinator, by its exact name {coordinator}."
+            "Threads may message only their coordinator, {how}, and their own subagents, by the \
+             name or agent id the Agent tool gave."
         ))
     };
     let reached = match input.coordinator {
@@ -1130,8 +1137,18 @@ mod tests {
             teammates: &[],
             listed: &all,
         };
+        assert!(matches!(evaluate(&none), Decision::Deny(r)
+            if r.contains("only their coordinator, by its exact name chief-p")
+                && r.contains("their own subagents")));
+        // From another account the coordinator's name doesn't reach: point at the reply address.
+        let elsewhere = evaluate(&GuardInput {
+            caller_elsewhere: Some("PB3"),
+            ..none.clone()
+        });
         assert!(
-            matches!(evaluate(&none), Decision::Deny(r) if r.contains("only their coordinator"))
+            matches!(&elsewhere, Decision::Deny(r)
+                if r.contains("from=\"uds:") && !r.contains("chief-p") && r.contains("own subagents")),
+            "{elsewhere:?}"
         );
         for to in ["ahelper-1111", "team-lead", "main"] {
             let d = evaluate(&GuardInput {
