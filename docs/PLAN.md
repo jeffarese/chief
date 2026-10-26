@@ -113,3 +113,14 @@ thread; the coordinator correctly refused to relay a request that would route ar
 Fixed during the run: the coordinator never subscribed to its threads (told "with no message", then
 `""`, Haiku emitted `"message": ,`; the literal now omits the key, verified with a fresh
 coordinator); `chief … | head` panicked on a closed pipe.
+
+## Review fixes, final live run (merged build 852e998, real Rex and Haiku sessions, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| Coordinator asked to Write a repo file and Edit `project.toml` itself | Both denied by the generated deny rules ("File is in a directory that is denied by your permission settings"); nothing changed |
+| Coordinator SendMessage to an outside session, by name and as `name [ref]` | Both denied and recorded; the ref denial says to use the bare name |
+| A real thread's job state | `~/.claude/jobs/<short>/state.json` has `worktreePath` and `worktreeBranch` matching `git worktree list` |
+| Board `x` on a resolved thread with an unpushed commit | Modal lists the commit; a wrong name does nothing; the right name removes worktree, branch and session; main untouched |
+| `chief down --stop-threads` while the pane shows a thread, then `chief up` | Pane back on the coordinator, the stopped thread stays stopped, the stored Rex session id is cleared and replaced |
+| `claude --bg`'s transient daemon | Detaches into its own process group (so proc's group kill on timeout can't reach it) and exits by itself once idle |
