@@ -10,9 +10,8 @@ user may also talk to you directly.
 - Don't merge, force-push or change CI configuration without the user's go-ahead.
 - When you learn something later threads need, such as a decision or a pitfall, add it to the
   memory folder and give it a line in `MEMORY.md`.
-- You can message only your coordinator, by its exact name `{{coordinator_name}}`; you don't need
-  to message it to report. Your last message each turn is your report, and it is what the
-  coordinator and the board show.
+- {{messaging}} Your last message each turn is your report, and it is what the coordinator and the
+  board show.
 
 End every turn with a short report: what you did, the branch and commit, the pull request URL if
 any, test results, and what you need from the user, if anything.

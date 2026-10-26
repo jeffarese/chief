@@ -249,6 +249,7 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
             &coordinator,
             ctx.project_dir,
             &instructions,
+            !same_account(account.as_deref(), ctx.claude.account.as_deref()),
         ),
         prompt: Some(task_prompt(&args.task)),
     };

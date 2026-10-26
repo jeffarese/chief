@@ -357,6 +357,76 @@ fn the_guard_asks_the_projects_account() {
     );
 }
 
+/// A thread in another account (§3, §6): the coordinator reaches it only at its socket address,
+/// checked in that account's own listing; the thread reaches its coordinator only at the
+/// coordinator's address, checked in the project's account.
+#[test]
+fn the_guard_checks_a_thread_in_its_own_account() {
+    let home = guarded_home();
+    let cpb = common::account(home.path(), "claude-cpb");
+    {
+        let mut t = SessionRow::new("demo-far-3333", "demo", Role::Thread, db::now_ms());
+        t.session_id = Some("far-sid".into());
+        common::in_account(&mut t, "cpb", "PB2", Some(&cpb));
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    common::account_agents(
+        &cpb,
+        &[agent(
+            "f1",
+            "far-sid",
+            "demo-far-3333",
+            "working",
+            Some(701),
+        )],
+    );
+    let guard = |role: &str, payload: &str| {
+        deny_reason(&home.run(
+            &["hook", "guard", "--project", "demo", "--role", role],
+            payload,
+        ))
+    };
+    assert_eq!(
+        guard("coordinator", &send("uds:/tmp/cc-socks/701.sock")),
+        None
+    );
+    let reason = guard("coordinator", &send("demo-far-3333")).unwrap();
+    assert!(
+        reason.contains("runs in another Claude account (PB2)")
+            && reason.contains("uds:/tmp/cc-socks/701.sock"),
+        "{reason}"
+    );
+    // A thread of the project's account by name: only that account is asked.
+    let before = home.fake.accounts().len();
+    assert_eq!(guard("coordinator", &send("demo-a-1111")), None);
+    let asked: Vec<_> = home.fake.accounts()[before..].to_vec();
+    assert_eq!(asked, [("agents".to_string(), "unset".to_string())]);
+
+    // The far thread messaging its coordinator.
+    let from_far = |to: &str| {
+        serde_json::json!({
+            "session_id": "far-sid",
+            "tool_name": "SendMessage",
+            "tool_input": {"to": to, "message": "done?"},
+        })
+        .to_string()
+    };
+    let reason = guard("thread", &from_far("chief-demo")).unwrap();
+    assert!(reason.contains("another Claude account (PB2)"), "{reason}");
+    assert_eq!(
+        guard("thread", &from_far("uds:/tmp/cc-socks/100.sock")),
+        None
+    );
+
+    // Its account can't be listed: denied, saying why.
+    std::fs::write(cpb.join("fake-agents.stdout"), "garbage").unwrap();
+    let reason = guard("coordinator", &send("uds:/tmp/cc-socks/701.sock")).unwrap();
+    assert!(
+        reason.contains("couldn't list the accounts of demo-far-3333"),
+        "{reason}"
+    );
+}
+
 #[test]
 fn guard_scopes_the_coordinator_to_its_threads() {
     let home = guarded_home();

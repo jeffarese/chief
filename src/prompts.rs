@@ -26,19 +26,33 @@ pub fn coordinator(config: &ProjectConfig, project_dir: &Path, instructions: &st
     with_instructions(prompt, instructions)
 }
 
-/// A thread's `--append-system-prompt`.
+/// A thread's `--append-system-prompt`. `elsewhere`: it runs in another Claude account than its
+/// coordinator, where the coordinator's name doesn't reach (§1, §6).
 pub fn thread(
     config: &ProjectConfig,
     coordinator_name: &str,
     project_dir: &Path,
     instructions: &str,
+    elsewhere: bool,
 ) -> String {
+    let messaging = if elsewhere {
+        "You run in another Claude account than your coordinator, so its name doesn't reach it, \
+         and you don't need to message it to report. To answer a message from it, reply with \
+         SendMessage to the exact `from=\"uds:…\"` address in that message's header."
+            .to_string()
+    } else {
+        format!(
+            "You can message only your coordinator, by its exact name `{coordinator_name}`; you \
+             don't need to message it to report."
+        )
+    };
     let prompt = render(
         THREAD,
         &[
             ("name", &config.name),
             ("coordinator_name", coordinator_name),
             ("project_dir", &project_dir.display().to_string()),
+            ("messaging", &messaging),
         ],
     );
     with_instructions(prompt, instructions)
@@ -118,18 +132,49 @@ mod tests {
 
     #[test]
     fn thread_fills_every_placeholder() {
-        let p = thread(&config(None), "chief-payments-latency", Path::new("/d"), "");
+        let p = thread(
+            &config(None),
+            "chief-payments-latency",
+            Path::new("/d"),
+            "",
+            false,
+        );
         assert!(!p.contains("{{"), "{p}");
         assert!(p.contains("`chief-payments-latency`"));
         assert!(p.contains("/d/memory/MEMORY.md"));
+        assert!(p.contains("- You can message only your coordinator, by its exact name"));
+
+        // In another account than the coordinator's: reply at the address, not the name.
+        let p = thread(
+            &config(None),
+            "chief-payments-latency",
+            Path::new("/d"),
+            "",
+            true,
+        );
+        assert!(!p.contains("{{"), "{p}");
+        assert!(
+            p.contains("- You run in another Claude account than your coordinator"),
+            "{p}"
+        );
+        assert!(p.contains("`from=\"uds:…\"` address"), "{p}");
+        assert!(!p.contains("by its exact name"), "{p}");
     }
 
     #[test]
     fn instructions_are_appended_when_not_empty() {
         let c = config(None);
         let template = "<!-- Standing brief.\nWrite here. -->\n\n";
-        assert!(!thread(&c, "x", Path::new("/d"), template).contains("## Project instructions"));
-        let p = thread(&c, "x", Path::new("/d"), "<!-- hint -->\nUse pnpm.\n");
+        assert!(
+            !thread(&c, "x", Path::new("/d"), template, false).contains("## Project instructions")
+        );
+        let p = thread(
+            &c,
+            "x",
+            Path::new("/d"),
+            "<!-- hint -->\nUse pnpm.\n",
+            false,
+        );
         assert!(
             p.ends_with("\n\n## Project instructions\n\nUse pnpm.\n"),
             "{p}"

@@ -541,6 +541,23 @@ and no other snapshot entry, in any state, carries that name. Otherwise it is as
 no pid), renamed (the entry carries another name, so the name may reach someone else), or
 ambiguous (another entry carries the name too). A coordinator with no row counts as not running.
 
+Threads in another account than the project's (§3). The coordinator's account (the project's)
+can't reach them by name (§1: the name reaches nothing there, or a session of that account), so
+for the coordinator such a thread is reachable only at its socket address, and the identity check
+above runs in a fresh `claude agents` of the thread's own account (polled in parallel with the
+project's, bounded the same; only the accounts of unresolved, uncleaned, unremoved threads the
+`to` could be for: the named one, or all of them for a `uds:` address). Its name → deny: "<name>
+runs in another Claude account (<label>), where names don't reach: message it at its address
+uds:… (list_threads shows it)", or the asleep/resolved/… reason when it isn't reachable. An
+account whose listing fails → deny for its threads, saying chief couldn't list it (a `uds:`
+denial names the accounts it couldn't check); the project's account failing is a guard failure
+(fail closed). A thread in another account calling (matched by the payload's `session_id`) can't
+reach its coordinator by name: `chief-<slug>` → deny: "You run in another Claude account (<label>)
+than your coordinator, and chief-<slug>'s name doesn't reach across accounts. To answer a message
+from it, send your reply to the exact `from="uds:…"` address in that message's header. Otherwise
+just finish your turn: …"; the coordinator's exact socket address is allowed as for any thread,
+checked in the coordinator's (the project's) account's listing.
+
 Socket addresses are accepted only in the exact form Claude Code gives a session's socket (§1, the
 `from` of every cross-session message): `uds:/tmp/cc-socks/<pid>.sock`, the pid in decimal with no
 sign or leading zeros, nothing before or after. The guard builds that string from the reachable
@@ -715,8 +732,10 @@ a pid. Otherwise it is left alone.
 
 - `coordinator.md`: role (route, never do the work), its tools (§7: read the repos, edit only
   memory and instructions, no shell), routing rules (quick question → answer;
-  new work → `start_thread`; follow-up → `SendMessage` to the matching thread with
-  `notify_when_idle`, waking it first if asleep, by its exact name with no `[ref]`; several tasks →
+  new work → `start_thread`, with `account` only when the user names one; follow-up →
+  `SendMessage` to the matching thread with `notify_when_idle`, waking it first if asleep, at its
+  exact address with no `[ref]` (its name, or the `uds:…` address of a thread in another account,
+  which changes when it is woken: subscribe again then); several tasks →
   several threads), say which thread got what, keep `max_parallel`, save preferences and decisions
   to `memory/` and update `memory/MEMORY.md`, read full reports with `read_report` when an idle
   notice arrives. Removing worktrees and branches is the user's call (board `x`, `chief clean`,
@@ -724,11 +743,14 @@ a pid. Otherwise it is left alone.
   (threads create their own).
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch; message only the coordinator, by its exact name
-  (the report needs no message); end every turn with a short report (what changed, branch, PR URL
-  if any, what you need); if something is missing, say exactly what and stop.
+  (the report needs no message), or, for a thread spawned in another account than the
+  coordinator's (§3), reply only to the `from="uds:…"` address of the coordinator's message; end
+  every turn with a short report (what changed, branch, PR URL if any, what you need); if
+  something is missing, say exactly what and stop.
 
 Placeholders (`{{name}}` replaced verbatim): coordinator `name`, `goal_line` (` Goal: …` or empty),
-`project_dir`, `max_parallel`; thread `name`, `coordinator_name`, `project_dir`. Both get
+`project_dir`, `max_parallel`; thread `name`, `coordinator_name`, `project_dir`, `messaging` (the
+by-name line, or the by-address line for a thread in another account, chosen at spawn). Both get
 `instructions.md` appended under `## Project instructions` when it isn't empty.
 
 The coordinator's UserPromptSubmit hook runs `claude agents` (≤5 s; stored rows if it fails, logged),

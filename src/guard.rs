@@ -20,6 +20,17 @@ pub struct Member {
     pub cleaned: bool,
     /// A sync found its session removed outside chief (§5); its worktree may remain.
     pub removed: bool,
+    /// Set when it runs in another Claude account than the coordinator (§3).
+    pub elsewhere: Option<Elsewhere>,
+}
+
+/// A thread's own account, which only its own account's `claude agents` lists.
+#[derive(Debug, Clone)]
+pub struct Elsewhere {
+    /// The account's name for messages (its agp label).
+    pub label: String,
+    /// A fresh `claude agents` of that account, or why chief couldn't take one.
+    pub snapshot: Result<Vec<AgentRow>, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,8 +44,11 @@ pub struct GuardInput<'a> {
     /// The coordinator's row; None before `chief up` first started it.
     pub coordinator: Option<&'a Member>,
     pub threads: &'a [Member],
-    /// A fresh `claude agents --json --all` snapshot (every state).
+    /// A fresh `claude agents --json --all` snapshot (every state) of the coordinator's account,
+    /// the project's (§3).
     pub snapshot: &'a [AgentRow],
+    /// For a thread's call: the label of its own account when that isn't its coordinator's.
+    pub caller_elsewhere: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +70,11 @@ pub const BARE_NAME: &str = "Use the bare name, without a `[ref]`: chief matches
 /// What a thread can do instead of messaging its coordinator.
 const REPORT_INSTEAD: &str = "Just finish your turn: your final message is recorded as your \
                               report when you stop anyway, and the coordinator reads it there.";
+/// What a thread in another account than its coordinator's can do instead.
+const REPLY_INSTEAD: &str = "To answer a message from it, send your reply to the exact \
+                             `from=\"uds:…\"` address in that message's header. Otherwise just \
+                             finish your turn: your final message is recorded as your report, \
+                             and the coordinator reads it there.";
 
 /// Shared by the guard, `wake_thread` and reopening: a cleaned thread has no session left.
 pub fn cleaned_message(name: &str) -> String {
@@ -104,13 +123,21 @@ pub fn evaluate(input: &GuardInput) -> Decision {
     }
 }
 
-/// Allowed: the exact name of one of this project's threads, or the exact socket address of
-/// one, when that thread can be reached (`reach_thread`).
+/// Allowed: the exact name of one of this project's threads in the coordinator's account, or
+/// the exact socket address of any of them, when that thread can be reached (`reach_thread`).
+/// A thread in another account is reached only by address: there its name reaches nothing, or
+/// another session (§1).
 fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
     if let Some(thread) = input.threads.iter().find(|t| t.name == to) {
-        return match reach_thread(input, thread) {
-            Ok(_) => Decision::Allow,
-            Err(reason) => Decision::Deny(reason),
+        return match (reach_thread(input, thread), &thread.elsewhere) {
+            (Ok(_), None) => Decision::Allow,
+            (Ok(pid), Some(e)) => Decision::Deny(format!(
+                "{to} runs in another Claude account ({}), where names don't reach: message it \
+                 at its address {} (list_threads shows it).",
+                e.label,
+                uds_address(pid)
+            )),
+            (Err(reason), _) => Decision::Deny(reason),
         };
     }
     if to.starts_with("uds:") {
@@ -118,14 +145,31 @@ fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
             .threads
             .iter()
             .any(|t| reach_thread(input, t).is_ok_and(|pid| uds_address(pid) == to));
-        return if reply {
-            Decision::Allow
+        if reply {
+            return Decision::Allow;
+        }
+        let unchecked: Vec<String> = input
+            .threads
+            .iter()
+            .filter(|t| !t.resolved && !t.cleaned && !t.removed)
+            .filter_map(|t| {
+                let e = t.elsewhere.as_ref()?;
+                let why = e.snapshot.as_ref().err()?;
+                Some(format!("{} ({}: {why})", t.name, e.label))
+            })
+            .collect();
+        let unchecked = if unchecked.is_empty() {
+            String::new()
         } else {
-            Decision::Deny(format!(
-                "{to} is not the address of a live thread of this project; message threads by \
-                 name."
-            ))
+            format!(
+                " chief couldn't list the accounts of {}.",
+                unchecked.join(", ")
+            )
         };
+        return Decision::Deny(format!(
+            "{to} is not the address of a live thread of this project; message threads at the \
+             address list_threads gives.{unchecked}"
+        ));
     }
     Decision::Deny(format!(
         "{to} is not a thread of this project. Call list_threads for the names; start a thread \
@@ -147,6 +191,13 @@ fn thread_send(input: &GuardInput, to: &str) -> Decision {
         None => Reach::Asleep,
     };
     if to == coordinator {
+        // From another account the name reaches nothing, or a session of that account's.
+        if let Some(label) = input.caller_elsewhere {
+            return Decision::Deny(format!(
+                "You run in another Claude account ({label}) than your coordinator, and \
+                 {coordinator}'s name doesn't reach across accounts. {REPLY_INSTEAD}"
+            ));
+        }
         return match reached {
             Reach::Live(_) => Decision::Allow,
             Reach::Asleep => Decision::Deny(format!(
@@ -183,7 +234,18 @@ fn reach_thread(input: &GuardInput, thread: &Member) -> Result<u32, String> {
         return Err(RESOLVED.to_string());
     }
     let name = &thread.name;
-    match reach(thread, name, input.snapshot) {
+    // Only its own account lists it (§1).
+    let snapshot = match &thread.elsewhere {
+        None => input.snapshot,
+        Some(e) => e.snapshot.as_deref().map_err(|why| {
+            format!(
+                "chief couldn't list {name}'s Claude account ({}) to check it ({why}); message \
+                 not sent.",
+                e.label
+            )
+        })?,
+    };
+    match reach(thread, name, snapshot) {
         Reach::Live(pid) => Ok(pid),
         Reach::Asleep => Err(ASLEEP.to_string()),
         Reach::Renamed(now) => Err(format!(
@@ -286,6 +348,7 @@ mod tests {
             resolved: false,
             cleaned: false,
             removed: false,
+            elsewhere: None,
         }
     }
 
@@ -377,6 +440,7 @@ mod tests {
             coordinator: Some(&coordinator),
             threads: &threads,
             snapshot: &snapshot,
+            caller_elsewhere: None,
         };
         let got = evaluate(&input);
         let case = format!("{role:?} {tool} {to:?}");
@@ -649,6 +713,119 @@ mod tests {
         for (role, tool, to, coord_pid, want) in cases {
             check(role, tool, to, coord_pid, want);
         }
+    }
+
+    /// Threads in another account than the coordinator's (§3): only their address reaches them,
+    /// checked in their own account's listing with the same identity rules; a thread there
+    /// can't reach its coordinator by name either.
+    #[test]
+    fn across_accounts() {
+        let coordinator = member("chief-p", "coord");
+        // The coordinator's account lists only the coordinator and a session that took a
+        // far thread's name; PB2 lists the far threads.
+        let here = vec![
+            row("coord", Some("chief-p"), Some(COORD_PID)),
+            row("someone", Some("p-far-1a2b"), Some(400)),
+        ];
+        let pb2 = vec![
+            row("far", Some("p-far-1a2b"), Some(701)),
+            row("far-renamed", Some("p-other-name"), Some(702)),
+            row("far-dup", Some("p-far-dup-3333"), Some(703)),
+            row("x-dup", Some("p-far-dup-3333"), None),
+            row("far-asleep", Some("p-far-asleep-4444"), None),
+        ];
+        let elsewhere = |snapshot: Result<Vec<AgentRow>, String>| {
+            Some(Elsewhere {
+                label: "PB2".into(),
+                snapshot,
+            })
+        };
+        let far = |name: &str, sid: &str| Member {
+            elsewhere: elsewhere(Ok(pb2.clone())),
+            ..member(name, sid)
+        };
+        let threads = vec![
+            far("p-far-1a2b", "far"),
+            far("p-far-renamed-2222", "far-renamed"),
+            far("p-far-dup-3333", "far-dup"),
+            far("p-far-asleep-4444", "far-asleep"),
+            Member {
+                elsewhere: elsewhere(Err("timed out".into())),
+                ..member("p-unlisted-5555", "unlisted")
+            },
+        ];
+        let decide = |role: Role, to: &str, caller: Option<&str>| {
+            evaluate(&GuardInput {
+                role,
+                tool: "SendMessage",
+                to: Some(to),
+                coordinator_name: "chief-p",
+                coordinator: Some(&coordinator),
+                threads: &threads,
+                snapshot: &here,
+                caller_elsewhere: caller,
+            })
+        };
+        let denied = |d: Decision, part: &str| match d {
+            Decision::Deny(r) => assert!(r.contains(part), "{r:?} lacks {part:?}"),
+            Decision::Allow => panic!("allowed, want {part:?}"),
+        };
+        use Role::{Coordinator as C, Thread as T};
+
+        // By address: checked in PB2's listing.
+        assert_eq!(
+            decide(C, "uds:/tmp/cc-socks/701.sock", None),
+            Decision::Allow
+        );
+        // By name: the name may reach someone else (pid 400 here); the denial gives the address.
+        denied(
+            decide(C, "p-far-1a2b", None),
+            "runs in another Claude account (PB2), where names don't reach: message it at its \
+             address uds:/tmp/cc-socks/701.sock",
+        );
+        // The same identity checks, in its own account.
+        denied(
+            decide(C, "uds:/tmp/cc-socks/702.sock", None),
+            "not the address",
+        );
+        denied(decide(C, "p-far-renamed-2222", None), "renamed");
+        denied(
+            decide(C, "uds:/tmp/cc-socks/703.sock", None),
+            "not the address",
+        );
+        denied(decide(C, "p-far-dup-3333", None), "ambiguous");
+        denied(decide(C, "p-far-asleep-4444", None), ASLEEP);
+        // Never another account's session at that address: 400 is in the coordinator's.
+        denied(
+            decide(C, "uds:/tmp/cc-socks/400.sock", None),
+            "not the address",
+        );
+        // An account chief couldn't list: denied, saying so.
+        denied(
+            decide(C, "p-unlisted-5555", None),
+            "couldn't list p-unlisted-5555's Claude account (PB2) to check it (timed out)",
+        );
+        denied(
+            decide(C, "uds:/tmp/cc-socks/999.sock", None),
+            "couldn't list the accounts of p-unlisted-5555 (PB2: timed out)",
+        );
+
+        // A thread in PB2: its coordinator only at its socket address, checked in the
+        // coordinator's own account's listing.
+        denied(
+            decide(T, "chief-p", Some("PB2")),
+            "You run in another Claude account (PB2) than your coordinator",
+        );
+        denied(decide(T, "chief-p", Some("PB2")), "from=\"uds:");
+        assert_eq!(
+            decide(T, &uds_address(COORD_PID), Some("PB2")),
+            Decision::Allow
+        );
+        denied(
+            decide(T, "uds:/tmp/cc-socks/701.sock", Some("PB2")),
+            "only their coordinator",
+        );
+        assert_eq!(decide(T, "chief-p", None), Decision::Allow);
     }
 
     #[test]

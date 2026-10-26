@@ -315,6 +315,12 @@ fn start_thread_runs_in_the_best_pool_account_that_trusts_the_repo() {
     let bg: Vec<_> = accounts.iter().filter(|(f, _)| f == "--bg").collect();
     assert_eq!(bg.len(), 1);
     assert_eq!(bg[0].1, cpe, "spawned in PB3");
+    let spawn = &env.fake.calls_of("--bg")[0];
+    let brief = arg_after(spawn, "--append-system-prompt");
+    assert!(
+        brief.contains("You run in another Claude account than your coordinator"),
+        "{brief}"
+    );
     // Free-name check in both accounts, then resolving in PB3 only.
     let mut listed: Vec<_> = accounts
         .iter()

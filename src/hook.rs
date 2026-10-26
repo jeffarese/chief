@@ -15,7 +15,7 @@ use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::state::{HookKind, Role};
 use crate::text::{local_hhmm, one_line};
-use crate::{context, guard, names, paths, registry, tools};
+use crate::{accounts, context, guard, names, paths, registry, tools};
 
 /// The guard holds up a tool call and the context a turn; neither may hang on the supervisor.
 pub const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -144,19 +144,54 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
         .and_then(Value::as_str);
     let conn = db::open(&paths::db())?;
     let rows = db::list_sessions(&conn, project, None)?;
-    // Only a SendMessage with an address needs to know who is alive.
-    let snapshot = if tool == "SendMessage" && to.is_some() {
-        project_claude(project).agents_within(GUARD_AGENTS_TIMEOUT)?
+    let caller_sid = payload.get("session_id").and_then(Value::as_str);
+    let claude = project_claude(project);
+    let project_account = claude.account.clone();
+    // Only a SendMessage with an address needs to know who is alive: in the coordinator's
+    // account, and in the accounts of the threads the message could be for (§3).
+    let (snapshot, others) = if tool == "SendMessage"
+        && let Some(to) = to
+    {
+        let mut wanted = vec![project_account.clone()];
+        if role == Role::Coordinator {
+            for r in rows.iter().filter(|r| reachable_elsewhere(r, to)) {
+                let account = r.account(project_account.as_deref());
+                if !wanted
+                    .iter()
+                    .any(|a| claude::same_account(a.as_deref(), account.as_deref()))
+                {
+                    wanted.push(account);
+                }
+            }
+        }
+        let listings = accounts::list(&claude, &wanted, GUARD_AGENTS_TIMEOUT, db::now_ms);
+        // Without the coordinator's account chief can check nothing: fail closed.
+        let snapshot = listings
+            .project()
+            .context("the project's account was listed")?
+            .agents()?
+            .to_vec();
+        (snapshot, listings.all)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
-    let decision = guard_decision(project, role, tool, to, &rows, &snapshot);
+    let decision = guard_decision_in(
+        project,
+        role,
+        tool,
+        to,
+        &rows,
+        &Accounts {
+            project: project_account.as_deref(),
+            snapshot: &snapshot,
+            others: &others,
+            caller: caller_sid,
+        },
+    );
     let guard::Decision::Deny(reason) = decision else {
         return Ok(None);
     };
-    let caller = payload
-        .get("session_id")
-        .and_then(Value::as_str)
+    let caller = caller_sid
         .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
         .map(|r| r.name.clone());
     db::insert_guard_denial(
@@ -181,7 +216,19 @@ fn project_claude(project: &str) -> Claude {
     Claude::for_account(account)
 }
 
-/// The §6 decision from the project's registry rows and a `claude agents` snapshot.
+/// A thread in another account than the project's that a coordinator's message to `to` could
+/// be for: by its name, or any live one for a socket address.
+fn reachable_elsewhere(row: &SessionRow, to: &str) -> bool {
+    row.role == Role::Thread.as_str()
+        && row.account_id.is_some()
+        && !row.resolved
+        && row.cleaned_at.is_none()
+        && row.removed_at.is_none()
+        && (row.name == to || to.starts_with("uds:"))
+}
+
+/// The §6 decision from the project's registry rows and a `claude agents` snapshot, every
+/// session in the project's account.
 pub fn guard_decision(
     project: &str,
     role: Role,
@@ -190,6 +237,56 @@ pub fn guard_decision(
     rows: &[SessionRow],
     snapshot: &[AgentRow],
 ) -> guard::Decision {
+    let accounts = Accounts {
+        project: None,
+        snapshot,
+        others: &[],
+        caller: None,
+    };
+    guard_decision_in(project, role, tool, to, rows, &accounts)
+}
+
+/// The listings the guard decides on (§3, §6).
+pub struct Accounts<'a> {
+    /// The project's account, the coordinator's.
+    pub project: Option<&'a Path>,
+    /// Its fresh `claude agents`.
+    pub snapshot: &'a [AgentRow],
+    /// Fresh listings of other accounts threads run in (the project's may be among them).
+    pub others: &'a [accounts::Listing],
+    /// The calling session's id, from the hook payload.
+    pub caller: Option<&'a str>,
+}
+
+/// `guard_decision` with threads in other accounts: each is checked in its own account's
+/// listing, and a thread calling from another account than its coordinator's is told so.
+pub fn guard_decision_in(
+    project: &str,
+    role: Role,
+    tool: &str,
+    to: Option<&str>,
+    rows: &[SessionRow],
+    accounts: &Accounts,
+) -> guard::Decision {
+    let elsewhere = |r: &SessionRow| -> Option<guard::Elsewhere> {
+        let account = r.account(accounts.project);
+        if claude::same_account(account.as_deref(), accounts.project) {
+            return None;
+        }
+        let label = r
+            .account_shown()
+            .map(str::to_string)
+            .unwrap_or_else(|| claude::account_label(account.as_deref()));
+        let snapshot = match accounts
+            .others
+            .iter()
+            .find(|l| claude::same_account(l.account(), account.as_deref()))
+        {
+            Some(l) => l.agents.clone(),
+            None => Err("not listed".to_string()),
+        };
+        Some(guard::Elsewhere { label, snapshot })
+    };
     let member = |r: &SessionRow| guard::Member {
         name: r.name.clone(),
         session_id: r.session_id.clone(),
@@ -197,6 +294,9 @@ pub fn guard_decision(
         resolved: r.resolved,
         cleaned: r.cleaned_at.is_some(),
         removed: r.removed_at.is_some(),
+        elsewhere: (r.role == Role::Thread.as_str())
+            .then(|| elsewhere(r))
+            .flatten(),
     };
     let threads: Vec<_> = rows
         .iter()
@@ -207,6 +307,18 @@ pub fn guard_decision(
         .iter()
         .find(|r| r.role == Role::Coordinator.as_str())
         .map(member);
+    let caller_elsewhere = accounts
+        .caller
+        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
+        .filter(|r| r.role == Role::Thread.as_str())
+        .and_then(|r| {
+            let account = r.account(accounts.project);
+            (!claude::same_account(account.as_deref(), accounts.project)).then(|| {
+                r.account_shown()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| claude::account_label(account.as_deref()))
+            })
+        });
     let coordinator_name = names::coordinator_name(project);
     guard::evaluate(&guard::GuardInput {
         role,
@@ -215,7 +327,8 @@ pub fn guard_decision(
         coordinator_name: &coordinator_name,
         coordinator: coordinator.as_ref(),
         threads: &threads,
-        snapshot,
+        snapshot: accounts.snapshot,
+        caller_elsewhere: caller_elsewhere.as_deref(),
     })
 }
 
