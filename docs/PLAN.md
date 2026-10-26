@@ -168,3 +168,80 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | Each subagent recorded under its own session (`teammates`) | Pass |
 | Guard: an Agent named like the coordinator or a project thread denied at spawn; a free name allowed; a thread messaging the coordinator's subagent, the coordinator messaging a thread's subagent, a lead messaging `team-lead` all denied; the thread's own subagent allowed by name and by agent id | Pass (the thread's catch-all denial reworded: it now names subagents, and the reply address for a thread in another account) |
 | `claude respawn` of the thread: SessionStart `resume` forgets its subagents; the old name is denied | Pass |
+
+## Next: threads that wait on subagents or background commands (designed, not built)
+
+Problem (side-agent note after the subagents run): a thread that hands work to a subagent ends its
+turn while it waits. Claude Code then reports it idle, the coordinator's idle notice fires, and
+the board shows it idle, so the coordinator can report half-finished work as done.
+
+### Verified live (Claude Code 2.1.310, Sonnet sessions with a payload-logging hook, 2026-10-26)
+
+Hook payloads: `tests/fixtures/hooks/subagent-wait-events.jsonl` (three leads: a follow-up to an
+idle subagent with a Stop-hook block, a `TaskStop`, and background commands).
+
+- A lead that ends its turn while its subagent works is `status: idle` in `claude agents`, and its
+  `notify_when_idle` subscriber gets "is idle now" right away.
+- Subscribing again to a session that is already idle notifies at once (at the subscriber's next
+  turn boundary), quoting the same turn. Re-subscribing can't wait for the next turn: a
+  coordinator that re-subscribes on every early notice would loop.
+- `SubagentStart` fires at spawn and again each time a message wakes an idle subagent;
+  `SubagentStop` fires at the end of every subagent turn, and on `TaskStop` (then
+  `background_tasks` lists no teammate). So a subagent is busy from `SubagentStart` to
+  `SubagentStop`.
+- When a subagent ends a turn, its lead gets `<teammate-message teammate_id="…">` with
+  `{"type":"idle_notification",…,"result":"<its last reply>"}` and runs a turn. No
+  UserPromptSubmit fires for it, but its Stop does. So the lead always Stops again after its
+  subagents' last `SubagentStop`. A subagent's `SendMessage(to: "team-lead")` can wake the lead
+  before that subagent's own `SubagentStop`.
+- The lead's Stop payload has `background_tasks`: `[{id, type: "teammate" | "shell", status:
+  "running", description, command?}]`. Teammates stay listed as `running` while idle; a
+  subagent's background shells are listed too.
+- A lead's own background command (`run_in_background`) wakes it when it finishes:
+  UserPromptSubmit with `<task-notification>…<status>completed</status>`, then a Stop.
+- **A subagent's background command does not wake the subagent** (seen twice: `sleep 60`, and a
+  real `cargo test`). Its `<task-notification>` is enqueued on the lead's transcript and never
+  dequeued; the subagent stays idle and the lead gets no turn. This is Claude Code's behaviour.
+- A foreground `sleep N` is refused by Bash ("Blocked: standalone sleep"); models then run it in
+  the background.
+- A Stop hook printing `{"decision":"block","reason":"…"}` works in a background session: the lead
+  went on, sent the `SendMessage` the reason asked for (delivered as a cross-session message), and
+  its next Stop had `stop_hook_active: true`.
+
+### Design
+
+1. **Busy subagents.** Migration 12: `teammates.busy`, `sessions.subagents_busy`,
+   `sessions.background_running`, `sessions.stopped_early_at`. In the hook transaction:
+   `SubagentStart` sets busy (after recording the teammate), `SubagentStop` clears it. A lead's
+   own Stop whose `background_tasks` lists no `teammate` clears them all. `subagents_busy` is
+   recounted after each. `background_running` = `background_tasks` entries of type `shell` with
+   status `running` at the lead's last Stop; set at every Stop, cleared by SessionStart (not
+   compact). Subagent hooks still don't change the lead's `last_hook` handling.
+2. **State (§5 rule 5).** Working when the process isn't gone and (`cc_status` busy, or the
+   provisional working hook, or `subagents_busy > 0`, or `background_running > 0`). Waiting rules
+   still come first. A subagent stalled on a background command keeps its thread Working rather
+   than finished.
+3. **The final report.** A thread's Stop with work still running sets `stopped_early_at`. Its
+   Stop with nothing running clears it, and, unless `stop_hook_active`, prints
+   `{"decision":"block","reason":…}` asking it to send its final report to the coordinator at the
+   coordinator's address: its name, or `uds:/tmp/cc-socks/<pid>.sock` for a thread in another
+   account (from a project-account `claude agents`, ≤5 s; no block if the coordinator isn't
+   live or the listing fails). The guard already allows both. Stop notifications (`[ui] notify`)
+   skip early Stops and blocked Stops.
+4. **Coordinator.** Snapshot line and `list_threads` show `N subagents working` /
+   `N background commands`. Prompt: an idle notice from a thread the board shows working isn't
+   a finish: say nothing, don't subscribe again (the notice would come straight back); its final
+   report arrives as a message.
+5. **Thread prompt.** When it ends a turn while subagents or background commands run, it says
+   what it waits for; chief asks for the final report once they're done. Tell subagents to run
+   long commands (tests, builds) in the foreground: a subagent isn't woken when its background
+   command ends.
+6. **Board.** Tags `N subagents` / `N bg commands` on Working rows; detail line.
+7. **Contract.** ARCHITECTURE §1 (the facts above), §5 (hook table, rule 5, the final report),
+   §7 `list_threads`, §8 prompts, the board section; `CLAUDE.md`: hooks print only the guard
+   decision, the coordinator's context and the Stop block.
+8. **Tests.** Derivation rows; hook replay of the fixture (busy counts, early stop, block once,
+   no block with `stop_hook_active`, TaskStop clears); context and tag rendering; migration
+   count 12. Then a live run with chief: a thread on another account whose subagent runs a
+   foreground test command, checking the board, the coordinator's early notice and the final
+   report.
