@@ -677,6 +677,11 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
 
 `chief pane` loop (`src/pane.rs`):
 
+0. Read `project.toml`. When it can't be read, doesn't parse or doesn't validate, print
+   `chief · project.toml can't be used:`, the error indented below it, and
+   `Fix project.toml; retrying every 5 s · q quits`, then read it again after 5 s, reading keys.
+   Nothing is attached, rewritten or respawned meanwhile: step 2 respawns from the file read
+   here, never from stale generated files.
 1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned,
    removed outside chief (`removed_at`, worktree left or not) or never started (no short id),
    means the coordinator, and a stale target is
@@ -692,7 +697,7 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
    run `claude attach <short_id>` as a child on the same TTY, wait, take raw mode back, clear
    `pane_showing`.
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
-   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1.
+   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 0.
 
 `q` while chief has the terminal ends the loop; so does the block being closed or the session
 killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to

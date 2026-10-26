@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +37,8 @@ const WAKE_WAIT: Duration = Duration::from_secs(20);
 const SHORT_ATTACH: Duration = Duration::from_secs(1);
 /// How long attach gets to exit after a hangup before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(2);
+/// How often an unusable project.toml is read again.
+const CONFIG_RETRY: Duration = Duration::from_secs(5);
 
 /// Set by SIGHUP or SIGTERM.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
@@ -98,11 +101,39 @@ pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<Session
     Ok(db::get_coordinator(conn, project)?.filter(|r| r.short_id.is_some()))
 }
 
+/// project.toml as it is now, or the lines the pane shows while it can't be read or doesn't
+/// validate: the pane then neither attaches nor rewrites or respawns from stale files.
+fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
+    ProjectConfig::load(&dir.join("project.toml")).map_err(|e| {
+        let mut lines = vec!["chief · project.toml can't be used:".to_string()];
+        lines.extend(format!("{e:#}").lines().map(|l| format!("  {l}")));
+        lines.push(format!(
+            "Fix project.toml; retrying every {} s · q quits",
+            CONFIG_RETRY.as_secs()
+        ));
+        lines
+    })
+}
+
 fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Result<()> {
+    let dir = project::project_dir(project);
     loop {
         if HUNG_UP.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let config = match project_config(&dir) {
+            Ok(config) => config,
+            Err(lines) => {
+                tty.say(&lines[0])?;
+                for line in &lines[1..] {
+                    tty.note(line)?;
+                }
+                if tty.quit_pressed(CONFIG_RETRY)? {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
         let Some(row) = resolve_target(conn, project)? else {
             tty.say(&format!(
                 "chief · no coordinator yet: run chief up {project} · q quits"
@@ -115,7 +146,7 @@ fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Re
         let name = row.name.clone();
         let short_id = row.short_id.clone().context("target has no short id")?;
         tty.say(&format!("chief · {name} …"))?;
-        if let Err(e) = wake(conn, claude, project, &row, tty) {
+        if let Err(e) = wake(conn, claude, project, (&dir, &config), &row, tty) {
             tty.say(&format!("chief · {name}: {e:#} · retrying · q quits"))?;
             if tty.quit_pressed(RETRY)? {
                 return Ok(());
@@ -161,12 +192,13 @@ fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Re
     }
 }
 
-/// Respawns `row` when `claude agents` shows no process for it and waits for one. A failing
-/// `claude agents` is no reason not to try attaching.
+/// Respawns `row` when `claude agents` shows no process for it and waits for one, from the
+/// project.toml just read. A failing `claude agents` is no reason not to try attaching.
 fn wake(
     conn: &Connection,
     claude: &Claude,
     project: &str,
+    (dir, config): (&Path, &ProjectConfig),
     row: &SessionRow,
     tty: &Tty,
 ) -> Result<()> {
@@ -181,9 +213,7 @@ fn wake(
         return Ok(());
     }
     tty.say(&format!("chief · waking {} …", row.name))?;
-    let dir = project::project_dir(project);
-    let config = ProjectConfig::load(&dir.join("project.toml"))?;
-    project::respawn(conn, claude, &dir, &config, &row, WAKE_WAIT)?;
+    project::respawn(conn, claude, dir, config, &row, WAKE_WAIT)?;
     Ok(())
 }
 
@@ -411,6 +441,34 @@ mod tests {
 
     fn target(conn: &Connection) -> Option<String> {
         resolve_target(conn, "demo").unwrap().map(|r| r.name)
+    }
+
+    /// The reviewer's probe: a malformed project.toml made every wake fail, and the error flashed
+    /// between retries. The pane says what is wrong and what to do, and uses nothing else.
+    #[test]
+    fn an_unusable_project_toml_is_shown_with_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("project.toml");
+        std::fs::write(&toml, "name = \"Demo\"\nslug = [\n").unwrap();
+        let lines = project_config(dir.path()).unwrap_err();
+        assert_eq!(lines[0], "chief · project.toml can't be used:");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("parsing") && l.contains("project.toml")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "Fix project.toml; retrying every 5 s · q quits"
+        );
+        assert!(lines.iter().all(|l| !l.contains('\n')), "{lines:?}");
+
+        // A valid one is used as it is now.
+        crate::config::ProjectConfig::new("Demo", "demo", None, vec![])
+            .save(&toml)
+            .unwrap();
+        assert_eq!(project_config(dir.path()).unwrap().slug, "demo");
     }
 
     #[test]
