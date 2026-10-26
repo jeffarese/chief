@@ -71,10 +71,9 @@ pub fn run(project: &str) -> Result<()> {
     if db::project_dir(&conn, project)?.is_none() {
         bail!("no chief project {project:?}");
     }
-    let claude = Claude::from_env();
     catch_hangup();
     let tty = Tty::take()?;
-    let result = pane_loop(&conn, &claude, project, &tty);
+    let result = pane_loop(&conn, project, &tty);
     let _ = db::set_pane_showing(&conn, project, None);
     drop(tty);
     result
@@ -115,7 +114,7 @@ fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
     })
 }
 
-fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Result<()> {
+fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
     let dir = project::project_dir(project);
     loop {
         if HUNG_UP.load(Ordering::SeqCst) {
@@ -134,6 +133,8 @@ fn pane_loop(conn: &Connection, claude: &Claude, project: &str, tty: &Tty) -> Re
                 continue;
             }
         };
+        // The project's account, whatever the block's shell names (§3).
+        let claude = &Claude::for_account(config.claude_config_dir.clone());
         let Some(row) = resolve_target(conn, project)? else {
             tty.say(&format!(
                 "chief · no coordinator yet: run chief up {project} · q quits"
@@ -206,7 +207,14 @@ fn wake(
     let Ok(snapshot) = claude.agents() else {
         return Ok(());
     };
-    registry::sync(conn, project, &snapshot, taken_at, db::now_ms())?;
+    registry::sync_in(
+        conn,
+        project,
+        &snapshot,
+        taken_at,
+        db::now_ms(),
+        &claude.config_dir,
+    )?;
     let row =
         db::get_session(conn, &row.name)?.with_context(|| format!("{} vanished", row.name))?;
     if row.pid.is_some() {
@@ -219,7 +227,7 @@ fn wake(
 
 /// Runs `claude attach <short_id>` on this terminal and waits for it.
 fn attach(claude: &Claude, short_id: &str) -> Result<ExitStatus> {
-    let mut cmd = Command::new(&claude.bin);
+    let mut cmd = claude.command();
     cmd.args(["attach", short_id]);
     with_default_tstp(&mut cmd);
     let child = cmd

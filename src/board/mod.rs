@@ -45,7 +45,9 @@ pub fn run(project: &str) -> Result<()> {
         dir: dir.clone(),
         db: paths::db(),
         claude_bin: crate::claude::Claude::from_env().bin,
-        claude_dir: crate::claude::claude_dir(),
+        // The project's account, whatever the block's shell names (§3).
+        claude_account: config.claude_config_dir.clone(),
+        claude_dir: crate::claude::claude_dir(config.claude_config_dir.as_deref()),
         gh_bin: crate::pr::Gh::from_env().bin,
         rex_bin: crate::mux::rex::Rex::from_env().bin,
     };

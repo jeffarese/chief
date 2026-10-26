@@ -37,9 +37,11 @@ impl Fake {
         Gh::new(self.bin())
     }
 
+    /// The default account, whose folder is `config_dir` (as `CHIEF_CLAUDE_DIR` makes it).
     pub fn claude(&self) -> Claude {
         Claude {
             bin: self.bin(),
+            account: None,
             config_dir: self.config_dir(),
         }
     }
@@ -119,6 +121,29 @@ impl Fake {
         let text = std::fs::read_to_string(self.dir.path().join(format!("calls/{n}.cwd"))).unwrap();
         PathBuf::from(text.trim())
     }
+
+    /// The account (`CLAUDE_CONFIG_DIR`) of every call so far, with its first argument;
+    /// `unset` for the default account.
+    pub fn accounts(&self) -> Vec<(String, String)> {
+        self.calls()
+            .into_iter()
+            .enumerate()
+            .map(|(n, args)| {
+                let env = std::fs::read_to_string(self.dir.path().join(format!("calls/{n}.env")))
+                    .unwrap();
+                (args.first().cloned().unwrap_or_default(), env)
+            })
+            .collect()
+    }
+}
+
+/// A Claude Code account folder of its own (`CLAUDE_CONFIG_DIR`): its trust file, and canned
+/// `claude agents` output the fake serves under it.
+pub fn account(parent: &Path, name: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".claude.json"), "{}").unwrap();
+    dir.canonicalize().unwrap()
 }
 
 /// `~/.claude.json` stand-in that trusts `folders` (canonical paths).
@@ -213,7 +238,32 @@ impl Home {
     }
 
     pub fn run(&self, args: &[&str], stdin: &str) -> Output {
-        let mut child = self.command(args).spawn().unwrap();
+        self.command(args).output_with_stdin(stdin)
+    }
+
+    pub fn db(&self) -> rusqlite::Connection {
+        chief::db::open(&self.home.path().join("chief.db")).unwrap()
+    }
+
+    /// Registers project `slug` with a default project.toml (the default account), as
+    /// `chief init` leaves it, without the other files.
+    pub fn register(&self, slug: &str) {
+        let dir = self.home.path().join("projects").join(slug);
+        chief::config::ProjectConfig::new(slug, slug, None, vec![])
+            .save(&dir.join("project.toml"))
+            .unwrap();
+        chief::db::register_project(&self.db(), slug, &dir, 0).unwrap();
+    }
+}
+
+/// Runs a piped command (`Home::command`) with `stdin` as its input.
+pub trait OutputWithStdin {
+    fn output_with_stdin(&mut self, stdin: &str) -> Output;
+}
+
+impl OutputWithStdin for Command {
+    fn output_with_stdin(&mut self, stdin: &str) -> Output {
+        let mut child = self.spawn().unwrap();
         child
             .stdin
             .take()
@@ -221,10 +271,6 @@ impl Home {
             .write_all(stdin.as_bytes())
             .unwrap();
         child.wait_with_output().unwrap()
-    }
-
-    pub fn db(&self) -> rusqlite::Connection {
-        chief::db::open(&self.home.path().join("chief.db")).unwrap()
     }
 }
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use crate::claude::{Claude, RmOutcome};
+use crate::claude::{self, Claude, RmOutcome};
 use crate::db::{self, SessionRow};
 use crate::pr::{self, Gh};
 use crate::state::{self, Group, Role};
@@ -436,17 +436,27 @@ fn shared(ctx: &Ctx, row: &SessionRow, ins: &Inspection) -> Result<Option<String
 pub const SHARED_WORKTREE: &str = "is also the worktree of";
 
 /// Another registered session (any project of this chief home) whose job state names the same
-/// worktree, if any.
+/// worktree, if any. Each session's job state is in its own project's account folder; one whose
+/// project.toml can't say is looked up in this project's.
 fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<String>> {
     let wt = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
+    let mut folders: Vec<(String, PathBuf)> =
+        vec![(row.project_slug.clone(), ctx.claude.config_dir.clone())];
     for other in db::all_sessions(ctx.conn)? {
-        if other.name == row.name {
+        let Some(short) = other.short_id.as_deref().filter(|_| other.name != row.name) else {
             continue;
-        }
-        let theirs = other
-            .short_id
-            .as_deref()
-            .and_then(|s| ctx.claude.job_worktree(s));
+        };
+        let folder = match folders.iter().find(|(slug, _)| *slug == other.project_slug) {
+            Some((_, folder)) => folder.clone(),
+            None => {
+                let folder = crate::project::account_of(&other.project_slug)
+                    .map(|account| claude::claude_dir(account.as_deref()))
+                    .unwrap_or_else(|_| ctx.claude.config_dir.clone());
+                folders.push((other.project_slug.clone(), folder.clone()));
+                folder
+            }
+        };
+        let theirs = claude::job_worktree(&folder, short);
         if theirs.is_some_and(|p| p.canonicalize().unwrap_or(p) == wt) {
             return Ok(Some(other.name));
         }
@@ -605,6 +615,7 @@ pub fn render_gc(slug: &str, verdicts: &[(String, Verdict)]) -> String {
 /// `chief gc [<slug>] [--dry-run]`.
 pub fn run_gc(slug: Option<&str>, dry_run: bool) -> Result<()> {
     let conn = db::open(&paths::db())?;
+    let slug_given = slug.is_some();
     let slugs: Vec<String> = match slug {
         Some(slug) => {
             if db::project_dir(&conn, slug)?.is_none() {
@@ -617,15 +628,26 @@ pub fn run_gc(slug: Option<&str>, dry_run: bool) -> Result<()> {
             .map(|(s, _)| s)
             .collect(),
     };
-    let claude = Claude::from_env();
     let gh = Gh::from_env();
-    let ctx = Ctx {
-        conn: &conn,
-        claude: &claude,
-        gh: &gh,
-        now: db::now_ms,
-    };
     for slug in &slugs {
+        // Each project in its own account (§3); across projects, no note about the shell's.
+        let account = match crate::project::account_of(slug) {
+            Ok(account) => account,
+            Err(e) => {
+                eprintln!("warning: {slug} skipped: {e:#}");
+                continue;
+            }
+        };
+        if slug_given && let Some(note) = claude::account_note(slug, account.as_deref()) {
+            eprintln!("{note}");
+        }
+        let claude = Claude::for_account(account);
+        let ctx = Ctx {
+            conn: &conn,
+            claude: &claude,
+            gh: &gh,
+            now: db::now_ms,
+        };
         let done = gc(&ctx, slug, dry_run)?;
         for w in &done.warnings {
             eprintln!("warning: {w}");
@@ -695,7 +717,7 @@ pub fn run_clean(slug: &str, thread: &str, discard: bool, yes: bool) -> Result<(
         Some(r) if r.project_slug == slug && r.role == Role::Thread.as_str() => {}
         _ => bail!("{name} is not a thread of {slug}; chief status {slug} lists them"),
     }
-    let claude = Claude::from_env();
+    let claude = crate::project::claude_for_slug(slug)?;
     let gh = Gh::from_env();
     let ctx = Ctx {
         conn: &conn,

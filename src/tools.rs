@@ -143,7 +143,14 @@ pub fn board_order(rows: &mut [SessionRow]) {
 pub fn refresh(ctx: &ToolCtx) -> Result<Vec<AgentRow>> {
     let taken_at = (ctx.now)();
     let rows = ctx.claude.agents()?;
-    registry::sync(ctx.conn, ctx.slug(), &rows, taken_at, (ctx.now)())?;
+    registry::sync_in(
+        ctx.conn,
+        ctx.slug(),
+        &rows,
+        taken_at,
+        (ctx.now)(),
+        &ctx.claude.config_dir,
+    )?;
     Ok(rows)
 }
 

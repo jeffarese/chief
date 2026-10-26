@@ -591,7 +591,7 @@ fn cli_discard_keeps_commits_it_did_not_show() {
     let home = Home::new();
     {
         let conn = home.db();
-        db::register_project(&conn, "demo", home.path(), 0).unwrap();
+        home.register("demo");
         let mut row = SessionRow::new("demo-x-1111", "demo", Role::Thread, NOW);
         row.short_id = Some(SHORT.into());
         row.session_id = Some("t-sid".into());
@@ -996,7 +996,7 @@ fn cli_gc_and_clean() {
     std::fs::write(wt.join("dirty.txt"), "x").unwrap();
     {
         let conn = home.db();
-        db::register_project(&conn, "demo", home.path(), 0).unwrap();
+        home.register("demo");
         let mut row = SessionRow::new("demo-cli-1111", "demo", Role::Thread, NOW);
         row.short_id = Some("cli1".into());
         row.session_id = Some("sid-cli1".into());

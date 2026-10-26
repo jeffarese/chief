@@ -30,7 +30,9 @@ pub struct Sources {
     pub dir: PathBuf,
     pub db: PathBuf,
     pub claude_bin: PathBuf,
-    /// Claude Code's config folder, for job state (`claude::claude_dir`).
+    /// The project's Claude Code account (`ProjectConfig::claude_config_dir`).
+    pub claude_account: Option<PathBuf>,
+    /// Its config folder, for job state (`claude::claude_dir`).
     pub claude_dir: PathBuf,
     pub gh_bin: PathBuf,
     /// `rex`, for switching the layout's main pane.
@@ -41,6 +43,7 @@ impl Sources {
     pub fn claude(&self) -> Claude {
         Claude {
             bin: self.claude_bin.clone(),
+            account: self.claude_account.clone(),
             config_dir: self.claude_dir.clone(),
         }
     }

@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::claude::{self, Claude, RESOLVE_TIMEOUT};
+use crate::claude::{Claude, RESOLVE_TIMEOUT};
 use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
 use crate::config::ProjectConfig;
 use crate::mux::rex::Rex;
@@ -97,7 +97,7 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
     let conn = db::open(&src.db)?;
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
     let claude = src.claude();
-    let trust_config = claude::claude_config_path();
+    let trust_config = claude.trust_config();
     let ctx = ToolCtx {
         conn: &conn,
         config: &config,

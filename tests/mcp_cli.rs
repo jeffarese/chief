@@ -3,7 +3,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::ChildStdin;
+use std::process::{Child, ChildStdin};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -43,15 +43,8 @@ impl Client {
     }
 }
 
-#[test]
-fn serves_the_tools_over_stdio() {
-    let home = Home::new();
-    home.fake
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
-        .set("agents.stdout", "[]");
-    assert!(home.run(&["init", "Demo"], "").status.success());
-
-    let mut child = home.command(&["mcp", "--project", "demo"]).spawn().unwrap();
+/// Reads the server's stdout and completes the MCP handshake.
+fn connect(child: &mut Child) -> Client {
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -65,7 +58,6 @@ fn serves_the_tools_over_stdio() {
         stdin: child.stdin.take().unwrap(),
         lines: rx,
     };
-
     client.send(
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18",
@@ -76,6 +68,46 @@ fn serves_the_tools_over_stdio() {
     let init = client.response(1);
     assert_eq!(init["result"]["serverInfo"]["name"], "chief", "{init}");
     client.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    client
+}
+
+/// The tools ask the project's account, whatever account the server's environment names.
+#[test]
+fn tools_run_in_the_projects_account() {
+    let home = Home::new();
+    home.fake
+        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("agents.stdout", "[]");
+    let carlos = common::account(home.path(), "claude-carlos");
+    let mut init = home.command(&["init", "Demo"]);
+    init.env("CLAUDE_CONFIG_DIR", &carlos);
+    assert!(init.output().unwrap().status.success());
+    std::fs::write(carlos.join("fake-agents.stdout"), "[]").unwrap();
+    let before = home.fake.accounts().len();
+
+    let mut child = home.command(&["mcp", "--project", "demo"]).spawn().unwrap();
+    let mut client = connect(&mut child);
+    let result = client.call(2, "list_threads", Value::Null);
+    assert_eq!(result["isError"], false, "{result}");
+    drop(client);
+    assert!(child.wait().unwrap().success());
+    let asked = home.fake.accounts()[before..].to_vec();
+    assert_eq!(
+        asked,
+        [("agents".to_string(), carlos.to_string_lossy().into_owned())]
+    );
+}
+
+#[test]
+fn serves_the_tools_over_stdio() {
+    let home = Home::new();
+    home.fake
+        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("agents.stdout", "[]");
+    assert!(home.run(&["init", "Demo"], "").status.success());
+
+    let mut child = home.command(&["mcp", "--project", "demo"]).spawn().unwrap();
+    let mut client = connect(&mut child);
 
     client.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let list = client.response(2);

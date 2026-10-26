@@ -89,6 +89,13 @@ fn init_creates_the_project() {
 
     let config = ProjectConfig::load(&dir.join("project.toml")).unwrap();
     assert_eq!(config.goal.as_deref(), Some("Hold p95 under 200 ms"));
+    // Made without CLAUDE_CONFIG_DIR: the default account, and no key for it.
+    assert_eq!(config.claude_config_dir, None);
+    assert!(
+        !std::fs::read_to_string(dir.join("project.toml"))
+            .unwrap()
+            .contains("claude_config_dir")
+    );
     let names: Vec<_> = config
         .repos
         .iter()
@@ -158,17 +165,18 @@ fn init_creates_the_project() {
     );
 }
 
-/// With `CLAUDE_CONFIG_DIR` set (one folder per account), trust comes from that folder's
-/// `.claude.json`, and every generated command carries the folder: each account has its own
-/// supervisor, sessions and job state.
+/// With `CLAUDE_CONFIG_DIR` set (one folder per account), the project belongs to that account:
+/// project.toml records it, trust comes from that folder's `.claude.json`, and every generated
+/// command carries the folder: each account has its own supervisor, sessions and job state.
 #[test]
 fn init_follows_claude_config_dir() {
     let home = Home::new();
     version_ok(&home);
     let (a, b) = repos(&home);
-    let account = home.path().join("claude-account");
-    std::fs::create_dir_all(&account).unwrap();
+    let account = common::account(home.path(), "claude-account");
     trust_file(&account.join(".claude.json"), &[&a, &b]);
+    // The default account's trust file trusts everything: it doesn't count for this project.
+    trust_file(&home.trust, &[&a, &b, home.path()]);
     let mut cmd = home.command(&[
         "init",
         "Payments Latency",
@@ -177,23 +185,34 @@ fn init_follows_claude_config_dir() {
         "--repo",
         b.to_str().unwrap(),
     ]);
-    cmd.env_remove("CHIEF_CLAUDE_CONFIG")
-        .env("CLAUDE_CONFIG_DIR", &account);
+    cmd.env("CLAUDE_CONFIG_DIR", &account);
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     let dir = project_dir(&home);
+    let config = ProjectConfig::load(&dir.join("project.toml")).unwrap();
+    assert_eq!(config.claude_config_dir.as_deref(), Some(account.as_path()));
     // Only the new project folder is untrusted; the repos are trusted in the account's file.
-    assert!(
-        text.contains(&format!("cd {} && claude", dir.display())),
-        "{text}"
-    );
+    // Trusting it means running Claude in that account.
+    let in_account = |folder: &Path| {
+        format!(
+            "cd {} && CLAUDE_CONFIG_DIR={} claude",
+            folder.display(),
+            account.display()
+        )
+    };
+    assert!(text.contains(&in_account(&dir)), "{text}");
     for repo in [&a, &b] {
-        assert!(
-            !text.contains(&format!("cd {} && claude", repo.display())),
-            "{text}"
-        );
+        assert!(!text.contains(&in_account(repo)), "{text}");
     }
+    assert!(
+        home.fake
+            .accounts()
+            .iter()
+            .all(|(_, env)| env == account.to_str().unwrap()),
+        "{:?}",
+        home.fake.accounts()
+    );
     let mcp = read_json(&dir.join("generated/mcp.json"));
     assert_eq!(
         mcp["mcpServers"]["chief"]["env"]["CLAUDE_CONFIG_DIR"],
@@ -203,6 +222,193 @@ fn init_follows_claude_config_dir() {
     assert!(
         coord.contains(&format!("CLAUDE_CONFIG_DIR={}", account.display())),
         "{coord}"
+    );
+}
+
+/// The reviewer's probe: `chief up` from a shell set for another account (or none). The project
+/// keeps its account: every Claude Code call runs with it, trust is checked in its file, and
+/// stderr says so once.
+#[test]
+fn up_runs_every_claude_call_in_the_projects_account() {
+    let home = Home::new();
+    version_ok(&home);
+    let carlos = common::account(home.path(), "claude-carlos");
+    let mut cmd = home.command(&["init", "Payments Latency"]);
+    cmd.env("CLAUDE_CONFIG_DIR", &carlos);
+    assert!(cmd.output().unwrap().status.success());
+    let dir = project_dir(&home);
+    trust_file(&carlos.join(".claude.json"), &[&dir]);
+    let name = "chief-payments-latency";
+    let mut ours = agent("c0ffee", "coord-sid", name, "done", Some(74112));
+    ours["cwd"] = dir.to_string_lossy().into_owned().into();
+    std::fs::write(
+        carlos.join("fake-bg.stdout"),
+        format!("backgrounded · c0ffee · {name}\n"),
+    )
+    .unwrap();
+    // Carlos's supervisor lists nothing before the spawn, then the new coordinator; the default
+    // account's lists nothing at all.
+    home.fake.set("agents.stdout", "[]");
+    std::fs::write(
+        carlos.join(format!("fake-agents.stdout.{}", next_agents_call(&home))),
+        "[]",
+    )
+    .unwrap();
+    std::fs::write(carlos.join("fake-agents.stdout"), json!([ours]).to_string()).unwrap();
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let row = db::get_coordinator(&home.db(), SLUG).unwrap().unwrap();
+    assert_eq!(row.short_id.as_deref(), Some("c0ffee"));
+    let accounts = home.fake.accounts();
+    assert!(accounts.iter().any(|(first, _)| first == "--bg"));
+    for (first, env) in &accounts {
+        assert_eq!(env, carlos.to_str().unwrap(), "{first}");
+    }
+    let err = stderr(&out);
+    assert_eq!(
+        err.matches("belongs to the Claude Code account").count(),
+        1,
+        "{err}"
+    );
+    assert!(err.contains(&carlos.display().to_string()), "{err}");
+    assert!(
+        stdout(&out).contains(&format!(
+            "CLAUDE_CONFIG_DIR={} claude attach c0ffee",
+            carlos.display()
+        )),
+        "{}",
+        stdout(&out)
+    );
+
+    // Run from the project's own account: nothing to say.
+    let mut cmd = home.command(&["up", SLUG]);
+    cmd.env("CLAUDE_CONFIG_DIR", &carlos);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("belongs to the Claude Code account"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A project without the key belongs to the default account, even when chief runs under another.
+#[test]
+fn a_project_without_an_account_runs_in_the_default_one() {
+    let home = Home::new();
+    version_ok(&home);
+    assert!(home.run(&["init", "Payments Latency"], "").status.success());
+    let dir = project_dir(&home);
+    trust_file(&home.trust, &[&dir]);
+    let carlos = common::account(home.path(), "claude-carlos");
+    let mut ours = agent(
+        "c0ffee",
+        "coord-sid",
+        "chief-payments-latency",
+        "done",
+        Some(7),
+    );
+    ours["cwd"] = dir.to_string_lossy().into_owned().into();
+    {
+        let mut row = db::SessionRow::new(
+            "chief-payments-latency",
+            SLUG,
+            chief::state::Role::Coordinator,
+            db::now_ms(),
+        );
+        row.short_id = Some("c0ffee".into());
+        db::insert_session(&home.db(), &row).unwrap();
+    }
+    home.fake.set("agents.stdout", &json!([ours]).to_string());
+    std::fs::write(carlos.join("fake-agents.stdout"), "[]").unwrap();
+    let mut cmd = home.command(&["up", SLUG]);
+    cmd.env("CLAUDE_CONFIG_DIR", &carlos);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("already running"), "{}", stdout(&out));
+    for (first, env) in home.fake.accounts() {
+        assert_eq!(env, "unset", "{first}");
+    }
+    let err = stderr(&out);
+    assert!(
+        err.contains("belongs to the default Claude Code account"),
+        "{err}"
+    );
+    let mcp = read_json(&dir.join("generated/mcp.json"));
+    assert!(
+        mcp["mcpServers"]["chief"]["env"]
+            .get("CLAUDE_CONFIG_DIR")
+            .is_none(),
+        "{mcp}"
+    );
+}
+
+/// `chief status` across projects of two accounts: one `claude agents` per account, each
+/// project synced with its own.
+#[test]
+fn status_takes_one_snapshot_per_account() {
+    let home = Home::new();
+    version_ok(&home);
+    assert!(home.run(&["init", "Alpha"], "").status.success());
+    assert!(home.run(&["init", "Gamma"], "").status.success());
+    let carlos = common::account(home.path(), "claude-carlos");
+    let mut cmd = home.command(&["init", "Beta"]);
+    cmd.env("CLAUDE_CONFIG_DIR", &carlos);
+    assert!(cmd.output().unwrap().status.success());
+    let conn = home.db();
+    for (slug, short) in [("alpha", "a1"), ("beta", "b1"), ("gamma", "g1")] {
+        let name = format!("chief-{slug}");
+        let mut row =
+            db::SessionRow::new(&name, slug, chief::state::Role::Coordinator, db::now_ms());
+        row.short_id = Some(short.into());
+        row.session_id = Some(format!("{short}-sid"));
+        db::insert_session(&conn, &row).unwrap();
+    }
+    home.fake.set(
+        "agents.stdout",
+        &json!([
+            agent("a1", "a1-sid", "chief-alpha", "done", Some(1)),
+            agent("g1", "g1-sid", "chief-gamma", "done", Some(3)),
+        ])
+        .to_string(),
+    );
+    std::fs::write(
+        carlos.join("fake-agents.stdout"),
+        json!([agent("b1", "b1-sid", "chief-beta", "done", Some(2))]).to_string(),
+    )
+    .unwrap();
+    let before = home.fake.accounts().len();
+    let out = home.run(&["status"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for slug in ["alpha", "beta", "gamma"] {
+        assert!(
+            text.contains(&format!("coordinator chief-{slug} (")),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&format!("coordinator chief-{slug} (asleep")),
+            "{text}"
+        );
+    }
+    assert!(
+        text.contains(&format!(
+            "CLAUDE_CONFIG_DIR={} claude attach b1",
+            carlos.display()
+        )),
+        "{text}"
+    );
+    let mut asked: Vec<_> = home.fake.accounts()[before..]
+        .iter()
+        .map(|(first, env)| (first.clone(), env.clone()))
+        .collect();
+    asked.sort();
+    assert_eq!(
+        asked,
+        [
+            ("agents".to_string(), carlos.to_string_lossy().into_owned()),
+            ("agents".to_string(), "unset".to_string()),
+        ]
     );
 }
 
@@ -678,7 +884,7 @@ fn status_lines_show_cleanup_then_end_with_the_age() {
     cleaned.cleaned_at = Some(1);
     let mut blocked = thread("payments-latency-b-2222");
     blocked.cleanup_blocked = Some("2 unpushed commits".into());
-    let text = chief::project::render_status(SLUG, &[cleaned, blocked], now);
+    let text = chief::project::render_status(SLUG, &[cleaned, blocked], "", now);
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("    ")).collect();
     assert_eq!(lines.len(), 2, "{text}");
     for (line, state) in lines

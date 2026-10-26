@@ -180,10 +180,10 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
 /// A stopped session stays listed in `claude agents --all`; only `claude rm` (here, or from
 /// `claude agents` itself) takes it off. So a thread missing from a non-stale snapshot (neither
 /// its session id nor its short id listed) was removed, but only when the snapshot can know: it
-/// was taken after the row was created and got its ids, and it lists another session registered
-/// in this chief home. A snapshot listing none of them comes from another Claude config or
-/// supervisor, or a supervisor that lists nothing for a moment. The coordinator is normally
-/// listed, so this only delays the verdict.
+/// was taken after the row was created and got its ids, and it lists another registered session
+/// of the same project. A snapshot listing none of them comes from another account's supervisor
+/// (another project of this chief home may live there), or a supervisor that lists nothing for a
+/// moment. The coordinator is normally listed, so this only delays the verdict.
 fn removed_outside(row: &SessionRow, poll: &Poll) -> bool {
     row.role == Role::Thread.as_str()
         && row.session_id.is_some()
@@ -198,6 +198,7 @@ fn lists_another_registered(row: &SessionRow, poll: &Poll) -> bool {
     poll.agents.iter().any(|a| {
         poll.registered.iter().any(|r| {
             r.name != row.name
+                && r.project_slug == row.project_slug
                 && (r.session_id.as_deref() == Some(a.session_id.as_str())
                     || (r.short_id.is_some() && r.short_id == a.id))
         })
@@ -278,26 +279,8 @@ fn restore_removed(row: &mut SessionRow) {
 }
 
 /// Writes a `claude agents` snapshot taken at `taken_at` into every session of the project (one
-/// transaction). Take `taken_at` just before running `claude agents`. Job state comes from
-/// `claude::claude_dir()`.
-pub fn sync(
-    conn: &Connection,
-    project_slug: &str,
-    snapshot: &[AgentRow],
-    taken_at: i64,
-    now: i64,
-) -> Result<()> {
-    sync_in(
-        conn,
-        project_slug,
-        snapshot,
-        taken_at,
-        now,
-        &claude::claude_dir(),
-    )
-}
-
-/// `sync` with job state read from `claude_dir`.
+/// transaction). Take `taken_at` just before running `claude agents`, in the project's account;
+/// job state comes from that account's folder, `claude_dir` (`Claude::config_dir`).
 pub fn sync_in(
     conn: &Connection,
     project_slug: &str,
@@ -578,6 +561,46 @@ mod tests {
         };
         sync_row(&mut t, &poll, 110);
         assert_eq!((t.cleaned_at, t.resolved), (None, false));
+    }
+
+    /// The reviewer's probe: another project of this chief home lives in the account that ran
+    /// `claude agents`, this one in another. Its sessions prove nothing about this project's.
+    #[test]
+    fn a_snapshot_listing_only_another_projects_sessions_removes_nothing() {
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        let mut theirs = thread("chief-other", Some("o1"), Some("o-sid"), 0);
+        theirs.project_slug = "other".into();
+        theirs.role = Role::Coordinator.as_str().into();
+        let registered = vec![
+            t.clone(),
+            thread("chief-demo", Some("c1"), Some("c-sid"), 0),
+            theirs,
+        ];
+        let other_coordinator = AgentRow {
+            id: Some("o1".into()),
+            session_id: "o-sid".into(),
+            name: Some("chief-other".into()),
+            ..coordinator_agent()
+        };
+        let sync = |t: &mut SessionRow, agents: &[AgentRow]| {
+            let poll = Poll {
+                agents,
+                taken_at: 100,
+                registered: &registered,
+                job: &no_job,
+            };
+            sync_row(t, &poll, 110);
+        };
+        sync(&mut t, std::slice::from_ref(&other_coordinator));
+        assert_eq!(
+            (t.removed_at, t.cleaned_at, t.resolved),
+            (None, None, false)
+        );
+
+        // Listing this project's coordinator, it can know.
+        t.synced_at = None;
+        sync(&mut t, &[other_coordinator, coordinator_agent()]);
+        assert_eq!(t.removed_at, Some(100));
     }
 
     /// A poll from another process that started before one already applied is ignored.

@@ -29,6 +29,31 @@ one is ignored.
 -->
 ";
 
+/// `claude` in the project's account (§3), saying once on stderr when this process's
+/// `CLAUDE_CONFIG_DIR` names another one. For commands about one project.
+pub fn claude_for(config: &ProjectConfig) -> Claude {
+    if let Some(note) = claude::account_note(&config.slug, config.claude_config_dir.as_deref()) {
+        eprintln!("{note}");
+    }
+    Claude::for_account(config.claude_config_dir.clone())
+}
+
+/// The project's account from its project.toml, read leniently (`ProjectConfig::read_account`).
+pub fn account_of(slug: &str) -> Result<Option<PathBuf>> {
+    ProjectConfig::read_account(&paths::project_dir(slug).join("project.toml"))
+        .context("chief can't tell which Claude Code account the project belongs to")
+}
+
+/// `claude_for` from the project's account alone (`account_of`), for commands that don't need
+/// the rest of project.toml.
+pub fn claude_for_slug(slug: &str) -> Result<Claude> {
+    let account = account_of(slug)?;
+    if let Some(note) = claude::account_note(slug, account.as_deref()) {
+        eprintln!("{note}");
+    }
+    Ok(Claude::for_account(account))
+}
+
 /// `<root>/projects/<slug>`, canonical when it exists: trust and session cwds use real paths
 /// (macOS `/tmp` is `/private/tmp`).
 pub fn project_dir(slug: &str) -> PathBuf {
@@ -38,20 +63,30 @@ pub fn project_dir(slug: &str) -> PathBuf {
 
 /// Creates `<root>/projects/<slug>/` with project.toml, instructions.md, memory/MEMORY.md and
 /// generated/*, registers the project, and offers to trust (or explains how to trust) every
-/// folder Claude Code doesn't trust yet.
+/// folder Claude Code doesn't trust yet. The project belongs to the account `CLAUDE_CONFIG_DIR`
+/// names here (the default one when unset), for good.
 pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: bool) -> Result<()> {
     let claude = Claude::from_env();
     claude.check_version()?;
     let exe = generated::chief_exe()?;
-    let (config, dir) = create(name, goal, repos, &exe, &generated::passthrough_env())?;
+    let account = claude.account.clone();
+    let env = generated::passthrough_env(account.as_deref());
+    let (config, dir) = create(name, goal, repos, account, &exe, &env)?;
     println!(
         "Created project {:?} ({}) in {}",
         config.name,
         config.slug,
         dir.display()
     );
+    if let Some(account) = &config.claude_config_dir {
+        println!(
+            "It belongs to the Claude Code account in {} (CLAUDE_CONFIG_DIR); every chief \
+             command uses that account for it.",
+            account.display()
+        );
+    }
 
-    let trust_config = claude::claude_config_path();
+    let trust_config = claude.trust_config();
     let untrusted = untrusted_folders(&config, &dir, &trust_config)?;
     let interactive =
         trust_prompt && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -74,8 +109,9 @@ pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: boo
         println!("\nTo trust a folder, run Claude there once, accept the trust prompt, then quit:");
         for folder in still {
             println!(
-                "  cd {} && claude",
-                crate::text::shell_quote(&folder.to_string_lossy())
+                "  cd {} && {}claude",
+                crate::text::shell_quote(&folder.to_string_lossy()),
+                claude.shell_prefix()
             );
         }
     }
@@ -88,6 +124,7 @@ pub fn create(
     name: &str,
     goal: Option<&str>,
     repos: &[PathBuf],
+    account: Option<PathBuf>,
     exe: &Path,
     env: &[(String, String)],
 ) -> Result<(ProjectConfig, PathBuf)> {
@@ -97,7 +134,8 @@ pub fn create(
         bail!("the project name {name:?} needs at least one letter or digit");
     }
     let goal = goal.map(str::trim).filter(|g| !g.is_empty());
-    let config = ProjectConfig::new(name, &slug, goal, repo_entries(repos)?);
+    let mut config = ProjectConfig::new(name, &slug, goal, repo_entries(repos)?);
+    config.claude_config_dir = account;
     config.validate()?;
 
     let conn = db::open(&paths::db())?;
@@ -232,11 +270,11 @@ pub enum CoordinatorAction {
 /// Starts or respawns the coordinator, then opens the Rex layout (§9). Without Rex it says how
 /// to attach and where to run the board instead.
 pub fn up(slug: &str) -> Result<()> {
-    let claude = Claude::from_env();
-    claude.check_version()?;
     let dir = project_dir(slug);
     let config = ProjectConfig::load(&dir.join("project.toml"))
         .with_context(|| format!("no usable chief project {slug:?}; create it with chief init"))?;
+    let claude = claude_for(&config);
+    claude.check_version()?;
     let exe = generated::chief_exe()?;
     if generated::in_cargo_target(&exe) {
         eprintln!(
@@ -245,13 +283,13 @@ pub fn up(slug: &str) -> Result<()> {
             exe.display()
         );
     }
-    let env = generated::passthrough_env();
+    let env = generated::passthrough_env(config.claude_config_dir.as_deref());
     generated::write_all(&dir, &config, &exe, &env)?;
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
         db::register_project(&conn, slug, &dir, db::now_ms())?;
     }
-    let trust_config = claude::claude_config_path();
+    let trust_config = claude.trust_config();
     let (row, action) = ensure_coordinator(&conn, &claude, &config, &dir, &trust_config)?;
     let verb = match action {
         CoordinatorAction::Started => "started",
@@ -282,7 +320,10 @@ pub fn up(slug: &str) -> Result<()> {
         Err(e) => {
             println!("No Rex layout: {e:#}");
             if let Some(short_id) = &row.short_id {
-                println!("Talk to it: claude attach {short_id}");
+                println!(
+                    "Talk to it: {}claude attach {short_id}",
+                    claude.shell_prefix()
+                );
             }
             println!("Board, in another terminal: chief board --project {slug}");
         }
@@ -306,7 +347,14 @@ pub fn ensure_coordinator(
     if let Some(row) = existing.as_ref().filter(|r| r.short_id.is_some()) {
         let taken_at = db::now_ms();
         let snapshot = claude.agents()?;
-        registry::sync(conn, slug, &snapshot, taken_at, db::now_ms())?;
+        registry::sync_in(
+            conn,
+            slug,
+            &snapshot,
+            taken_at,
+            db::now_ms(),
+            &claude.config_dir,
+        )?;
         let row = db::get_session(conn, &row.name)?.context("coordinator row vanished")?;
         if row.pid.is_some() {
             return Ok((row, CoordinatorAction::Running));
@@ -465,7 +513,14 @@ pub fn wait_for_pid(
     loop {
         let taken_at = db::now_ms();
         if let Ok(snapshot) = claude.agents() {
-            registry::sync(conn, slug, &snapshot, taken_at, db::now_ms())?;
+            registry::sync_in(
+                conn,
+                slug,
+                &snapshot,
+                taken_at,
+                db::now_ms(),
+                &claude.config_dir,
+            )?;
         }
         let row = db::get_session(conn, name)?.with_context(|| format!("{name} vanished"))?;
         if row.pid.is_some() || Instant::now() >= deadline {
@@ -508,10 +563,23 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     // showed would wake it right after `--stop-threads` stopped it.
     db::set_pane_target(&conn, slug, None)?;
 
-    let claude = Claude::from_env();
+    let claude = match claude_for_slug(slug) {
+        Ok(claude) => claude,
+        Err(e) => {
+            println!("No session stopped: {e:#}");
+            bail!("chief down {slug} didn't finish cleanly");
+        }
+    };
     let taken_at = db::now_ms();
     match claude.agents() {
-        Ok(snapshot) => registry::sync(&conn, slug, &snapshot, taken_at, db::now_ms())?,
+        Ok(snapshot) => registry::sync_in(
+            &conn,
+            slug,
+            &snapshot,
+            taken_at,
+            db::now_ms(),
+            &claude.config_dir,
+        )?,
         Err(e) => eprintln!("warning: `claude agents` failed, using the last known state: {e:#}"),
     }
     let mut left_running = 0;
@@ -568,28 +636,49 @@ pub fn status(slug: Option<&str>) -> Result<()> {
         println!("No projects yet. Create one with chief init <name>.");
         return Ok(());
     }
-    let taken_at = db::now_ms();
-    let snapshot = match Claude::from_env().agents() {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("warning: `claude agents` failed, showing the last known state: {e:#}");
-            None
-        }
-    };
+    // One `claude agents` per account: each sees only its own supervisor's sessions (§1).
+    let mut snapshots: Vec<(Option<PathBuf>, i64, Option<Vec<AgentRow>>)> = Vec::new();
     let mut out = String::new();
     for slug in &projects {
-        if let Some(snapshot) = &snapshot {
-            registry::sync(&conn, slug, snapshot, taken_at, db::now_ms())?;
+        let account = match account_of(slug) {
+            Ok(account) => Some(account),
+            Err(e) => {
+                eprintln!("warning: {slug}: {e:#}; showing the last known state");
+                None
+            }
+        };
+        if let Some(account) = &account {
+            if !snapshots.iter().any(|(a, ..)| a == account) {
+                let taken_at = db::now_ms();
+                let snapshot = match Claude::for_account(account.clone()).agents() {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: `claude agents` failed for the account {}, showing the \
+                             last known state: {e:#}",
+                            claude::account_label(account.as_deref())
+                        );
+                        None
+                    }
+                };
+                snapshots.push((account.clone(), taken_at, snapshot));
+            }
+            let (_, taken_at, snapshot) = snapshots.iter().find(|(a, ..)| a == account).unwrap();
+            if let Some(snapshot) = snapshot {
+                let claude_dir = claude::claude_dir(account.as_deref());
+                registry::sync_in(&conn, slug, snapshot, *taken_at, db::now_ms(), &claude_dir)?;
+            }
         }
         let rows = db::list_sessions(&conn, slug, None)?;
-        out.push_str(&render_status(slug, &rows, db::now_ms()));
+        let prefix = claude::shell_prefix(account.flatten().as_deref());
+        out.push_str(&render_status(slug, &rows, &prefix, db::now_ms()));
     }
     print!("{out}");
     Ok(())
 }
 
-/// One project's board as text.
-pub fn render_status(slug: &str, rows: &[SessionRow], now: i64) -> String {
+/// One project's board as text; `prefix` goes before `claude attach` (`Claude::shell_prefix`).
+pub fn render_status(slug: &str, rows: &[SessionRow], prefix: &str, now: i64) -> String {
     let mut out = format!("{slug}\n");
     match rows.iter().find(|r| r.role == Role::Coordinator.as_str()) {
         Some(c) => {
@@ -601,7 +690,7 @@ pub fn render_status(slug: &str, rows: &[SessionRow], now: i64) -> String {
             let attach = c
                 .short_id
                 .as_deref()
-                .map(|id| format!(", claude attach {id}"))
+                .map(|id| format!(", {prefix}claude attach {id}"))
                 .unwrap_or_default();
             out.push_str(&format!("  coordinator {} ({state}{attach})\n", c.name));
         }

@@ -16,16 +16,15 @@ use crate::text::shell_quote;
 /// layout's blocks get them too (they start from the login shell's environment, §9).
 /// `CHIEF_HOME` is always written, as the resolved root: the supervisor doesn't have our
 /// `XDG_DATA_HOME` either.
-pub const PASSTHROUGH: [&str; 7] = [
+/// `CLAUDE_CONFIG_DIR` isn't among them: it comes from the project's account, not from this
+/// process (`passthrough_env`).
+pub const PASSTHROUGH: [&str; 6] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
     "CHIEF_GH_BIN",
     "CHIEF_REX_BIN",
     "CHIEF_CLAUDE_CONFIG",
     "CHIEF_NO_NOTIFY",
-    // Claude Code's per-account config folder: each has its own supervisor, sessions, job state
-    // and trust file, and Rex blocks don't inherit this process's environment.
-    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Hook events chief records, with the PreToolUse/PostToolUse matcher where one applies.
@@ -65,8 +64,22 @@ pub fn chief_exe() -> Result<PathBuf> {
 }
 
 /// The `PASSTHROUGH` variables set in this process, with `CHIEF_HOME` always set to the resolved
-/// root (`paths::root`). Paths are made absolute: hooks run in the session's cwd.
-pub fn passthrough_env() -> Vec<(String, String)> {
+/// root (`paths::root`), then `CLAUDE_CONFIG_DIR` for a project of a non-default `account`
+/// (§3): Claude Code's per-account config folder, with its own supervisor, sessions, job state
+/// and trust file, which Rex blocks and the supervisor don't inherit from this process. Paths
+/// are made absolute: hooks run in the session's cwd.
+pub fn passthrough_env(account: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = this_process_env();
+    if let Some(dir) = account {
+        env.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ));
+    }
+    env
+}
+
+fn this_process_env() -> Vec<(String, String)> {
     PASSTHROUGH
         .iter()
         .filter_map(|key| {
@@ -122,7 +135,8 @@ pub fn write_all(
 /// Claude Code reads the hook settings when a session starts, so any edit to them since the
 /// last write (one that drops the guard, say) never reaches a later session (§3).
 pub fn rewrite(dir: &Path, config: &ProjectConfig) -> Result<()> {
-    write_all(dir, config, &chief_exe()?, &passthrough_env())
+    let env = passthrough_env(config.claude_config_dir.as_deref());
+    write_all(dir, config, &chief_exe()?, &env)
         .with_context(|| format!("rewriting {}", dir.join("generated").display()))
 }
 

@@ -25,7 +25,8 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
 - `CLAUDE_CONFIG_DIR` gives Claude Code a separate config folder (one per account): its own
   `.claude.json` (trust), `jobs/` and supervisor, so `claude agents`, `attach` and `rm` only see that
   folder's sessions. Unset, the folder is `~/.claude` and the config file `~/.claude.json`
-  (checked on this machine with two account folders).
+  (checked on this machine with two account folders). So each chief project belongs to one
+  account and every call for it runs there (§3).
 - `claude agents --json --all` rows: `id`, `sessionId`, `name`, `cwd`, `kind`, `startedAt`, `state`
   (seen: `working`, `blocked`, `done`; docs also list failed/stopped/idle), `status` (`busy`,
   `waiting`, `idle`, absent when the process is gone), `pid` (absent when the process is gone).
@@ -100,9 +101,12 @@ taken, every `--repo` an existing folder, stored canonical and named after its f
 trust yet: the project folder always, plus untrusted repos. When stdin and stdout are terminals
 (and without `--no-trust-prompt`) it asks for each "Open Claude there now to trust it? [Y/n]" and
 runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twice), then re-checks;
-otherwise it prints `cd <folder> && claude` for each.
+otherwise it prints `cd <folder> && claude` for each (`cd <folder> && CLAUDE_CONFIG_DIR=<dir>
+claude` for a non-default account). The project belongs to the account `CLAUDE_CONFIG_DIR` names
+when `init` runs (§3); `init` says so for a non-default one.
 
-`chief up` checks the version, rewrites `generated/*`, runs the coordinator step (§7), then opens
+`chief up` loads project.toml, checks the version in the project's account (§3), rewrites
+`generated/*`, runs the coordinator step (§7), then opens
 the layout (§9) and stores its session id in `ui_state.rex_session`. When Rex isn't installed or its server isn't running (or opening the layout fails)
 it prints why, `claude attach <short_id>`, and `chief board --project <slug>` to run in another
 terminal.
@@ -116,7 +120,8 @@ syncs `claude agents` (stored rows if it fails), and runs
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
-`chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
+`chief status [<slug>]` polls `claude agents` once per account among the projects shown (§3;
+stored rows if it fails), syncs each project with its account's snapshot (§5), and prints
 each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
 its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>` (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
@@ -151,12 +156,33 @@ hook command is shell-quoted.
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
 `CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
 `$XDG_DATA_HOME`, which the supervisor doesn't have, or from the default), and the variables
-`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG`, `CHIEF_NO_NOTIFY` and
-`CLAUDE_CONFIG_DIR` (§1: every chief process must talk to the same account's supervisor) are
-written when set at generation time: as `K='v'` prefixes on every hook command and in the MCP
-server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY`
+are written when set at generation time: as `K='v'` prefixes on every hook command and in the MCP
+server's `env`. `CLAUDE_CONFIG_DIR` is written from the project's account (below), never from the
+generating process: set to `claude_config_dir` for a non-default account, absent for the default
+one. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or
 `CHIEF_REX_BIN` without a slash is kept for PATH lookup). Rex blocks start from the login shell's
 environment, so the layout's commands carry the same variables (§9).
+
+A project belongs to one Claude Code account (§1), for good: the `CLAUDE_CONFIG_DIR` in effect at
+`chief init`, made absolute and recorded as `claude_config_dir` in project.toml (no key for the
+default account; a project.toml without the key, from before, is the default account). Every
+Claude Code call for the project (`agents`, `attach`, `rm`, `respawn`, `--bg`, `stop`, the trust
+prompt) runs with `CLAUDE_CONFIG_DIR` set to that folder, or removed for the default account
+(`Claude::command`); job state is read from that folder's `jobs/` and trust from its
+`.claude.json` (`claude::claude_dir`, `claude::claude_config_path`), and the generated env above
+carries it. This holds for every caller: the CLI, the board, the pane, the MCP server and the
+hooks (which read just `claude_config_dir` from project.toml, `ProjectConfig::read_account`, and
+fall back to the account their generated command set when the file can't say). A command about
+one project (`up`, `down`, `clean`, `gc <slug>`) run under another `CLAUDE_CONFIG_DIR` than the
+project's uses the project's and says so once on stderr (`note: <slug> belongs to …; chief uses
+that account, not …`). Commands across projects (`chief status`, `chief gc` without a slug) use
+each project's own account: `status` takes one `claude agents` snapshot per account and syncs each
+project with its account's; a project whose project.toml can't say shows its stored rows with a
+warning. Commands a user types to reach a session (`claude attach <id>`, `claude` for trust) are
+printed with the `CLAUDE_CONFIG_DIR=<dir> ` prefix for a non-default account. The board's settings
+screen shows the account read-only. `CHIEF_CLAUDE_DIR` and `CHIEF_CLAUDE_CONFIG` are test overrides
+for the default account's folder and config file (§11).
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -194,6 +220,8 @@ one-line header.
 name = "Payments latency"          # display name
 slug = "payments-latency"          # [a-z0-9-], unique, immutable
 goal = "Hold p95 under 200 ms"     # optional
+claude_config_dir = "/Users/me/.claude-carlos"  # the account, absolute; set by init, never
+                                   # changed; no key = the default account (~/.claude)
 
 [coordinator]
 model = "opus"                     # passed to --model
@@ -388,9 +416,9 @@ Removed outside chief: a stopped session stays listed in `claude agents --all`, 
 marked removed, and is missing from a non-stale snapshot (neither its `session_id` nor its
 `short_id` listed) was removed, but only when the snapshot can know that: it was taken after the
 row was created and after its ids were last set (`ids_at`), and it lists at least one other
-session registered in this chief home (any project). A snapshot that lists none of them comes from
-another Claude config or supervisor, or from one that lists nothing for a moment; a wrong verdict
-would lock the thread out (§12). The coordinator is normally listed, so this only delays the
+registered session of the same project (normally its coordinator). A snapshot that lists none of
+them comes from another account's supervisor (another project of this chief home may live in it,
+§3), or from one that lists nothing for a moment; a wrong verdict would lock the thread out (§12). The coordinator is normally listed, so this only delays the
 verdict. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
 `resolved_reason = 'removed'`. When its worktree is gone too (job state names none, §12, or the
 folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
@@ -549,10 +577,11 @@ are awaited before the child is reaped, and the group is signalled only while th
 unreaped: until then its pid, the group's id, can't be reused, so the kill can't reach another
 process group.
 
-Trust (`claude::is_trusted`) walks up both the path as given and its canonical form (macOS `/tmp`
-is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on the way
-counts. It reads `$CHIEF_CLAUDE_CONFIG` when set, else `$CLAUDE_CONFIG_DIR/.claude.json` when that
-is set (§1), else `~/.claude.json`.
+Trust (`claude::is_trusted_in`) walks up both the path as given and its canonical form (macOS
+`/tmp` is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on
+the way counts. It reads the project's account's config file (§3, `Claude::trust_config`):
+`<claude_config_dir>/.claude.json`, or for the default account `$CHIEF_CLAUDE_CONFIG` (tests) else
+`~/.claude.json`.
 
 ### Coordinator spawn (`chief up`)
 
@@ -681,7 +710,8 @@ Then focus `main` and `show` the session. When `show` returns false, `up` prints
    `chief · project.toml can't be used:`, the error indented below it, and
    `Fix project.toml; retrying every 5 s · q quits`, then read it again after 5 s, reading keys.
    Nothing is attached, rewritten or respawned meanwhile: step 2 respawns from the file read
-   here, never from stale generated files.
+   here, never from stale generated files. Every `claude` call of this pass runs in the account
+   it names (§3), whatever the block's shell has in `CLAUDE_CONFIG_DIR`.
 1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned,
    removed outside chief (`removed_at`, worktree left or not) or never started (no short id),
    means the coordinator, and a stale target is
@@ -784,7 +814,9 @@ are tested without a terminal (`TestBackend`).
 - Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, default repo, cleanup (merged/manual),
   `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
-  in `init`; `d` removes one, moving the default repo to the first remaining). Efforts, modes,
+  in `init`; `d` removes one, moving the default repo to the first remaining). It also shows the
+  project's Claude Code account (`claude_config_dir`, or `default (~/.claude)`) read-only: Enter
+  or ←/→ there only says it can't be changed (§3). Efforts, modes,
   default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal and max_parallel are
   free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
   errors shown in the form), writes with `save`, regenerates `generated/*`, and says "Saved. New
@@ -811,10 +843,14 @@ are tested without a terminal (`TestBackend`).
   reaches the real one). Layout and switch logic is also tested against an in-memory `Mux`. `claude rm` outputs from the live
   M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
   remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
-  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_CLAUDE_DIR` replaces
-  Claude Code's config folder (job state; checked before `CLAUDE_CONFIG_DIR`, never written into
-  generated files), `CLAUDE_CONFIG_DIR` is removed from the tests' environment, and
-  `CHIEF_NO_NOTIFY=1` turns off notifications.
+  tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces the default account's `~/.claude.json`,
+  `CHIEF_CLAUDE_DIR` replaces the default account's folder `~/.claude` (job state; never written
+  into generated files); a project with its own account (`claude_config_dir`, §3) uses that folder
+  for both, so tests give such projects a temp account folder. `CLAUDE_CONFIG_DIR` is removed from
+  the tests' environment unless a test sets it, and `CHIEF_NO_NOTIFY=1` turns off notifications.
+  The fake records each call's `CLAUDE_CONFIG_DIR` (`calls/<n>.env`) and serves
+  `$CLAUDE_CONFIG_DIR/fake-<key>.stdout[.<k>]` before its own canned output, so each account has
+  its own sessions.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
 
 ## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)
@@ -824,9 +860,9 @@ Resolving a thread keeps its session, worktree and branch. Cleanup removes them 
 branch. The row stays, with its reports: `cleaned_at` is set and `cleanup_blocked` cleared.
 
 The worktree is the one `claude rm` itself deletes: the session's job state,
-`<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is
-`$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (as Claude Code reads it), else
-`~/.claude`. It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
+`<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is the
+project's account folder (§3: `claude_config_dir`, or for the default account `$CHIEF_CLAUDE_DIR`
+in tests, else `~/.claude`). It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
 `git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
 answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
 anywhere, another thread's worktree included, and never a name derived from the thread's. No state
@@ -860,8 +896,8 @@ head is the branch's sha.
    (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
    `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
-4. Either mode: when the job state of another session registered in this chief home names the
-   same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
+4. Either mode: when the job state of another session registered in this chief home (read in
+   that session's own project's account folder) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
    `cleanup_blocked` and stop without calling `claude rm` (it would delete the worktree and its
    branch under that session); `chief gc --dry-run` reports it as blocked, and neither the board
    nor `chief clean` offers a discard for it (they say to finish and clean up the other thread
@@ -908,7 +944,8 @@ neither working nor waiting nor showing in the pane and has no `cleanup_blocked`
 thread waits for the user, a
 working one is tried again on the next refresh. `cleanup = "manual"` never cleans on its own.
 
-`chief gc [<slug>] [--dry-run]` per project: `poll_project`, sync `claude agents`, then
+`chief gc [<slug>] [--dry-run]` per project, in that project's account (§3; a project whose
+project.toml can't say is skipped with a warning): `poll_project`, sync `claude agents`, then
 `clean(Safe)` on every resolved, uncleaned thread (dry: what it would do, from `inspect`). It prints
 `cleaned` / `would clean` / `blocked <reason>` / `skipped <why>` (working or waiting, or an error)
 per thread, or `nothing to clean`; warnings go to stderr. `--dry-run` still stores PR status, as

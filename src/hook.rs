@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::claude::{AgentRow, Claude};
+use crate::claude::{self, AgentRow, Claude};
 use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::state::{HookKind, Role};
@@ -146,7 +146,7 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     let rows = db::list_sessions(&conn, project, None)?;
     // Only a SendMessage with an address needs to know who is alive.
     let snapshot = if tool == "SendMessage" && to.is_some() {
-        Claude::from_env().agents_within(GUARD_AGENTS_TIMEOUT)?
+        project_claude(project).agents_within(GUARD_AGENTS_TIMEOUT)?
     } else {
         Vec::new()
     };
@@ -171,6 +171,14 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
         },
     )?;
     Ok(Some(guard::deny_json(&reason)))
+}
+
+/// `claude` in the project's account (project.toml → `claude_config_dir`), whatever account the
+/// hook's environment names. When project.toml can't say, the account the generated hook
+/// command set (§3), which is the project's unless project.toml was edited by hand since.
+fn project_claude(project: &str) -> Claude {
+    let account = crate::project::account_of(project).unwrap_or_else(|_| claude::env_account());
+    Claude::for_account(account)
 }
 
 /// The §6 decision from the project's registry rows and a `claude agents` snapshot.
@@ -234,9 +242,19 @@ fn guard_failed(project: &str, error: &str) -> String {
 /// the UserPromptSubmit output with the board snapshot and MEMORY.md.
 fn coordinator_context(conn: &Connection, project: &str) -> Result<String> {
     let taken_at = db::now_ms();
-    let refreshed = Claude::from_env()
+    let claude = project_claude(project);
+    let refreshed = claude
         .agents_within(CONTEXT_AGENTS_TIMEOUT)
-        .and_then(|snapshot| registry::sync(conn, project, &snapshot, taken_at, db::now_ms()));
+        .and_then(|snapshot| {
+            registry::sync_in(
+                conn,
+                project,
+                &snapshot,
+                taken_at,
+                db::now_ms(),
+                &claude.config_dir,
+            )
+        });
     if let Err(e) = refreshed {
         log_error(
             &paths::hook_error_log(),

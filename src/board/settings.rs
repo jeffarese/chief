@@ -9,11 +9,17 @@ use crate::config::{Cleanup, EFFORTS, ProjectConfig, THREAD_PERMISSION_MODES};
 
 use super::app::Action;
 
+/// The project's sessions, job state and folder trust live in its account's folder (§3).
+const ACCOUNT_FIXED: &str = "The Claude Code account can't be changed: the project's sessions live \
+     in it. It is the CLAUDE_CONFIG_DIR chief init ran with.";
+
 pub const SAVED_MESSAGE: &str = "Saved. New threads use these settings; the coordinator's model and effort apply on its next \
      start.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    /// The project's Claude Code account: shown, never edited (§3).
+    Account,
     Goal,
     CoordinatorModel,
     CoordinatorEffort,
@@ -34,6 +40,7 @@ pub enum Field {
 impl Field {
     pub fn label(self) -> &'static str {
         match self {
+            Field::Account => "Claude Code account",
             Field::Goal => "Goal",
             Field::CoordinatorModel => "Coordinator model",
             Field::CoordinatorEffort => "Coordinator effort",
@@ -109,6 +116,7 @@ impl SettingsForm {
             Field::DefaultRepo,
             Field::Cleanup,
             Field::Notify,
+            Field::Account,
         ];
         fields.extend((0..self.draft.repos.len()).map(Field::Repo));
         fields.extend([
@@ -133,6 +141,7 @@ impl SettingsForm {
     pub fn value(&self, field: Field) -> String {
         let c = &self.draft;
         match field {
+            Field::Account => crate::claude::account_label(c.claude_config_dir.as_deref()),
             Field::Goal => c.goal.clone().unwrap_or_default(),
             Field::CoordinatorModel => c.coordinator.model.clone(),
             Field::CoordinatorEffort => c.coordinator.effort.clone(),
@@ -294,6 +303,10 @@ impl SettingsForm {
     }
 
     fn cycle(&mut self, field: Field, step: isize) {
+        if field == Field::Account {
+            self.message = Some(ACCOUNT_FIXED.to_string());
+            return;
+        }
         let c = &mut self.draft;
         match field {
             Field::CoordinatorEffort => {
@@ -393,6 +406,30 @@ mod tests {
         for c in text.chars() {
             f.on_key(ch(c));
         }
+    }
+
+    /// The account is shown, never edited: the project's sessions, job state and trust live in
+    /// that account's folder.
+    #[test]
+    fn the_account_is_shown_read_only() {
+        let mut f = form();
+        goto(&mut f, Field::Account);
+        assert_eq!(f.value(Field::Account), "default (~/.claude)");
+        for k in [key(KeyCode::Enter), key(KeyCode::Right), key(KeyCode::Left)] {
+            assert_eq!(f.on_key(k), Outcome::Stay);
+        }
+        assert!(f.editing.is_none());
+        assert!(!f.dirty());
+        assert!(
+            f.message.as_deref().unwrap().contains("can't be changed"),
+            "{:?}",
+            f.message
+        );
+
+        let mut config = f.draft.clone();
+        config.claude_config_dir = Some("/Users/me/.claude-carlos".into());
+        let f = SettingsForm::new(&config, PathBuf::from("/p/demo"));
+        assert_eq!(f.value(Field::Account), "/Users/me/.claude-carlos");
     }
 
     #[test]

@@ -77,24 +77,61 @@ pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Claude {
     pub bin: PathBuf,
-    /// Claude Code's config folder (`claude_dir`), where background sessions' job state lives.
+    /// The Claude Code account every call runs in (§1): Some sets `CLAUDE_CONFIG_DIR` to that
+    /// folder, None removes it (the default account), whatever this process's environment says.
+    pub account: Option<PathBuf>,
+    /// The account's config folder (`claude_dir`), where background sessions' job state lives.
     pub config_dir: PathBuf,
 }
 
 impl Claude {
+    /// The account this process's `CLAUDE_CONFIG_DIR` names: for `chief init`, which gives a new
+    /// project that account, and tests. Everything about an existing project uses
+    /// `for_account(config.claude_config_dir)`.
     pub fn from_env() -> Self {
+        Claude::for_account(env_account())
+    }
+
+    /// `bin` with the account from the environment.
+    pub fn new(bin: PathBuf) -> Self {
+        Claude::with_bin(bin, env_account())
+    }
+
+    /// `CHIEF_CLAUDE_BIN` (else `claude`) in `account`.
+    pub fn for_account(account: Option<PathBuf>) -> Self {
         let bin = std::env::var_os("CHIEF_CLAUDE_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        Claude::new(bin)
+        Claude::with_bin(bin, account)
     }
 
-    /// `bin` with the config folder from the environment.
-    pub fn new(bin: PathBuf) -> Self {
+    pub fn with_bin(bin: PathBuf, account: Option<PathBuf>) -> Self {
+        let config_dir = claude_dir(account.as_deref());
         Claude {
             bin,
-            config_dir: claude_dir(),
+            account,
+            config_dir,
         }
+    }
+
+    /// The account's `.claude.json`, where Claude Code keeps folder trust (`claude_config_path`).
+    pub fn trust_config(&self) -> PathBuf {
+        claude_config_path(self.account.as_deref())
+    }
+
+    /// `claude` in this account; every call chief makes goes through here.
+    pub fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        match &self.account {
+            Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
+            None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
+        };
+        cmd
+    }
+
+    /// What a user types before `claude` to reach this account's sessions (`shell_prefix`).
+    pub fn shell_prefix(&self) -> String {
+        shell_prefix(self.account.as_deref())
     }
 
     /// The worktree a background session works in, as its job state records it: the folder
@@ -140,7 +177,7 @@ impl Claude {
 
     /// Runs `claude` in `cwd` on this terminal and waits for it to exit (for the trust prompt).
     pub fn run_interactive(&self, cwd: &Path) -> Result<std::process::ExitStatus> {
-        Command::new(&self.bin)
+        self.command()
             .current_dir(cwd)
             .status()
             .with_context(|| format!("running {} in {}", self.bin.display(), cwd.display()))
@@ -256,7 +293,7 @@ impl Claude {
 
     /// Runs the binary; fails only if it can't start or outlives `timeout`.
     fn run(&self, args: &[OsString], cwd: Option<&Path>, timeout: Duration) -> Result<Output> {
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = self.command();
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -449,15 +486,69 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Claude Code's config folder: `$CHIEF_CLAUDE_DIR` (tests), else `$CLAUDE_CONFIG_DIR` (Claude
-/// Code's own override), else `~/.claude`.
-pub fn claude_dir() -> PathBuf {
-    for var in ["CHIEF_CLAUDE_DIR", "CLAUDE_CONFIG_DIR"] {
-        if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
-            return PathBuf::from(dir);
-        }
+/// The account this process's `CLAUDE_CONFIG_DIR` names, made absolute; None (the default
+/// account) when it is unset or empty.
+pub fn env_account() -> Option<PathBuf> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty())?;
+    let dir = PathBuf::from(dir);
+    Some(
+        dir.canonicalize()
+            .or_else(|_| std::path::absolute(&dir))
+            .unwrap_or(dir),
+    )
+}
+
+/// An account's config folder: the folder itself, or for the default account
+/// `$CHIEF_CLAUDE_DIR` (tests) else `~/.claude`.
+pub fn claude_dir(account: Option<&Path>) -> PathBuf {
+    if let Some(dir) = account {
+        return dir.to_path_buf();
+    }
+    if let Some(dir) = std::env::var_os("CHIEF_CLAUDE_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
     }
     dirs::home_dir().unwrap_or_default().join(".claude")
+}
+
+/// `CLAUDE_CONFIG_DIR=<dir> `, or nothing for the default account: what a user types before
+/// `claude` to reach that account's sessions.
+pub fn shell_prefix(account: Option<&Path>) -> String {
+    match account {
+        Some(dir) => format!(
+            "CLAUDE_CONFIG_DIR={} ",
+            crate::text::shell_quote(&dir.to_string_lossy())
+        ),
+        None => String::new(),
+    }
+}
+
+/// The account's own folder for display: the path, or `default (~/.claude)`.
+pub fn account_label(account: Option<&Path>) -> String {
+    match account {
+        Some(dir) => dir.display().to_string(),
+        None => "default (~/.claude)".to_string(),
+    }
+}
+
+/// When this process's `CLAUDE_CONFIG_DIR` names another account than the project's: the line
+/// that says chief uses the project's (§3). Folders are compared canonically.
+pub fn account_note(slug: &str, account: Option<&Path>) -> Option<String> {
+    let here = env_account();
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if here.as_deref().map(canonical) == account.map(canonical) {
+        return None;
+    }
+    let theirs = match account {
+        Some(dir) => format!("the Claude Code account in {}", dir.display()),
+        None => "the default Claude Code account (~/.claude)".to_string(),
+    };
+    let ours = match &here {
+        Some(dir) => format!("CLAUDE_CONFIG_DIR={}", dir.display()),
+        None => "the default account (CLAUDE_CONFIG_DIR is unset here)".to_string(),
+    };
+    Some(format!(
+        "note: {slug} belongs to {theirs}; chief uses that account, not {ours}"
+    ))
 }
 
 /// What the supervisor records about a background session's worktree (§1): the source of truth
@@ -500,24 +591,21 @@ pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
     job_state(config_dir, short_id)?.worktree
 }
 
-/// `$CHIEF_CLAUDE_CONFIG`, else `$CLAUDE_CONFIG_DIR/.claude.json` (where Claude Code keeps it
-/// when that folder is set, one per account), else `~/.claude.json`.
-pub fn claude_config_path() -> PathBuf {
+/// An account's Claude Code config file, where folder trust lives: `<dir>/.claude.json` (one
+/// per account folder), or for the default account `$CHIEF_CLAUDE_CONFIG` (tests) else
+/// `~/.claude.json`.
+pub fn claude_config_path(account: Option<&Path>) -> PathBuf {
+    if let Some(dir) = account {
+        return dir.join(".claude.json");
+    }
     if let Some(p) = std::env::var_os("CHIEF_CLAUDE_CONFIG") {
         return PathBuf::from(p);
-    }
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir).join(".claude.json");
     }
     dirs::home_dir().unwrap_or_default().join(".claude.json")
 }
 
-/// Reads `~/.claude.json` → `projects[<path>].hasTrustDialogAccepted`. Read-only, never writes.
-pub fn is_trusted(path: &Path) -> Result<bool> {
-    is_trusted_in(&claude_config_path(), path)
-}
-
-/// `is_trusted` against an explicit config file. A missing file trusts nothing. Matches what
+/// Reads `config` (`claude_config_path`) → `projects[<path>].hasTrustDialogAccepted`.
+/// Read-only, never writes. A missing file trusts nothing. Matches what
 /// Claude Code 2.1.310 did live: a trusted folder covers the folders under it (with `/` trusted, a
 /// background session started in a folder whose own entry said false), but not past a git
 /// repository's root (the same `/` didn't cover a fresh repo; Claude asked to trust it). So the
@@ -821,10 +909,7 @@ mod tests {
         );
         write("e5f6", r#"{"state":"done","bgIsolation":"none"}"#);
         write("bad", "{");
-        let claude = Claude {
-            bin: "claude".into(),
-            config_dir: dir.path().to_path_buf(),
-        };
+        let claude = Claude::with_bin("claude".into(), Some(dir.path().to_path_buf()));
         assert_eq!(
             claude.job_worktree("a1b2c3d4"),
             Some(PathBuf::from("/r/.claude/worktrees/fix"))

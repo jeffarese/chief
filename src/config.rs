@@ -11,6 +11,11 @@ pub struct ProjectConfig {
     pub slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// The Claude Code account the project belongs to (§1, §3): the `CLAUDE_CONFIG_DIR` in
+    /// effect at `chief init`, absolute. None (no key) is the default account, `~/.claude`. Every
+    /// Claude Code call for the project runs in it; it is never changed afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<PathBuf>,
     pub coordinator: ModelSettings,
     pub threads: ThreadSettings,
     #[serde(default)]
@@ -77,6 +82,7 @@ impl ProjectConfig {
             name: name.to_string(),
             slug: slug.to_string(),
             goal: goal.map(str::to_string),
+            claude_config_dir: None,
             coordinator: ModelSettings {
                 model: "opus".to_string(),
                 effort: "low".to_string(),
@@ -119,6 +125,25 @@ impl ProjectConfig {
         Ok(())
     }
 
+    /// Only `claude_config_dir` from a project.toml: hooks and cross-project commands find the
+    /// project's account even when another key doesn't validate.
+    pub fn read_account(path: &Path) -> Result<Option<PathBuf>> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        match table.get("claude_config_dir") {
+            None => Ok(None),
+            Some(toml::Value::String(dir)) if Path::new(dir).is_absolute() => {
+                Ok(Some(PathBuf::from(dir)))
+            }
+            Some(other) => bail!(
+                "claude_config_dir in {} must be an absolute path, not {other}",
+                path.display()
+            ),
+        }
+    }
+
     /// Rejects unknown efforts and permission modes, duplicate repo names, a default_repo
     /// that names no repo, and max_parallel = 0.
     pub fn validate(&self) -> Result<()> {
@@ -129,6 +154,14 @@ impl ProjectConfig {
             bail!(
                 "slug {:?} must be lowercase letters, digits and single hyphens",
                 self.slug
+            );
+        }
+        if let Some(dir) = &self.claude_config_dir
+            && !dir.is_absolute()
+        {
+            bail!(
+                "claude_config_dir {} must be an absolute path",
+                dir.display()
             );
         }
         for (what, m) in [

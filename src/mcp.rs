@@ -11,7 +11,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde_json::Value;
 
-use crate::claude::{self, Claude, RESOLVE_TIMEOUT};
+use crate::claude::{Claude, RESOLVE_TIMEOUT};
 use crate::config::ProjectConfig;
 use crate::tools::{
     self, ListThreadsArgs, NameArgs, ReadReportArgs, ResolveThreadArgs, StartThreadArgs, ToolCtx,
@@ -125,8 +125,9 @@ fn with_ctx<T>(project: &str, f: impl FnOnce(&ToolCtx) -> Result<T>) -> Result<T
     let dir = crate::project::project_dir(project);
     let config = ProjectConfig::load(&dir.join("project.toml"))?;
     let conn = db::open(&paths::db())?;
-    let claude = Claude::from_env();
-    let trust_config = claude::claude_config_path();
+    // The project's account, whatever the server's environment names (§3).
+    let claude = Claude::for_account(config.claude_config_dir.clone());
+    let trust_config = claude.trust_config();
     let ctx = ToolCtx {
         conn: &conn,
         config: &config,
