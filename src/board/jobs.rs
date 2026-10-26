@@ -166,6 +166,15 @@ fn loss(
     why: &str,
 ) -> Result<(String, Option<Inspection>)> {
     let row = db::get_session(conn, name)?.with_context(|| format!("no thread named {name}"))?;
+    if why.contains(cleanup::SHARED_WORKTREE) {
+        return Ok((
+            format!(
+                "Cleanup blocked: {why}.\nAnother thread works in that worktree: finish and \
+                 clean up that thread first.\n"
+            ),
+            None,
+        ));
+    }
     Ok(match cleanup::inspect(claude, &row) {
         Ok(ins) if ins.blocker().is_some() => (
             format!(

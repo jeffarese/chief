@@ -274,6 +274,26 @@ fn discard_resets_only_the_threads_own_worktree() {
     assert_eq!(env.rm_calls().len(), rm_before);
 }
 
+/// The reviewer's probe: two registered sessions whose job state names one worktree. `claude rm`
+/// would delete it and its branch under the other session, so a safe cleanup refuses too, before
+/// `claude rm`, even with nothing unsaved.
+#[test]
+fn safe_clean_refuses_a_worktree_another_session_names() {
+    let env = Env::new();
+    let mut other = SessionRow::new("demo-b-2222", "demo", Role::Thread, NOW);
+    other.short_id = Some("bb22".into());
+    other.session_id = Some("sid-bb22".into());
+    db::insert_session(&env.conn, &other).unwrap();
+    env.claude.job("bb22", Some(&env.worktree));
+    let Outcome::Blocked(why) = env.clean(Mode::Safe).unwrap() else {
+        panic!("want blocked");
+    };
+    assert!(why.contains("also the worktree of demo-b-2222"), "{why}");
+    assert_eq!(env.row().cleanup_blocked.as_deref(), Some(why.as_str()));
+    assert!(env.rm_calls().is_empty());
+    assert!(env.worktree.is_dir());
+}
+
 #[test]
 fn safe_clean_removes_a_thread_with_nothing_to_lose() {
     let env = Env::new();

@@ -848,13 +848,18 @@ head is the branch's sha.
    (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
    `claude rm` stops the session even when it refuses.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
-4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
+4. Either mode: when the job state of another session registered in this chief home names the
+   same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
+   `cleanup_blocked` and stop without calling `claude rm` (it would delete the worktree and its
+   branch under that session); `chief gc --dry-run` reports it as blocked, and neither the board
+   nor `chief clean` offers a discard for it (they say to finish and clean up the other thread
+   first).
+   `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
    in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
    `, `) and stop without calling `claude rm`.
    `Discard(confirmed)` carries the inspection the user was shown and confirmed. It is refused
    (stored in `cleanup_blocked`, nothing run) when a fresh `inspect` differs from it ("the
-   worktree changed after you confirmed …") or when the job state of another session registered
-   in this chief home names the same worktree; otherwise in a dirty worktree run
+   worktree changed after you confirmed …"); otherwise in a dirty worktree run
    `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`: ignored files stay),
    in step 5.
 5. Steps 1 and 2 again, with a fresh `claude agents`, right before anything is reset or

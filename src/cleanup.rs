@@ -325,6 +325,12 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         }
         (Err(e), Mode::Discard(_)) => return Err(e),
     };
+    // `claude rm` would delete the worktree and its branch under the other session, whatever the
+    // mode; a discard would reset its work too.
+    if let Some(why) = shared(ctx, &row, &ins)? {
+        record(ctx, name, Some(&why))?;
+        return Ok(Outcome::Blocked(why));
+    }
     let confirmed = match &mode {
         Mode::Safe => {
             if let Some(why) = ins.blocker() {
@@ -340,16 +346,6 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
                     .unwrap_or_else(|| "nothing unsaved".to_string());
                 let why = format!(
                     "the worktree changed after you confirmed (now: {now}); nothing was discarded"
-                );
-                record(ctx, name, Some(&why))?;
-                return Ok(Outcome::Blocked(why));
-            }
-            if let Some(wt) = &ins.worktree
-                && let Some(other) = sharing_worktree(ctx, &row, wt)?
-            {
-                let why = format!(
-                    "{} is also the worktree of {other}; not discarding anything there",
-                    wt.display()
                 );
                 record(ctx, name, Some(&why))?;
                 return Ok(Outcome::Blocked(why));
@@ -409,6 +405,24 @@ fn discards_only_confirmed(confirmed: &Inspection, token: &str) -> bool {
             .as_deref()
             .is_some_and(|head| head.eq_ignore_ascii_case(sha))
 }
+
+/// Why cleanup leaves the thread alone when another session works in its worktree: `claude rm`
+/// would delete the worktree and its branch under that session.
+fn shared(ctx: &Ctx, row: &SessionRow, ins: &Inspection) -> Result<Option<String>> {
+    let Some(wt) = &ins.worktree else {
+        return Ok(None);
+    };
+    Ok(sharing_worktree(ctx, row, wt)?.map(|other| {
+        format!(
+            "{} {SHARED_WORKTREE} {other}; chief won't remove or reset it",
+            wt.display()
+        )
+    }))
+}
+
+/// In a `cleanup_blocked` reason: another session's job state names the same worktree. No
+/// discard can help then.
+pub const SHARED_WORKTREE: &str = "is also the worktree of";
 
 /// Another registered session (any project of this chief home) whose job state names the same
 /// worktree, if any.
@@ -503,7 +517,7 @@ pub fn gc(ctx: &Ctx, slug: &str, dry_run: bool) -> Result<Gc> {
     let mut verdicts = Vec::new();
     for row in rows {
         let verdict = if dry_run {
-            dry_verdict(ctx.claude, &row)
+            dry_verdict(ctx, &row)
         } else {
             match clean(ctx, &row.name, Mode::Safe) {
                 Ok(Outcome::Cleaned | Outcome::AlreadyCleaned) => Verdict::Cleaned,
@@ -530,19 +544,25 @@ fn sync_agents(ctx: &Ctx, slug: &str) -> Result<()> {
     )
 }
 
-fn dry_verdict(claude: &Claude, row: &SessionRow) -> Verdict {
+fn dry_verdict(ctx: &Ctx, row: &SessionRow) -> Verdict {
     if active(row) {
         return Verdict::Skipped("still working or waiting".to_string());
     }
     if row.short_id.is_none() {
         return Verdict::WouldClean;
     }
-    match inspect(claude, row) {
-        Ok(ins) => match ins.blocker() {
-            Some(why) => Verdict::Blocked(why),
-            None => Verdict::WouldClean,
-        },
-        Err(e) => Verdict::Blocked(format!("could not inspect the worktree: {e:#}")),
+    let ins = match inspect(ctx.claude, row) {
+        Ok(ins) => ins,
+        Err(e) => return Verdict::Blocked(format!("could not inspect the worktree: {e:#}")),
+    };
+    match shared(ctx, row, &ins) {
+        Ok(Some(why)) => return Verdict::Blocked(why),
+        Ok(None) => {}
+        Err(e) => return Verdict::Skipped(format!("{e:#}")),
+    }
+    match ins.blocker() {
+        Some(why) => Verdict::Blocked(why),
+        None => Verdict::WouldClean,
     }
 }
 
@@ -695,7 +715,10 @@ pub fn run_clean(slug: &str, thread: &str, discard: bool, yes: bool) -> Result<(
             let listed = db::get_session(&conn, name)?
                 .and_then(|row| inspect(&claude, &row).ok())
                 .is_some_and(|ins| ins.blocker().is_some());
-            let hint = if discarding {
+            let hint = if why.contains(SHARED_WORKTREE) {
+                " Another thread works in that worktree: finish and clean up that thread first."
+                    .to_string()
+            } else if discarding {
                 " chief discards only what it listed and you confirmed; push or remove the rest \
                  yourself."
                     .to_string()
