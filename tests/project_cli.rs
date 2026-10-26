@@ -439,7 +439,11 @@ fn running_project(home: &Home) -> PathBuf {
         text.contains("Board, in another terminal: chief board --project payments-latency"),
         "{text}"
     );
-    home.rex.unset("list.exit").unset("list.stderr");
+    home.rex
+        .unset("list.exit")
+        .unset("list.stderr")
+        .unset("new.exit")
+        .unset("new.stderr");
     dir
 }
 
@@ -470,7 +474,8 @@ fn up_opens_then_reuses_the_rex_layout() {
     home.rex
         .set(
             "list.stdout",
-            r#"{"sessions": [{"session_id": "session:theirs", "label": "chief-payments-latency-x"}]}"#,
+            // Labelled like chief's, but chief never created it: not even looked at.
+            r#"{"sessions": [{"session_id": "session:theirs", "label": "chief-payments-latency"}]}"#,
         )
         .set(
             "new.stdout",
@@ -532,9 +537,6 @@ fn up_opens_then_reuses_the_rex_layout() {
     assert_eq!(
         calls,
         [
-            ["list", "--autostart=false", "--json"]
-                .map(String::from)
-                .to_vec(),
             new,
             [
                 "block",
@@ -560,6 +562,10 @@ fn up_opens_then_reuses_the_rex_layout() {
             .map(String::from)
             .to_vec(),
         ]
+    );
+    assert_eq!(
+        db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
+        Some("session:new")
     );
 
     // Open and running: shown again, nothing created. This time no single app takes it.
@@ -604,7 +610,8 @@ fn up_opens_then_reuses_the_rex_layout() {
             "do session.select",
         ]
     );
-    assert_eq!(home.rex.calls_of("new").len(), 1);
+    // The first `up` without a Rex server, then the one that created it.
+    assert_eq!(home.rex.calls_of("new").len(), 2);
     assert_eq!(home.rex.calls_of("run").len(), 1);
 }
 
@@ -624,6 +631,7 @@ fn down_closes_the_layout_and_stops_sessions() {
             db::insert_session(&conn, &t).unwrap();
         }
         db::set_pane_showing(&conn, SLUG, Some("chief-payments-latency")).unwrap();
+        db::set_rex_session(&conn, SLUG, Some("session:7")).unwrap();
     }
     home.fake.set(
         "agents.stdout",
@@ -646,11 +654,17 @@ fn down_closes_the_layout_and_stops_sessions() {
         ])
         .to_string(),
     );
-    home.rex.set(
-        "list.stdout",
-        r#"{"sessions": [{"session_id": "session:theirs", "label": "work"},
-                         {"session_id": "session:7", "label": "chief-payments-latency"}]}"#,
-    );
+    home.rex
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:theirs", "label": "chief-payments-latency"},
+                             {"session_id": "session:7", "label": "chief-payments-latency"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
 
     let out = home.run(&["down", SLUG], "");
     assert!(out.status.success(), "{}", stderr(&out));
@@ -667,6 +681,7 @@ fn down_closes_the_layout_and_stops_sessions() {
     );
     assert_eq!(home.fake.calls_of("stop"), [vec!["stop", "c0ffee"]]);
     assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(db::get_rex_session(&home.db(), SLUG).unwrap(), None);
 
     // With --stop-threads only the live thread is stopped; nothing is ever removed. The layout
     // is gone now.
@@ -696,4 +711,46 @@ fn down_closes_the_layout_and_stops_sessions() {
     );
     assert!(home.fake.calls_of("rm").is_empty());
     assert_eq!(home.rex.calls_of("kill").len(), 1);
+
+    // chief's session now holds a block of the user's too: only main and board close.
+    db::set_rex_session(&home.db(), SLUG, Some("session:7")).unwrap();
+    home.rex
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:7", "label": "chief-payments-latency"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:logs", "label": "logs"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with(
+            "Closed chief's blocks in Rex session chief-payments-latency; it holds other blocks \
+             too, so it stays open.\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(home.rex.calls_of("kill").len(), 1);
+    let closed: Vec<Vec<String>> = home
+        .rex
+        .calls_of("block")
+        .into_iter()
+        .filter(|c| c[1] == "close")
+        .collect();
+    assert_eq!(
+        closed,
+        [
+            vec!["block", "close", "block:main", "--autostart=false"],
+            vec!["block", "close", "block:board", "--autostart=false"]
+        ]
+    );
+    assert_eq!(
+        db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
+        Some("session:7")
+    );
 }

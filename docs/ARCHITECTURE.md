@@ -89,12 +89,13 @@ runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twi
 otherwise it prints `cd <folder> && claude` for each.
 
 `chief up` checks the version, rewrites `generated/*`, runs the coordinator step (§7), then opens
-the layout (§9). When Rex isn't installed or its server isn't running (or opening the layout fails)
+the layout (§9) and stores its session id in `ui_state.rex_session`. When Rex isn't installed or its server isn't running (or opening the layout fails)
 it prints why, `claude attach <short_id>`, and `chief board --project <slug>` to run in another
 terminal.
 
-`chief down <slug> [--stop-threads]` kills the `chief-<slug>` Rex session (exact id, if there is
-one), clears `ui_state.pane_showing`, syncs `claude agents` (stored rows if it fails), and runs
+`chief down <slug> [--stop-threads]` closes the Rex layout (§9 `close`: kills the session `chief up`
+created when it holds only chief's blocks, else closes just `main` and `board`), clears
+`ui_state.pane_showing`, syncs `claude agents` (stored rows if it fails), and runs
 `claude stop` on the coordinator when it has a process; with `--stop-threads` also on every
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
@@ -261,7 +262,8 @@ CREATE TABLE guard_denials (
 CREATE TABLE ui_state (
   project_slug TEXT PRIMARY KEY,
   pane_target  TEXT,                      -- session name the left pane should show
-  pane_showing TEXT                       -- session `chief pane` is attached to now; NULL between attaches (migration 5)
+  pane_showing TEXT,                      -- session `chief pane` is attached to now; NULL between attaches (migration 5)
+  rex_session  TEXT                       -- id of the Rex session `chief up` created, §9 (migration 8)
 );
 ```
 
@@ -520,7 +522,7 @@ with a marker, then the board itself.
 
 ```rust
 pub trait Mux {
-    fn find_session(&self, label: &str) -> Result<Option<SessionRef>>;   // exact label; Err = not installed / not running
+    fn has_session(&self, s: &SessionRef) -> Result<bool>;                // by id, never by label; Err = not installed / not running
     fn create_session(&self, label: &str, first: &BlockSpec) -> Result<(SessionRef, BlockRef)>;
     fn run_block(&self, s: &SessionRef, spec: &BlockSpec) -> Result<BlockRef>; // split, ratio, label, cwd, cmd, focus
     fn blocks(&self, s: &SessionRef) -> Result<Vec<BlockInfo>>;            // id + label
@@ -542,19 +544,27 @@ timeout: `rex list --json`; `rex new <label> --cwd <dir> --keep-open --json -- <
 -- <cmd>`; `rex block ls -s <s> --json`; `rex block call -b <b> process` (running while it lists a
 `child`); `rex block close <b>`; `rex send-key -b <b> <key>`; `rex focus <b>`; `rex kill <s>`; and
 `rex do session.select session_id=<s>` for `show` (a client action: Rex picks the app when exactly
-one is connected, and fails otherwise). chief only touches the session labelled `chief-<slug>`, by
-its exact id.
+one is connected, and fails otherwise). chief only touches the session `chief up` created, by the
+id it stored in `ui_state.rex_session` (migration 8): a session that merely carries the label
+`chief-<slug>` may be the user's, and is never reused, sent keys or killed.
 
 `src/layout.rs` builds the layout over any `Mux`: session `chief-<slug>`, block `main` running
 `chief pane --project <slug>`, block `board` split right of it at 32 % running
 `chief board --project <slug>`, both with the project folder as cwd. Each command is the canonical
 chief path, behind `env K=V…` with the §3 passthrough variables when any is set. `open`:
 
-1. No session `chief-<slug>`: create it with `main`, add `board` with `--focus=false`.
+1. No stored session, or the stored id is gone: create `chief-<slug>` with `main`, add `board`
+   with `--focus=false`. `up` stores the new id.
 2. Both blocks there and running: reuse.
 3. One running: close the other if it is there but ended, and run it again beside the running one
    (`board` right of `main` at 32 %, or `main` left of `board` at 68 %).
-4. Neither running: kill the session and create it again (closing its last block could end it).
+4. Neither running: run `main` in a new window of the same session first, then close the dead
+   `main`/`board` blocks (closing the last block first could end the session), then add `board`
+   beside the new `main`. The session may hold the user's blocks, so `open` never kills it.
+
+`close` (for `chief down`): nothing stored or the id gone → nothing to close. A session holding
+only `main` and `board` is killed and the stored id cleared; one that holds other blocks too (the
+user added them) keeps running with those, and only `main` and `board` are closed.
 
 Then focus `main` and `show` the session. When `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
@@ -594,8 +604,9 @@ group, so the kernel discards terminal stop signals there anyway (verified in M4
 
 Board switching: write `pane_target`, then `pane::request_switch(mux, conn, slug)`: when
 `pane_showing` is NULL (between attaches, or no pane) or equals the target (NULL target = the
-coordinator's name), do nothing; otherwise find `chief-<slug>` and its `main` block and
-`send_key(main, "ctrl+z")`, or do nothing when either is missing (a board run on its own). The pane
+coordinator's name), do nothing; otherwise find the stored session (`ui_state.rex_session`) and
+its `main` block and `send_key(main, "ctrl+z")`, or do nothing when either is missing (a board run
+on its own). The pane
 writes `pane_showing` before its last read of the target and the board writes the target before
 reading `pane_showing`, so a switch that sends nothing is always seen by the pane's next read.
 

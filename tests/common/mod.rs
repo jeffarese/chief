@@ -160,9 +160,12 @@ impl Home {
         std::fs::write(&trust, "{}").unwrap();
         let gh = Fake::named("gh");
         gh.set("pr.stdout", "[]");
+        // No Rex server: every command chief starts with fails.
         let rex = Fake::named("rex");
         rex.set("list.exit", "1")
-            .set("list.stderr", "Error: no Rex server is running\n");
+            .set("list.stderr", "Error: no Rex server is running\n")
+            .set("new.exit", "1")
+            .set("new.stderr", "Error: no Rex server is running\n");
         Home {
             home,
             fake: Fake::new(),

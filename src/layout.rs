@@ -1,5 +1,7 @@
 //! The `chief up` layout over any `Mux` (ARCHITECTURE §9): session `chief-<slug>`, block `main`
-//! running `chief pane`, block `board` split right at 32 % running `chief board`.
+//! running `chief pane`, block `board` split right at 32 % running `chief board`. chief only ever
+//! reuses or kills the session it created itself (its id is stored in `ui_state.rex_session`),
+//! never one that merely carries the label.
 
 use std::path::Path;
 
@@ -30,6 +32,18 @@ pub struct Layout {
     pub opened: Opened,
     /// Whether the multiplexer brought it into the user's view.
     pub shown: bool,
+}
+
+/// What `close` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Closed {
+    /// The session held only `main` and `board`, and was killed.
+    Killed(SessionRef),
+    /// The session holds other blocks too (the user's): only `main` and `board` were closed, and
+    /// it stays open.
+    Blocks(SessionRef),
+    /// No session of chief's is open.
+    Nothing,
 }
 
 /// `chief <args>` for a block: through `env` with the passthrough variables, because a block
@@ -78,17 +92,29 @@ fn block_state(mux: &dyn Mux, s: &SessionRef, label: &str) -> Result<Option<(Blo
     }
 }
 
-/// Opens the layout: reuses `chief-<slug>` when both blocks run, replaces a missing or ended
-/// block, and creates the session when there is none (or neither block is left). Focuses `main`
-/// and asks the multiplexer to show the session.
+/// `ours` (the stored session id) while the multiplexer still has it.
+fn live(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Option<SessionRef>> {
+    match ours {
+        Some(s) if mux.has_session(s)? => Ok(Some(s.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Opens the layout in `ours`, the session `chief up` created before: reuses it when both blocks
+/// run and replaces a missing or ended block. When neither runs, `main` starts in a new window
+/// of the same session before the dead blocks close (closing the last block could end the
+/// session, and the session may hold the user's blocks, so it is never killed). Without a live
+/// `ours` it creates `chief-<slug>`; a session that only carries that label isn't chief's and is
+/// left alone. Focuses `main` and asks the multiplexer to show the session; the caller stores the
+/// returned session's id as the new `ours`.
 pub fn open(
     mux: &dyn Mux,
     slug: &str,
     dir: &Path,
     exe: &Path,
     env: &[(String, String)],
+    ours: Option<&SessionRef>,
 ) -> Result<Layout> {
-    let label = session_label(slug);
     let main = main_spec(slug, dir, exe, env);
     let board = board_spec(slug, dir, exe, env);
     let beside = |anchor: &BlockRef, split: Split, spec: &BlockSpec, ratio: u8| BlockSpec {
@@ -97,40 +123,37 @@ pub fn open(
         ..spec.clone()
     };
 
-    let existing = match mux.find_session(&label)? {
-        Some(s) => {
-            let m = block_state(mux, &s, MAIN)?;
-            let b = block_state(mux, &s, BOARD)?;
-            Some((s, m, b))
-        }
-        None => None,
-    };
-    let (session, main_block, opened) = match existing {
-        Some((s, Some((m, true)), Some((_, true)))) => (s, m, Opened::Reused),
-        Some((s, Some((m, true)), b)) => {
-            if let Some((dead, _)) = b {
-                mux.close_block(&dead)?;
-            }
-            mux.run_block(&s, &beside(&m, Split::Right, &board, BOARD_RATIO))?;
-            (s, m, Opened::Repaired)
-        }
-        Some((s, m, Some((b, true)))) => {
-            if let Some((dead, _)) = m {
-                mux.close_block(&dead)?;
-            }
-            let m = mux.run_block(&s, &beside(&b, Split::Left, &main, 100 - BOARD_RATIO))?;
-            (s, m, Opened::Repaired)
-        }
-        other => {
-            // Nothing of ours runs there; closing the last block could end the session under
-            // us, so start over.
-            if let Some((s, _, _)) = other {
-                mux.kill_session(&s)?;
-            }
-            let (s, m) = mux.create_session(&label, &main)?;
+    let (session, main_block, opened) = match live(mux, ours)? {
+        None => {
+            let (s, m) = mux.create_session(&session_label(slug), &main)?;
             mux.run_block(&s, &beside(&m, Split::Right, &board, BOARD_RATIO))?;
             (s, m, Opened::Created)
         }
+        Some(s) => match (block_state(mux, &s, MAIN)?, block_state(mux, &s, BOARD)?) {
+            (Some((m, true)), Some((_, true))) => (s, m, Opened::Reused),
+            (Some((m, true)), b) => {
+                if let Some((dead, _)) = b {
+                    mux.close_block(&dead)?;
+                }
+                mux.run_block(&s, &beside(&m, Split::Right, &board, BOARD_RATIO))?;
+                (s, m, Opened::Repaired)
+            }
+            (m, Some((b, true))) => {
+                if let Some((dead, _)) = m {
+                    mux.close_block(&dead)?;
+                }
+                let m = mux.run_block(&s, &beside(&b, Split::Left, &main, 100 - BOARD_RATIO))?;
+                (s, m, Opened::Repaired)
+            }
+            (m, b) => {
+                let new_main = mux.run_block(&s, &main)?;
+                for (dead, _) in [m, b].into_iter().flatten() {
+                    mux.close_block(&dead)?;
+                }
+                mux.run_block(&s, &beside(&new_main, Split::Right, &board, BOARD_RATIO))?;
+                (s, new_main, Opened::Repaired)
+            }
+        },
     };
     mux.focus(&main_block)?;
     let shown = mux.show(&session)?;
@@ -141,21 +164,30 @@ pub fn open(
     })
 }
 
-/// The `main` block of the project's layout, if the layout is open.
-pub fn main_block(mux: &dyn Mux, slug: &str) -> Result<Option<BlockRef>> {
-    match mux.find_session(&session_label(slug))? {
+/// The `main` block of the project's layout (`ours`), if it is open.
+pub fn main_block(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Option<BlockRef>> {
+    match live(mux, ours)? {
         Some(s) => mux.find_block(&s, MAIN),
         None => Ok(None),
     }
 }
 
-/// Kills the project's layout session; returns it, or None when there was none.
-pub fn close(mux: &dyn Mux, slug: &str) -> Result<Option<SessionRef>> {
-    let Some(s) = mux.find_session(&session_label(slug))? else {
-        return Ok(None);
+/// Closes the project's layout (`ours`): kills the session when it holds only `main` and
+/// `board`, otherwise closes just those two blocks so the user's blocks stay.
+pub fn close(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Closed> {
+    let Some(s) = live(mux, ours)? else {
+        return Ok(Closed::Nothing);
     };
-    mux.kill_session(&s)?;
-    Ok(Some(s))
+    let blocks = mux.blocks(&s)?;
+    let chiefs = |label: &str| label == MAIN || label == BOARD;
+    if blocks.iter().all(|b| chiefs(&b.label)) {
+        mux.kill_session(&s)?;
+        return Ok(Closed::Killed(s));
+    }
+    for b in blocks.iter().filter(|b| chiefs(&b.label)) {
+        mux.close_block(&b.block)?;
+    }
+    Ok(Closed::Blocks(s))
 }
 
 #[cfg(test)]
@@ -215,14 +247,14 @@ pub mod testing {
         }
     }
 
+    /// The id `FakeMux::with_session` gives its session.
+    pub fn s0() -> SessionRef {
+        SessionRef("s0".into())
+    }
+
     impl Mux for FakeMux {
-        fn find_session(&self, label: &str) -> Result<Option<SessionRef>> {
-            Ok(self
-                .sessions
-                .borrow()
-                .iter()
-                .find(|s| s.1 == label)
-                .map(|s| SessionRef(s.0.clone())))
+        fn has_session(&self, session: &SessionRef) -> Result<bool> {
+            Ok(self.sessions.borrow().iter().any(|s| s.0 == session.0))
         }
 
         fn create_session(&self, label: &str, first: &BlockSpec) -> Result<(SessionRef, BlockRef)> {
@@ -314,15 +346,20 @@ pub mod testing {
 mod tests {
     use std::path::PathBuf;
 
-    use super::testing::{Call, FakeMux};
+    use super::testing::{Call, FakeMux, s0};
     use super::*;
 
     const EXE: &str = "/bin/chief";
     const DIR: &str = "/p/demo";
 
+    /// `open` with `s0` stored as chief's session.
     fn open_demo(mux: &FakeMux) -> Layout {
+        open_in(mux, Some(&s0()))
+    }
+
+    fn open_in(mux: &FakeMux, ours: Option<&SessionRef>) -> Layout {
         let env = vec![("CHIEF_HOME".to_string(), "/h".to_string())];
-        open(mux, "demo", Path::new(DIR), Path::new(EXE), &env).unwrap()
+        open(mux, "demo", Path::new(DIR), Path::new(EXE), &env, ours).unwrap()
     }
 
     fn cmd(sub: &str) -> Vec<String> {
@@ -406,26 +443,90 @@ mod tests {
         assert_eq!(calls[1], Call::Focus("b-new1".into()));
     }
 
+    /// The session may hold the user's blocks: never killed. `main` starts in a new window first
+    /// so closing the dead blocks can't end the session.
     #[test]
-    fn starts_over_when_neither_block_runs() {
-        let mux = FakeMux::with_session("chief-demo", &[("main", false), ("shell", true)]);
-        assert_eq!(open_demo(&mux).opened, Opened::Created);
+    fn rebuilds_inside_the_session_when_neither_block_runs() {
+        let mux = FakeMux::with_session(
+            "chief-demo",
+            &[("main", false), ("shell", true), ("board", false)],
+        );
+        assert_eq!(open_demo(&mux).opened, Opened::Repaired);
         let calls = mux.calls();
-        assert_eq!(calls[0], Call::Kill("s0".into()));
-        assert!(matches!(&calls[1], Call::Create(l, _) if l == "chief-demo"));
+        let Call::Run(s, main) = &calls[0] else {
+            panic!("{calls:?}")
+        };
+        assert_eq!(
+            (s.as_str(), main.label.as_str(), main.anchor.clone()),
+            ("s0", "main", None)
+        );
+        assert_eq!(
+            calls[1..3],
+            [Call::Close("b0".into()), Call::Close("b2".into())]
+        );
+        let Call::Run(_, board) = &calls[3] else {
+            panic!("{calls:?}")
+        };
+        assert_eq!(
+            (board.label.as_str(), board.anchor.clone()),
+            ("board", Some((BlockRef("b-new1".into()), Split::Right)))
+        );
+        assert_eq!(calls[4], Call::Focus("b-new1".into()));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::Kill(_) | Call::Create(..)))
+        );
+        let blocks = mux.sessions.borrow()[0].2.clone();
+        let labels: Vec<_> = blocks.iter().map(|b| b.1.as_str()).collect();
+        assert_eq!(labels, ["shell", "main", "board"]);
+
+        // Nothing of chief's left at all: the same.
+        let mux = FakeMux::with_session("chief-demo", &[("shell", true)]);
+        assert_eq!(open_demo(&mux).opened, Opened::Repaired);
+        assert!(!mux.calls().iter().any(|c| matches!(c, Call::Kill(_))));
     }
 
+    /// Only the stored id is chief's: a session that merely carries the label, or chief's own
+    /// after it was killed, is never reused or killed.
     #[test]
-    fn other_sessions_are_left_alone() {
-        let mux = FakeMux::with_session("chief-demo-2", &[("main", true), ("board", true)]);
-        assert_eq!(open_demo(&mux).opened, Opened::Created);
-        assert_eq!(close(&mux, "other").unwrap(), None);
-        assert!(!mux.calls().iter().any(|c| matches!(c, Call::Kill(_))));
+    fn only_the_session_chief_created_is_touched() {
+        let theirs = FakeMux::with_session("chief-demo", &[("main", true), ("board", true)]);
+        let layout = open_in(&theirs, None);
         assert_eq!(
-            close(&mux, "demo").unwrap(),
-            Some(SessionRef("s-new1".into()))
+            (layout.opened, layout.session.clone()),
+            (Opened::Created, SessionRef("s-new1".into()))
         );
-        assert_eq!(mux.calls().last(), Some(&Call::Kill("s-new1".into())));
+        assert_eq!(close(&theirs, None).unwrap(), Closed::Nothing);
+        let gone = SessionRef("s-gone".into());
+        assert_eq!(open_in(&theirs, Some(&gone)).opened, Opened::Created);
+        assert_eq!(close(&theirs, Some(&gone)).unwrap(), Closed::Nothing);
+        assert_eq!(main_block(&theirs, None).unwrap(), None);
+        assert!(!theirs.calls().iter().any(|c| matches!(c, Call::Kill(_))));
+        let untouched = theirs.sessions.borrow()[0].clone();
+        assert_eq!((untouched.0.as_str(), untouched.2.len()), ("s0", 2));
+
+        // chief's own, holding only its blocks: killed.
+        assert_eq!(
+            close(&theirs, Some(&layout.session)).unwrap(),
+            Closed::Killed(layout.session.clone())
+        );
+        assert_eq!(theirs.calls().last(), Some(&Call::Kill("s-new1".into())));
+    }
+
+    /// The user added a block to chief's session: `chief down` closes only chief's two.
+    #[test]
+    fn close_keeps_a_session_holding_the_users_blocks() {
+        let mux = FakeMux::with_session(
+            "chief-demo",
+            &[("main", true), ("logs", true), ("board", true)],
+        );
+        assert_eq!(close(&mux, Some(&s0())).unwrap(), Closed::Blocks(s0()));
+        assert_eq!(
+            mux.calls(),
+            [Call::Close("b0".into()), Call::Close("b2".into())]
+        );
+        assert_eq!(main_block(&mux, Some(&s0())).unwrap(), None);
     }
 
     #[test]

@@ -206,6 +206,8 @@ fn show_switches_the_main_pane() {
                            {"block_id": "block:board", "label": "board"}]}"#,
         );
     db::set_pane_showing(&env.conn, "demo", Some("chief-demo")).unwrap();
+    // Only the session `chief up` created and stored: never the label-alike listed first.
+    db::set_rex_session(&env.conn, "demo", Some("session:1")).unwrap();
     let msg = jobs::run(&env.src, Action::Show(Some(NAME.into())));
     assert_eq!(msg, Msg::Notice(format!("Main pane: {NAME}")));
     assert_eq!(

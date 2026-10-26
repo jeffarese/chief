@@ -22,7 +22,7 @@ use rusqlite::Connection;
 
 use crate::claude::Claude;
 use crate::db::{self, SessionRow};
-use crate::mux::Mux;
+use crate::mux::{Mux, SessionRef};
 use crate::{layout, names, paths, project, registry};
 
 /// How often a failed attach is retried.
@@ -290,7 +290,8 @@ pub fn request_switch(mux: &dyn Mux, conn: &Connection, project: &str) -> Result
     if showing == target {
         return Ok(());
     }
-    match layout::main_block(mux, project)? {
+    let ours = db::get_rex_session(conn, project)?.map(SessionRef);
+    match layout::main_block(mux, ours.as_ref())? {
         Some(main) => mux.send_key(&main, "ctrl+z"),
         None => Ok(()),
     }
@@ -307,6 +308,8 @@ mod tests {
         let conn = db::open(&dir.path().join("chief.db")).unwrap();
         db::register_project(&conn, "demo", dir.path(), 0).unwrap();
         db::register_project(&conn, "other", dir.path(), 0).unwrap();
+        // `FakeMux::with_session` makes s0; `chief up` would have stored it.
+        db::set_rex_session(&conn, "demo", Some("s0")).unwrap();
         (dir, conn)
     }
 
@@ -392,6 +395,12 @@ mod tests {
         request_switch(&no_main, &conn, "demo").unwrap();
         assert_eq!(none.calls(), []);
         assert_eq!(no_main.calls(), []);
+
+        // A session that only carries the label isn't chief's: its `main` gets no keys.
+        db::set_rex_session(&conn, "demo", None).unwrap();
+        let theirs = FakeMux::with_session("chief-demo", &[("main", true)]);
+        request_switch(&theirs, &conn, "demo").unwrap();
+        assert_eq!(theirs.calls(), []);
     }
 
     /// The child of a pane that ignores SIGTSTP gets the default back (it stops when it sends

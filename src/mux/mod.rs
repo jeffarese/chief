@@ -41,9 +41,10 @@ pub struct BlockInfo {
 }
 
 pub trait Mux {
-    /// The first session labelled exactly `label`. Errors when the multiplexer isn't installed
-    /// or isn't running.
-    fn find_session(&self, label: &str) -> Result<Option<SessionRef>>;
+    /// Whether the session still exists. Errors when the multiplexer isn't installed or isn't
+    /// running. Sessions are found by id, never by label: a label proves nothing about who
+    /// created the session.
+    fn has_session(&self, session: &SessionRef) -> Result<bool>;
     /// Creates a session labelled `label` whose first block is `first` (its anchor is ignored).
     fn create_session(&self, label: &str, first: &BlockSpec) -> Result<(SessionRef, BlockRef)>;
     fn run_block(&self, session: &SessionRef, spec: &BlockSpec) -> Result<BlockRef>;

@@ -111,6 +111,8 @@ CREATE TABLE ui_state (
     // Which process is cleaning a thread up, as when it claimed it (§12). Not in `SessionRow`:
     // only `claim_cleanup` and `release_cleanup` touch it, so no row write can drop a claim.
     "ALTER TABLE sessions ADD COLUMN cleaning_at INTEGER;",
+    // The multiplexer session `chief up` created (§9): the only one chief reuses or kills.
+    "ALTER TABLE ui_state ADD COLUMN rex_session TEXT;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -725,6 +727,27 @@ pub fn set_pane_showing(conn: &Connection, project_slug: &str, name: Option<&str
     Ok(())
 }
 
+/// The id of the layout session `chief up` created for the project, if it stored one.
+pub fn get_rex_session(conn: &Connection, project_slug: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT rex_session FROM ui_state WHERE project_slug = ?1",
+            [project_slug],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+pub fn set_rex_session(conn: &Connection, project_slug: &str, id: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ui_state (project_slug, rex_session) VALUES (?1, ?2)
+         ON CONFLICT(project_slug) DO UPDATE SET rex_session = excluded.rex_session",
+        params![project_slug, id],
+    )?;
+    Ok(())
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -944,5 +967,15 @@ mod tests {
         assert_eq!(get_pane_target(&conn, "q").unwrap(), None);
         set_pane_showing(&conn, "p", None).unwrap();
         assert_eq!(get_pane_showing(&conn, "p").unwrap(), None);
+
+        assert_eq!(get_rex_session(&conn, "p").unwrap(), None);
+        set_rex_session(&conn, "p", Some("session:1")).unwrap();
+        assert_eq!(
+            get_rex_session(&conn, "p").unwrap().as_deref(),
+            Some("session:1")
+        );
+        assert_eq!(get_pane_showing(&conn, "p").unwrap(), None, "kept apart");
+        set_rex_session(&conn, "p", None).unwrap();
+        assert_eq!(get_rex_session(&conn, "p").unwrap(), None);
     }
 }
