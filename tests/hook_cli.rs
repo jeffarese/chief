@@ -779,11 +779,29 @@ fn coordinator_prompts_get_the_board_and_memory() {
     assert!(thread.stdout.is_empty());
 }
 
-/// §5 "Background work": a subagent's command in the background is denied, as Claude Code
-/// wouldn't wake the subagent when it ends; its lead's own isn't.
+/// §5 "Background work": a recorded subagent's command in the background is denied, as Claude
+/// Code wouldn't wake the subagent when it ends; its lead's own isn't, nor an unknown agent's.
 #[test]
 fn subagent_background_commands_are_denied() {
     let home = guarded_home();
+    let start = serde_json::json!({
+        "session_id": "a-sid",
+        "hook_event_name": "SubagentStart",
+        "agent_id": "aworker-1",
+        "agent_type": "general-purpose",
+        "cwd": "/x",
+    });
+    assert_silent_success(&home.run(
+        &[
+            "hook",
+            "SubagentStart",
+            "--project",
+            "demo",
+            "--role",
+            "thread",
+        ],
+        &start.to_string(),
+    ));
     let bash = |agent_id: Option<&str>| {
         let mut payload = serde_json::json!({
             "session_id": "a-sid",
@@ -813,6 +831,7 @@ fn subagent_background_commands_are_denied() {
         "{reason}"
     );
     assert_silent_success(&bash(None));
+    assert_silent_success(&bash(Some("aunknown-2")));
     assert_eq!(error_log(home.path()), "");
 }
 

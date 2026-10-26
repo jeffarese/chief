@@ -540,8 +540,8 @@ pub fn read_report(ctx: &ToolCtx, args: &ReadReportArgs) -> Result<Value> {
     // §5 "Background work": its idle notice came from a turn that ended while these run.
     if let Some(work) = registry::background_work(&row) {
         out["note"] = json!(format!(
-            "Not finished: {work} still running. The thread ended its own turn while they run, \
-             and it sends you its final report when they finish."
+            "Not finished: {work} still running. The thread may have ended its own turn while \
+             they run; it reports to you when they finish."
         ));
         out["running"] = json!(work);
     }

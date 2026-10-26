@@ -143,7 +143,10 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
     if block.is_some() {
         return Ok(block);
     }
-    if event == "PreToolUse" && subagent_background_command(&payload) {
+    if event == "PreToolUse"
+        && let Some(session) = outcome.session.as_deref()
+        && subagent_background_command(&conn, session, &payload)?
+    {
         return Ok(Some(guard::deny_json(SUBAGENT_BACKGROUND_REASON)));
     }
     if role == Role::Coordinator && event == "UserPromptSubmit" {
@@ -152,20 +155,30 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// A subagent's Bash call with `run_in_background` (§5 "Background work"). Claude Code doesn't
-/// wake a subagent when its background command ends (§1), so the subagent would stall with its
-/// work unfinished, and its lead would look done.
-pub fn subagent_background_command(payload: &Value) -> bool {
-    let from_subagent = payload
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .is_some_and(|a| !a.is_empty());
-    from_subagent
-        && payload.get("tool_name").and_then(Value::as_str) == Some("Bash")
+/// A Bash call with `run_in_background` from one of `session`'s recorded subagents (§5
+/// "Background work"). Claude Code doesn't wake a subagent when its background command ends
+/// (§1), so the subagent would stall with its work unfinished, and its lead would look done.
+/// Other agent ids, such as an agent auto mode runs (§1), are left alone.
+pub fn subagent_background_command(
+    conn: &Connection,
+    session: &str,
+    payload: &Value,
+) -> Result<bool> {
+    let field = |k: &str| payload.get(k).and_then(Value::as_str);
+    let (Some(sid), Some(agent)) = (field("session_id"), field("agent_id")) else {
+        return Ok(false);
+    };
+    let background = field("tool_name") == Some("Bash")
         && payload
             .pointer("/tool_input/run_in_background")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
+            .unwrap_or(false);
+    if !background {
+        return Ok(false);
+    }
+    Ok(db::teammates(conn, session, sid)?
+        .iter()
+        .any(|t| t.agent_id == agent))
 }
 
 /// Why chief denies a subagent's background command; the subagent reads it as the tool result.
@@ -227,9 +240,9 @@ pub fn final_report_json(address: &str) -> String {
     json!({
         "decision": "block",
         "reason": format!(
-            "Your subagents and background commands have all finished. You ended an earlier \
-             turn while they still ran, so your coordinator was told you were idle and doesn't \
-             know you're done. Send it your final report now with SendMessage (to: \"{address}\"): \
+            "Everything you waited on has finished. You ended an earlier turn while a subagent \
+             still worked, so your coordinator was told you were idle and doesn't know you're \
+             done. Send it your final report now with SendMessage (to: \"{address}\"): \
              what you did, the branch and commit, the pull request URL if any, test results, and \
              what you need from the user. Then end your turn."
         ),
@@ -663,7 +676,8 @@ pub fn handle(conn: &Connection, ctx: &Ctx, event: &str, payload: &Value) -> Res
                 r.background_running = 0;
                 r.stopped_early_at = None;
             }
-            Some(HookKind::Stop) => r.background_running = running_commands(payload),
+            // A session's own command wakes it when it ends, so the Stop after that recounts.
+            Some(HookKind::Stop) => r.background_running = listed_tasks(payload, |k| k == "shell"),
             _ => {}
         }
         if let Some(kind) = kind
@@ -707,9 +721,9 @@ fn background_work(row: &SessionRow) -> bool {
     row.subagents_busy > 0 || row.background_running > 0
 }
 
-/// The background commands a Stop lists as still running: `background_tasks` entries of type
-/// `shell` (§1). A lead's own command wakes it when it ends, and so ends in a Stop that recounts.
-fn running_commands(payload: &Value) -> u32 {
+/// The `background_tasks` entries a Stop lists as running whose `type` passes `kind` (§1):
+/// `shell` for a background command, `teammate` or `subagent` for a subagent.
+fn listed_tasks(payload: &Value, kind: impl Fn(&str) -> bool) -> u32 {
     let field = |t: &Value, k: &str| t.get(k).and_then(Value::as_str).map(str::to_string);
     payload
         .get("background_tasks")
@@ -718,23 +732,26 @@ fn running_commands(payload: &Value) -> u32 {
             tasks
                 .iter()
                 .filter(|t| {
-                    field(t, "type").as_deref() == Some("shell")
+                    field(t, "type").is_some_and(|k| kind(&k))
                         && field(t, "status").as_deref() == Some("running")
                 })
                 .count() as u32
         })
 }
 
-/// §5 "Background work". A thread's Stop while its subagents or background commands still run
-/// told its coordinator it was idle (§1), so it is marked; the next Stop that finds nothing
-/// running clears the mark and is due to ask for the final report. Not while a Stop hook's block
-/// runs (`stop_hook_active`): the mark waits for a Stop of the thread's own.
+/// §5 "Background work". A thread's Stop while an in-process teammate works told its
+/// coordinator it was idle (§1), so it is marked; async agents and background commands keep it
+/// busy, so they don't. The next Stop that finds nothing running clears the mark and is due to
+/// ask for the final report. Not while a Stop hook's block runs (`stop_hook_active`): the mark
+/// waits for a Stop of the thread's own.
 fn final_report_due(row: &mut SessionRow, payload: &Value, now: i64) -> bool {
     if row.role != Role::Thread.as_str() {
         return false;
     }
-    if background_work(row) {
+    if row.subagents_busy > 0 && listed_tasks(payload, |kind| kind == "teammate") > 0 {
         row.stopped_early_at = Some(now);
+    }
+    if background_work(row) {
         return false;
     }
     let blocked = payload
@@ -808,20 +825,15 @@ fn record_teammates(
                 db::set_teammate_busy(conn, session, agent, false)?;
             }
         }
-        // The session's own Stop lists the subagents it still has, idle ones included: with
-        // none listed, none can be mid-turn, whatever SubagentStop chief missed.
-        "Stop" if text(Some(payload), "agent_id").is_none() => {
-            let listed = payload
-                .get("background_tasks")
-                .and_then(Value::as_array)
-                .map(|tasks| {
-                    tasks
-                        .iter()
-                        .any(|t| t.get("type").and_then(Value::as_str) == Some("teammate"))
-                });
-            if listed == Some(false) {
-                db::idle_teammates(conn, session)?;
-            }
+        // The session's own Stop lists the subagents it still has (a teammate even while idle,
+        // an async agent until its hand-back): every task that isn't a `shell`. With none
+        // listed, none can be mid-turn, whatever SubagentStop chief missed.
+        "Stop"
+            if text(Some(payload), "agent_id").is_none()
+                && payload.get("background_tasks").is_some_and(Value::is_array)
+                && listed_tasks(payload, |k| k != "shell") == 0 =>
+        {
+            db::idle_teammates(conn, session)?;
         }
         "PostToolUse" if text(Some(payload), "tool_name") == Some("Agent") => {
             let response = payload.get("tool_response");
@@ -1510,9 +1522,10 @@ mod tests {
     }
 
     /// Background commands its Stops list as running keep a lead working (§5): two, then one
-    /// after the subagent's finished, then none once its own woke it. The fixture's subagent
-    /// started its command in the background, which chief now denies, because its result never
-    /// reached it (§1).
+    /// after the subagent's finished, then none once its own woke it. Its subagent was between
+    /// turns, and commands keep a lead busy (§1), so its coordinator heard nothing early and the
+    /// last Stop is a plain finish. The fixture's subagent started its command in the
+    /// background, which chief now denies, because its result never reached it (§1).
     #[test]
     fn background_commands_keep_their_lead_working() {
         let (_dir, conn) = wait_setup();
@@ -1523,7 +1536,7 @@ mod tests {
         assert_eq!((row.background_running, row.stopped_early_at), (0, None));
         assert_eq!(
             (at(46), at(47), at(49)),
-            ((0, false), (0, false), (0, true))
+            ((0, false), (0, false), (1, false))
         );
 
         let (_dir, conn) = wait_setup();
@@ -1554,21 +1567,70 @@ mod tests {
         assert!(!replay(&conn, &lines[49], 49).final_report);
     }
 
-    /// Only a subagent's Bash call in the background (§5).
+    /// The second machine's flavour (§1): an async agent, listed as a `subagent` until its
+    /// hand-back, and a lead's own background command. Both keep the lead busy, so its
+    /// coordinator hears nothing early, and the Stop after them is a plain finish, notified.
+    #[test]
+    fn async_agents_and_commands_keep_their_lead_working() {
+        let lines: Vec<Value> = include_str!("../tests/fixtures/hooks/async-wait-events.jsonl")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let setup = || {
+            let (dir, conn) = wait_setup();
+            for name in ["spike-sub2", "spike-sh2"] {
+                db::insert_session(&conn, &SessionRow::new(name, "demo", Role::Thread, 0)).unwrap();
+            }
+            (dir, conn)
+        };
+        let row = |conn: &Connection, name: &str| {
+            let r = get(conn, name);
+            (r.subagents_busy, r.background_running, r.group_name)
+        };
+        let (_dir, conn) = setup();
+        replay_range(&conn, &lines, 0..=11);
+        assert_eq!(
+            row(&conn, "spike-sub2"),
+            (1, 0, "working".into()),
+            "listed: running"
+        );
+        assert_eq!(row(&conn, "spike-sh2"), (0, 1, "working".into()));
+
+        let (_dir, conn) = setup();
+        let out = replay_range(&conn, &lines, 0..=22);
+        let stop = |i: usize| (out[i].notices.len(), out[i].final_report);
+        // Early Stops while the command (9) and the subagent (11) run; then plain finishes.
+        assert_eq!((stop(9), stop(11)), ((0, false), (0, false)));
+        assert_eq!((stop(14), stop(20)), ((1, false), (1, false)));
+        for name in ["spike-sub2", "spike-sh2"] {
+            assert_eq!(get(&conn, name).stopped_early_at, None, "{name}");
+        }
+        assert_eq!(row(&conn, "spike-sub2"), (0, 0, "idle".into()));
+    }
+
+    /// Only a recorded subagent's Bash call in the background (§5).
     #[test]
     fn subagent_background_commands_are_denied() {
+        let (_dir, conn) = wait_setup();
         let lines = subagent_wait_fixture();
-        assert!(subagent_background_command(&lines[43]), "the subagent's");
-        assert!(!subagent_background_command(&lines[41]), "the lead's own");
+        let denied =
+            |payload: &Value| subagent_background_command(&conn, "spike-lead4", payload).unwrap();
+        replay_range(&conn, &lines, 36..=40);
+        assert!(denied(&lines[43]), "the subagent's");
+        assert!(!denied(&lines[41]), "the lead's own");
         let mut other_tool = lines[43].clone();
         other_tool["tool_name"] = "Monitor".into();
-        assert!(!subagent_background_command(&other_tool));
+        assert!(!denied(&other_tool));
         let mut foreground = lines[43].clone();
         foreground["tool_input"]["run_in_background"] = false.into();
-        assert!(!subagent_background_command(&foreground));
+        assert!(!denied(&foreground));
+        // An agent chief has no SubagentStart for, like the one auto mode runs (§1).
+        let mut unknown = lines[43].clone();
+        unknown["agent_id"] = "a0627549f1501fc2e".into();
+        assert!(!denied(&unknown));
         let mut blank = lines[43].clone();
         blank["agent_id"] = "".into();
-        assert!(!subagent_background_command(&blank));
+        assert!(!denied(&blank));
     }
 
     #[test]

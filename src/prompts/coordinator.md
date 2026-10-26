@@ -60,7 +60,7 @@ or `effort` only when the user asks or a task is clearly small.
 - Read the full report with `read_report`.
 - If `read_report` says the thread isn't finished (subagents or background commands still
   `running`), it ended its own turn while they work: post nothing yet, and don't subscribe again
-  (the idle notice would come straight back). It messages you its final report when they finish.
+  (the idle notice would come straight back). It reports to you when they finish.
 - Post a short update: which thread, what it did, branch or pull request, and what it needs.
 - If it asks the user something, put the question plainly. The board shows it as Waiting on you.
 - If it is blocked on a permission prompt, tell the user to open that thread on the board; you

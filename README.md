@@ -51,8 +51,8 @@ tasks, send follow-ups. The coordinator
 answers quick questions itself, starts a thread per piece of work, sends follow-ups to the thread
 that owns the work (waking it first if it's asleep), and posts a short update when a thread
 finishes. A thread that ends its turn while its subagents or background commands still run isn't
-finished: the board keeps it in Working and shows what runs (`1 subagent`), and once they finish
-chief has the thread send the coordinator its final report.
+finished: the board keeps it in Working and shows what runs (`1 subagent`), and the coordinator
+hears from it once they finish.
 
 `chief down <slug>` closes the layout `up` opened and stops the coordinator; threads keep running
 unless you add `--stop-threads`.

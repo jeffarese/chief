@@ -91,11 +91,22 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
     before this send. Re-send with the ref…"). So a teammate is addressable only within the
     process that spawned it, and a stale name can point outside.
 - Background work, verified live on 2.1.310 (samples in
-  `tests/fixtures/hooks/subagent-wait-events.jsonl`):
-  - A lead that ends its turn while its subagent works is `status: idle` in `claude agents`, and
+  `tests/fixtures/hooks/subagent-wait-events.jsonl` and `async-wait-events.jsonl`):
+  - The Agent tool in a background session starts one of two kinds of subagent, depending on the
+    machine's Claude Code configuration (same version: one Mac got teammates, another async
+    agents). An in-process **teammate** (`tool_response.status: "teammate_spawned"`, above)
+    stays registered between turns. An **async agent** (`status: "async_launched"`, `isAsync:
+    true`) runs once and ends with its `SubagentHandback` tool call, which reaches the lead as
+    UserPromptSubmit `<agent-message from="<name>"> [Subagent hand-back] …`, then SubagentStop,
+    then the lead's turn and Stop.
+  - A lead that ends its turn while a **teammate** works is `status: idle` in `claude agents`, and
     a `notify_when_idle` subscriber gets its idle notice right then. Subscribing again to a
     session that is already idle notifies at once, quoting the same turn, so a subscriber can't
     wait out the subagent that way.
+  - A lead that ends its turn while an **async agent** or its own background command runs stays
+    `status: busy` until the work is done and the lead's last turn ends: no early idle notice
+    (polled every 2 s; and a real chief coordinator subscribed to such a thread heard nothing
+    until its real finish).
   - `SubagentStart` fires at spawn and again each time a message wakes an idle subagent;
     `SubagentStop` fires at the end of each of its turns, and on `TaskStop` (the lead's next Stop
     then lists no teammate).
@@ -103,9 +114,13 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
     runs a turn: no UserPromptSubmit fires, but a Stop does. So a lead always stops again after
     its subagents' last SubagentStop. A subagent's `SendMessage(to: "team-lead")` can wake the
     lead before the subagent's own SubagentStop.
-  - Stop and SubagentStop carry `background_tasks`: `[{id, type: "teammate" | "shell", status:
-    "running", description, command?}]`. A teammate stays listed while idle; a subagent's
+  - Stop and SubagentStop carry `background_tasks`: `[{id, type: "teammate" | "subagent" |
+    "shell", status: "running", description, command?}]`. A teammate stays listed while idle; an
+    async agent is listed as `subagent` (its `id` the agent id) until its hand-back; a subagent's
     background commands are listed in its lead's.
+  - In auto permission mode, a PreToolUse can carry an `agent_id` that never had a
+    SubagentStart (seen repeating a subagent's own Bash call), presumably an agent auto mode
+    runs.
   - A lead's own background command wakes it when it ends (UserPromptSubmit with a
     `<task-notification>`). A subagent's does **not** wake the subagent: the notification is
     queued on the lead's transcript and never delivered, so the subagent's work stops there
@@ -606,30 +621,35 @@ Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Fai
 ### Background work
 
 A session's subagents and background commands run inside its process after its own turn ends
-(§1). Claude Code then calls the session idle, so its coordinator gets an idle notice for a thread
-that isn't done, and the session's own turn says nothing about them. chief counts them from the
-hooks, in the same transaction as the rest (§4 `sessions.subagents_busy`,
+(§1), and the session's own turn says nothing about them. While a teammate works, Claude Code
+even calls the session idle, so its coordinator gets an idle notice for a thread that isn't done.
+chief counts them from the hooks, in the same transaction as the rest (§4 `sessions.subagents_busy`,
 `background_running`, `stopped_early_at`; `teammates.busy`):
 
 - **Subagents mid-turn.** SubagentStart marks its teammate row `busy` (recording the row first,
   as above); SubagentStop clears it. A Stop of the session's own (no `agent_id`) whose
-  `background_tasks` lists no `teammate` clears every row: none is left (a TaskStop, say).
+  `background_tasks` lists no task but `shell`s clears every row: no teammate or async agent is
+  left (a TaskStop, say).
   `subagents_busy` counts the busy rows under the payload's `session_id`.
 - **Background commands.** `background_running` is the number of `background_tasks` entries
   of type `shell` and status `running` at the session's last Stop. A command of the session's own
   wakes it when it ends (§1), so the Stop after that counts again.
 - **Subagents don't run background commands.** Claude Code doesn't wake a subagent when its
   background command ends (§1): its work would stop half done, and its lead would look done. So
-  the PreToolUse hook (not the guard: it fails open) denies a Bash call from a subagent
-  (`agent_id` set) with `tool_input.run_in_background: true`, telling it to run the command in
+  the PreToolUse hook (not the guard: it fails open) denies a Bash call with
+  `tool_input.run_in_background: true` whose `agent_id` is one of the session's recorded
+  subagents (an agent auto mode runs isn't, §1), telling it to run the command in
   the foreground with a long enough timeout, or leave a longer one to its lead. Denials are not
   recorded in `guard_denials`, whose count is the message guard's.
 - Background work is `subagents_busy > 0` or `background_running > 0`, unless the process is
   gone. It makes rule 5 match, and the board, the coordinator's snapshot (§8), `list_threads` and
   `read_report` (§7) show it, e.g. `1 subagent, 2 background commands`.
-- **No finish while it runs.** A thread's Stop with background work sends no notification and
-  sets `stopped_early_at`: its coordinator was told it was idle. The thread's next Stop without
-  background work clears it and is the **final report**: the hook prints
+- **No finish while it runs.** A thread's Stop with background work sends no notification. A
+  thread's Stop with a busy subagent while `background_tasks` lists a `teammate` also sets
+  `stopped_early_at`: its coordinator was told it was idle (§1). Async agents and the thread's own
+  commands keep it busy, so its idle notice comes at its real finish and nothing more is needed.
+  The thread's next Stop without background work clears `stopped_early_at` and is the **final
+  report**: the hook prints
   `{"decision":"block","reason":"…"}`, telling the thread that everything it waited on finished
   and to send its coordinator the final report with SendMessage (what it did, the branch and
   commit, the PR, test results, what it needs), at the address `thread_send` allows (§6): the
@@ -777,7 +797,7 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | --- | --- | --- |
 | `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?`, `account?` (an agp id or label from the pool, only when the user asks) | Picks the thread's account (below), which also checks trust of the repo path there, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread in that account, resolves its ids. Returns `{name, short_id, repo, model, effort, account, address, next}` (`account` the agp label, null for the project's account), plus `account_note` when the choice skipped accounts or fell back, and `warning` when it adopted a session whose spawn reported a failure |
 | `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` in every account the project uses (stored rows plus a `warning` naming what failed), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, running, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`, `account`, `address`; `running` is its background work (§5), e.g. `"1 subagent"`, or null. Resolved and cleaned threads are left out unless `include_resolved` |
-| `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text; with background work (§5) also `running` and a `note` that the thread isn't finished and will message its final report |
+| `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text; with background work (§5) also `running` and a `note` that the thread isn't finished and reports when it is |
 | `wake_thread` | `name` | Refreshes from its own account; if no live pid: `claude respawn <short_id>` there, poll its account's `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there). A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 
@@ -925,7 +945,7 @@ a pid. Otherwise it is left alone.
   to `memory/` and update `memory/MEMORY.md`, read full reports with `read_report` when an idle
   notice arrives; when `read_report` says the thread still runs subagents or background
   commands, the notice isn't a finish: say nothing yet and don't subscribe again (the notice
-  would come straight back, §1), as the thread messages its final report (§5 "Background
+  would come straight back, §1), as the thread reports when they finish (§5 "Background
   work"). Removing worktrees and branches is the user's call (board `x`, `chief clean`,
   `chief gc`), so it never offers to; it names no branch in a thread's brief unless the user did
   (threads create their own). One line says it can message its own subagents by the name or agent
@@ -936,7 +956,7 @@ a pid. Otherwise it is left alone.
   than the coordinator's (§3), reply only to the `from="uds:…"` address of the coordinator's
   message; you can message your own subagents by the name or agent id the Agent tool gave them,
   and they report to you (§6 "Subagents"); when it ends a turn to wait for subagents or a
-  background command, say what it waits for (chief asks for the final report once they finish);
+  background command, say what it waits for, and send the final report if chief asks for it;
   tell subagents to run tests and builds in the foreground, as chief denies their background
   commands, and run anything over 10 minutes itself (§5 "Background work"); end every turn with a short report (what changed,
   branch, PR URL if any, what you need); if something is missing, say exactly what and stop.

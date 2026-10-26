@@ -14,7 +14,7 @@ user may also talk to you directly.
   board show.
 - You can message your own subagents by the name or agent id the Agent tool gave them, and they report to you.
 - When you end a turn to wait for subagents or a background command, say what you are waiting for.
-  Your coordinator is told you are idle; once they all finish, chief asks you for your final report.
+  If chief later asks you for your final report, send it as asked.
 - Tell subagents to run tests and builds in the foreground, with a long enough timeout: chief
   denies their background commands, because Claude Code doesn't wake a subagent when one ends.
   Run anything that takes longer than 10 minutes yourself.
