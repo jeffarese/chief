@@ -206,7 +206,7 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
     let (short_id, adopted, warning) = match ctx.claude.spawn_bg(&spec) {
         Ok(id) => (id, None, None),
         Err(e) => {
-            let (agent, warning) = after_failed_spawn(ctx, &name, &live, e)?;
+            let (agent, warning) = after_failed_spawn(ctx, &name, &live, &spec.cwd, e)?;
             let id = agent
                 .id
                 .clone()
@@ -256,21 +256,24 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
     Ok(out)
 }
 
-/// A `claude --bg` that failed (a timeout, output chief doesn't recognise) may have started the
-/// session anyway; deleting its row would leave it working unseen, and the guard would refuse
-/// it. So: when `claude agents` lists it, return it with a warning to adopt; when it doesn't,
-/// delete the row and return the spawn's error; when chief can't tell, keep the row (its hooks
-/// match it by title if it did start) and say so.
+/// A `claude --bg` in `cwd` that failed (a timeout, output chief doesn't recognise) may have
+/// started the session anyway; deleting its row would leave it working unseen, and the guard
+/// would refuse it. So: when `claude agents` lists it (by name, in `cwd`), return it with a
+/// warning to adopt; when it doesn't, delete the row and return the spawn's error; when chief
+/// can't tell, keep the row (its hooks match it by title if it did start) and say so.
 fn after_failed_spawn(
     ctx: &ToolCtx,
     name: &str,
     before: &[AgentRow],
+    cwd: &Path,
     err: anyhow::Error,
 ) -> Result<(AgentRow, String)> {
     // An untrusted folder starts nothing.
     let found = match err.downcast_ref::<ClaudeError>() {
         Some(ClaudeError::NotTrusted(_)) => Ok(None),
-        None => ctx.claude.find_started(name, before, ctx.resolve_timeout),
+        None => ctx
+            .claude
+            .find_started(name, before, cwd, ctx.resolve_timeout),
     };
     match found {
         Ok(Some(agent)) => {

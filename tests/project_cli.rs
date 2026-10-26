@@ -589,7 +589,8 @@ fn up_adopts_a_coordinator_that_started_anyway() {
     let name = "chief-payments-latency";
     // An old, stopped session with the same name is not the new one.
     let old = agent("01d", "old-sid", name, "stopped", None);
-    let new = agent("c0ffee", "coord-sid", name, "done", Some(74112));
+    let mut new = agent("c0ffee", "coord-sid", name, "done", Some(74112));
+    new["cwd"] = project_dir(&home).to_string_lossy().into_owned().into();
     home.fake
         .set(
             &format!("agents.stdout.{}", next_agents_call(&home)),
@@ -628,10 +629,24 @@ fn up_adopts_a_coordinator_left_by_an_unclear_spawn() {
         let row = db::SessionRow::new(name, SLUG, chief::state::Role::Coordinator, db::now_ms());
         db::insert_session(&home.db(), &row).unwrap();
     }
-    home.fake.set(
-        "agents.stdout",
-        &json!([agent("c0ffee", "coord-sid", name, "done", Some(74112))]).to_string(),
+    // A live session with the name in another folder (another chief home's coordinator, or the
+    // user's own) is not adopted; the name is taken, so nothing starts.
+    let mut theirs = agent("0th3r", "other-sid", name, "done", Some(5));
+    theirs["cwd"] = home.path().to_string_lossy().into_owned().into();
+    home.fake.set("agents.stdout", &json!([theirs]).to_string());
+    let out = home.run(&["up", SLUG], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("already named chief-payments-latency"),
+        "{}",
+        stderr(&out)
     );
+    let row = db::get_coordinator(&home.db(), SLUG).unwrap().unwrap();
+    assert_eq!(row.short_id, None);
+
+    let mut ours = agent("c0ffee", "coord-sid", name, "done", Some(74112));
+    ours["cwd"] = project_dir(&home).to_string_lossy().into_owned().into();
+    home.fake.set("agents.stdout", &json!([ours]).to_string());
     let out = home.run(&["up", SLUG], "");
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(

@@ -319,10 +319,11 @@ pub fn ensure_coordinator(
         return Err(ClaudeError::NotTrusted(dir.to_path_buf()).into());
     }
     let live = claude.agents()?;
-    // A row without a short id is left by a spawn chief couldn't confirm: adopt its session.
+    // A row without a short id is left by a spawn chief couldn't confirm: adopt its session, but
+    // only one in the project folder (the name alone may be another chief home's coordinator).
     let leftover = existing.as_ref().and_then(|row| match &row.session_id {
         Some(sid) => live.iter().find(|a| &a.session_id == sid && a.id.is_some()),
-        None => claude::started_session(&live, &name, &[]),
+        None => claude::started_session(&live, &name, &[], dir),
     });
     if let Some(agent) = leftover {
         eprintln!(
@@ -380,7 +381,7 @@ pub fn ensure_coordinator(
         }
         // It may have started anyway (a timeout, output chief doesn't recognise); deleting the
         // row would make the next `up` refuse the name as taken.
-        Err(e) => match claude.find_started(&name, &live, RESOLVE_TIMEOUT) {
+        Err(e) => match claude.find_started(&name, &live, dir, RESOLVE_TIMEOUT) {
             Ok(Some(agent)) => {
                 eprintln!(
                     "warning: `claude --bg` reported a failure, but {name} started anyway, so \

@@ -215,14 +215,15 @@ impl Claude {
         }
     }
 
-    /// After a `claude --bg` that failed or printed no id, which may have started the session
-    /// anyway (a timeout, output chief doesn't recognise): `claude agents` until `timeout`, for
-    /// `started_session`. Ok(None) once a listing succeeded without it; the last error when every
-    /// listing failed (chief can't tell).
+    /// After a `claude --bg` in `cwd` that failed or printed no id, which may have started the
+    /// session anyway (a timeout, output chief doesn't recognise): `claude agents` until
+    /// `timeout`, for `started_session`. Ok(None) once a listing succeeded without it; the last
+    /// error when every listing failed (chief can't tell).
     pub fn find_started(
         &self,
         name: &str,
         before: &[AgentRow],
+        cwd: &Path,
         timeout: Duration,
     ) -> Result<Option<AgentRow>> {
         let deadline = Instant::now() + timeout;
@@ -230,7 +231,7 @@ impl Claude {
         loop {
             let error = match self.agents() {
                 Ok(rows) => {
-                    if let Some(row) = started_session(&rows, name, before) {
+                    if let Some(row) = started_session(&rows, name, before, cwd) {
                         return Ok(Some(row.clone()));
                     }
                     listed = true;
@@ -321,18 +322,30 @@ pub fn bg_args(spec: &BgSpawn) -> Vec<OsString> {
     args
 }
 
-/// The background session (it has a short id) named exactly `name` that `before` didn't list:
-/// the one a spawn of `name` just started.
+/// The background session (it has a short id) named exactly `name`, working in `cwd`, that
+/// `before` didn't list: the one a spawn of `name` in `cwd` just started. A session with the name
+/// in another folder is someone else's (another chief home's, or the user's own).
 pub fn started_session<'a>(
     rows: &'a [AgentRow],
     name: &str,
     before: &[AgentRow],
+    cwd: &Path,
 ) -> Option<&'a AgentRow> {
     rows.iter().find(|r| {
         r.id.is_some()
             && r.name.as_deref() == Some(name)
+            && r.cwd
+                .as_deref()
+                .is_some_and(|c| same_folder(Path::new(c), cwd))
             && !before.iter().any(|b| b.session_id == r.session_id)
     })
+}
+
+/// Whether two paths name one folder, compared canonically when both exist (macOS `/tmp` is
+/// `/private/tmp`).
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canonical(a) == canonical(b)
 }
 
 /// Parses `2.1.310 (Claude Code)`.

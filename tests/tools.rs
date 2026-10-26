@@ -336,14 +336,24 @@ fn spawns_and_respawns_rewrite_the_generated_files_first() {
 }
 
 /// A `claude` whose `--bg` prints no id (`bg_exit` as its exit code) and whose `agents` lists the
-/// session that `--bg` named, as if it had started anyway.
+/// session that `--bg` named, as if it had started anyway, in the folder `--bg` ran in (or
+/// `cwd` when given).
 fn started_anyway(dir: &Path, bg_exit: u8) -> chief::claude::Claude {
+    started_anyway_in(dir, bg_exit, None)
+}
+
+fn started_anyway_in(dir: &Path, bg_exit: u8, cwd: Option<&Path>) -> chief::claude::Claude {
     let bin = dir.join("claude-started-anyway");
+    let listed_cwd = match cwd {
+        Some(p) => format!("'{}'", p.display()),
+        None => "\"$(cat \"$dir/started-cwd\")\"".to_string(),
+    };
     let script = format!(
         r#"#!/bin/sh
 dir=$(dirname "$0")
 case "$1" in
   --bg)
+    pwd -P > "$dir/started-cwd"
     while [ $# -gt 1 ]; do
       [ "$1" = "--name" ] && printf '%s' "$2" > "$dir/started-name"
       shift
@@ -352,7 +362,7 @@ case "$1" in
     exit {bg_exit} ;;
   agents)
     if [ -f "$dir/started-name" ]; then
-      printf '[{{"id":"ad0pt","sessionId":"sid-adopt","name":"%s","state":"working","status":"busy","pid":42}}]' "$(cat "$dir/started-name")"
+      printf '[{{"id":"ad0pt","sessionId":"sid-adopt","name":"%s","cwd":"%s","state":"working","status":"busy","pid":42}}]' "$(cat "$dir/started-name")" {listed_cwd}
     else
       echo '[]'
     fi ;;
@@ -400,6 +410,39 @@ fn start_thread_adopts_a_session_that_started_anyway() {
             (Some("ad0pt"), Some("sid-adopt"), Some(42))
         );
     }
+}
+
+/// A session with the new name in another folder isn't the one this spawn started (another chief
+/// home's thread, say): not adopted, and the row goes.
+#[test]
+fn start_thread_adopts_only_a_session_in_the_repo() {
+    let env = Env::new();
+    let elsewhere = env.root.path().canonicalize().unwrap();
+    let claude = started_anyway_in(env.fake.dir.path(), 1, Some(&elsewhere));
+    let err = tools::start_thread(
+        &ToolCtx {
+            conn: &env.conn,
+            config: &env.config,
+            claude: &claude,
+            project_dir: &env.dir,
+            trust_config: &env.trust,
+            now,
+            resolve_timeout: Duration::from_millis(300),
+            wake_timeout: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(10),
+        },
+        &start_args("Fix login bug", "Fix it"),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("printed no session id"),
+        "{err:#}"
+    );
+    assert!(
+        db::list_sessions(&env.conn, "demo", None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// When `claude agents` can't say whether the session started, the row stays: hooks match it by

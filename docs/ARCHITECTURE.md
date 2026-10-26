@@ -498,8 +498,10 @@ a flag. If the spawn fails, the session may have started anyway (a timeout, an o
 the `backgrounded` line), and a deleted row would leave it working unseen and unreachable through
 the guard. So unless the error is `NotTrusted`, chief first looks for it in `claude agents` (polled
 up to the 5 s resolve timeout, each call bounded): a background session (it has an `id`) named
-exactly the new name that the pre-spawn snapshot didn't list is adopted (its short id, session id
-and pid are stored) and the call succeeds with a `warning` that quotes the failure. When listings
+exactly the new name, whose `cwd` is the folder the spawn ran in (compared canonically), that the
+pre-spawn snapshot didn't list is adopted (its short id, session id and pid are stored) and the
+call succeeds with a `warning` that quotes the failure. A session with that name in another
+folder is someone else's (another chief home's, or the user's own). When listings
 succeed without it, the row is deleted and the error returned. When every listing fails, chief
 can't tell: the row is kept without a short id (hooks attach it by title if the session did start)
 and the error says so. Failing to resolve the session id is not an error (hooks match by title,
@@ -573,8 +575,10 @@ trusted, and no other live session may already use the name). A failed spawn is 
 thread's is (above): a session that started anyway is adopted, with a warning on stderr; a row it
 inserted is removed only when listings show no such session, and kept when chief can't tell. A
 kept row (no `short_id`) is adopted by the next `up` when `claude agents` lists its session (by
-`session_id` if a hook stored one, else a background session with exactly the name), instead of
-refusing the name as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
+`session_id` if a hook stored one, else a background session with exactly the name whose `cwd`
+is the project folder, compared canonically), instead of refusing the name as taken. A live
+session with the name in another folder (another chief home's coordinator, or the user's own) is
+never adopted: the name counts as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
 a pid. Otherwise it is left alone.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)

@@ -156,8 +156,13 @@ fn resolve_session_gives_up() {
 
 #[test]
 fn find_started_looks_for_a_new_background_session_by_exact_name() {
-    let row = |id: Option<&str>, sid: &str, name: &str| {
-        let mut v = serde_json::json!({"sessionId": sid, "name": name});
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    // As `claude agents` lists it: the canonical folder (macOS temp dirs are under /private).
+    let listed = repo.canonicalize().unwrap();
+    let row = |id: Option<&str>, sid: &str, name: &str, cwd: &Path| {
+        let mut v = serde_json::json!({"sessionId": sid, "name": name, "cwd": cwd});
         if let Some(id) = id {
             v["id"] = id.into();
         }
@@ -165,38 +170,50 @@ fn find_started_looks_for_a_new_background_session_by_exact_name() {
     };
     let fake = Fake::new();
     let before = chief::claude::parse_agents(
-        &serde_json::json!([row(Some("01d"), "old", "demo-x-1111")]).to_string(),
+        &serde_json::json!([row(Some("01d"), "old", "demo-x-1111", &listed)]).to_string(),
     )
     .unwrap();
-    fake.set(
-        "agents.stdout",
-        &serde_json::json!([
-            row(Some("01d"), "old", "demo-x-1111"),
-            row(None, "interactive", "demo-x-1111"),
-            row(Some("n0pe"), "lookalike", "demo-x-1111 "),
-            row(Some("n3w"), "new", "demo-x-1111"),
-        ])
-        .to_string(),
-    );
+    let elsewhere = tmp.path().to_path_buf();
+    let new = row(Some("n3w"), "new", "demo-x-1111", &listed);
+    let rows = [
+        row(Some("01d"), "old", "demo-x-1111", &listed),
+        row(None, "interactive", "demo-x-1111", &listed),
+        row(Some("n0pe"), "lookalike", "demo-x-1111 ", &listed),
+        // The same name in another folder: another chief home's, or the user's own session.
+        row(Some("0th3r"), "other", "demo-x-1111", &elsewhere),
+    ];
+    let mut all = rows.to_vec();
+    all.push(new);
+    fake.set("agents.stdout", &serde_json::json!(all).to_string());
     let claude = fake.claude();
+    // Asked for with the path as given; matched canonically.
     let found = claude
-        .find_started("demo-x-1111", &before, Duration::from_millis(100))
+        .find_started("demo-x-1111", &before, &repo, Duration::from_millis(100))
         .unwrap()
         .unwrap();
     assert_eq!(found.session_id, "new");
+
+    // Only the one in another folder: none.
+    fake.set("agents.stdout", &serde_json::json!(rows).to_string());
+    assert_eq!(
+        claude
+            .find_started("demo-x-1111", &before, &repo, Duration::from_millis(100))
+            .unwrap(),
+        None
+    );
 
     // Listed, but not there: none.
     fake.set("agents.stdout", "[]");
     assert_eq!(
         claude
-            .find_started("demo-x-1111", &before, Duration::from_millis(100))
+            .find_started("demo-x-1111", &before, &repo, Duration::from_millis(100))
             .unwrap(),
         None
     );
     // Never listed: chief can't tell.
     fake.set("agents.exit", "1").set("agents.stderr", "down");
     let err = claude
-        .find_started("demo-x-1111", &before, Duration::from_millis(100))
+        .find_started("demo-x-1111", &before, &repo, Duration::from_millis(100))
         .unwrap_err();
     assert!(err.to_string().contains("down"), "{err}");
 }
