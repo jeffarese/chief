@@ -311,9 +311,15 @@ fn blocked_cleanup_asks_then_discards() {
             mode: Mode::Safe,
         },
     );
-    let Msg::CleanBlocked { name, loss } = msg else {
+    let Msg::CleanBlocked {
+        name,
+        loss,
+        confirmed,
+    } = msg
+    else {
         panic!("expected a confirmation, got {msg:?}")
     };
+    let confirmed = confirmed.expect("chief listed the loss, so it offers to discard it");
     assert_eq!(name, NAME);
     assert!(
         loss.starts_with("Cleanup stopped: 1 unpushed commit"),
@@ -331,7 +337,7 @@ fn blocked_cleanup_asks_then_discards() {
         &env.src,
         Action::Clean {
             name: NAME.into(),
-            mode: Mode::Discard,
+            mode: Mode::Discard(confirmed),
         },
     );
     assert_eq!(msg, Msg::Done(format!("Cleaned up {NAME}.")));
@@ -340,6 +346,43 @@ fn blocked_cleanup_asks_then_discards() {
         "reset and cleaned"
     );
     assert!(env.row().cleaned_at.is_some());
+}
+
+/// `claude rm` refuses over work chief can't list itself: the modal says why and offers no
+/// discard, and never "Nothing unsaved will be lost" beside a refusal.
+#[test]
+fn a_refusal_chief_cannot_list_offers_no_discard() {
+    let env = Env::new();
+    env.claude
+        .set(
+            "rm.stdout",
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/rm/unpushed-one.txt"
+            ))
+            .unwrap(),
+        )
+        .set("rm.exit", "1");
+    let msg = jobs::run(
+        &env.src,
+        Action::Clean {
+            name: NAME.into(),
+            mode: Mode::Safe,
+        },
+    );
+    let Msg::CleanBlocked {
+        loss, confirmed, ..
+    } = msg
+    else {
+        panic!("expected the blocked modal, got {msg:?}")
+    };
+    assert_eq!(confirmed, None);
+    assert!(
+        loss.starts_with("Cleanup blocked: 1 unpushed commit."),
+        "{loss}"
+    );
+    assert!(!loss.contains("Nothing unsaved will be lost"), "{loss}");
+    assert_eq!(env.claude.calls_of("rm").len(), 1);
 }
 
 #[test]

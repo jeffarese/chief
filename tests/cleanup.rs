@@ -102,6 +102,26 @@ impl Env {
         self.with(|ctx| cleanup::clean(ctx, NAME, mode))
     }
 
+    /// What the user is shown and confirms before a discard.
+    fn inspect(&self) -> cleanup::Inspection {
+        cleanup::inspect(&self.claude.claude(), &self.row()).unwrap()
+    }
+
+    /// `claude rm` refusing with one unpushed commit at `head`.
+    fn rm_refuses_unpushed(&self, k: usize, head: &str) {
+        let text =
+            fixture("unpushed-one").replace("a2a6266abcfc311c36e618d6f2c556188b528181", head);
+        self.claude
+            .set(&format!("rm.stdout.{k}"), &text)
+            .set(&format!("rm.exit.{k}"), "1");
+    }
+
+    fn head(&self) -> String {
+        git(&self.worktree, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string()
+    }
+
     fn row(&self) -> SessionRow {
         db::get_session(&self.conn, NAME).unwrap().unwrap()
     }
@@ -236,14 +256,17 @@ fn discard_resets_only_the_threads_own_worktree() {
     // A never got a worktree of its own: nothing is reset, wherever its cwd was.
     env.insert(|r| r.cwd = Some(b.join("src").to_string_lossy().into_owned()));
     env.claude.job(SHORT, None);
-    assert_eq!(env.clean(Mode::Discard).unwrap(), Outcome::Cleaned);
+    assert_eq!(
+        env.clean(Mode::Discard(env.inspect())).unwrap(),
+        Outcome::Cleaned
+    );
     b_intact();
 
     // A's job names B's worktree: another registered session works there, so no reset and no rm.
     env.insert(|_| {});
     env.claude.job(SHORT, Some(&b));
     let rm_before = env.rm_calls().len();
-    let Outcome::Blocked(why) = env.clean(Mode::Discard).unwrap() else {
+    let Outcome::Blocked(why) = env.clean(Mode::Discard(env.inspect())).unwrap() else {
         panic!("want blocked");
     };
     assert!(why.contains("demo-b-2222"), "{why}");
@@ -338,7 +361,10 @@ fn clean_refuses_threads_that_are_open_or_busy() {
         r.resolved_reason = None;
         r.group_name = "idle".into();
     });
-    let err = env.clean(Mode::Discard).unwrap_err().to_string();
+    let err = env
+        .clean(Mode::Discard(Default::default()))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("is not resolved"), "{err}");
 
     // Resolved (its PR merged) but still mid-turn: rm would stop it.
@@ -371,21 +397,25 @@ fn discard_resets_the_worktree_and_retries_with_the_token() {
     std::fs::create_dir(env.worktree.join("newdir")).unwrap();
     std::fs::write(env.worktree.join("newdir/f.txt"), "x").unwrap();
     env.git.commit(&env.worktree, "c.txt", "Unpushed");
-    env.claude
-        .set("rm.stdout.1", &fixture("unpushed-one"))
-        .set("rm.exit.1", "1")
-        .set(
-            "rm.stdout.2",
-            &fixture("removed").replace("58534bf3", SHORT),
-        );
+    let confirmed = env.inspect();
+    assert_eq!(confirmed.unpushed_count, 1);
+    assert_eq!(confirmed.head.as_deref(), Some(env.head().as_str()));
+    env.rm_refuses_unpushed(1, &env.head());
+    env.claude.set(
+        "rm.stdout.2",
+        &fixture("removed").replace("58534bf3", SHORT),
+    );
 
-    assert_eq!(env.clean(Mode::Discard).unwrap(), Outcome::Cleaned);
-    let token = "a2a6266abcfc311c36e618d6f2c556188b528181@03abe83c324a9c3e9a0db4020ffa195d";
+    assert_eq!(
+        env.clean(Mode::Discard(confirmed)).unwrap(),
+        Outcome::Cleaned
+    );
+    let token = format!("{}@03abe83c324a9c3e9a0db4020ffa195d", env.head());
     assert_eq!(
         env.rm_calls(),
         [
             vec!["rm".to_string(), SHORT.to_string()],
-            ["rm", SHORT, "--discard-unpushed", token]
+            ["rm", SHORT, "--discard-unpushed", token.as_str()]
                 .map(String::from)
                 .to_vec(),
         ]
@@ -399,6 +429,96 @@ fn discard_resets_the_worktree_and_retries_with_the_token() {
     assert!(!env.worktree.join("newdir").exists());
     assert!(env.worktree.join("keep.log").exists(), "never git clean -x");
     assert_eq!(env.row().cleaned_at, Some(NOW));
+}
+
+/// `--discard-unpushed` only for commits chief listed itself, the user confirmed, at the head it
+/// saw; anything else stops with rm's reason.
+#[test]
+fn discard_never_passes_the_token_for_commits_nobody_confirmed() {
+    let env = Env::new();
+    let blocked = |want: &str| {
+        let outcome = env.clean(Mode::Discard(env.inspect()));
+        assert_eq!(outcome.unwrap(), Outcome::Blocked(want.into()));
+        assert_eq!(env.row().cleanup_blocked.as_deref(), Some(want));
+        assert_eq!(env.row().cleaned_at, None);
+    };
+
+    // chief sees nothing unpushed (rm counts something it doesn't): no retry.
+    env.rm_refuses_unpushed(1, &env.head());
+    blocked("1 unpushed commit");
+    assert_eq!(env.rm_calls(), [vec!["rm".to_string(), SHORT.to_string()]]);
+
+    // Listed and confirmed, but the token is for another head.
+    env.git.commit(&env.worktree, "late.txt", "Late");
+    env.rm_refuses_unpushed(2, "0123456789abcdef0123456789abcdef01234567");
+    blocked("1 unpushed commit");
+    assert_eq!(env.rm_calls().len(), 2);
+    assert!(
+        env.rm_calls().iter().all(|c| c.len() == 2),
+        "never the token"
+    );
+
+    // Confirmed, then the worktree changed: nothing is reset and rm doesn't run.
+    let confirmed = env.inspect();
+    env.git.commit(&env.worktree, "later.txt", "Later");
+    std::fs::write(env.worktree.join("scratch.txt"), "x").unwrap();
+    let Outcome::Blocked(why) = env.clean(Mode::Discard(confirmed)).unwrap() else {
+        panic!("want blocked");
+    };
+    assert!(why.contains("changed"), "{why}");
+    assert!(env.worktree.join("scratch.txt").exists());
+    assert_eq!(env.rm_calls().len(), 2);
+}
+
+/// The reviewer's CLI repro: a thread chief can see no worktree for printed "Nothing unsaved will
+/// be lost." and then discarded a commit `claude rm` reported.
+#[test]
+fn cli_discard_keeps_commits_it_did_not_show() {
+    let home = Home::new();
+    {
+        let conn = home.db();
+        db::register_project(&conn, "demo", home.path(), 0).unwrap();
+        let mut row = SessionRow::new("demo-x-1111", "demo", Role::Thread, NOW);
+        row.short_id = Some(SHORT.into());
+        row.session_id = Some("t-sid".into());
+        row.resolved = true;
+        db::insert_session(&conn, &row).unwrap();
+    }
+    home.fake
+        .set(
+            "agents.stdout",
+            &json!([
+                agent(SHORT, "t-sid", "demo-x-1111", "done", None),
+                agent("c0", "c-sid", "chief-demo", "done", Some(100)),
+            ])
+            .to_string(),
+        )
+        .set("rm.stdout.1", &fixture("unpushed-one"))
+        .set("rm.exit.1", "1")
+        .set("rm.stdout.2", &format!("removed {SHORT}\n"));
+
+    let out = home.run(&["clean", "demo", "demo-x-1111", "--discard"], "");
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("Nothing unsaved will be lost."),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        stderr(&out).contains("1 unpushed commit"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        home.fake.calls_of("rm"),
+        [vec!["rm".to_string(), SHORT.to_string()]],
+        "no --discard-unpushed"
+    );
+    let row = db::get_session(&home.db(), "demo-x-1111").unwrap().unwrap();
+    assert_eq!(
+        (row.cleaned_at, row.cleanup_blocked.as_deref()),
+        (None, Some("1 unpushed commit"))
+    );
 }
 
 #[test]

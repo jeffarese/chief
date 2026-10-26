@@ -622,9 +622,12 @@ are tested without a terminal (`TestBackend`).
   (`tools::wake_thread`, refused for cleaned); r resolve or reopen (`registry::set_resolved`,
   reason `user`; reopening a cleaned thread is refused with its message); o open the PR URL
   (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
-  uncleaned thread: `cleanup::clean(Safe)`, and when blocked a modal shows why plus
-  `cleanup::render_loss` and runs `clean(Discard)` only after the thread's name is typed exactly
-  (Enter with a wrong name clears the input; Esc cancels); R show or hide resolved; Tab detail on
+  uncleaned thread: `cleanup::clean(Safe)`. When blocked, a fresh `cleanup::inspect` decides the
+  modal: if it lists the loss, "Discard unsaved work?" shows why plus `cleanup::render_loss` and
+  runs `clean(Discard(<that inspection>))` only after the thread's name is typed exactly (Enter
+  with a wrong name clears the input; Esc cancels); if it lists nothing or fails (`claude rm`
+  refused over work chief can't see), "Cleanup blocked" says `Cleanup blocked: <why>.` and why no
+  discard is offered, and any key closes it; R show or hide resolved; Tab detail on
   short terminals; s settings; ? help (any key closes); q or Ctrl+C quit the board only. Wake and
   cleanup run one at a time on a worker thread ("waking …" in the status line).
 - Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
@@ -685,8 +688,9 @@ exists, its branch (`git branch --show-current`, else `sessions.branch`),
 `git status --porcelain --untracked-files=normal` lines (ignored files aren't listed, as Claude
 Code ignores them), and unpushed commits as Claude Code means them:
 `git rev-list --count HEAD refs/heads/<branch> --not --remotes`, listed with
-`git log --format='%h %s' -n20 …`. When the worktree is gone, commits are checked in `repo_path`
-if the branch still exists there.
+`git log --format='%h %s' -n20 …`, and the head they end at (`git rev-parse HEAD`). When the
+worktree is gone, commits are checked in `repo_path` if the branch still exists there, and the
+head is the branch's sha.
 
 `clean(ctx, name, mode)`:
 
@@ -698,13 +702,17 @@ if the branch still exists there.
 4. `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
    in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
    `, `) and stop without calling `claude rm`.
-   `Discard` (the user confirmed): refused (stored in `cleanup_blocked`, nothing run) when the job
-   state of another session registered in this chief home names the same worktree; otherwise in
-   a dirty worktree run `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`:
-   ignored files stay).
+   `Discard(confirmed)` carries the inspection the user was shown and confirmed. It is refused
+   (stored in `cleanup_blocked`, nothing run) when a fresh `inspect` differs from it ("the
+   worktree changed after you confirmed …") or when the job state of another session registered
+   in this chief home names the same worktree; otherwise in a dirty worktree run
+   `git -C <wt> reset --hard -q` and `git -C <wt> clean -fdq` (never `-x`: ignored files stay).
 5. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
-   `--discard-unpushed <token>` from the refusal. Removed → cleaned. Unpushed → `N unpushed
-   commits`; dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in
+   `--discard-unpushed <token>` only when the confirmed inspection itself listed unpushed commits
+   and the token's head sha (`<sha>@<worktree-id>`) equals the head it saw (`git rev-parse HEAD`
+   in the worktree, else the branch's sha). Otherwise `claude rm` counts work nobody was shown,
+   and no destructive flag is ever passed. Removed → cleaned. Unpushed → `N unpushed commits`;
+   dirty → `uncommitted changes`; anything else → `claude rm: <output>`, all stored in
    `cleanup_blocked`.
 
 `claude rm` output (`claude::parse_rm`): a `removed <id>` line is removed (exit status alone isn't:
@@ -728,10 +736,13 @@ working one is tried again on the next refresh. `cleanup = "manual"` never clean
 per thread, or `nothing to clean`; warnings go to stderr. `--dry-run` still stores PR status, as
 the board would.
 
-`chief clean <slug> <thread>` runs `clean(Safe)` and fails with the reason and the `--discard`
-command when blocked. With `--discard` it checks step 2 first, prints what would be deleted and
-lost (`git status --short` lines, the unpushed commits), and, when something would be lost, asks
-`Type the thread name to confirm:` on a terminal; without one it refuses unless `--yes`.
+`chief clean <slug> <thread>` runs `clean(Safe)` and fails with the reason when blocked, plus the
+`--discard` command when `inspect` lists the loss, or else that chief can't list that work and
+won't discard it. With `--discard` it checks step 2 first, prints what would be deleted and lost
+(`git status --short` lines, the unpushed commits), and, when something would be lost, asks
+`Type the thread name to confirm:` on a terminal; without one it refuses unless `--yes`. It then
+runs `clean(Discard(<that inspection>))`, so "Nothing unsaved will be lost" never discards a
+commit `claude rm` reports.
 
 A cleaned thread can't be woken, reopened or messaged (§6, §7) and is hidden from `list_threads`
 unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
