@@ -88,8 +88,16 @@ trust yet: the project folder always, plus untrusted repos. When stdin and stdou
 runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twice), then re-checks;
 otherwise it prints `cd <folder> && claude` for each.
 
-`chief up` checks the version, rewrites `generated/*`, then runs the coordinator step (§7). Until
-the layout lands (§9) it prints the coordinator's name and `claude attach <short_id>`.
+`chief up` checks the version, rewrites `generated/*`, runs the coordinator step (§7), then opens
+the layout (§9). When Rex isn't installed or its server isn't running (or opening the layout fails)
+it prints why, `claude attach <short_id>`, and `chief board --project <slug>` to run in another
+terminal.
+
+`chief down <slug> [--stop-threads]` kills the `chief-<slug>` Rex session (exact id, if there is
+one), clears `ui_state.pane_showing`, syncs `claude agents` (stored rows if it fails), and runs
+`claude stop` on the coordinator when it has a process; with `--stop-threads` also on every
+uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
+`claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
 `chief status [<slug>]` polls `claude agents` once (stored rows if it fails), syncs (§5), and prints
 each project's coordinator and threads grouped in board order. A thread's line ends with
@@ -116,10 +124,12 @@ canonical absolute path of the `chief` binary (`std::env::current_exe()`), so in
 `cargo install --path .`. Every word of a hook command is shell-quoted.
 
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so the
-variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_CLAUDE_CONFIG` and
-`CHIEF_NO_NOTIFY`, when set at generation time, are written into the files: as `K='v'` prefixes on
-every hook command and in the MCP server's `env`. Paths among them are made absolute (a bare
-`CHIEF_CLAUDE_BIN` or `CHIEF_GH_BIN` without a slash is kept for PATH lookup).
+variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG`
+and `CHIEF_NO_NOTIFY`, when set at generation time, are written into the files: as `K='v'` prefixes
+on every hook command and in the MCP server's `env`. Paths among them are made absolute (a bare
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or `CHIEF_REX_BIN` without a slash is kept for PATH lookup).
+Rex blocks start from the login shell's environment, so the layout's commands carry the same
+variables (§9).
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -239,7 +249,8 @@ CREATE TABLE guard_denials (
 
 CREATE TABLE ui_state (
   project_slug TEXT PRIMARY KEY,
-  pane_target  TEXT                       -- session name the left pane should show
+  pane_target  TEXT,                      -- session name the left pane should show
+  pane_showing TEXT                       -- session `chief pane` is attached to now; NULL between attaches (migration 5)
 );
 ```
 
@@ -476,29 +487,88 @@ with a marker, then the board itself.
 
 ## 9. Layout (`chief up`, Rex first, tmux later)
 
-`src/mux/mod.rs` defines:
+`src/mux/mod.rs` defines a backend-neutral trait (block ids are unique across sessions):
 
 ```rust
 pub trait Mux {
-    fn ensure_session(&self, label: &str, cwd: &Path) -> Result<SessionRef>;
-    fn run_block(&self, s: &SessionRef, spec: &BlockSpec) -> Result<BlockRef>; // split, ratio, label, cmd
-    fn find_block(&self, s: &SessionRef, label: &str) -> Result<Option<BlockRef>>;
+    fn find_session(&self, label: &str) -> Result<Option<SessionRef>>;   // exact label; Err = not installed / not running
+    fn create_session(&self, label: &str, first: &BlockSpec) -> Result<(SessionRef, BlockRef)>;
+    fn run_block(&self, s: &SessionRef, spec: &BlockSpec) -> Result<BlockRef>; // split, ratio, label, cwd, cmd, focus
+    fn blocks(&self, s: &SessionRef) -> Result<Vec<BlockInfo>>;            // id + label
+    fn is_running(&self, b: &BlockRef) -> Result<bool>;                    // a kept-open block outlives its program
+    fn close_block(&self, b: &BlockRef) -> Result<()>;
     fn send_key(&self, b: &BlockRef, key: &str) -> Result<()>;
     fn focus(&self, b: &BlockRef) -> Result<()>;
+    fn show(&self, s: &SessionRef) -> Result<bool>;                        // false: can't bring it into view
     fn kill_session(&self, s: &SessionRef) -> Result<()>;
+    fn find_block(&self, s: &SessionRef, label: &str) -> Result<Option<BlockRef>>; // provided, via blocks
 }
 ```
 
-`src/mux/rex.rs` implements it with the `rex` CLI (`--json` outputs). Layout: Rex session
-`chief-<slug>`, block `main` running `chief pane --project <slug>`, block `board` split right at 32 %
-running `chief board --project <slug>`.
+`src/mux/rex.rs` implements it with the `rex` CLI (`CHIEF_REX_BIN` overrides the binary), always
+with `--autostart=false` (no server means no layout, never a server chief started) and a 15 s
+timeout: `rex list --json`; `rex new <label> --cwd <dir> --keep-open --json -- <cmd>` then
+`rex block rename -s <s> <block> <label>` (`new` labels its first block "shell"); `rex run -s <s>
+--label <l> --focus=<bool> [-b <anchor> --split <dir> --ratio <n>] --cwd <dir> --keep-open --json
+-- <cmd>`; `rex block ls -s <s> --json`; `rex block call -b <b> process` (running while it lists a
+`child`); `rex block close <b>`; `rex send-key -b <b> <key>`; `rex focus <b>`; `rex kill <s>`; and
+`rex do session.select session_id=<s>` for `show` (a client action: Rex picks the app when exactly
+one is connected, and fails otherwise). chief only touches the session labelled `chief-<slug>`, by
+its exact id.
 
-`chief pane` loop: read `ui_state.pane_target` (default the coordinator); run
-`claude attach <short_id>` as a child on the same TTY; when it exits (Ctrl+Z detach), read the target
-again and repeat. If the target is asleep, respawn it first. If attach fails, print why and poll the
-target every 500 ms.
+`src/layout.rs` builds the layout over any `Mux`: session `chief-<slug>`, block `main` running
+`chief pane --project <slug>`, block `board` split right of it at 32 % running
+`chief board --project <slug>`, both with the project folder as cwd. Each command is the canonical
+chief path, behind `env K=V…` with the §3 passthrough variables when any is set. `open`:
 
-Board switching: write `pane_target`, then `send_key(main, "ctrl+z")`.
+1. No session `chief-<slug>`: create it with `main`, add `board` with `--focus=false`.
+2. Both blocks there and running: reuse.
+3. One running: close the other if it is there but ended, and run it again beside the running one
+   (`board` right of `main` at 32 %, or `main` left of `board` at 68 %).
+4. Neither running: kill the session and create it again (closing its last block could end it).
+
+Then focus `main` and `show` the session. When `show` returns false, `up` prints
+`rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
+
+`chief pane` loop (`src/pane.rs`):
+
+1. Target: `ui_state.pane_target`; NULL, or a session that is unknown, of another project, cleaned
+   (removed counts) or never started (no short id), means the coordinator, and a stale target is
+   cleared (only while it still holds that name, so a newer board write survives). No coordinator
+   with a short id yet: print `chief · no coordinator yet: run chief up <slug>` and look again
+   every 500 ms.
+2. Print `chief · <name> …` on a cleared screen. Sync `claude agents`; with no pid, `claude
+   respawn <short_id>` and poll for a pid up to 20 s (`chief · waking <name> …`). A failing
+   `claude agents` skips this step; a failing respawn is shown and retried after 500 ms.
+3. Write `pane_showing = <name>`, then read the target again; if it changed, clear
+   `pane_showing` and start over (see board switching below).
+4. Drain queued keys (`q` quits), restore the terminal mode the pane started in but with ISIG off,
+   run `claude attach <short_id>` as a child on the same TTY, wait, take raw mode back, clear
+   `pane_showing`.
+5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
+   (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 1.
+
+`q` while chief has the terminal ends the loop; so does the session being killed (the pty hangs
+up). On exit `pane_showing` is cleared.
+
+Ctrl+Z: the board switches by sending Ctrl+Z to `main`. Inside `claude attach` it detaches. While
+chief itself has the terminal, the terminal is in raw mode (ISIG off), so Ctrl+Z, Ctrl+C and
+other keys are plain bytes chief reads and drops (only `q` counts). Attach starts with ISIG still
+off, so a Ctrl+Z that arrives before Claude's UI is up stays queued as input; Claude reads it once
+it takes the terminal and detaches, and the loop attaches to the current target (a switch is never
+lost). In case a SIGTSTP gets through anyway, chief ignores it and spawns attach with SIGTSTP reset
+to default (an ignored signal would survive exec); it waits with `waitpid(WUNTRACED)` and sends
+SIGCONT to a stopped attach, so the loop can't hang. On exit chief restores the terminal mode it
+started with. Also, Rex runs the command as the leader of its own session, an orphaned process
+group, so the kernel discards terminal stop signals there anyway (verified in M4: with ISIG on,
+`^Z` echoes and nothing stops).
+
+Board switching: write `pane_target`, then `pane::request_switch(mux, conn, slug)`: when
+`pane_showing` is NULL (between attaches, or no pane) or equals the target (NULL target = the
+coordinator's name), do nothing; otherwise find `chief-<slug>` and its `main` block and
+`send_key(main, "ctrl+z")`, or do nothing when either is missing (a board run on its own). The pane
+writes `pane_showing` before its last read of the target and the board writes the target before
+reading `pane_showing`, so a switch that sends nothing is always seen by the pane's next read.
 
 ## 10. Board
 
@@ -544,8 +614,9 @@ are tested without a terminal (`TestBackend`).
   short terminals; s settings; ? help (any key closes); q or Ctrl+C quit the board only. Wake and
   cleanup run one at a time on a worker thread ("waking …" in the status line).
 - Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
-  `pane::request_switch(slug)`. Until the layout lands it is a no-op; milestone 4 makes it
-  `send_key(main, "ctrl+z")` (§9).
+  `pane::request_switch` with Rex (`CHIEF_REX_BIN`, kept in the board's `Sources`), which sends
+  Ctrl+Z to the layout's `main` block unless the pane already shows the target or no layout is
+  open (§9).
 - Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, default repo, cleanup (merged/manual),
   `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
@@ -570,7 +641,9 @@ are tested without a terminal (`TestBackend`).
   `tests/fixtures/agents/agents-sample.json`, config round trip, migrations on a fresh DB.
 - `CHIEF_CLAUDE_BIN` overrides the `claude` binary; integration tests use a fake script
   (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_GH_BIN`
-  overrides `gh` the same way (the same script, linked as `gh`). `claude rm` outputs from the live
+  overrides `gh` the same way (the same script, linked as `gh`), and `CHIEF_REX_BIN` overrides
+  `rex` (linked as `rex`; the test home's default fails like a Rex with no server, so no test
+  reaches the real one). Layout and switch logic is also tested against an in-memory `Mux`. `claude rm` outputs from the live
   M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
   remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
   tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_NO_NOTIFY=1` turns off

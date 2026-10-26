@@ -10,6 +10,8 @@ use rusqlite::Connection;
 use crate::claude::{self, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT};
 use crate::config::{ProjectConfig, Repo};
 use crate::db::{self, SessionRow};
+use crate::layout::{self, Opened};
+use crate::mux::rex::Rex;
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
 use crate::{generated, names, paths, prompts, registry, tools};
@@ -226,19 +228,17 @@ pub enum CoordinatorAction {
     Running,
 }
 
-/// Starts or respawns the coordinator, then (M4) opens the layout.
+/// Starts or respawns the coordinator, then opens the Rex layout (§9). Without Rex it says how
+/// to attach and where to run the board instead.
 pub fn up(slug: &str) -> Result<()> {
     let claude = Claude::from_env();
     claude.check_version()?;
     let dir = project_dir(slug);
     let config = ProjectConfig::load(&dir.join("project.toml"))
         .with_context(|| format!("no usable chief project {slug:?}; create it with chief init"))?;
-    generated::write_all(
-        &dir,
-        slug,
-        &generated::chief_exe()?,
-        &generated::passthrough_env(),
-    )?;
+    let exe = generated::chief_exe()?;
+    let env = generated::passthrough_env();
+    generated::write_all(&dir, slug, &exe, &env)?;
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
         db::register_project(&conn, slug, &dir, db::now_ms())?;
@@ -251,9 +251,31 @@ pub fn up(slug: &str) -> Result<()> {
         CoordinatorAction::Running => "already running",
     };
     println!("Coordinator {} {verb}.", row.name);
-    // M4 opens the Rex layout here; until then, attach by hand.
-    if let Some(short_id) = &row.short_id {
-        println!("Talk to it: claude attach {short_id}");
+
+    let label = layout::session_label(slug);
+    match layout::open(&Rex::from_env(), slug, &dir, &exe, &env) {
+        Ok(opened) => {
+            let what = match opened.opened {
+                Opened::Created => "opened",
+                Opened::Repaired => "repaired",
+                Opened::Reused => "already open",
+            };
+            println!("Rex session {label} {what}.");
+            if !opened.shown {
+                println!(
+                    "Rex didn't switch to it (that needs exactly one Rex app connected). Pick \
+                     {label} in the app, or run: rex -C <app> do session.select session_id={}",
+                    opened.session.0
+                );
+            }
+        }
+        Err(e) => {
+            println!("No Rex layout: {e:#}");
+            if let Some(short_id) = &row.short_id {
+                println!("Talk to it: claude attach {short_id}");
+            }
+            println!("Board, in another terminal: chief board --project {slug}");
+        }
     }
     Ok(())
 }
@@ -350,7 +372,7 @@ pub fn ensure_coordinator(
 }
 
 /// Polls `claude agents` until `name` has a pid or `timeout` passes; returns the row either way.
-fn wait_for_pid(
+pub fn wait_for_pid(
     conn: &Connection,
     claude: &Claude,
     slug: &str,
@@ -371,9 +393,64 @@ fn wait_for_pid(
     }
 }
 
+/// Closes the Rex layout and stops the coordinator; with `stop_threads`, every live thread too.
+/// Stopping keeps conversations and worktrees (`claude stop`, never `claude rm`).
 pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
-    let _ = (slug, stop_threads);
-    todo!("M4")
+    let conn = db::open(&paths::db())?;
+    if db::project_dir(&conn, slug)?.is_none() {
+        bail!("no chief project {slug:?}");
+    }
+    let mut failed = 0;
+    let label = layout::session_label(slug);
+    match layout::close(&Rex::from_env(), slug) {
+        Ok(Some(_)) => println!("Closed Rex session {label}."),
+        Ok(None) => println!("No Rex session {label} was open."),
+        Err(e) => {
+            failed += 1;
+            println!("Rex session {label} not closed: {e:#}");
+        }
+    }
+    db::set_pane_showing(&conn, slug, None)?;
+
+    let claude = Claude::from_env();
+    let taken_at = db::now_ms();
+    match claude.agents() {
+        Ok(snapshot) => registry::sync(&conn, slug, &snapshot, taken_at, db::now_ms())?,
+        Err(e) => eprintln!("warning: `claude agents` failed, using the last known state: {e:#}"),
+    }
+    let mut left_running = 0;
+    for row in db::list_sessions(&conn, slug, None)? {
+        let coordinator = row.role == Role::Coordinator.as_str();
+        let live = row.pid.is_some() && row.cleaned_at.is_none();
+        let Some(short_id) = row.short_id.as_deref().filter(|_| live) else {
+            if coordinator {
+                println!("Coordinator {} isn't running.", row.name);
+            }
+            continue;
+        };
+        if !coordinator && !stop_threads {
+            left_running += 1;
+            continue;
+        }
+        let what = if coordinator { "coordinator" } else { "thread" };
+        match claude.stop(short_id) {
+            Ok(()) => println!("Stopped {what} {}.", row.name),
+            Err(e) => {
+                failed += 1;
+                println!("Could not stop {what} {}: {e:#}", row.name);
+            }
+        }
+    }
+    if left_running > 0 {
+        println!(
+            "{left_running} thread{} still running; chief down {slug} --stop-threads stops them.",
+            if left_running == 1 { " is" } else { "s are" }
+        );
+    }
+    if failed > 0 {
+        bail!("chief down {slug} didn't finish cleanly");
+    }
+    Ok(())
 }
 
 /// Prints the board as text, grouped as on the board: one project, or all of them.

@@ -121,6 +121,9 @@ pub struct Home {
     pub fake: Fake,
     /// `gh`; lists no PRs unless told otherwise.
     pub gh: Fake,
+    /// `rex`; fails like a Rex without a running server unless told otherwise, so no test
+    /// reaches the real one.
+    pub rex: Fake,
     pub trust: PathBuf,
 }
 
@@ -131,10 +134,14 @@ impl Home {
         std::fs::write(&trust, "{}").unwrap();
         let gh = Fake::named("gh");
         gh.set("pr.stdout", "[]");
+        let rex = Fake::named("rex");
+        rex.set("list.exit", "1")
+            .set("list.stderr", "Error: no Rex server is running\n");
         Home {
             home,
             fake: Fake::new(),
             gh,
+            rex,
             trust,
         }
     }
@@ -149,6 +156,7 @@ impl Home {
             .env("CHIEF_HOME", self.home.path())
             .env("CHIEF_CLAUDE_BIN", self.fake.bin())
             .env("CHIEF_GH_BIN", self.gh.bin())
+            .env("CHIEF_REX_BIN", self.rex.bin())
             .env("CHIEF_CLAUDE_CONFIG", &self.trust)
             .env("CHIEF_NO_NOTIFY", "1")
             .stdin(Stdio::piped())

@@ -27,6 +27,7 @@ struct Env {
     conn: Connection,
     claude: Fake,
     gh: Fake,
+    rex: Fake,
     git: GitRepo,
     worktree: PathBuf,
 }
@@ -59,12 +60,15 @@ impl Env {
         let claude = Fake::new();
         let gh = Fake::named("gh");
         gh.set("pr.stdout", "[]");
+        let rex = Fake::named("rex");
+        rex.set("list.stdout", r#"{"sessions": []}"#);
         let src = Sources {
             slug: "demo".into(),
             dir,
             db: db_path,
             claude_bin: claude.bin(),
             gh_bin: gh.bin(),
+            rex_bin: rex.bin(),
         };
         let env = Env {
             _root: root,
@@ -72,6 +76,7 @@ impl Env {
             conn,
             claude,
             gh,
+            rex,
             git,
             worktree,
         };
@@ -180,6 +185,51 @@ fn old_events_are_pruned() {
     let removed = db::prune_events(&env.conn, db::now_ms() - refresh::EVENTS_KEPT_MS).unwrap();
     assert_eq!(removed, 1);
     assert_eq!(db::recent_events(&env.conn, "demo", 10).unwrap().len(), 1);
+}
+
+/// Showing a thread while the layout is open and the pane shows the coordinator sends exactly one
+/// Ctrl+Z to the `main` block; showing what is already there sends nothing.
+#[test]
+fn show_switches_the_main_pane() {
+    let env = Env::new();
+    env.rex
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:other", "label": "chief-demo-2"},
+                             {"session_id": "session:1", "label": "chief-demo"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
+    db::set_pane_showing(&env.conn, "demo", Some("chief-demo")).unwrap();
+    let msg = jobs::run(&env.src, Action::Show(Some(NAME.into())));
+    assert_eq!(msg, Msg::Notice(format!("Main pane: {NAME}")));
+    assert_eq!(
+        env.rex.calls_of("send-key"),
+        [vec![
+            "send-key",
+            "--autostart=false",
+            "-b",
+            "block:main",
+            "ctrl+z"
+        ]]
+    );
+    assert_eq!(
+        env.rex.calls_of("block")[0],
+        [
+            "block",
+            "ls",
+            "--autostart=false",
+            "-s",
+            "session:1",
+            "--json"
+        ]
+    );
+
+    jobs::run(&env.src, Action::Show(None));
+    assert_eq!(env.rex.calls_of("send-key").len(), 1, "already showing it");
 }
 
 #[test]

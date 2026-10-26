@@ -9,6 +9,7 @@ pub mod db;
 pub mod generated;
 pub mod guard;
 pub mod hook;
+pub mod layout;
 pub mod mcp;
 pub mod mux;
 pub mod names;

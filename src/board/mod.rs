@@ -46,6 +46,7 @@ pub fn run(project: &str) -> Result<()> {
         db: paths::db(),
         claude_bin: crate::claude::Claude::from_env().bin,
         gh_bin: crate::pr::Gh::from_env().bin,
+        rex_bin: crate::mux::rex::Rex::from_env().bin,
     };
     let (tx, rx) = mpsc::channel();
     let refresher = refresh::spawn(src.clone(), tx.clone());

@@ -11,11 +11,13 @@ use crate::text::shell_quote;
 
 /// Variables that point chief somewhere other than its defaults. When set at generation time
 /// they are written into every hook command and the MCP server's env, so sessions started by
-/// Claude Code's supervisor (which doesn't inherit our environment) use the same home.
-pub const PASSTHROUGH: [&str; 5] = [
+/// Claude Code's supervisor (which doesn't inherit our environment) use the same home. The Rex
+/// layout's blocks get them too (they start from the login shell's environment, §9).
+pub const PASSTHROUGH: [&str; 6] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
     "CHIEF_GH_BIN",
+    "CHIEF_REX_BIN",
     "CHIEF_CLAUDE_CONFIG",
     "CHIEF_NO_NOTIFY",
 ];
@@ -63,7 +65,9 @@ pub fn passthrough_env() -> Vec<(String, String)> {
             let value = match *key {
                 "CHIEF_NO_NOTIFY" => value.to_string_lossy().into_owned(),
                 // A bare `claude` or `gh` is looked up on PATH; anything with a slash is a path.
-                "CHIEF_CLAUDE_BIN" | "CHIEF_GH_BIN" if !value.to_string_lossy().contains('/') => {
+                "CHIEF_CLAUDE_BIN" | "CHIEF_GH_BIN" | "CHIEF_REX_BIN"
+                    if !value.to_string_lossy().contains('/') =>
+                {
                     value.to_string_lossy().into_owned()
                 }
                 _ => std::path::absolute(&value)

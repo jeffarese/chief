@@ -31,6 +31,8 @@ pub struct Sources {
     pub db: PathBuf,
     pub claude_bin: PathBuf,
     pub gh_bin: PathBuf,
+    /// `rex`, for switching the layout's main pane.
+    pub rex_bin: PathBuf,
 }
 
 /// Handles to the refresh threads. Dropping it stops them at their next wait.

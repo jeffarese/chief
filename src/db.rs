@@ -94,6 +94,9 @@ CREATE TABLE ui_state (
     // last attempt didn't.
     "ALTER TABLE sessions ADD COLUMN cleaned_at INTEGER;
      ALTER TABLE sessions ADD COLUMN cleanup_blocked TEXT;",
+    // The session `chief pane` is attached to right now, so the board skips a needless switch
+    // (§9).
+    "ALTER TABLE ui_state ADD COLUMN pane_showing TEXT;",
 ];
 
 /// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
@@ -584,6 +587,37 @@ pub fn set_pane_target(conn: &Connection, project_slug: &str, target: Option<&st
     Ok(())
 }
 
+/// Clears `pane_target` only while it still names `name`, so a target the board just wrote
+/// isn't lost.
+pub fn clear_pane_target_if(conn: &Connection, project_slug: &str, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE ui_state SET pane_target = NULL WHERE project_slug = ?1 AND pane_target = ?2",
+        params![project_slug, name],
+    )?;
+    Ok(())
+}
+
+/// The session `chief pane` is attached to; None between attaches or when no pane runs.
+pub fn get_pane_showing(conn: &Connection, project_slug: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT pane_showing FROM ui_state WHERE project_slug = ?1",
+            [project_slug],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+pub fn set_pane_showing(conn: &Connection, project_slug: &str, name: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ui_state (project_slug, pane_showing) VALUES (?1, ?2)
+         ON CONFLICT(project_slug) DO UPDATE SET pane_showing = excluded.pane_showing",
+        params![project_slug, name],
+    )?;
+    Ok(())
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -750,5 +784,24 @@ mod tests {
         assert_eq!(get_pane_target(&conn, "p").unwrap().as_deref(), Some("t"));
         set_pane_target(&conn, "p", None).unwrap();
         assert_eq!(get_pane_target(&conn, "p").unwrap(), None);
+
+        set_pane_target(&conn, "p", Some("new")).unwrap();
+        clear_pane_target_if(&conn, "p", "old").unwrap();
+        assert_eq!(get_pane_target(&conn, "p").unwrap().as_deref(), Some("new"));
+        clear_pane_target_if(&conn, "p", "new").unwrap();
+        assert_eq!(get_pane_target(&conn, "p").unwrap(), None);
+
+        assert_eq!(get_pane_showing(&conn, "p").unwrap(), None);
+        set_pane_showing(&conn, "p", Some("chief-p")).unwrap();
+        set_pane_target(&conn, "p", Some("t")).unwrap();
+        assert_eq!(
+            get_pane_showing(&conn, "p").unwrap().as_deref(),
+            Some("chief-p")
+        );
+        assert_eq!(get_pane_target(&conn, "p").unwrap().as_deref(), Some("t"));
+        set_pane_showing(&conn, "q", Some("chief-q")).unwrap();
+        assert_eq!(get_pane_target(&conn, "q").unwrap(), None);
+        set_pane_showing(&conn, "p", None).unwrap();
+        assert_eq!(get_pane_showing(&conn, "p").unwrap(), None);
     }
 }
