@@ -133,3 +133,13 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | `chief up` inside tmux with Rex unavailable: window `chief-<slug>` opens next to the current one, pane left, board right; Enter / Esc switch | Pass after a fix (`new-window -t` takes a window, not `$TMUX_PANE`) |
 | `chief down` from a terminal outside tmux closes the stored tmux window | Pass |
 | No Rex, not in tmux: `chief up` prints the two commands; run in two unrelated windows, Enter / Esc still switch | Pass |
+
+## Account per project: live run (project on agp account cpb, commands from a default-account shell, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| `chief init` from a cpb shell records `claude_config_dir = "~/.claude-cpb"` | Pass |
+| `chief up` from a shell without `CLAUDE_CONFIG_DIR`: says it uses the project's account; coordinator listed by cpb, not by the default account | Pass |
+| `chief pane` / `chief board` started by hand without `CLAUDE_CONFIG_DIR`: pane attaches through cpb; a thread starts on cpb; Enter / Esc switch | Pass |
+| Thread branch taken from cpb's job state (`worktreeBranch`) | Pass |
+| `chief status` from the default account: nothing marked removed; the attach hint carries `CLAUDE_CONFIG_DIR` | Pass |
