@@ -109,6 +109,65 @@ fn bad_payload_exits_zero_and_logs() {
     assert!(log.contains("parsing the hook payload"), "{log}");
 }
 
+/// Claude Code reads exit 2 as "block" (every tool for the `*` PreToolUse, the prompt erased,
+/// the turn forced on), so a hook whose arguments clap rejects logs it and exits 0, silently.
+#[test]
+fn hook_argument_errors_never_block_a_session() {
+    let home = tempfile::tempdir().unwrap();
+    let cases: [&[&str]; 6] = [
+        &["Stop", "--project", "demo", "--role", "bogus"],
+        &[
+            "PreToolUse",
+            "--project",
+            "demo",
+            "--role",
+            "thread",
+            "--bogus",
+        ],
+        &["UserPromptSubmit", "--role", "thread"],
+        &["Stop", "--project", "guard", "--role", "bogus"],
+        &["--project", "demo", "--role", "nope", "Stop"],
+        &[],
+    ];
+    for args in cases {
+        let out = hook(home.path(), args, "{}");
+        assert_silent_success(&out);
+    }
+    let log = error_log(home.path());
+    assert_eq!(log.lines().count(), cases.len(), "{log}");
+    assert!(
+        log.contains("hook Stop --project demo: bad arguments"),
+        "{log}"
+    );
+    assert!(log.contains("bogus"), "{log}");
+}
+
+/// The guard fails closed instead: exit 2 with the reason on stderr blocks the call.
+#[test]
+fn guard_argument_errors_block_the_call() {
+    let home = tempfile::tempdir().unwrap();
+    let cases: [&[&str]; 3] = [
+        &["guard", "--project", "demo", "--role", "bogus"],
+        &["guard", "--project", "demo"],
+        &["--project", "demo", "--role", "nope", "guard"],
+    ];
+    for args in cases {
+        let out = hook(home.path(), args, "{}");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains("message is blocked"), "{args:?}: {err}");
+    }
+    // Other subcommands keep clap's usual handling.
+    let out = Command::new(env!("CARGO_BIN_EXE_chief"))
+        .args(["status", "--bogus"])
+        .env("CHIEF_HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("--bogus"));
+}
+
 #[test]
 fn guard_fails_closed() {
     // No tool_name: the guard can't decide, so it denies, logs, and records the denial.

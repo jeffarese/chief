@@ -149,7 +149,12 @@ variables (§9).
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
   `SendMessage|ListAgents`, `chief hook guard`), PostToolUse (matcher `*`), Notification, Stop,
   SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`. The
-  state and context hooks fail open (a missing binary is a non-blocking hook error). The guard's
+  state and context hooks fail open (a missing binary is a non-blocking hook error). So do bad
+  arguments: clap's exit 2 would block (every tool for the `*` PreToolUse, the prompt for
+  UserPromptSubmit, the end of the turn for Stop), so a `chief hook` whose arguments clap rejects
+  logs `bad arguments: …` to the hook error log and exits 0 with empty stdout, unless one of its
+  words (not the `--project` or `--role` value) is `guard`: then it exits 2 with the reason on
+  stderr. Other subcommands keep clap's usual exit 2. The guard's
   command fails closed: `<chief> hook guard --project <slug> --role <role> || { echo "chief's
   message guard could not run (<chief path>); message blocked. Run chief up again." >&2; exit 2; }`
   (the message is one shell-quoted word), so a missing or broken binary (exit 127 or any non-zero
@@ -415,8 +420,9 @@ closed) and the sessions fall back to names.
 string `to` or a blank one, is denied. Other tools are allowed. `claude agents` is only run for a
 SendMessage with a `to`.
 
-The guard process itself always exits 0 (deny JSON or empty stdout); its generated command turns
-any other exit, including a chief binary that can't start, into exit 2 (§3), which blocks the call.
+The guard process itself exits 0 (deny JSON or empty stdout), except on arguments it can't read,
+where it exits 2 with the reason on stderr (§3); its generated command turns any other exit,
+including a chief binary that can't start, into exit 2 (§3), which blocks the call.
 
 Time budget. When Claude Code's hook timeout fires it cancels the command and the call proceeds
 (the `|| exit 2` never runs), so the guard must answer first. Its entry sets `"timeout": 30`

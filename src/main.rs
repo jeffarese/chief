@@ -100,8 +100,67 @@ impl From<RoleArg> for Role {
     }
 }
 
+/// clap exits 2 on bad arguments, which Claude Code reads from a hook as "block": the `*`
+/// PreToolUse would block every tool, UserPromptSubmit would erase the prompt, Stop would force
+/// the turn on. So a `chief hook` other than the guard logs the error and exits 0 with nothing on
+/// stdout; the guard fails closed (exit 2, the reason on stderr). Other subcommands, and help or
+/// version requests, keep clap's usual handling.
+fn argument_error(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let help = matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    if help || args.first().map(String::as_str) != Some("hook") {
+        e.exit();
+    }
+    let (words, project) = hook_words(&args[1..]);
+    let error = e.to_string();
+    if words.iter().any(|w| w == "guard") {
+        eprintln!(
+            "chief's message guard got arguments it can't read, so the message is blocked. Run \
+             chief up again to rewrite the hooks.\n{error}"
+        );
+        std::process::exit(2);
+    }
+    chief::hook::log_error(
+        &chief::paths::hook_error_log(),
+        words.first().map(String::as_str).unwrap_or("?"),
+        project.as_deref().unwrap_or("?"),
+        &format!("bad arguments: {}", error.trim()),
+    );
+    std::process::exit(0);
+}
+
+/// The plain words (the event first) and the `--project` of a `chief hook` argument list that
+/// clap rejected. Values of `--project` and `--role` aren't words, so a project named `guard`
+/// isn't taken for the guard.
+fn hook_words(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut words = Vec::new();
+    let mut project = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some(v) = arg.strip_prefix("--project=") {
+            project = Some(v.to_string());
+        } else if arg == "--project" {
+            project = it.next().cloned();
+        } else if arg == "--role" {
+            it.next();
+        } else if !arg.starts_with('-') {
+            words.push(arg.clone());
+        }
+    }
+    (words, project)
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|e| argument_error(e));
     // Rust ignores SIGPIPE, so `chief status | head` panicked in println!. Commands people pipe get
     // the usual quiet exit; hooks and the MCP server keep the error path they already handle.
     if !matches!(cli.command, Command::Hook { .. } | Command::Mcp { .. }) {
