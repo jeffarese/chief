@@ -145,7 +145,7 @@ fn start_thread_spawns_and_resolves() {
     assert_eq!(
         out["next"],
         format!(
-            "Subscribe now: SendMessage(to=\"{name}\", notify_when_idle=true) with no message."
+            "Subscribe now with exactly this input: {{\"to\": \"{name}\", \"message\": \"\", \"notify_when_idle\": true}}. The empty message only subscribes."
         )
     );
 

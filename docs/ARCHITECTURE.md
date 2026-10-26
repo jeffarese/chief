@@ -409,8 +409,10 @@ registry nor among `claude agents` names (a few suffixes are tried; if `claude a
 nothing starts). A task that starts with `-` is sent as `Task: <task>` so the CLI can't read it as
 a flag. If the spawn fails, the inserted row is deleted and the error returned. Failing to resolve
 the session id is not an error (hooks match by title, sync by short id). `next` is
-`Subscribe now: SendMessage(to="<name>", notify_when_idle=true) with no message.`: the coordinator
-subscribes right after starting a thread, which is how it hears the thread finished.
+a literal SendMessage input, `{"to": "<name>", "message": "", "notify_when_idle": true}`, with "The empty
+message only subscribes.": the coordinator subscribes right after starting a thread, which is how it
+hears the thread finished. (M5 live run: told "with no message", Haiku emitted `"message": ,`, which
+is invalid JSON, three times.)
 
 The coordinator sends work to existing threads itself with `SendMessage` (`to` = name,
 `notify_when_idle: true`); the guard enforces scope.
