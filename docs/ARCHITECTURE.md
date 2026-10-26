@@ -440,6 +440,12 @@ Parse `backgrounded · <short-id>` from stdout (error if missing, include stderr
 with stdin closed; "Workspace not trusted" in its output becomes `ClaudeError::NotTrusted(cwd)`,
 whose message says to run `claude` in that folder once and accept the trust prompt.
 
+Every external command chief waits on (`claude`, `git`, `gh`, `rex`) runs through
+`proc::output_with_timeout`, and its timeout is a real bound: the child leads its own process
+group, and the call must see the child exit *and* both pipes close before the deadline. Otherwise
+the whole group gets SIGKILL and the call fails as a timeout, without waiting for readers still
+stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it open).
+
 Trust (`claude::is_trusted`) walks up both the path as given and its canonical form (macOS `/tmp`
 is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on the way
 counts. It reads `$CHIEF_CLAUDE_CONFIG` instead of `~/.claude.json` when set.
