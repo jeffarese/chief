@@ -1,0 +1,332 @@
+{
+  "views": [
+    {
+      "profile_id": "default",
+      "label": "Main",
+      "color": null,
+      "identity": {
+        "display_name": null,
+        "email": "default@example.invalid",
+        "org": "default org",
+        "subscription": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+        "tool": "claude"
+      },
+      "token": {
+        "Valid": {
+          "expires_at": 1792991914
+        }
+      },
+      "usage": {
+        "fetched_at": 1792984345,
+        "five_hour": {
+          "utilization": 1.0,
+          "resets_at": 1793001600,
+          "inferred": false
+        },
+        "seven_day": {
+          "utilization": 48.0,
+          "resets_at": 1793275200,
+          "inferred": false
+        },
+        "scoped": [
+          {
+            "label": "Fable",
+            "kind": "weekly_scoped",
+            "utilization": 0.0,
+            "resets_at": 1793275200,
+            "inferred": false
+          }
+        ],
+        "extra_usage_enabled": false,
+        "limit_reached": false
+      },
+      "usage_status": {
+        "Stale": {
+          "age_secs": 311
+        }
+      },
+      "projection": {
+        "five_hour": 31.76888900877276,
+        "seven_day": 100.0
+      },
+      "in_pool": false,
+      "active_here": false,
+      "active_elsewhere": 0,
+      "limited": null,
+      "next_pick": false,
+      "score": null,
+      "reason": "not in pool"
+    },
+    {
+      "profile_id": "carlos",
+      "label": "PB1",
+      "color": null,
+      "identity": {
+        "display_name": "carlos org",
+        "email": "carlos@example.invalid",
+        "org": "carlos org",
+        "subscription": "team",
+        "rate_limit_tier": "default_claude_max_5x",
+        "tool": "claude"
+      },
+      "token": {
+        "Valid": {
+          "expires_at": 1792991914
+        }
+      },
+      "usage": {
+        "fetched_at": 1792984587,
+        "five_hour": {
+          "utilization": 82.0,
+          "resets_at": 1792993799,
+          "inferred": false
+        },
+        "seven_day": null,
+        "scoped": [
+          {
+            "label": "Fable",
+            "kind": "weekly_scoped",
+            "utilization": 0.0,
+            "resets_at": 1793419200,
+            "inferred": false
+          }
+        ],
+        "extra_usage_enabled": false,
+        "limit_reached": false
+      },
+      "usage_status": {
+        "Stale": {
+          "age_secs": 69
+        }
+      },
+      "projection": {
+        "five_hour": 100.0,
+        "seven_day": null
+      },
+      "in_pool": true,
+      "active_here": false,
+      "active_elsewhere": 1,
+      "limited": null,
+      "next_pick": false,
+      "score": 0.23100000000000007,
+      "reason": null
+    },
+    {
+      "profile_id": "cpb",
+      "label": "PB2",
+      "color": null,
+      "identity": {
+        "display_name": "cpb org",
+        "email": "cpb@example.invalid",
+        "org": "cpb org",
+        "subscription": "team",
+        "rate_limit_tier": "default_claude_max_5x",
+        "tool": "claude"
+      },
+      "token": {
+        "Valid": {
+          "expires_at": 1792991914
+        }
+      },
+      "usage": {
+        "fetched_at": 1792984652,
+        "five_hour": {
+          "utilization": 3.0,
+          "resets_at": 1793001601,
+          "inferred": false
+        },
+        "seven_day": null,
+        "scoped": [
+          {
+            "label": "Fable",
+            "kind": "weekly_scoped",
+            "utilization": 0.0,
+            "resets_at": 1793203200,
+            "inferred": false
+          }
+        ],
+        "extra_usage_enabled": false,
+        "limit_reached": false
+      },
+      "usage_status": "Fresh",
+      "projection": {
+        "five_hour": 58.69549017025724,
+        "seven_day": null
+      },
+      "in_pool": true,
+      "active_here": false,
+      "active_elsewhere": 1,
+      "limited": null,
+      "next_pick": false,
+      "score": 0.5865,
+      "reason": null
+    },
+    {
+      "profile_id": "cpe",
+      "label": "PB3",
+      "color": null,
+      "identity": {
+        "display_name": "cpe org",
+        "email": "cpe@example.invalid",
+        "org": "cpe org",
+        "subscription": "team",
+        "rate_limit_tier": "default_claude_max_5x",
+        "tool": "claude"
+      },
+      "token": {
+        "Valid": {
+          "expires_at": 1792991914
+        }
+      },
+      "usage": {
+        "fetched_at": 1792984612,
+        "five_hour": {
+          "utilization": 1.0,
+          "resets_at": 1792985999,
+          "inferred": false
+        },
+        "seven_day": null,
+        "scoped": [
+          {
+            "label": "Fable",
+            "kind": "weekly_scoped",
+            "utilization": 0.0,
+            "resets_at": 1793350800,
+            "inferred": false
+          }
+        ],
+        "extra_usage_enabled": false,
+        "limit_reached": false
+      },
+      "usage_status": "Fresh",
+      "projection": {
+        "five_hour": 1.0,
+        "seven_day": null
+      },
+      "in_pool": true,
+      "active_here": false,
+      "active_elsewhere": 1,
+      "limited": null,
+      "next_pick": false,
+      "score": 0.5955,
+      "reason": null
+    },
+    {
+      "profile_id": "laura",
+      "label": "PB4",
+      "color": null,
+      "identity": {
+        "display_name": "laura org",
+        "email": "laura@example.invalid",
+        "org": "laura org",
+        "subscription": "team",
+        "rate_limit_tier": "default_claude_max_5x",
+        "tool": "claude"
+      },
+      "token": {
+        "Valid": {
+          "expires_at": 1792991914
+        }
+      },
+      "usage": {
+        "fetched_at": 1792984653,
+        "five_hour": {
+          "utilization": 22.0,
+          "resets_at": 1792993199,
+          "inferred": false
+        },
+        "seven_day": null,
+        "scoped": [
+          {
+            "label": "Fable",
+            "kind": "weekly_scoped",
+            "utilization": 0.0,
+            "resets_at": 1793188800,
+            "inferred": false
+          }
+        ],
+        "extra_usage_enabled": false,
+        "limit_reached": false
+      },
+      "usage_status": "Fresh",
+      "projection": {
+        "five_hour": 38.648754629354656,
+        "seven_day": null
+      },
+      "in_pool": true,
+      "active_here": false,
+      "active_elsewhere": 1,
+      "limited": null,
+      "next_pick": false,
+      "score": 0.501,
+      "reason": null
+    },
+    {
+      "profile_id": "pb5",
+      "label": "PB5",
+      "color": null,
+      "identity": {
+        "display_name": "pb5 org",
+        "email": "pb5@example.invalid",
+        "org": "pb5 org",
+        "subscription": "team",
+        "rate_limit_tier": "default_claude_max_5x",
+        "tool": "claude"
+      },
+      "token": {
+        "Valid": {
+          "expires_at": 1792991914
+        }
+      },
+      "usage": {
+        "fetched_at": 1792984451,
+        "five_hour": {
+          "utilization": 0.0,
+          "resets_at": 1793002199,
+          "inferred": false
+        },
+        "seven_day": null,
+        "scoped": [
+          {
+            "label": "Fable",
+            "kind": "weekly_scoped",
+            "utilization": 0.0,
+            "resets_at": 1793455200,
+            "inferred": false
+          }
+        ],
+        "extra_usage_enabled": false,
+        "limit_reached": false
+      },
+      "usage_status": {
+        "Stale": {
+          "age_secs": 205
+        }
+      },
+      "projection": {
+        "five_hour": null,
+        "seven_day": null
+      },
+      "in_pool": true,
+      "active_here": false,
+      "active_elsewhere": 1,
+      "limited": null,
+      "next_pick": true,
+      "score": 0.6,
+      "reason": "most 5h headroom (100%)"
+    }
+  ],
+  "pick": {
+    "chosen": "pb5",
+    "reason": "most 5h headroom (100%)",
+    "earliest_reset": null
+  },
+  "picks": {
+    "claude": {
+      "chosen": "pb5",
+      "reason": "most 5h headroom (100%)",
+      "earliest_reset": null
+    }
+  }
+}

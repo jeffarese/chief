@@ -1,5 +1,6 @@
 //! chief: local Claude Projects. See docs/ARCHITECTURE.md for the contract.
 
+pub mod agp;
 pub mod board;
 pub mod claude;
 pub mod cleanup;

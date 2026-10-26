@@ -202,6 +202,35 @@ pub fn agent(
     v
 }
 
+/// One `agp status --json` view: an account in agp's pool unless `in_pool` is false (then it has
+/// no score, as agp gives it none).
+pub fn agp_view(id: &str, label: &str, in_pool: bool, score: f64) -> serde_json::Value {
+    serde_json::json!({
+        "profile_id": id,
+        "label": label,
+        "identity": {"tool": "claude"},
+        "usage": {"five_hour": {"utilization": 10.0}, "seven_day": {"utilization": 20.0}},
+        "in_pool": in_pool,
+        "limited": null,
+        "score": if in_pool { serde_json::json!(score) } else { serde_json::Value::Null },
+    })
+}
+
+/// Gives the fake `agp` these accounts: `status --json` lists `views`, and `exec <id>` prints
+/// each account's folder (None: the default account, no `CLAUDE_CONFIG_DIR`).
+pub fn agp_accounts(agp: &Fake, views: &[serde_json::Value], dirs: &[(&str, Option<&Path>)]) {
+    agp.set(
+        "status.stdout",
+        &serde_json::json!({ "views": views }).to_string(),
+    );
+    for (id, dir) in dirs {
+        let text = dir
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        agp.set(&format!("exec.{id}.stdout"), &text);
+    }
+}
+
 /// Runs the chief binary with a temp home, the fake claude and a trust file.
 pub struct Home {
     pub home: tempfile::TempDir,
@@ -214,6 +243,9 @@ pub struct Home {
     /// `tmux`; only reached when a test sets `TMUX` (`run_env`): chief runs outside tmux
     /// otherwise.
     pub tmux: Fake,
+    /// `agp`; not installed (its link is missing) until `install_agp`, so no test reaches the
+    /// real one and threads stay in the project's account.
+    pub agp: Fake,
     pub trust: PathBuf,
 }
 
@@ -230,14 +262,26 @@ impl Home {
             .set("list.stderr", "Error: no Rex server is running\n")
             .set("new.exit", "1")
             .set("new.stderr", "Error: no Rex server is running\n");
+        let agp = Fake::named("agp");
+        std::fs::remove_file(agp.bin()).unwrap();
         Home {
             home,
             fake: Fake::new(),
             gh,
             rex,
             tmux: Fake::named("tmux"),
+            agp,
             trust,
         }
+    }
+
+    /// Puts the fake `agp` in place; give it accounts with `agp_accounts`.
+    pub fn install_agp(&self) -> &Fake {
+        if !self.agp.bin().exists() {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-claude.sh");
+            std::os::unix::fs::symlink(script, self.agp.bin()).unwrap();
+        }
+        &self.agp
     }
 
     pub fn path(&self) -> &Path {
@@ -252,6 +296,7 @@ impl Home {
             .env("CHIEF_GH_BIN", self.gh.bin())
             .env("CHIEF_REX_BIN", self.rex.bin())
             .env("CHIEF_TMUX_BIN", self.tmux.bin())
+            .env("CHIEF_AGP_BIN", self.agp.bin())
             .env("CHIEF_CLAUDE_CONFIG", &self.trust)
             .env("CHIEF_CLAUDE_DIR", self.fake.config_dir())
             .env("CHIEF_NO_NOTIFY", "1")

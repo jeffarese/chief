@@ -569,6 +569,7 @@ fn run_hook(command: &str, payload: &Value) -> std::process::Output {
         .env_remove("CHIEF_GH_BIN")
         .env_remove("CHIEF_REX_BIN")
         .env_remove("CHIEF_TMUX_BIN")
+        .env_remove("CHIEF_AGP_BIN")
         .env_remove("CHIEF_CLAUDE_CONFIG")
         .env_remove("CHIEF_NO_NOTIFY")
         .env_remove("XDG_DATA_HOME")
@@ -974,6 +975,7 @@ fn block_command(home: &Home, sub: &str) -> Vec<String> {
         format!("CHIEF_GH_BIN={}", home.gh.bin().display()),
         format!("CHIEF_REX_BIN={}", home.rex.bin().display()),
         format!("CHIEF_TMUX_BIN={}", home.tmux.bin().display()),
+        format!("CHIEF_AGP_BIN={}", home.agp.bin().display()),
         format!("CHIEF_CLAUDE_CONFIG={}", home.trust.display()),
         "CHIEF_NO_NOTIFY=1".to_string(),
         exe.to_string_lossy().into_owned(),

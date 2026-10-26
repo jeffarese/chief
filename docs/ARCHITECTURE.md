@@ -27,6 +27,24 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   folder's sessions. Unset, the folder is `~/.claude` and the config file `~/.claude.json`
   (checked on this machine with two account folders). So each chief project belongs to one
   account and every call for it runs there (§3).
+- Verified live with agp (agent-prism, the user's account switcher) on 2.1.310: an agp account
+  is a Claude Code config folder. `agp exec <id> -- <cmd>` runs `<cmd>` with that account's
+  `CLAUDE_CONFIG_DIR` (unset for the default account, `~/.claude`), and `agp exec <id> --
+  claude --bg …` started a background session in that account. `claude agents` lists only the
+  calling account's sessions.
+- Across accounts, `SendMessage` by name fails both ways ("No agent named '<x>' is reachable.").
+  By socket address, `uds:/tmp/cc-socks/<pid>.sock`, it works both ways: `/tmp/cc-socks` is
+  shared by every account, and the receiver sees `from="uds:/tmp/cc-socks/<pid>.sock"
+  from-name="<name>"`. `notify_when_idle` by socket address works across accounts too: the
+  subscription's reply warns that "whether it supports idle notices is unknown", but the notice
+  ("uds:/tmp/cc-socks/<pid>.sock … is idle now") arrives at the subscriber's next turn boundary
+  (idle notices are delivered between turns; a 30 s wait inside one turn saw nothing).
+- `agp status --json` → `views[]`: `profile_id`, `label`, `in_pool`, `limited` (null or an
+  object), `score` (a float; null outside the pool), `usage.five_hour.utilization` and
+  `usage.seven_day.utilization` (percent; `seven_day` may be null), `projection`;
+  `identity.tool` is `claude` for Claude accounts. `agp pick --json` ignores `--accounts` and
+  `--exclude` (it always returned the same account), so chief ranks accounts itself (§7).
+  Sample in `tests/fixtures/agp/status.json`.
 - `claude agents --json --all` rows: `id`, `sessionId`, `name`, `cwd`, `kind`, `startedAt`, `state`
   (seen: `working`, `blocked`, `done`; docs also list failed/stopped/idle), `status` (`busy`,
   `waiting`, `idle`, absent when the process is gone), `pid` (absent when the process is gone).
@@ -166,12 +184,13 @@ hook command is shell-quoted.
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
 `CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
 `$XDG_DATA_HOME`, which the supervisor doesn't have, or from the default), and the variables
-`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`, `CHIEF_CLAUDE_CONFIG` and
-`CHIEF_NO_NOTIFY` are written when set at generation time: as `K='v'` prefixes on every hook
-command and in the MCP server's `env`. `CLAUDE_CONFIG_DIR` is written from the project's account
-(below), never from the generating process: set to `claude_config_dir` for a non-default account,
-absent for the default one. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`,
-`CHIEF_GH_BIN`, `CHIEF_REX_BIN` or `CHIEF_TMUX_BIN` without a slash is kept for PATH lookup). Rex
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`, `CHIEF_AGP_BIN`,
+`CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY` are written when set at generation time: as `K='v'`
+prefixes on every hook command and in the MCP server's `env`. `CLAUDE_CONFIG_DIR` is written from
+the project's account (below), never from the generating process: set to `claude_config_dir` for
+a non-default account, absent for the default one. Paths among them are made absolute (a bare
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN` or `CHIEF_AGP_BIN` without a
+slash is kept for PATH lookup). Rex
 blocks start from the login shell's environment and tmux panes from the tmux server's, so the
 layout's commands carry the same variables (§9).
 
@@ -905,7 +924,10 @@ are tested without a terminal (`TestBackend`).
   overrides `gh` the same way (the same script, linked as `gh`), and `CHIEF_REX_BIN` overrides
   `rex` (linked as `rex`; the test home's default fails like a Rex with no server, so no test
   reaches the real one). `CHIEF_TMUX_BIN` overrides `tmux` (linked as `tmux`; reached only when a
-  test sets `TMUX`). Layout logic is also tested against an in-memory `Mux`, and the tmux backend
+  test sets `TMUX`). `CHIEF_AGP_BIN` overrides `agp` (linked as `agp`, with canned
+  `status.stdout` and per-account `exec.<id>.stdout`: the fake serves `<key>.<second argument>`
+  files first); the test home's link is missing until a test installs it, so agp counts as not
+  installed and no test reaches the real one. Layout logic is also tested against an in-memory `Mux`, and the tmux backend
   against a real tmux server on a private socket (`-L chief-test-…`, no config) that the test kills.
   The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps. `claude rm` outputs from the live
   M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare

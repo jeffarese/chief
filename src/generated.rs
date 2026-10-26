@@ -19,12 +19,13 @@ use crate::text::shell_quote;
 /// `XDG_DATA_HOME` either.
 /// `CLAUDE_CONFIG_DIR` isn't among them: it comes from the project's account, not from this
 /// process (`passthrough_env`).
-pub const PASSTHROUGH: [&str; 7] = [
+pub const PASSTHROUGH: [&str; 8] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
     "CHIEF_GH_BIN",
     "CHIEF_REX_BIN",
     "CHIEF_TMUX_BIN",
+    "CHIEF_AGP_BIN",
     "CHIEF_CLAUDE_CONFIG",
     "CHIEF_NO_NOTIFY",
 ];
@@ -94,6 +95,7 @@ fn this_process_env() -> Vec<(String, String)> {
                 "CHIEF_NO_NOTIFY" => value.to_string_lossy().into_owned(),
                 // A bare `claude` or `gh` is looked up on PATH; anything with a slash is a path.
                 "CHIEF_CLAUDE_BIN" | "CHIEF_GH_BIN" | "CHIEF_REX_BIN" | "CHIEF_TMUX_BIN"
+                | "CHIEF_AGP_BIN"
                     if !value.to_string_lossy().contains('/') =>
                 {
                     value.to_string_lossy().into_owned()
