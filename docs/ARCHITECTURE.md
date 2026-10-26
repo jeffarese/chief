@@ -105,7 +105,7 @@ each project's coordinator and threads grouped in board order. A thread's line e
 
 ## 3. Files
 
-`<root>` = `$CHIEF_HOME`, else `$XDG_DATA_HOME/chief`, else `~/.local/share/chief`.
+`<root>` = `$CHIEF_HOME`, else `$XDG_DATA_HOME/chief`, else `~/.local/share/chief`, made absolute.
 
 ```
 <root>/chief.db
@@ -125,11 +125,13 @@ canonical absolute path of the `chief` binary (`std::env::current_exe()`), so in
 `target/` folder (an ancestor named `target` beside a `Cargo.toml`), since `cargo clean` would
 disable chief's hooks and guard. Every word of a hook command is shell-quoted.
 
-Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so the
-variables `CHIEF_HOME`, `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG`
-and `CHIEF_NO_NOTIFY`, when set at generation time, are written into the files: as `K='v'` prefixes
-on every hook command and in the MCP server's `env`. Paths among them are made absolute (a bare
-`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or `CHIEF_REX_BIN` without a slash is kept for PATH lookup).
+Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
+`CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
+`$XDG_DATA_HOME`, which the supervisor doesn't have, or from the default), and the variables
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG` and `CHIEF_NO_NOTIFY` are
+written when set at generation time: as `K='v'` prefixes on every hook command and in the MCP
+server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or
+`CHIEF_REX_BIN` without a slash is kept for PATH lookup).
 Rex blocks start from the login shell's environment, so the layout's commands carry the same
 variables (§9).
 

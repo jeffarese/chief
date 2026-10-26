@@ -13,6 +13,8 @@ use crate::text::shell_quote;
 /// they are written into every hook command and the MCP server's env, so sessions started by
 /// Claude Code's supervisor (which doesn't inherit our environment) use the same home. The Rex
 /// layout's blocks get them too (they start from the login shell's environment, §9).
+/// `CHIEF_HOME` is always written, as the resolved root: the supervisor doesn't have our
+/// `XDG_DATA_HOME` either.
 pub const PASSTHROUGH: [&str; 6] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
@@ -58,12 +60,16 @@ pub fn chief_exe() -> Result<PathBuf> {
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
-/// The `PASSTHROUGH` variables set in this process. Paths are made absolute: hooks run in the
-/// session's cwd.
+/// The `PASSTHROUGH` variables set in this process, with `CHIEF_HOME` always set to the resolved
+/// root (`paths::root`). Paths are made absolute: hooks run in the session's cwd.
 pub fn passthrough_env() -> Vec<(String, String)> {
     PASSTHROUGH
         .iter()
         .filter_map(|key| {
+            if *key == "CHIEF_HOME" {
+                let root = crate::paths::root();
+                return Some((key.to_string(), root.to_string_lossy().into_owned()));
+            }
             let value = std::env::var_os(key)?;
             let value = match *key {
                 "CHIEF_NO_NOTIFY" => value.to_string_lossy().into_owned(),

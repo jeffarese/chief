@@ -227,6 +227,57 @@ fn generated_hook_commands_reach_this_home() {
     assert_eq!(out.status.code(), Some(127), "fails open: {}", stderr(&out));
 }
 
+/// With only `XDG_DATA_HOME` set, the generated files still carry the resolved home: sessions
+/// started by Claude Code's supervisor don't have our `XDG_DATA_HOME`.
+#[test]
+fn generated_files_carry_the_resolved_home() {
+    let home = Home::new();
+    version_ok(&home);
+    let xdg = home.path().join("xdg");
+    let root = xdg.join("chief");
+    let out = home
+        .command(&["init", "Demo"])
+        .env_remove("CHIEF_HOME")
+        .env("XDG_DATA_HOME", &xdg)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let dir = root.join("projects/demo");
+    let mcp = read_json(&dir.join("generated/mcp.json"));
+    assert_eq!(
+        mcp["mcpServers"]["chief"]["env"]["CHIEF_HOME"],
+        root.to_str().unwrap()
+    );
+    for file in ["thread-settings.json", "coordinator-settings.json"] {
+        let settings = read_json(&dir.join("generated").join(file));
+        for (event, entries) in settings["hooks"].as_object().unwrap() {
+            for entry in entries.as_array().unwrap() {
+                let command = entry["hooks"][0]["command"].as_str().unwrap();
+                assert!(
+                    command.starts_with(&format!("CHIEF_HOME={} ", root.display())),
+                    "{file} {event}: {command}"
+                );
+            }
+        }
+    }
+    // The hook reaches this home without XDG_DATA_HOME (or CHIEF_HOME) in its environment.
+    {
+        let conn = db::open(&root.join("chief.db")).unwrap();
+        let row = db::SessionRow::new("demo-x-1111", "demo", chief::state::Role::Thread, 0);
+        db::insert_session(&conn, &row).unwrap();
+    }
+    let settings = read_json(&dir.join("generated/thread-settings.json"));
+    let stop = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let payload = json!({"session_id": "s", "session_title": "demo-x-1111", "cwd": "/", "last_assistant_message": "hi"});
+    assert!(run_hook(stop, &payload).status.success());
+    let row = db::get_session(&db::open(&root.join("chief.db")).unwrap(), "demo-x-1111")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.last_report.as_deref(), Some("hi"));
+}
+
 /// Runs a generated hook command through `sh` from `/`, without chief's variables in the
 /// environment, as Claude Code would.
 fn run_hook(command: &str, payload: &Value) -> std::process::Output {
@@ -239,6 +290,7 @@ fn run_hook(command: &str, payload: &Value) -> std::process::Output {
         .env_remove("CHIEF_REX_BIN")
         .env_remove("CHIEF_CLAUDE_CONFIG")
         .env_remove("CHIEF_NO_NOTIFY")
+        .env_remove("XDG_DATA_HOME")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
