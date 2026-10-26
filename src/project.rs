@@ -11,8 +11,9 @@ use crate::claude::{self, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOU
 use crate::config::{ProjectConfig, Repo};
 use crate::db::{self, SessionRow};
 use crate::layout::{self, Closed, Opened};
-use crate::mux::SessionRef;
 use crate::mux::rex::Rex;
+use crate::mux::tmux::Tmux;
+use crate::mux::{Mux, SessionRef};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
 use crate::{generated, names, paths, prompts, registry, tools};
@@ -229,8 +230,9 @@ pub enum CoordinatorAction {
     Running,
 }
 
-/// Starts or respawns the coordinator, then opens the Rex layout (§9). Without Rex it says how
-/// to attach and where to run the board instead.
+/// Starts or respawns the coordinator, then opens the layout (§9): with Rex when its server
+/// runs, else in a tmux window when this runs inside tmux, else it prints the two commands to
+/// run side by side.
 pub fn up(slug: &str) -> Result<()> {
     let claude = Claude::from_env();
     claude.check_version()?;
@@ -261,33 +263,63 @@ pub fn up(slug: &str) -> Result<()> {
     println!("Coordinator {} {verb}.", row.name);
 
     let label = layout::session_label(slug);
-    let ours = db::get_rex_session(&conn, slug)?.map(SessionRef);
-    match layout::open(&Rex::from_env(), slug, &dir, &exe, &env, ours.as_ref()) {
-        Ok(opened) => {
-            db::set_rex_session(&conn, slug, Some(&opened.session.0))?;
-            let what = match opened.opened {
-                Opened::Created => "opened",
-                Opened::Repaired => "repaired",
-                Opened::Reused => "already open",
-            };
-            println!("Rex session {label} {what}.");
-            if !opened.shown {
+    let rex = Rex::from_env();
+    let open = |mux: &dyn Mux, ours: Option<String>| {
+        let ours = ours.map(SessionRef);
+        layout::open(mux, slug, &dir, &exe, &env, ours.as_ref())
+    };
+    let done = |opened: &layout::Layout| match opened.opened {
+        Opened::Created => "opened",
+        Opened::Repaired => "repaired",
+        Opened::Reused => "already open",
+    };
+    match rex.check() {
+        Ok(()) => match open(&rex, db::get_rex_session(&conn, slug)?) {
+            Ok(opened) => {
+                db::set_rex_session(&conn, slug, Some(&opened.session.0))?;
+                println!("Rex session {label} {}.", done(&opened));
+                if !opened.shown {
+                    println!(
+                        "Rex didn't switch to it (that needs exactly one Rex app connected). \
+                         Pick {label} in the app, or run: rex -C <app> do session.select \
+                         session_id={}",
+                        opened.session.0
+                    );
+                }
+            }
+            Err(e) => {
+                println!("No Rex layout: {e:#}");
+                print_manual_layout(slug);
+            }
+        },
+        Err(why) => match Tmux::current() {
+            Some(tmux) => match open(&tmux, db::get_tmux_window(&conn, slug)?) {
+                Ok(opened) => {
+                    db::set_tmux_window(&conn, slug, Some(&opened.session.0))?;
+                    println!("tmux window {label} {}.", done(&opened));
+                }
+                Err(e) => {
+                    println!("No tmux layout: {e:#}");
+                    print_manual_layout(slug);
+                }
+            },
+            None => {
                 println!(
-                    "Rex didn't switch to it (that needs exactly one Rex app connected). Pick \
-                     {label} in the app, or run: rex -C <app> do session.select session_id={}",
-                    opened.session.0
+                    "No layout: Rex isn't available ({why:#}) and this terminal isn't inside tmux."
                 );
+                print_manual_layout(slug);
             }
-        }
-        Err(e) => {
-            println!("No Rex layout: {e:#}");
-            if let Some(short_id) = &row.short_id {
-                println!("Talk to it: claude attach {short_id}");
-            }
-            println!("Board, in another terminal: chief board --project {slug}");
-        }
+        },
     }
     Ok(())
+}
+
+/// Without a multiplexer the user makes the layout: any two terminals or splits work, since the
+/// board switches the pane by signalling it (§9).
+fn print_manual_layout(slug: &str) {
+    println!("Run these side by side, in two terminals or splits of one:");
+    println!("  chief pane --project {slug}");
+    println!("  chief board --project {slug}");
 }
 
 /// §7 "Coordinator spawn": start it when it has no row or no short id, `claude respawn` it
@@ -474,8 +506,9 @@ pub fn wait_for_pid(
     }
 }
 
-/// Closes the Rex layout and stops the coordinator; with `stop_threads`, every live thread too.
-/// Stopping keeps conversations and worktrees (`claude stop`, never `claude rm`).
+/// Closes the layout `up` opened (Rex or tmux; nothing when the user made it) and stops the
+/// coordinator; with `stop_threads`, every live thread too. Stopping keeps conversations and
+/// worktrees (`claude stop`, never `claude rm`).
 pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
@@ -483,23 +516,54 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     }
     let mut failed = 0;
     let label = layout::session_label(slug);
-    let ours = db::get_rex_session(&conn, slug)?.map(SessionRef);
-    match layout::close(&Rex::from_env(), ours.as_ref()) {
-        Ok(Closed::Killed(_)) => {
-            db::set_rex_session(&conn, slug, None)?;
-            println!("Closed Rex session {label}.");
+    let rex_session = db::get_rex_session(&conn, slug)?.map(SessionRef);
+    let tmux_window = db::get_tmux_window(&conn, slug)?.map(SessionRef);
+    if rex_session.is_none() && tmux_window.is_none() {
+        println!("No layout of chief's is open.");
+    }
+    if let Some(ours) = &rex_session {
+        match layout::close(&Rex::from_env(), Some(ours)) {
+            Ok(Closed::Killed(_)) => {
+                db::set_rex_session(&conn, slug, None)?;
+                println!("Closed Rex session {label}.");
+            }
+            Ok(Closed::Blocks(_)) => println!(
+                "Closed chief's blocks in Rex session {label}; it holds other blocks too, so it \
+                 stays open."
+            ),
+            Ok(Closed::Nothing) => {
+                db::set_rex_session(&conn, slug, None)?;
+                println!("No Rex session {label} was open.");
+            }
+            Err(e) => {
+                failed += 1;
+                println!("Rex session {label} not closed: {e:#}");
+            }
         }
-        Ok(Closed::Blocks(_)) => println!(
-            "Closed chief's blocks in Rex session {label}; it holds other blocks too, so it stays \
-             open."
-        ),
-        Ok(Closed::Nothing) => {
-            db::set_rex_session(&conn, slug, None)?;
-            println!("No Rex session {label} was open.");
-        }
-        Err(e) => {
-            failed += 1;
-            println!("Rex session {label} not closed: {e:#}");
+    }
+    if let Some(ours) = &tmux_window {
+        // The stored id names the server, so this works from any terminal.
+        let closed = match Tmux::for_layout(ours) {
+            Some(tmux) => layout::close(&tmux, Some(ours)),
+            None => Ok(Closed::Nothing),
+        };
+        match closed {
+            Ok(Closed::Killed(_)) => {
+                db::set_tmux_window(&conn, slug, None)?;
+                println!("Closed tmux window {label}.");
+            }
+            Ok(Closed::Blocks(_)) => println!(
+                "Closed chief's panes in tmux window {label}; it holds other panes too, so it \
+                 stays open."
+            ),
+            Ok(Closed::Nothing) => {
+                db::set_tmux_window(&conn, slug, None)?;
+                println!("No tmux window {label} was open.");
+            }
+            Err(e) => {
+                failed += 1;
+                println!("tmux window {label} not closed: {e:#}");
+            }
         }
     }
     db::set_pane_showing(&conn, slug, None)?;

@@ -11,7 +11,9 @@
 #   <key>.exit.<k>     exit code for the k-th call of that subcommand, if present
 #   <key>.sleep        after the output, sleep this many seconds in place (exec, same pid) instead
 #                      of exiting: a `claude attach` that stays attached
-# The same script stands in for `gh` (tests link it as `gh`; `pr list` has key `pr`).
+# The same script stands in for `gh` (tests link it as `gh`; `pr list` has key `pr`) and `tmux`
+# (a leading `-S <socket>`, as chief passes it, is skipped: `-S s new-window …` has key
+# `new-window`).
 dir=$(dirname "$0")
 mkdir -p "$dir/calls"
 n=$(ls "$dir/calls" | grep -c '^[0-9][0-9]*$')
@@ -19,7 +21,9 @@ printf '%s\0' "$@" > "$dir/calls/$n"
 pwd > "$dir/calls/$n.cwd"
 echo $$ > "$dir/calls/$n.pid"
 
-key=$(printf '%s' "$1" | sed 's/^-*//')
+first=$1
+[ "$1" = "-S" ] && first=$3
+key=$(printf '%s' "$first" | sed 's/^-*//')
 count_file="$dir/$key.count"
 k=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
 echo "$k" > "$count_file"

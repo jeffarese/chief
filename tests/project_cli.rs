@@ -352,6 +352,7 @@ fn run_hook(command: &str, payload: &Value) -> std::process::Output {
         .env_remove("CHIEF_CLAUDE_BIN")
         .env_remove("CHIEF_GH_BIN")
         .env_remove("CHIEF_REX_BIN")
+        .env_remove("CHIEF_TMUX_BIN")
         .env_remove("CHIEF_CLAUDE_CONFIG")
         .env_remove("CHIEF_NO_NOTIFY")
         .env_remove("XDG_DATA_HOME")
@@ -414,7 +415,10 @@ fn up_starts_then_leaves_then_respawns_the_coordinator() {
         text.contains("Coordinator chief-payments-latency started."),
         "{text}"
     );
-    assert!(text.contains("claude attach c0ffee"), "{text}");
+    assert!(
+        text.contains("  chief pane --project payments-latency\n"),
+        "{text}"
+    );
 
     let calls = home.fake.calls();
     let i = calls.iter().position(|c| c[0] == "--bg").unwrap();
@@ -600,11 +604,6 @@ fn up_adopts_a_coordinator_that_started_anyway() {
     let out = home.run(&["up", SLUG], "");
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stderr(&out).contains("started anyway"), "{}", stderr(&out));
-    assert!(
-        stdout(&out).contains("claude attach c0ffee"),
-        "{}",
-        stdout(&out)
-    );
     let row = db::get_coordinator(&home.db(), SLUG).unwrap().unwrap();
     assert_eq!(
         (row.short_id.as_deref(), row.session_id.as_deref(), row.pid),
@@ -678,7 +677,8 @@ fn status_lines_show_cleanup_then_end_with_the_age() {
     }
 }
 
-/// A project whose coordinator runs (started by a first `up` that found no Rex).
+/// A project whose coordinator runs (started by a first `up` that found no Rex and no tmux, so
+/// it printed the two commands to run by hand).
 fn running_project(home: &Home) -> PathBuf {
     version_ok(home);
     let (a, b) = repos(home);
@@ -705,13 +705,24 @@ fn running_project(home: &Home) -> PathBuf {
     let out = home.run(&["up", SLUG], "");
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.contains("No Rex layout: "), "{text}");
-    assert!(text.contains("no Rex server is running"), "{text}");
-    assert!(text.contains("claude attach c0ffee"), "{text}");
     assert!(
-        text.contains("Board, in another terminal: chief board --project payments-latency"),
+        text.contains("No layout: Rex isn't available (`rex list` failed"),
         "{text}"
     );
+    assert!(text.contains("no Rex server is running"), "{text}");
+    assert!(
+        text.contains(
+            "and this terminal isn't inside tmux.\n\
+             Run these side by side, in two terminals or splits of one:\n  \
+             chief pane --project payments-latency\n  \
+             chief board --project payments-latency\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("claude attach"), "{text}");
+    assert!(home.tmux.calls().is_empty(), "outside tmux: never asked");
+    assert_eq!(home.rex.calls_of("list").len(), 1);
+    assert!(home.rex.calls_of("new").is_empty());
     home.rex
         .unset("list.exit")
         .unset("list.stderr")
@@ -731,6 +742,7 @@ fn block_command(home: &Home, sub: &str) -> Vec<String> {
         format!("CHIEF_CLAUDE_BIN={}", home.fake.bin().display()),
         format!("CHIEF_GH_BIN={}", home.gh.bin().display()),
         format!("CHIEF_REX_BIN={}", home.rex.bin().display()),
+        format!("CHIEF_TMUX_BIN={}", home.tmux.bin().display()),
         format!("CHIEF_CLAUDE_CONFIG={}", home.trust.display()),
         "CHIEF_NO_NOTIFY=1".to_string(),
         exe.to_string_lossy().into_owned(),
@@ -758,7 +770,8 @@ fn up_opens_then_reuses_the_rex_layout() {
             "run.stdout",
             r#"{"window_id": "window:1", "block_ids": ["block:board"], "revision": 2}"#,
         );
-    let out = home.run(&["up", SLUG], "");
+    // Inside tmux too: a running Rex comes first.
+    let out = home.run_env(&["up", SLUG], &[("TMUX", "/tmp/tmux-sock,1,0")], "");
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(
@@ -769,6 +782,7 @@ fn up_opens_then_reuses_the_rex_layout() {
         text.contains("Rex session chief-payments-latency opened."),
         "{text}"
     );
+    assert!(home.tmux.calls().is_empty(), "{:?}", home.tmux.calls());
     assert!(!text.contains("claude attach"), "{text}");
     assert!(!text.contains("didn't switch"), "{text}");
 
@@ -810,6 +824,9 @@ fn up_opens_then_reuses_the_rex_layout() {
     assert_eq!(
         calls,
         [
+            ["list", "--autostart=false", "--json"]
+                .map(String::from)
+                .to_vec(),
             new,
             [
                 "block",
@@ -875,6 +892,7 @@ fn up_opens_then_reuses_the_rex_layout() {
         firsts,
         [
             "list --autostart=false",
+            "list --autostart=false",
             "block ls",
             "block call",
             "block ls",
@@ -883,9 +901,172 @@ fn up_opens_then_reuses_the_rex_layout() {
             "do session.select",
         ]
     );
-    // The first `up` without a Rex server, then the one that created it.
-    assert_eq!(home.rex.calls_of("new").len(), 2);
+    assert_eq!(home.rex.calls_of("new").len(), 1);
     assert_eq!(home.rex.calls_of("run").len(), 1);
+}
+
+/// The fake tmux's calls, without the leading `-S <socket>` chief always passes.
+fn tmux_calls(home: &Home, socket: &str) -> Vec<Vec<String>> {
+    home.tmux
+        .calls()
+        .into_iter()
+        .map(|c| {
+            assert_eq!(c[..2], ["-S", socket], "{c:?}");
+            c[2..].to_vec()
+        })
+        .collect()
+}
+
+fn strings(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
+/// Without Rex but inside tmux, `up` opens a window `chief-<slug>` in the current session right
+/// after the user's window: the pane on the left, the board split right at 32 %, both carrying
+/// the passthrough variables. It stores the window with its server, reuses it, and `down`
+/// closes it.
+#[test]
+fn up_opens_a_tmux_window_and_down_closes_it() {
+    let home = Home::new();
+    let dir = running_project(&home);
+    // No Rex server after all.
+    home.rex
+        .set("list.exit", "1")
+        .set("list.stderr", "Error: no Rex server is running\n");
+    let d = dir.to_string_lossy().into_owned();
+    let sock = "/tmp/tmux-501/default";
+    let tmux_env = [
+        ("TMUX", "/tmp/tmux-501/default,4242,0"),
+        ("TMUX_PANE", "%9"),
+    ];
+    home.tmux
+        .set("new-window.stdout", "%5 @3 4242\n")
+        .set("split-window.stdout", "%6\n");
+    let out = home.run_env(&["up", SLUG], &tmux_env, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("tmux window chief-payments-latency opened."),
+        "{text}"
+    );
+    assert!(!text.contains("side by side"), "{text}");
+
+    let mut new = strings(&[
+        "new-window",
+        "-n",
+        "chief-payments-latency",
+        "-a",
+        "-t",
+        "%9",
+        "-P",
+        "-F",
+        "#{pane_id} #{window_id} #{pid}",
+        "-c",
+        &d,
+        "--",
+    ]);
+    new.extend(block_command(&home, "pane"));
+    let mut split = strings(&[
+        "split-window",
+        "-h",
+        "-l",
+        "32%",
+        "-t",
+        "%5",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-c",
+        &d,
+        "--",
+    ]);
+    split.extend(block_command(&home, "board"));
+    let mark = |pane: &str, label: &str| {
+        strings(&[
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            "@chief-block",
+            label,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            "remain-on-exit",
+            "on",
+        ])
+    };
+    assert_eq!(
+        tmux_calls(&home, sock),
+        [
+            new,
+            mark("%5", "main"),
+            split,
+            mark("%6", "board"),
+            strings(&["select-pane", "-t", "%5"]),
+            strings(&["select-window", "-t", "@3"]),
+        ]
+    );
+    assert_eq!(
+        db::get_tmux_window(&home.db(), SLUG).unwrap().as_deref(),
+        Some("@3 4242 /tmp/tmux-501/default")
+    );
+
+    // Open and running: reused. One canned `display-message` answers both panes.
+    home.tmux
+        .set("list-windows.stdout", "4242 @1\n4242 @3\n")
+        .set("list-panes.stdout", "%5 main\n%6 board\n")
+        .set("display-message.stdout", "0\n");
+    let before = home.tmux.calls().len();
+    let out = home.run_env(&["up", SLUG], &tmux_env, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("tmux window chief-payments-latency already open."),
+        "{text}"
+    );
+    let firsts: Vec<String> = tmux_calls(&home, sock)[before..]
+        .iter()
+        .map(|c| c[0].clone())
+        .collect();
+    assert_eq!(
+        firsts,
+        [
+            "list-windows",
+            "list-panes",
+            "display-message",
+            "list-panes",
+            "display-message",
+            "select-pane",
+            "select-window",
+        ]
+    );
+
+    // `down` closes it from any terminal (no TMUX here): the stored socket names the server.
+    let before = home.tmux.calls().len();
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("Closed tmux window chief-payments-latency.\n"),
+        "{text}"
+    );
+    let calls = tmux_calls(&home, sock)[before..].to_vec();
+    assert_eq!(
+        calls.last().unwrap(),
+        &strings(&["kill-window", "-t", "@3"])
+    );
+    assert_eq!(db::get_tmux_window(&home.db(), SLUG).unwrap(), None);
+    assert!(home.rex.calls_of("kill").is_empty());
+
+    // Nothing of chief's open any more: nothing to close.
+    let before = home.tmux.calls().len();
+    let out = home.run(&["down", SLUG], "");
+    assert!(stdout(&out).starts_with("No layout of chief's is open.\n"));
+    assert_eq!(home.tmux.calls().len(), before);
 }
 
 #[test]
@@ -966,15 +1147,11 @@ fn down_closes_the_layout_and_stops_sessions() {
 
     // With --stop-threads only the live thread is stopped; nothing is ever removed. The layout
     // is gone now.
-    home.rex.set(
-        "list.stdout",
-        r#"{"sessions": [{"session_id": "session:theirs", "label": "work"}]}"#,
-    );
     let out = home.run(&["down", SLUG, "--stop-threads"], "");
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(
-        text.starts_with("No Rex session chief-payments-latency was open.\n"),
+        text.starts_with("No layout of chief's is open.\n"),
         "{text}"
     );
     assert!(

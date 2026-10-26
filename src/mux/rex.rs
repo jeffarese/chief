@@ -96,6 +96,12 @@ impl Rex {
         Ok(out)
     }
 
+    /// Whether Rex is installed and its server running: `rex list` succeeds.
+    pub fn check(&self) -> Result<()> {
+        self.run(&["list".into(), "--json".into()])?;
+        Ok(())
+    }
+
     fn json<T: for<'de> Deserialize<'de>>(&self, args: &[OsString]) -> Result<T> {
         let out = self.run(args)?;
         let text = String::from_utf8_lossy(&out.stdout);

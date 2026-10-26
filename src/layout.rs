@@ -1,7 +1,7 @@
 //! The `chief up` layout over any `Mux` (ARCHITECTURE §9): session `chief-<slug>`, block `main`
 //! running `chief pane`, block `board` split right at 32 % running `chief board`. chief only ever
-//! reuses or kills the session it created itself (its id is stored in `ui_state.rex_session`),
-//! never one that merely carries the label.
+//! reuses or kills the session it created itself (its id is stored in `ui_state.rex_session` or
+//! `ui_state.tmux_window`), never one that merely carries the label.
 
 use std::path::Path;
 

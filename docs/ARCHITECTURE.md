@@ -77,7 +77,7 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | Command | Started by | Job |
 | --- | --- | --- |
 | `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
-| `chief up <slug>` | you | Start or revive the coordinator, open the Rex layout |
+| `chief up <slug>` | you | Start or revive the coordinator, open the layout (Rex, tmux, or say how) |
 | `chief down <slug> [--stop-threads]` | you | Close the layout; threads keep running unless asked |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
 | `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session |
@@ -102,12 +102,16 @@ runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twi
 otherwise it prints `cd <folder> && claude` for each.
 
 `chief up` checks the version, rewrites `generated/*`, runs the coordinator step (§7), then opens
-the layout (§9) and stores its session id in `ui_state.rex_session`. When Rex isn't installed or its server isn't running (or opening the layout fails)
-it prints why, `claude attach <short_id>`, and `chief board --project <slug>` to run in another
-terminal.
+the layout (§9): with Rex when it is installed and its server runs (`rex list` succeeds), storing
+the session id in `ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux
+window, storing it in `ui_state.tmux_window`; else it prints why and the two commands to run side
+by side in terminals or splits of the user's own, `chief pane --project <slug>` and `chief board
+--project <slug>`. When opening the chosen layout fails it prints why and the same two commands.
 
-`chief down <slug> [--stop-threads]` closes the Rex layout (§9 `close`: kills the session `chief up`
-created when it holds only chief's blocks, else closes just `main` and `board`), clears
+`chief down <slug> [--stop-threads]` closes the layout `chief up` opened, and only that: the Rex
+session and the tmux window it stored, each when stored (§9 `close`: kills the session or window
+when it holds only chief's blocks, else closes just `main` and `board`), or nothing when none is
+stored (`No layout of chief's is open.`, as for a layout the user made). It clears
 `ui_state.pane_showing` and `ui_state.pane_target` (the next `chief up` shows the coordinator; a
 pane back on the thread it last showed would respawn it right after `--stop-threads` stopped it),
 syncs `claude agents` (stored rows if it fails), and runs
@@ -150,12 +154,13 @@ hook command is shell-quoted.
 Sessions are started by Claude Code's supervisor and don't inherit chief's environment, so
 `CHIEF_HOME` is always written into the files, set to the resolved `<root>` (a root that came from
 `$XDG_DATA_HOME`, which the supervisor doesn't have, or from the default), and the variables
-`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_CLAUDE_CONFIG`, `CHIEF_NO_NOTIFY` and
-`CLAUDE_CONFIG_DIR` (§1: every chief process must talk to the same account's supervisor) are
-written when set at generation time: as `K='v'` prefixes on every hook command and in the MCP
-server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN` or
-`CHIEF_REX_BIN` without a slash is kept for PATH lookup). Rex blocks start from the login shell's
-environment, so the layout's commands carry the same variables (§9).
+`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`, `CHIEF_CLAUDE_CONFIG`,
+`CHIEF_NO_NOTIFY` and `CLAUDE_CONFIG_DIR` (§1: every chief process must talk to the same account's
+supervisor) are written when set at generation time: as `K='v'` prefixes on every hook command and
+in the MCP server's `env`. Paths among them are made absolute (a bare `CHIEF_CLAUDE_BIN`,
+`CHIEF_GH_BIN`, `CHIEF_REX_BIN` or `CHIEF_TMUX_BIN` without a slash is kept for PATH lookup). Rex
+blocks start from the login shell's environment and tmux panes from the tmux server's, so the
+layout's commands carry the same variables (§9).
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -299,7 +304,8 @@ CREATE TABLE ui_state (
   pane_showing TEXT,                      -- session `chief pane` is attached to now; NULL between attaches (migration 5)
   rex_session  TEXT,                      -- id of the Rex session `chief up` created, §9 (migration 8)
   pane_pid     INTEGER,                   -- the running `chief pane`, which the board signals to switch, §9 (migration 9)
-  pane_started TEXT                       -- that process's start time, proving the pid is still it (migration 9)
+  pane_started TEXT,                      -- that process's start time, proving the pid is still it (migration 9)
+  tmux_window  TEXT                       -- '<window id> <server pid> <socket>' of the tmux window `chief up` opened, §9 (migration 9)
 );
 ```
 
@@ -611,7 +617,17 @@ Waiting on you:
 The whole context stays under 8 KB: previews shrink first (200, 100, 40, none), then memory is cut
 with a marker, then the board itself.
 
-## 9. Layout (`chief up`, Rex first, tmux later)
+## 9. Layout (`chief up`: Rex, tmux, or the user's own)
+
+The layout is two panes side by side: `chief pane` on the left, `chief board` on the right.
+Nothing in it depends on a multiplexer: the board switches the pane by signalling it (below), so
+any two terminals or splits work. `chief up` opens it for the user with the first that applies:
+
+1. Rex, when `rex list --json` succeeds (installed, server running): the Rex session below.
+2. tmux, when `$TMUX` is set (chief runs inside tmux): a tmux window, below.
+3. Neither: it prints why and the two commands, `chief pane --project <slug>` and
+   `chief board --project <slug>`, to run side by side (two windows, iTerm or Ghostty splits,
+   anything). `chief down` has nothing to close then.
 
 `src/mux/mod.rs` defines a backend-neutral trait (block ids are unique across sessions):
 
@@ -640,7 +656,25 @@ timeout: `rex list --json`; `rex new <label> --cwd <dir> --keep-open --json -- <
 `rex do session.select session_id=<s>` for `show` (a client action: Rex picks the app when exactly
 one is connected, and fails otherwise). chief only touches the session `chief up` created, by the
 id it stored in `ui_state.rex_session` (migration 8): a session that merely carries the label
-`chief-<slug>` may be the user's, and is never reused, sent keys or killed.
+`chief-<slug>` may be the user's, and is never reused or killed.
+
+`src/mux/tmux.rs` implements it with the `tmux` CLI (`CHIEF_TMUX_BIN` overrides the binary). A
+"session" is one tmux window and a block one of its panes. Every command names the server with
+`-S <socket>` (and runs without `TMUX`/`TMUX_PANE`, so nothing else picks the target), with a 15 s
+timeout. `up` takes the socket from `$TMUX` (`<socket>,<pid>,<session>`); the stored id is
+`<window id> <server pid> <socket>`, so `down` finds the server from any terminal, and a window id
+from an earlier server (ids restart with each server) is never taken for chief's: `has_session`
+runs `list-windows -a -F '#{pid} #{window_id}'` and needs that exact pair, on the same socket (no
+server there: false, not an error). `create_session`: `new-window -n chief-<slug> [-a -t
+$TMUX_PANE] [-d] -P -F '#{pane_id} #{window_id} #{pid}' -c <dir> -- <cmd>` (the window opens right
+after the user's, in the current session). `run_block`: `split-window -h|-v [-b] -l <ratio>% -t
+<anchor> [-d] -P -F '#{pane_id}' -c <dir> -- <cmd>` (`-b` for left or above; without an anchor it
+splits the window). Each new pane gets `set-option -p @chief-block <label>` (a label programs
+can't change, unlike the pane title) and `remain-on-exit on` (kept open, like Rex's
+`--keep-open`). `blocks`: `list-panes -t <window> -F '#{pane_id} #{@chief-block}'`;
+`is_running`: `display-message -p -t <pane> '#{pane_dead}'` is `0`; `close_block`: `kill-pane`;
+`focus`: `select-pane`; `show`: `select-window` (true when it succeeds); `kill_session`:
+`kill-window`.
 
 `src/layout.rs` builds the layout over any `Mux`: session `chief-<slug>`, block `main` running
 `chief pane --project <slug>`, block `board` split right of it at 32 % running
@@ -660,7 +694,7 @@ chief path, behind `env K=V…` with the §3 passthrough variables when any is s
 only `main` and `board` is killed and the stored id cleared; one that holds other blocks too (the
 user added them) keeps running with those, and only `main` and `board` are closed.
 
-Then focus `main` and `show` the session. When `show` returns false, `up` prints
+Then focus `main` and `show` the session. When Rex's `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
 
 `chief pane` loop (`src/pane.rs`). On start it catches its signals (below), then records its pid
@@ -803,7 +837,10 @@ are tested without a terminal (`TestBackend`).
   (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_GH_BIN`
   overrides `gh` the same way (the same script, linked as `gh`), and `CHIEF_REX_BIN` overrides
   `rex` (linked as `rex`; the test home's default fails like a Rex with no server, so no test
-  reaches the real one). Layout and switch logic is also tested against an in-memory `Mux`. `claude rm` outputs from the live
+  reaches the real one). `CHIEF_TMUX_BIN` overrides `tmux` (linked as `tmux`; reached only when a
+  test sets `TMUX`). Layout logic is also tested against an in-memory `Mux`, and the tmux backend
+  against a real tmux server on a private socket (`-L chief-test-…`, no config) that the test kills.
+  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps. `claude rm` outputs from the live
   M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
   remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
   tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces `~/.claude.json`, `CHIEF_CLAUDE_DIR` replaces

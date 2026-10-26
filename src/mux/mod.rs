@@ -1,6 +1,7 @@
-//! Terminal multiplexer access (ARCHITECTURE §9). Rex first; tmux can implement the same trait.
+//! Terminal multiplexer access (ARCHITECTURE §9): Rex, and tmux behind the same trait.
 
 pub mod rex;
+pub mod tmux;
 
 use std::path::PathBuf;
 

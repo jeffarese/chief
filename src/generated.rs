@@ -12,15 +12,17 @@ use crate::text::shell_quote;
 
 /// Variables that point chief somewhere other than its defaults. When set at generation time
 /// they are written into every hook command and the MCP server's env, so sessions started by
-/// Claude Code's supervisor (which doesn't inherit our environment) use the same home. The Rex
-/// layout's blocks get them too (they start from the login shell's environment, §9).
+/// Claude Code's supervisor (which doesn't inherit our environment) use the same home. The
+/// layout's Rex blocks and tmux panes get them too (they start from the login shell's or the
+/// tmux server's environment, §9).
 /// `CHIEF_HOME` is always written, as the resolved root: the supervisor doesn't have our
 /// `XDG_DATA_HOME` either.
-pub const PASSTHROUGH: [&str; 7] = [
+pub const PASSTHROUGH: [&str; 8] = [
     "CHIEF_HOME",
     "CHIEF_CLAUDE_BIN",
     "CHIEF_GH_BIN",
     "CHIEF_REX_BIN",
+    "CHIEF_TMUX_BIN",
     "CHIEF_CLAUDE_CONFIG",
     "CHIEF_NO_NOTIFY",
     // Claude Code's per-account config folder: each has its own supervisor, sessions, job state
@@ -78,7 +80,7 @@ pub fn passthrough_env() -> Vec<(String, String)> {
             let value = match *key {
                 "CHIEF_NO_NOTIFY" => value.to_string_lossy().into_owned(),
                 // A bare `claude` or `gh` is looked up on PATH; anything with a slash is a path.
-                "CHIEF_CLAUDE_BIN" | "CHIEF_GH_BIN" | "CHIEF_REX_BIN"
+                "CHIEF_CLAUDE_BIN" | "CHIEF_GH_BIN" | "CHIEF_REX_BIN" | "CHIEF_TMUX_BIN"
                     if !value.to_string_lossy().contains('/') =>
                 {
                     value.to_string_lossy().into_owned()

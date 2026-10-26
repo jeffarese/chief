@@ -114,9 +114,11 @@ CREATE TABLE ui_state (
     // The multiplexer session `chief up` created (§9): the only one chief reuses or kills.
     "ALTER TABLE ui_state ADD COLUMN rex_session TEXT;",
     // The running `chief pane`, which the board signals to switch (§9): its pid, and its start
-    // time to prove a pid is still that pane and not a reuse.
+    // time to prove a pid is still that pane and not a reuse. And the tmux window `chief up`
+    // opened, with its server (§9).
     "ALTER TABLE ui_state ADD COLUMN pane_pid INTEGER;
-     ALTER TABLE ui_state ADD COLUMN pane_started TEXT;",
+     ALTER TABLE ui_state ADD COLUMN pane_started TEXT;
+     ALTER TABLE ui_state ADD COLUMN tmux_window TEXT;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -752,6 +754,28 @@ pub fn set_rex_session(conn: &Connection, project_slug: &str, id: Option<&str>) 
     Ok(())
 }
 
+/// The tmux window `chief up` opened for the project (`<window id> <server pid> <socket>`), if
+/// it stored one.
+pub fn get_tmux_window(conn: &Connection, project_slug: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT tmux_window FROM ui_state WHERE project_slug = ?1",
+            [project_slug],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+pub fn set_tmux_window(conn: &Connection, project_slug: &str, id: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ui_state (project_slug, tmux_window) VALUES (?1, ?2)
+         ON CONFLICT(project_slug) DO UPDATE SET tmux_window = excluded.tmux_window",
+        params![project_slug, id],
+    )?;
+    Ok(())
+}
+
 /// The running `chief pane`'s pid and start time (`proc::start_time`), if one recorded itself.
 pub fn get_pane_process(conn: &Connection, project_slug: &str) -> Result<Option<(i32, String)>> {
     Ok(conn
@@ -1019,6 +1043,15 @@ mod tests {
         assert_eq!(get_pane_showing(&conn, "p").unwrap(), None, "kept apart");
         set_rex_session(&conn, "p", None).unwrap();
         assert_eq!(get_rex_session(&conn, "p").unwrap(), None);
+
+        assert_eq!(get_tmux_window(&conn, "p").unwrap(), None);
+        set_tmux_window(&conn, "p", Some("@3 42 /tmp/s")).unwrap();
+        assert_eq!(
+            get_tmux_window(&conn, "p").unwrap().as_deref(),
+            Some("@3 42 /tmp/s")
+        );
+        set_tmux_window(&conn, "p", None).unwrap();
+        assert_eq!(get_tmux_window(&conn, "p").unwrap(), None);
 
         assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
         set_pane_process(&conn, "p", 41, "100.5").unwrap();

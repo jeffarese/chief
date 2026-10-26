@@ -171,6 +171,9 @@ pub struct Home {
     /// `rex`; fails like a Rex without a running server unless told otherwise, so no test
     /// reaches the real one.
     pub rex: Fake,
+    /// `tmux`; only reached when a test sets `TMUX` (`run_env`): chief runs outside tmux
+    /// otherwise.
+    pub tmux: Fake,
     pub trust: PathBuf,
 }
 
@@ -192,6 +195,7 @@ impl Home {
             fake: Fake::new(),
             gh,
             rex,
+            tmux: Fake::named("tmux"),
             trust,
         }
     }
@@ -207,11 +211,15 @@ impl Home {
             .env("CHIEF_CLAUDE_BIN", self.fake.bin())
             .env("CHIEF_GH_BIN", self.gh.bin())
             .env("CHIEF_REX_BIN", self.rex.bin())
+            .env("CHIEF_TMUX_BIN", self.tmux.bin())
             .env("CHIEF_CLAUDE_CONFIG", &self.trust)
             .env("CHIEF_CLAUDE_DIR", self.fake.config_dir())
             .env("CHIEF_NO_NOTIFY", "1")
             // A developer's own account folder must not leak into the generated files.
             .env_remove("CLAUDE_CONFIG_DIR")
+            // Tests run outside tmux unless they say otherwise, even when cargo runs inside it.
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -219,7 +227,14 @@ impl Home {
     }
 
     pub fn run(&self, args: &[&str], stdin: &str) -> Output {
-        let mut child = self.command(args).spawn().unwrap();
+        self.run_env(args, &[], stdin)
+    }
+
+    /// `run` with extra environment variables (`TMUX`, say).
+    pub fn run_env(&self, args: &[&str], env: &[(&str, &str)], stdin: &str) -> Output {
+        let mut cmd = self.command(args);
+        cmd.envs(env.iter().copied());
+        let mut child = cmd.spawn().unwrap();
         child
             .stdin
             .take()

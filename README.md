@@ -21,8 +21,8 @@ status, and you can open any thread's own conversation from it.
 ## Requirements
 
 - macOS or Linux, Rust (stable), and Claude Code **2.1.310 or later** (`claude --version`).
-- Rex (the `rex` terminal) for the two-pane layout. Without it, chief still works: `chief up` prints a
-  `claude attach` command and you run `chief board` in another terminal.
+- Any terminal. Rex or tmux are optional: they let `chief up` open the two-pane layout for you
+  (see [The layout](#the-layout)).
 - `gh`, signed in, for pull request status on the board (optional).
 
 ## Install
@@ -46,13 +46,29 @@ trusts the project folder and each repo; background sessions refuse untrusted fo
 trusted, it offers to open Claude there so you can accept the trust prompt.
 
 `up` starts the coordinator (or revives it) and opens the layout: the conversation on the left, the
-board on the right. Then just talk: ask questions, hand over tasks, send follow-ups. The coordinator
+board on the right (or tells you how to open it yourself). Then just talk: ask questions, hand over
+tasks, send follow-ups. The coordinator
 answers quick questions itself, starts a thread per piece of work, sends follow-ups to the thread
 that owns the work (waking it first if it's asleep), and posts a short update when a thread
 finishes.
 
-`chief down <slug>` closes the layout and stops the coordinator; threads keep running unless you add
-`--stop-threads`.
+`chief down <slug>` closes the layout `up` opened and stops the coordinator; threads keep running
+unless you add `--stop-threads`.
+
+## The layout
+
+Two panes side by side: `chief pane --project <slug>` on the left shows the coordinator or the
+thread you picked, `chief board --project <slug>` on the right. `chief up` opens them with the
+first that applies:
+
+- **Rex**, when it is installed and its server is running: a Rex session `chief-<slug>`.
+- **tmux**, when you run `chief up` inside tmux: a new window `chief-<slug>` in your current
+  session, the pane on the left and the board on the right.
+- **Anything else**: `chief up` prints the two commands. Run them side by side in two terminal
+  windows or in splits of your terminal (iTerm, Ghostty, …).
+
+Switching works the same in all three: Enter on the board tells the pane process to show that
+thread, whatever terminal it runs in. `chief down` closes only a layout `chief up` opened.
 
 ## The board
 
@@ -74,7 +90,8 @@ process has ended), **Failed**, **Resolved** (hidden until you press `R`).
 | ? | Help |
 | q | Quit the board (the layout stays) |
 
-In the left pane, Claude's own Ctrl+Z detaches; chief re-attaches to whatever the board selected.
+In the left pane, Claude's own Ctrl+Z detaches too; chief re-attaches to whatever the board
+selected.
 
 ## Settings
 
@@ -119,13 +136,13 @@ readable.
 | `chief init <name> [--goal …] [--repo PATH…]` | Create a project |
 | `chief up <slug>` | Start or revive the coordinator and open the layout |
 | `chief down <slug> [--stop-threads]` | Close the layout and stop the coordinator |
+| `chief pane --project <slug>` | The left pane on its own, for a layout of your own |
 | `chief board --project <slug>` | The board on its own |
 | `chief status [<slug>]` | The board as text |
 | `chief clean <slug> <thread> [--discard] [--yes]` | Clean up one resolved thread |
 | `chief gc [<slug>] [--dry-run]` | Clean up every resolved thread that loses nothing |
 
-`chief pane`, `chief hook` and `chief mcp` are called by the layout, Claude Code's hooks and the
-coordinator's MCP config.
+`chief hook` and `chief mcp` are called by Claude Code's hooks and the coordinator's MCP config.
 
 ## How it works
 
@@ -153,5 +170,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Tests never start real Claude sessions: they use fake `claude`, `gh` and `rex` binaries
-(`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`) and a temporary `CHIEF_HOME`.
+Tests never start real Claude sessions: they use fake `claude`, `gh`, `rex` and `tmux` binaries
+(`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`) and a temporary
+`CHIEF_HOME`. The tmux backend is also tested against a real tmux server on a private socket,
+which the test kills; your own tmux server is never touched.
