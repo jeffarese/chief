@@ -124,3 +124,12 @@ coordinator); `chief … | head` panicked on a closed pipe.
 | Board `x` on a resolved thread with an unpushed commit | Modal lists the commit; a wrong name does nothing; the right name removes worktree, branch and session; main untouched |
 | `chief down --stop-threads` while the pane shows a thread, then `chief up` | Pane back on the coordinator, the stopped thread stays stopped, the stored Rex session id is cleared and replaced |
 | `claude --bg`'s transient daemon | Detaches into its own process group (so proc's group kill on timeout can't reach it) and exits by itself once idle |
+
+## Rex optional: live run (real Rex, real tmux 3.7b, Haiku sessions, 2026-10-26)
+
+| Check | Result |
+| --- | --- |
+| `chief up` with Rex running: Enter / Esc on the board switch the left pane by signal | Pass; the previous screen is fully cleared |
+| `chief up` inside tmux with Rex unavailable: window `chief-<slug>` opens next to the current one, pane left, board right; Enter / Esc switch | Pass after a fix (`new-window -t` takes a window, not `$TMUX_PANE`) |
+| `chief down` from a terminal outside tmux closes the stored tmux window | Pass |
+| No Rex, not in tmux: `chief up` prints the two commands; run in two unrelated windows, Enter / Esc still switch | Pass |
