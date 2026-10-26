@@ -64,6 +64,32 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   calls. The idle notice truncates the reply, so full reports come from the Stop hook.
 - Incoming cross-session messages show in the receiver's UserPromptSubmit `prompt` as
   `<cross-session-message from="uds:/tmp/cc-socks/<pid>.sock" from-name="<name>" …>`.
+- Subagents, verified live on 2.1.310 in a `claude --bg` session with a hook logging every
+  payload (samples in `tests/fixtures/hooks/teammate-events.jsonl`):
+  - In a background session the Agent tool spawns an in-process "teammate": PostToolUse for
+    `Agent` has `tool_input.name` (`"helper"`) and `tool_response` `{status: "teammate_spawned",
+    agentId: "ahelper-886b99f57d4badec", name, teammate_id, …}`.
+  - `SubagentStart` fires at spawn, before that PostToolUse, with the lead's `session_id`,
+    `agent_id` (`"ahelper-886b99f57d4badec"`) and `agent_type` (`"helper"`: the name, because one
+    was given; for an unnamed agent it is presumably the agent type, so `agent_type` is never an
+    address). It fires again each time a teammate is resumed. `SubagentStop` fires after every
+    teammate turn while the teammate stays registered (the Stop hook's `background_tasks` lists
+    it as a running `teammate`), so SubagentStop does not mean gone.
+  - A teammate's own tool calls fire PreToolUse/PostToolUse with the lead's `session_id` plus
+    `agent_id` and `agent_type`, set by Claude Code, not the model. Teammates report with
+    `SendMessage(to: "team-lead")`; the SendMessage tool doc also names `"main"` ("the main
+    conversation, background subagents only").
+  - Lead → teammate: `to: "helper"` and `to: "ahelper-886b99f57d4badec"` both reach it.
+  - In-process names win: with a teammate named `spike-other` and a live outside session also
+    named `spike-other`, `to: "spike-other"` reached the teammate and the outside session got
+    nothing. Same after `TaskStop` of the teammate ("Teammate "spike-other" was not running;
+    resumed it as an in-process teammate with 27 prior messages…"). The tool doc says the bare
+    in-process name always wins, and when two in-process agents share a name the latest wins.
+  - After `claude stop` + `claude respawn` (SessionStart `source: "resume"`, a new process) the
+    teammates are gone: `to: "helper"` → "No agent named 'helper' is reachable."; `to:
+    "spike-other"` now resolved to the outside session ("'spike-other' needs a one-time confirm
+    before this send. Re-send with the ref…"). So a teammate is addressable only within the
+    process that spawned it, and a stale name can point outside.
 - `claude stop <id>` ends the process and keeps the conversation and worktree.
   `claude respawn <id>` restarts it under the same id with its saved options.
   **Never** use `claude --bg --resume <id> <anything>`: it starts a copy that shares the worktree.
@@ -241,7 +267,7 @@ lists only that thread's account.
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
   `SendMessage|ListAgents`, `chief hook guard`), PostToolUse (matcher `*`), Notification, Stop,
-  SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`. The
+  SubagentStart, SubagentStop, SessionEnd. Each runs `chief hook <event> --project <slug> --role <role>`. The
   state and context hooks fail open (a missing binary is a non-blocking hook error). So do bad
   arguments: clap's exit 2 would block (every tool for the `*` PreToolUse, the prompt for
   UserPromptSubmit, the end of the turn for Stop), so a `chief hook` whose arguments clap rejects
@@ -399,6 +425,15 @@ CREATE TABLE ui_state (
   pane_started TEXT,                      -- that process's start time, proving the pid is still it (migration 9)
   tmux_window  TEXT                       -- '<window id> <server pid> <socket>' of the tmux window `chief up` opened, §9 (migration 9)
 );
+
+CREATE TABLE teammates (                  -- a session's subagents in its current process, §5, §6 "Subagents" (migration 11)
+  session_name TEXT NOT NULL,             -- the lead: the sessions.name its hook matched (below)
+  session_id   TEXT NOT NULL,             -- the lead's session id that hook carried; a record counts only for it
+  agent_id     TEXT NOT NULL,             -- Claude Code's agent id, e.g. 'ahelper-886b99f57d4badec'
+  name         TEXT,                      -- the Agent call's `name`; NULL when it had none, or none is known yet
+  recorded_at  INTEGER NOT NULL,          -- unix ms of the latest hook that recorded it
+  PRIMARY KEY (session_name, agent_id)
+);
 ```
 
 Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
@@ -430,9 +465,22 @@ Hook updates (per matched session):
 | Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` (shown only; a thread's branch comes from its job state on sync, below) |
 
 Every hook above also sets `last_hook`, `updated_at` and `cc_fresh = 0`, re-derives the group, and
-(except Notification `idle_prompt`) sets `last_activity_at`. Other events (SubagentStop,
-SessionEnd, other notification types) are only recorded in `events`. Coordinator Stops store
-reports too.
+(except Notification `idle_prompt`) sets `last_activity_at`. Other events (SubagentStart,
+SubagentStop, SessionEnd, other notification types) are only recorded in `events`, apart from
+`teammates` (below). Coordinator Stops store reports too.
+
+Subagents (§1, §6 "Subagents"): in the same transaction, a matched session's hook keeps its
+`teammates` rows, under the payload's `session_id` (a subagent's own hooks carry its lead's).
+SubagentStart records its `agent_id` alone, and keeps a name already recorded (it fires again on
+every resume); `agent_type` is never taken for a name. PostToolUse for `Agent` records
+`tool_response.agentId` (else `agent_id`) with `tool_input.name`; the name is left out when it is
+missing or empty, or when `tool_response.name` differs from it (Claude Code registered another,
+which could reach someone else; the agent id still works). A name goes to the latest agent
+recorded with it (the others keep their ids, without a name), as Claude Code delivers it. A
+SessionStart whose `source` is anything but `compact` (startup, resume, clear, or none) deletes
+the session's rows: a new process has none of its old teammates (§1). A compaction keeps them,
+and SubagentStop changes nothing (it fires after every turn of a teammate that stays). Deleting a
+session row (a failed spawn) deletes its teammates too.
 
 When `[ui] notify` is true, a thread's `permission_prompt` and a thread's Stop send a macOS
 notification (`osascript`, spawned without waiting; skipped if missing or `CHIEF_NO_NOTIFY=1`).
@@ -1021,7 +1069,8 @@ are tested without a terminal (`TestBackend`).
 ## 11. Testing
 
 - Unit tests: §5 derivation (table-driven), §6 guard (table-driven), hook payload parsing against
-  `tests/fixtures/hooks/spike-events.jsonl`, `claude agents` parsing against
+  `tests/fixtures/hooks/spike-events.jsonl` and, for subagents, the raw payloads in
+  `tests/fixtures/hooks/teammate-events.jsonl` (§1), `claude agents` parsing against
   `tests/fixtures/agents/agents-sample.json`, config round trip, migrations on a fresh DB.
 - `CHIEF_CLAUDE_BIN` overrides the `claude` binary; integration tests use a fake script
   (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_GH_BIN`

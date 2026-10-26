@@ -125,6 +125,17 @@ CREATE TABLE ui_state (
     "ALTER TABLE sessions ADD COLUMN account_id TEXT;
      ALTER TABLE sessions ADD COLUMN account_label TEXT;
      ALTER TABLE sessions ADD COLUMN account_dir TEXT;",
+    // The subagents (in-process teammates) a session spawned in its current process, which the
+    // guard lets it and them message (§6 "Subagents"). A new process has none (§1), so its
+    // SessionStart forgets them.
+    "CREATE TABLE teammates (
+       session_name TEXT NOT NULL,
+       session_id   TEXT NOT NULL,
+       agent_id     TEXT NOT NULL,
+       name         TEXT,
+       recorded_at  INTEGER NOT NULL,
+       PRIMARY KEY (session_name, agent_id)
+     );",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -544,6 +555,7 @@ pub fn release_cleanup(conn: &Connection, name: &str, claimed_at: i64) -> Result
 pub fn delete_session(conn: &Connection, name: &str) -> Result<()> {
     conn.execute("DELETE FROM events WHERE session_name = ?1", [name])?;
     conn.execute("DELETE FROM reports WHERE session_name = ?1", [name])?;
+    forget_teammates(conn, name)?;
     conn.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
     Ok(())
 }
@@ -681,6 +693,68 @@ pub fn recent_reports(conn: &Connection, session_name: &str, limit: usize) -> Re
                 session_name: r.get(0)?,
                 ts: r.get(1)?,
                 text: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// A subagent a session spawned (§6 "Subagents").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Teammate {
+    /// Claude Code's id for it (`ahelper-886b99f57d4badec`).
+    pub agent_id: String,
+    /// The `name` its Agent call gave it; None when it had none, or none is known yet.
+    pub name: Option<String>,
+}
+
+/// Records a subagent of the session `session_name`, under the session id its hook carried.
+/// A name goes to the latest agent given it, as Claude Code delivers it (§1). `name` None keeps
+/// a name already recorded: SubagentStart, which fires again on every resume, knows only the id.
+pub fn record_teammate(
+    conn: &Connection,
+    session_name: &str,
+    session_id: &str,
+    agent_id: &str,
+    name: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    if let Some(name) = name {
+        conn.execute(
+            "UPDATE teammates SET name = NULL
+             WHERE session_name = ?1 AND name = ?2 AND agent_id <> ?3",
+            params![session_name, name, agent_id],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO teammates (session_name, session_id, agent_id, name, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_name, agent_id) DO UPDATE SET session_id = excluded.session_id,
+           name = coalesce(excluded.name, name), recorded_at = excluded.recorded_at",
+        params![session_name, session_id, agent_id, name, now],
+    )?;
+    Ok(())
+}
+
+/// Forgets every subagent of `session_name`, whose process started again; returns how many.
+pub fn forget_teammates(conn: &Connection, session_name: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM teammates WHERE session_name = ?1",
+        [session_name],
+    )?)
+}
+
+/// The subagents `session_name` recorded under `session_id`, in the order first recorded.
+pub fn teammates(conn: &Connection, session_name: &str, session_id: &str) -> Result<Vec<Teammate>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, name FROM teammates WHERE session_name = ?1 AND session_id = ?2
+         ORDER BY rowid",
+    )?;
+    let rows = stmt
+        .query_map(params![session_name, session_id], |r| {
+            Ok(Teammate {
+                agent_id: r.get(0)?,
+                name: r.get(1)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -903,9 +977,11 @@ mod tests {
                 "projects",
                 "reports",
                 "sessions",
+                "teammates",
                 "ui_state"
             ]
         );
+        assert_eq!(MIGRATIONS.len(), 11);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
@@ -1019,6 +1095,54 @@ mod tests {
         u.session_id = Some("sid-u".into());
         insert_session(&conn, &u).unwrap();
         assert_eq!(get_session(&conn, "u").unwrap().unwrap().ids_at, Some(60));
+    }
+
+    /// A session's subagents (§6 "Subagents"): by agent id, a name moving to the latest agent
+    /// given it, kept apart per session and per session id, forgotten all at once.
+    #[test]
+    fn teammates_per_session() {
+        let (_dir, conn) = fresh();
+        register_project(&conn, "p", Path::new("/p"), 1).unwrap();
+        for name in ["t", "u"] {
+            insert_session(&conn, &SessionRow::new(name, "p", Role::Thread, 1)).unwrap();
+        }
+        let of = |name: &str, sid: &str| teammates(&conn, name, sid).unwrap();
+        let mate = |id: &str, name: Option<&str>| Teammate {
+            agent_id: id.into(),
+            name: name.map(String::from),
+        };
+        assert!(of("t", "sid-t").is_empty());
+
+        // The Agent call's response names it; SubagentStart (again on every resume) knows only
+        // the id and keeps the name.
+        record_teammate(&conn, "t", "sid-t", "ahelper-1", Some("helper"), 10).unwrap();
+        record_teammate(&conn, "t", "sid-t", "ahelper-1", None, 11).unwrap();
+        assert_eq!(of("t", "sid-t"), [mate("ahelper-1", Some("helper"))]);
+        // SubagentStart may come first.
+        record_teammate(&conn, "t", "sid-t", "aother-2", None, 12).unwrap();
+        record_teammate(&conn, "t", "sid-t", "aother-2", Some("other"), 13).unwrap();
+        // The latest agent given a name has it.
+        record_teammate(&conn, "t", "sid-t", "ahelper-3", Some("helper"), 14).unwrap();
+        assert_eq!(
+            of("t", "sid-t"),
+            [
+                mate("ahelper-1", None),
+                mate("aother-2", Some("other")),
+                mate("ahelper-3", Some("helper")),
+            ]
+        );
+        // Another session's are its own, and a record counts only for the session id it was made
+        // under.
+        record_teammate(&conn, "u", "sid-u", "ahelper-9", Some("helper"), 15).unwrap();
+        assert_eq!(of("u", "sid-u"), [mate("ahelper-9", Some("helper"))]);
+        assert!(of("t", "sid-u").is_empty());
+        assert_eq!(of("t", "sid-t").len(), 3);
+
+        assert_eq!(forget_teammates(&conn, "t").unwrap(), 3);
+        assert!(of("t", "sid-t").is_empty());
+        assert_eq!(of("u", "sid-u").len(), 1, "only that session's");
+        delete_session(&conn, "u").unwrap();
+        assert!(of("u", "sid-u").is_empty());
     }
 
     #[test]

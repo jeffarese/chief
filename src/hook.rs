@@ -417,6 +417,9 @@ pub fn handle(conn: &Connection, ctx: &Ctx, event: &str, payload: &Value) -> Res
         let Some(r) = row.as_mut() else {
             return Ok(None);
         };
+        if let Some(sid) = session_id {
+            record_teammates(conn, &r.name, sid, event, payload, ctx.now)?;
+        }
         if let Some(kind) = kind
             && let Some(report) = apply(r, kind, payload, ctx.now)
         {
@@ -462,6 +465,49 @@ fn match_session(
     }
     row.session_id = session_id.map(str::to_string);
     Ok(Some(row))
+}
+
+/// §6 "Subagents": a session's subagents are recorded under it, by the session id its hooks
+/// carry (a subagent's own hooks carry its lead's), and forgotten when its process starts again:
+/// a SessionStart other than `compact` is a new process, which has none of them (§1).
+fn record_teammates(
+    conn: &Connection,
+    session: &str,
+    session_id: &str,
+    event: &str,
+    payload: &Value,
+    now: i64,
+) -> Result<()> {
+    fn text<'a>(v: Option<&'a Value>, k: &str) -> Option<&'a str> {
+        v.and_then(|v| v.get(k))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+    match event {
+        "SessionStart" if text(Some(payload), "source") != Some("compact") => {
+            db::forget_teammates(conn, session)?;
+        }
+        // Only the id: `agent_type` is the agent's name only when it was given one.
+        "SubagentStart" => {
+            if let Some(agent) = text(Some(payload), "agent_id") {
+                db::record_teammate(conn, session, session_id, agent, None, now)?;
+            }
+        }
+        "PostToolUse" if text(Some(payload), "tool_name") == Some("Agent") => {
+            let response = payload.get("tool_response");
+            let Some(agent) = text(response, "agentId").or(text(response, "agent_id")) else {
+                return Ok(());
+            };
+            // The name it was given, unless Claude Code registered another: then that name
+            // could reach someone else, and only the id is kept.
+            let registered = response.and_then(|r| r.get("name")).and_then(Value::as_str);
+            let name = text(payload.get("tool_input"), "name")
+                .filter(|n| registered.is_none_or(|r| r == *n));
+            db::record_teammate(conn, session, session_id, agent, name, now)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// §5 "Hook updates". The hook is newer than any `claude agents` poll, so the stored snapshot
@@ -534,6 +580,7 @@ pub fn summary(event: &str, payload: &Value) -> String {
         "Stop" => field("last_assistant_message").to_string(),
         "SessionStart" => field("source").to_string(),
         "SessionEnd" => field("reason").to_string(),
+        "SubagentStart" | "SubagentStop" => field("agent_id").to_string(),
         _ => String::new(),
     };
     one_line(&text, SUMMARY_CHARS)
@@ -859,6 +906,179 @@ mod tests {
                 .any(|m| m.starts_with("Curl check finished: The request returned"))
         );
         assert!(notices.iter().all(|n| n.title == "chief · demo"));
+    }
+
+    /// The lead of `tests/fixtures/hooks/teammate-events.jsonl` (§1: a background session whose
+    /// Agent calls spawn in-process teammates).
+    const LEAD: &str = "7df9ed81-5900-4844-80cf-77bb499e7e0a";
+    const HELPER: &str = "ahelper-886b99f57d4badec";
+    const SPIKE_OTHER: &str = "aspike-other-ba38036fce05d0d2";
+
+    /// The fixture's raw payloads, in the order the hook logged them.
+    pub(crate) fn teammate_fixture() -> Vec<Value> {
+        include_str!("../tests/fixtures/hooks/teammate-events.jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The fixture's lead as a thread of project demo.
+    fn lead_setup() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("chief.db")).unwrap();
+        db::register_project(&conn, "demo", dir.path(), 0).unwrap();
+        db::insert_session(
+            &conn,
+            &SessionRow::new("spike-main", "demo", Role::Thread, 0),
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn replay(conn: &Connection, payload: &Value, now: i64) -> Outcome {
+        let ctx = Ctx {
+            project: "demo",
+            role: Role::Thread,
+            now,
+        };
+        let event = payload["hook_event_name"].as_str().unwrap();
+        handle(conn, &ctx, event, payload).unwrap()
+    }
+
+    fn mates(conn: &Connection) -> Vec<(String, Option<String>)> {
+        db::teammates(conn, "spike-main", LEAD)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.agent_id, t.name))
+            .collect()
+    }
+
+    /// F1, F2: the Agent call's PostToolUse gives the agent id and the name, SubagentStart the
+    /// id alone; `agent_type` is never taken for a name. F6: a SessionStart other than
+    /// `compact` is a new process, without them.
+    #[test]
+    fn teammates_are_recorded_from_the_fixture() {
+        let (_dir, conn) = lead_setup();
+        let lines = teammate_fixture();
+        assert_eq!(lines.len(), 20);
+        let event = |i: usize| lines[i]["hook_event_name"].as_str().unwrap();
+        assert_eq!(
+            (event(0), event(2), event(3), event(17)),
+            (
+                "SessionStart",
+                "PostToolUse",
+                "SubagentStart",
+                "SessionStart"
+            )
+        );
+
+        // startup: learns the session id from the title.
+        assert_eq!(
+            replay(&conn, &lines[0], 1).session.as_deref(),
+            Some("spike-main")
+        );
+        // The Agent call's PreToolUse records nothing: the agent doesn't exist yet.
+        replay(&conn, &lines[1], 2);
+        assert!(mates(&conn).is_empty());
+        // PostToolUse Agent: `tool_response.agentId` and `tool_input.name`.
+        replay(&conn, &lines[2], 3);
+        assert_eq!(mates(&conn), [(HELPER.into(), Some("helper".into()))]);
+        // SubagentStart keeps the name it doesn't carry.
+        replay(&conn, &lines[3], 4);
+        assert_eq!(mates(&conn), [(HELPER.into(), Some("helper".into()))]);
+
+        // A SubagentStart alone: its `agent_type` is the name here, but for an unnamed agent
+        // it is the type, so it is never taken for a name.
+        let mut start = lines[3].clone();
+        start["agent_id"] = SPIKE_OTHER.into();
+        start["agent_type"] = "spike-other".into();
+        replay(&conn, &start, 5);
+        assert_eq!(
+            mates(&conn),
+            [
+                (HELPER.into(), Some("helper".into())),
+                (SPIKE_OTHER.into(), None)
+            ]
+        );
+        // The rest of the first process (the teammates' own calls, SubagentStop, messages)
+        // changes nothing.
+        for (i, line) in lines.iter().enumerate().take(17).skip(4) {
+            replay(&conn, line, 10 + i as i64);
+        }
+        assert_eq!(mates(&conn).len(), 2);
+
+        // A compaction keeps the process, and its teammates.
+        let mut compact = lines[17].clone();
+        compact["source"] = "compact".into();
+        replay(&conn, &compact, 30);
+        assert_eq!(mates(&conn).len(), 2);
+        // `claude respawn`: SessionStart `resume`, a new process without them.
+        assert_eq!(
+            replay(&conn, &lines[17], 31).session.as_deref(),
+            Some("spike-main")
+        );
+        assert!(mates(&conn).is_empty());
+        for (i, line) in lines.iter().enumerate().skip(18) {
+            replay(&conn, line, 40 + i as i64);
+        }
+        assert!(mates(&conn).is_empty());
+
+        // `clear` and `startup` are new processes too, and so is a SessionStart without a
+        // source.
+        for source in [Some("clear"), Some("startup"), None] {
+            replay(&conn, &lines[2], 50);
+            assert_eq!(mates(&conn).len(), 1);
+            let mut start = lines[17].clone();
+            start["source"] = source.into();
+            replay(&conn, &start, 51);
+            assert!(mates(&conn).is_empty(), "{source:?}");
+        }
+
+        // Newest first: the fixture's own SubagentStart is the older one.
+        let events = db::recent_events(&conn, "demo", 100).unwrap();
+        let start = events.iter().rfind(|e| e.hook == "SubagentStart").unwrap();
+        assert_eq!(start.session_name.as_deref(), Some("spike-main"));
+        assert_eq!(start.summary.as_deref(), Some(HELPER));
+    }
+
+    /// Only what Claude Code registered: a response naming the agent differently gives no name
+    /// (the id still works), and a response without an agent id records nothing.
+    #[test]
+    fn teammates_need_the_registered_name_and_an_id() {
+        let (_dir, conn) = lead_setup();
+        let lines = teammate_fixture();
+        replay(&conn, &lines[0], 1);
+        let mut renamed = lines[2].clone();
+        renamed["tool_response"]["name"] = "helper-2".into();
+        replay(&conn, &renamed, 2);
+        assert_eq!(mates(&conn), [(HELPER.into(), None)]);
+
+        let mut no_id = lines[2].clone();
+        let response = no_id["tool_response"].as_object_mut().unwrap();
+        response.remove("agentId");
+        response.remove("agent_id");
+        no_id["tool_input"]["name"] = "nobody".into();
+        replay(&conn, &no_id, 3);
+        let mut blank = lines[3].clone();
+        blank["agent_id"] = "".into();
+        replay(&conn, &blank, 4);
+        // Another tool's PostToolUse with the same shape is not a spawn.
+        let mut other_tool = lines[2].clone();
+        other_tool["tool_name"] = "Task".into();
+        other_tool["tool_response"]["agentId"] = "atask-1".into();
+        replay(&conn, &other_tool, 5);
+        assert_eq!(mates(&conn), [(HELPER.into(), None)]);
+
+        // A hook of a session chief doesn't know records nothing.
+        let mut stranger = lines[2].clone();
+        stranger["session_id"] = "someone-else".into();
+        assert_eq!(replay(&conn, &stranger, 6).session, None);
+        assert!(
+            db::teammates(&conn, "spike-main", "someone-else")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

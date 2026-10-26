@@ -31,13 +31,15 @@ pub const PASSTHROUGH: [&str; 8] = [
 ];
 
 /// Hook events chief records, with the PreToolUse/PostToolUse matcher where one applies.
-const EVENTS: [(&str, Option<&str>); 8] = [
+/// SubagentStart and PostToolUse `Agent` record a session's subagents (§6 "Subagents").
+const EVENTS: [(&str, Option<&str>); 9] = [
     ("SessionStart", None),
     ("UserPromptSubmit", None),
     ("PreToolUse", Some("*")),
     ("PostToolUse", Some("*")),
     ("Notification", None),
     ("Stop", None),
+    ("SubagentStart", None),
     ("SubagentStop", None),
     ("SessionEnd", None),
 ];
@@ -357,10 +359,12 @@ mod tests {
                 "SessionEnd",
                 "SessionStart",
                 "Stop",
+                "SubagentStart",
                 "SubagentStop",
                 "UserPromptSubmit"
             ]
         );
+        assert!(hooks["SubagentStart"][0].get("matcher").is_none());
         assert_eq!(
             hooks["Stop"],
             json!([{"hooks": [{"type": "command",

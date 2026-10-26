@@ -109,6 +109,61 @@ fn bad_payload_exits_zero_and_logs() {
     assert!(log.contains("parsing the hook payload"), "{log}");
 }
 
+/// The fixture's raw payloads (§1: a background session's in-process teammates).
+fn teammate_fixture() -> Vec<Value> {
+    include_str!("fixtures/hooks/teammate-events.jsonl")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+const LEAD: &str = "7df9ed81-5900-4844-80cf-77bb499e7e0a";
+
+/// The hooks record a session's teammates and forget them when its process starts again, each
+/// silently and with exit 0, as every hook.
+#[test]
+fn hooks_record_and_forget_subagents() {
+    let home = tempfile::tempdir().unwrap();
+    {
+        let conn = db::open(&home.path().join("chief.db")).unwrap();
+        db::register_project(&conn, "demo", &home.path().join("projects/demo"), 0).unwrap();
+        let mut lead = SessionRow::new("demo-lead-1111", "demo", Role::Thread, 0);
+        lead.session_id = Some(LEAD.into());
+        db::insert_session(&conn, &lead).unwrap();
+    }
+    let lines = teammate_fixture();
+    let run = |payload: &Value| {
+        let event = payload["hook_event_name"].as_str().unwrap();
+        let out = hook(
+            home.path(),
+            &[event, "--project", "demo", "--role", "thread"],
+            &payload.to_string(),
+        );
+        assert_silent_success(&out);
+    };
+    let mates = || {
+        let conn = db::open(&home.path().join("chief.db")).unwrap();
+        db::teammates(&conn, "demo-lead-1111", LEAD)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.agent_id, t.name))
+            .collect::<Vec<_>>()
+    };
+    run(&lines[2]); // PostToolUse Agent
+    run(&lines[3]); // SubagentStart
+    assert_eq!(
+        mates(),
+        [(
+            "ahelper-886b99f57d4badec".to_string(),
+            Some("helper".to_string())
+        )]
+    );
+    run(&lines[17]); // SessionStart resume
+    assert!(mates().is_empty());
+    assert_eq!(error_log(home.path()), "");
+}
+
 /// Claude Code reads exit 2 as "block" (every tool for the `*` PreToolUse, the prompt erased,
 /// the turn forced on), so a hook whose arguments clap rejects logs it and exits 0, silently.
 #[test]
