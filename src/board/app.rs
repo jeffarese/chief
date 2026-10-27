@@ -1,10 +1,12 @@
 //! Board state and key handling, without a terminal. Keys become `Action`s that `mod.rs` runs
 //! (on worker threads where they shell out); results come back as `Msg`s through `apply`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::cleanup::{Inspection, Mode};
 use crate::config::ProjectConfig;
@@ -36,8 +38,8 @@ pub enum Action {
     Edit(PathBuf),
     /// Check which repos of this draft the pool's accounts trust (§3).
     CheckTrust(Box<ProjectConfig>),
-    /// Run Claude's trust prompt for this pair on this terminal, through agp.
-    Trust(Box<Untrusted>),
+    /// Mark this pair trusted (the user pressed Enter on it), then check `config` again.
+    Trust(Box<Untrusted>, Box<ProjectConfig>),
 }
 
 /// What the refresher and the workers send back.
@@ -63,6 +65,11 @@ pub enum Msg {
     SaveFailed(String),
     /// The pool's trust check, or why it failed.
     Trust(Result<PoolTrust, String>),
+    /// Marking a pair trusted went as `text` says; `check` is the check that followed.
+    Trusted {
+        text: String,
+        check: Result<PoolTrust, String>,
+    },
 }
 
 /// One refresh: every session of the project plus what the header needs.
@@ -104,6 +111,8 @@ pub enum Screen {
 /// A line of the thread list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Item<'a> {
+    /// The coordinator, always first: the conversation in the main pane.
+    Coordinator,
     Header {
         group: Group,
         count: usize,
@@ -112,6 +121,17 @@ pub enum Item<'a> {
     Thread(&'a SessionRow),
     /// "No threads yet".
     Empty,
+}
+
+/// What a click on a screen line lands on, recorded by the last draw.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hit {
+    Coordinator,
+    Thread(String),
+    /// A collapsed or expanded Resolved header: a click toggles it.
+    Resolved,
+    /// A settings field, by index.
+    Field(usize),
 }
 
 pub struct App {
@@ -124,7 +144,12 @@ pub struct App {
     pub denials: i64,
     /// What the main pane shows; None is the coordinator.
     pub pane_target: Option<String>,
+    /// The selected thread; ignored while `on_coordinator`.
     pub selected: Option<String>,
+    /// The coordinator's row is selected.
+    pub on_coordinator: bool,
+    /// Selected only because no thread showed: the first thread to show takes the selection.
+    coordinator_by_default: bool,
     pub show_resolved: bool,
     /// Short terminals show the detail instead of the list while this is on.
     pub detail_open: bool,
@@ -141,6 +166,8 @@ pub struct App {
     pub now: i64,
     /// First visible list line, kept between frames so the list doesn't jump.
     pub scroll: Cell<usize>,
+    /// Screen row → what is drawn there, from the last frame, for the mouse.
+    pub hits: RefCell<Vec<(u16, Hit)>>,
 }
 
 impl App {
@@ -154,6 +181,8 @@ impl App {
             denials: 0,
             pane_target: None,
             selected: None,
+            on_coordinator: false,
+            coordinator_by_default: false,
             show_resolved: false,
             detail_open: false,
             screen: Screen::Board,
@@ -166,6 +195,7 @@ impl App {
             pr_error: None,
             now,
             scroll: Cell::new(0),
+            hits: RefCell::new(Vec::new()),
         }
     }
 
@@ -233,18 +263,10 @@ impl App {
                     form.trust_checked(result);
                 }
             }
-        }
-    }
-
-    /// A trust fix ran on the terminal; `text` says how it went. Returns the check to run again
-    /// when the settings screen is still open.
-    pub fn trust_ran(&mut self, text: String) -> Option<Action> {
-        match &mut self.screen {
-            Screen::Settings(form) => Some(form.trust_ran(text)),
-            _ => {
-                self.status = Some(text);
-                None
-            }
+            Msg::Trusted { text, check } => match &mut self.screen {
+                Screen::Settings(form) => form.trust_marked(text, check),
+                _ => self.status = Some(text),
+            },
         }
     }
 
@@ -257,10 +279,11 @@ impl App {
     }
 
     pub fn items(&self) -> Vec<Item<'_>> {
+        let mut items = vec![Item::Coordinator];
         if self.threads.is_empty() {
-            return vec![Item::Empty];
+            items.push(Item::Empty);
+            return items;
         }
-        let mut items = Vec::new();
         for group in Group::ORDER {
             let rows: Vec<_> = self
                 .threads
@@ -283,37 +306,116 @@ impl App {
         items
     }
 
+    /// The selected thread; None when the coordinator's row is selected.
     pub fn selected_row(&self) -> Option<&SessionRow> {
+        if self.on_coordinator {
+            return None;
+        }
         let name = self.selected.as_deref()?;
         self.visible().into_iter().find(|r| r.name == name)
     }
 
-    /// Keeps the selection on a visible thread: the same one if it still shows, else the first.
+    /// Keeps the selection on a visible thread: the same one if it still shows, else the first,
+    /// else the coordinator. A selected coordinator stays selected.
     fn fix_selection(&mut self) {
+        if self.on_coordinator && !self.coordinator_by_default {
+            return;
+        }
         let visible = self.visible();
         let keep = self
             .selected
             .as_deref()
             .is_some_and(|n| visible.iter().any(|r| r.name == n));
-        if !keep {
+        if !keep || self.coordinator_by_default {
             self.selected = visible.first().map(|r| r.name.clone());
+            self.on_coordinator = self.selected.is_none();
+            self.coordinator_by_default = self.on_coordinator;
         }
     }
 
+    /// Moves over the coordinator (position 0) and the visible threads, stopping at the ends.
     fn move_selection(&mut self, delta: isize) {
         let visible = self.visible();
-        if visible.is_empty() {
-            return;
-        }
-        let current = self
-            .selected
-            .as_deref()
-            .and_then(|n| visible.iter().position(|r| r.name == n));
-        let next = match current {
-            Some(i) => (i as isize + delta).clamp(0, visible.len() as isize - 1) as usize,
-            None => 0,
+        let current = if self.on_coordinator {
+            0
+        } else {
+            self.selected
+                .as_deref()
+                .and_then(|n| visible.iter().position(|r| r.name == n))
+                .map_or(0, |i| i + 1)
         };
-        self.selected = Some(visible[next].name.clone());
+        let next = (current as isize)
+            .saturating_add(delta)
+            .clamp(0, visible.len() as isize);
+        let thread = (next > 0).then(|| visible[next as usize - 1].name.clone());
+        self.on_coordinator = thread.is_none();
+        self.coordinator_by_default = false;
+        if thread.is_some() {
+            self.selected = thread;
+        }
+    }
+
+    fn select(&mut self, hit: &Hit) {
+        match hit {
+            Hit::Coordinator => {
+                self.on_coordinator = true;
+                self.coordinator_by_default = false;
+            }
+            Hit::Thread(name) => {
+                self.on_coordinator = false;
+                self.coordinator_by_default = false;
+                self.selected = Some(name.clone());
+            }
+            Hit::Resolved | Hit::Field(_) => {}
+        }
+    }
+
+    /// Clicks select (a click on the selection shows it, as Enter does; one on the Resolved
+    /// header shows or hides it); the wheel moves the selection.
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> Vec<Action> {
+        let hit = || {
+            self.hits
+                .borrow()
+                .iter()
+                .find(|(y, _)| *y == ev.row)
+                .map(|(_, h)| h.clone())
+        };
+        match (&mut self.screen, ev.kind) {
+            (Screen::Help, MouseEventKind::Down(_)) => self.screen = Screen::Board,
+            (Screen::Settings(form), MouseEventKind::ScrollUp) => form.move_cursor(-1),
+            (Screen::Settings(form), MouseEventKind::ScrollDown) => form.move_cursor(1),
+            (Screen::Settings(_), MouseEventKind::Down(MouseButton::Left)) => {
+                if let (Some(Hit::Field(i)), Screen::Settings(form)) = (hit(), &mut self.screen) {
+                    form.cursor = i;
+                }
+            }
+            (Screen::Board, MouseEventKind::ScrollUp) => self.move_selection(-1),
+            (Screen::Board, MouseEventKind::ScrollDown) => self.move_selection(1),
+            (Screen::Board, MouseEventKind::Down(MouseButton::Left)) => {
+                self.status = None;
+                match hit() {
+                    Some(Hit::Resolved) => {
+                        self.show_resolved = !self.show_resolved;
+                        self.fix_selection();
+                    }
+                    Some(h) if self.is_selected(&h) => {
+                        return self.board_key(KeyEvent::from(KeyCode::Enter));
+                    }
+                    Some(h) => self.select(&h),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn is_selected(&self, hit: &Hit) -> bool {
+        match hit {
+            Hit::Coordinator => self.on_coordinator,
+            Hit::Thread(name) => !self.on_coordinator && self.selected.as_deref() == Some(name),
+            Hit::Resolved | Hit::Field(_) => false,
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -359,10 +461,8 @@ impl App {
                 self.screen =
                     Screen::Settings(Box::new(SettingsForm::new(&self.config, self.dir.clone())))
             }
-            KeyCode::Esc | KeyCode::Char('c') => {
-                self.pane_target = None;
-                return vec![Action::Show(None)];
-            }
+            KeyCode::Esc | KeyCode::Char('c') => return self.show_coordinator(),
+            KeyCode::Enter if self.on_coordinator => return self.show_coordinator(),
             KeyCode::Enter => return self.on_thread(|app, row| app.show(row)),
             KeyCode::Char('w') => return self.on_thread(|app, row| app.wake(row)),
             KeyCode::Char('r') => return self.on_thread(|app, row| app.resolve(row)),
@@ -373,14 +473,21 @@ impl App {
         Vec::new()
     }
 
+    fn show_coordinator(&mut self) -> Vec<Action> {
+        self.pane_target = None;
+        vec![Action::Show(None)]
+    }
+
     /// Runs a thread key on the selection, or says there is none.
     fn on_thread(&mut self, f: impl FnOnce(&mut App, SessionRow) -> Vec<Action>) -> Vec<Action> {
         match self.selected_row().cloned() {
             Some(row) => f(self, row),
-            None => {
-                self.status = Some("No thread selected.".to_string());
-                Vec::new()
-            }
+            None if self.on_coordinator => self.refuse(
+                "That key acts on a thread: pick one with ↓. The coordinator is the conversation in \
+                 the main pane."
+                    .to_string(),
+            ),
+            None => self.refuse("No thread selected.".to_string()),
         }
     }
 
@@ -569,11 +676,13 @@ pub(crate) mod tests {
                 ),
                 Item::Thread(r) => r.name.clone(),
                 Item::Empty => "empty".into(),
+                Item::Coordinator => "coordinator".into(),
             })
             .collect();
         assert_eq!(
             shown,
             [
+                "coordinator",
                 "[waiting 1]",
                 "wait-1",
                 "[working 2]",
@@ -586,13 +695,24 @@ pub(crate) mod tests {
         );
         assert_eq!(app.coordinator.as_ref().unwrap().name, "chief-demo");
         assert_eq!(app.selected.as_deref(), Some("wait-1"));
-        assert_eq!(app_with(vec![]).items(), [Item::Empty]);
+        assert!(!app.on_coordinator);
+        let empty = app_with(vec![]);
+        assert_eq!(empty.items(), [Item::Coordinator, Item::Empty]);
+        // Nothing else to select: the coordinator is.
+        assert!(empty.on_coordinator);
+        assert_eq!(empty.selected_row(), None);
     }
 
     #[test]
     fn selection_skips_headers_and_stops_at_the_ends() {
         let mut app = sample();
+        // Above the first thread is the coordinator, and above it nothing.
         app.on_key(key(KeyCode::Up));
+        assert!(app.on_coordinator);
+        app.on_key(key(KeyCode::Up));
+        assert!(app.on_coordinator);
+        app.on_key(key(KeyCode::Down));
+        assert!(!app.on_coordinator);
         assert_eq!(app.selected.as_deref(), Some("wait-1"));
         let mut seen = Vec::new();
         for _ in 0..5 {
@@ -603,6 +723,8 @@ pub(crate) mod tests {
         app.on_key(ch('k'));
         assert_eq!(app.selected.as_deref(), Some("work-1"));
         app.on_key(ch('g'));
+        assert!(app.on_coordinator);
+        app.on_key(ch('j'));
         assert_eq!(app.selected.as_deref(), Some("wait-1"));
 
         // Showing resolved threads makes them selectable; hiding them moves off.
@@ -647,6 +769,17 @@ pub(crate) mod tests {
         assert_eq!(app.on_key(key(KeyCode::Esc)), [Action::Show(None)]);
         assert_eq!(app.pane_target, None);
         assert_eq!(app.on_key(ch('c')), [Action::Show(None)]);
+        // Enter on the coordinator's row shows it too; thread keys there say so.
+        app.on_key(ch('g'));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), [Action::Show(None)]);
+        assert!(app.on_key(ch('w')).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("acts on a thread"));
+        // A refresh keeps the coordinator selected.
+        app.apply(Msg::Rows(Snapshot {
+            sessions: app.threads.clone(),
+            ..Default::default()
+        }));
+        assert!(app.on_coordinator);
         assert_eq!(app.on_key(ch('q')), [Action::Quit]);
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
@@ -760,13 +893,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn no_selection_means_no_thread_actions() {
+    fn without_threads_thread_keys_say_what_they_need() {
         let mut app = app_with(vec![]);
+        assert!(app.on_coordinator);
         for c in ['w', 'r', 'o', 'x'] {
             assert!(app.on_key(ch(c)).is_empty());
-            assert_eq!(app.status.as_deref(), Some("No thread selected."));
+            assert!(
+                app.status.as_deref().unwrap().contains("acts on a thread"),
+                "{:?}",
+                app.status
+            );
         }
-        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.on_key(key(KeyCode::Enter)), [Action::Show(None)]);
+        // The first thread to show takes the default selection.
+        app.apply(Msg::Rows(Snapshot {
+            sessions: vec![thread("new-1", Group::Working, 1)],
+            ..Default::default()
+        }));
+        assert!(!app.on_coordinator);
+        assert_eq!(app.selected.as_deref(), Some("new-1"));
     }
 
     fn listed_loss() -> Inspection {

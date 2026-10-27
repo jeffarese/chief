@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use crate::agp::Agp;
 use crate::claude::{
     self, AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError, RESOLVE_TIMEOUT,
 };
@@ -19,7 +18,7 @@ use crate::mux::tmux::Tmux;
 use crate::mux::{Mux, SessionRef};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
-use crate::{accounts, generated, names, paths, placement, prompts, tools};
+use crate::{accounts, generated, names, paths, prompts, tools, trust};
 
 const SLUG_CHARS: usize = 40;
 const STATUS_PREVIEW_CHARS: usize = 160;
@@ -90,114 +89,81 @@ pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: boo
         );
     }
 
-    let trust_config = claude.trust_config();
-    let untrusted = untrusted_folders(&config, &dir, &trust_config)?;
     let interactive =
         trust_prompt && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if !untrusted.is_empty() {
-        println!(
-            "\nClaude Code doesn't trust these folders yet, and background sessions refuse them:"
-        );
-        for folder in &untrusted {
-            println!("  {}", folder.display());
-        }
-    }
-    let mut still = Vec::new();
-    for folder in &untrusted {
-        if interactive && offer_trust(&claude, folder, &trust_config)? {
-            continue;
-        }
-        still.push(folder);
-    }
-    if !still.is_empty() {
-        println!("\nTo trust a folder, run Claude there once, accept the trust prompt, then quit:");
-        for folder in still {
-            println!(
-                "  cd {} && {}claude",
-                crate::text::shell_quote(&folder.to_string_lossy()),
-                claude.shell_prefix()
-            );
-        }
-    }
-    check_pool_trust(&config, &claude, interactive)?;
-    println!("\nNext: chief up {}", config.slug);
+    let check = trust::check(&config, &dir, &claude)?;
+    report_trust(&config, &check, interactive)?;
+    println!(
+        "\nNext: chief up {} (or run chief and pick it)",
+        config.slug
+    );
     Ok(())
 }
 
-/// Threads may run in any account of agp's pool (§7 "Thread account"), and each account trusts
-/// folders on its own: lists the repos a pool account doesn't trust yet, leaving out the
-/// project's own account (checked above), and on a terminal offers to fix each. Without agp,
-/// nothing.
-fn check_pool_trust(config: &ProjectConfig, claude: &Claude, interactive: bool) -> Result<()> {
-    let agp = Agp::from_env();
-    let repos: Vec<PathBuf> = config.repos.iter().map(|r| r.path.clone()).collect();
-    let found = match placement::pool_trust(&config.threads, &agp, &repos) {
-        Ok(found) => found,
-        Err(e) => {
-            println!("\nchief couldn't check which repos agp's accounts trust: {e:#}");
-            return Ok(());
+/// Marks chief's own project folder trusted, lists the repos no account trusts yet and, on a
+/// terminal, asks once to mark them all (§3 "Trust"); otherwise says how.
+fn report_trust(config: &ProjectConfig, check: &trust::Check, interactive: bool) -> Result<()> {
+    if let Some(need) = &check.project {
+        for line in trust::mark_all([need]) {
+            println!("{}", line.unwrap_or_else(|e| e));
         }
-    };
-    if !found.checked.is_empty() {
+    }
+    if !check.pool.is_empty() {
         println!(
             "\nThreads can also run in these agp accounts: {}.",
-            found.checked.join(", ")
+            check.pool.join(", ")
         );
     }
-    for e in &found.errors {
-        println!("chief couldn't check the account {e}");
+    for e in &check.errors {
+        println!("chief couldn't check {e}");
     }
-    let project = config.claude_config_dir.as_deref();
-    let untrusted: Vec<_> = found
-        .untrusted
-        .into_iter()
-        .filter(|u| !claude::same_account(u.dir.as_deref(), project))
-        .collect();
-    if untrusted.is_empty() {
+    if check.repos.is_empty() {
         return Ok(());
     }
-    println!("These don't trust a repo yet, so threads there skip them:");
-    for u in &untrusted {
-        println!("  {} doesn't trust {}", u.label, u.folder.display());
+    println!("\nClaude Code doesn't trust these folders yet, and background sessions refuse them:");
+    for need in &check.repos {
+        println!("  {}", need.shown());
     }
-    let mut still = Vec::new();
-    for u in untrusted {
-        if interactive && offer_pool_trust(&agp, claude, &u)? {
-            continue;
+    if interactive && ask("Trust them now, as accepting Claude's trust prompt would? [Y/n] ")? {
+        for line in trust::mark_all(&check.repos) {
+            println!("{}", line.unwrap_or_else(|e| e));
         }
-        still.push(u);
-    }
-    if !still.is_empty() {
-        println!(
-            "\nTo trust a repo in an account, run Claude there once through agp, accept the \
-             trust prompt, then quit:"
-        );
-        for u in &still {
-            println!("  {}", u.command());
-        }
+    } else {
+        println!("To trust them later: chief trust {}", config.slug);
     }
     Ok(())
 }
 
-/// Asks to open Claude in the account and folder; returns whether it is trusted afterwards.
-fn offer_pool_trust(agp: &Agp, claude: &Claude, u: &placement::Untrusted) -> Result<bool> {
-    let question = format!(
-        "\nOpen Claude in {} in {} now to trust it? [Y/n] ",
-        u.folder.display(),
-        u.label
-    );
-    if !ask(&question)? {
-        return Ok(false);
+/// `chief trust <slug>`: marks every folder the project's sessions need trusted (§3 "Trust").
+/// Running it is the yes.
+pub fn trust(slug: &str) -> Result<()> {
+    let dir = project_dir(slug);
+    let config = ProjectConfig::load(&dir.join("project.toml"))
+        .with_context(|| format!("no usable chief project {slug:?}"))?;
+    let claude = claude_for(&config);
+    let check = trust::check(&config, &dir, &claude)?;
+    for e in &check.errors {
+        println!("chief couldn't check {e}");
     }
-    println!("Accept the trust prompt, then quit with /exit or Ctrl+C twice.");
-    agp.run_interactive(&u.id, &claude.bin, &u.folder)?;
-    let trusted = u.trusted()?;
-    if trusted {
-        println!("{} trusts {} now.", u.label, u.folder.display());
-    } else {
-        println!("{} still doesn't trust {}.", u.label, u.folder.display());
+    let needs: Vec<&trust::Need> = check.project.iter().chain(&check.repos).collect();
+    if needs.is_empty() {
+        println!("Every folder of {slug} is trusted already.");
+        return Ok(());
     }
-    Ok(trusted)
+    let mut failed = false;
+    for line in trust::mark_all(needs) {
+        match line {
+            Ok(l) => println!("{l}"),
+            Err(l) => {
+                failed = true;
+                println!("{l}");
+            }
+        }
+    }
+    if failed {
+        bail!("some folders aren't trusted");
+    }
+    Ok(())
 }
 
 /// Prints `question` and reads a yes (the default) or no.
@@ -221,19 +187,44 @@ pub fn create(
     exe: &Path,
     env: &[(String, String)],
 ) -> Result<(ProjectConfig, PathBuf)> {
+    create_with(name, goal, repos, account, exe, env, |_| {})
+}
+
+/// The slug a project name gets: `[a-z0-9-]`, empty when the name has no letter or digit.
+pub fn slug_of(name: &str) -> String {
+    names::slugify(name.trim(), SLUG_CHARS)
+}
+
+/// Whether a project already has `slug` (its folder or its registration).
+pub fn slug_taken(conn: &Connection, slug: &str) -> Result<bool> {
+    Ok(paths::project_dir(slug).exists() || db::project_dir(conn, slug)?.is_some())
+}
+
+/// `create`, with `tune` changing the defaults (the launcher's quick settings) before anything
+/// is validated or written.
+pub fn create_with(
+    name: &str,
+    goal: Option<&str>,
+    repos: &[PathBuf],
+    account: Option<PathBuf>,
+    exe: &Path,
+    env: &[(String, String)],
+    tune: impl FnOnce(&mut ProjectConfig),
+) -> Result<(ProjectConfig, PathBuf)> {
     let name = name.trim();
-    let slug = names::slugify(name, SLUG_CHARS);
+    let slug = slug_of(name);
     if slug.is_empty() {
         bail!("the project name {name:?} needs at least one letter or digit");
     }
     let goal = goal.map(str::trim).filter(|g| !g.is_empty());
     let mut config = ProjectConfig::new(name, &slug, goal, repo_entries(repos)?);
     config.claude_config_dir = account;
+    tune(&mut config);
     config.validate()?;
 
     let conn = db::open(&paths::db())?;
     let dir = paths::project_dir(&slug);
-    if dir.exists() || db::project_dir(&conn, &slug)?.is_some() {
+    if slug_taken(&conn, &slug)? {
         bail!(
             "a project with slug {slug:?} already exists ({})",
             dir.display()
@@ -312,43 +303,6 @@ pub fn add_repo(repos: &mut Vec<Repo>, path: &Path) -> Result<(String, bool)> {
     Ok((name, true))
 }
 
-/// The project folder (always checked) and every repo Claude Code doesn't trust.
-pub fn untrusted_folders(
-    config: &ProjectConfig,
-    dir: &Path,
-    trust_config: &Path,
-) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let folders =
-        std::iter::once(dir.to_path_buf()).chain(config.repos.iter().map(|r| r.path.clone()));
-    for folder in folders {
-        if !claude::is_trusted_in(trust_config, &folder)? {
-            out.push(folder);
-        }
-    }
-    Ok(out)
-}
-
-/// Asks to open Claude in `folder`; returns whether it is trusted afterwards.
-fn offer_trust(claude: &Claude, folder: &Path, trust_config: &Path) -> Result<bool> {
-    let question = format!(
-        "\nOpen Claude in {} now to trust it? [Y/n] ",
-        folder.display()
-    );
-    if !ask(&question)? {
-        return Ok(false);
-    }
-    println!("Accept the trust prompt, then quit with /exit or Ctrl+C twice.");
-    claude.run_interactive(folder)?;
-    let trusted = claude::is_trusted_in(trust_config, folder)?;
-    if trusted {
-        println!("Trusted {}.", folder.display());
-    } else {
-        println!("{} is still not trusted.", folder.display());
-    }
-    Ok(trusted)
-}
-
 /// What `up` did to the coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordinatorAction {
@@ -361,18 +315,54 @@ pub enum CoordinatorAction {
 /// runs, else in a tmux window when this runs inside tmux, else it prints the two commands to
 /// run side by side.
 pub fn up(slug: &str) -> Result<()> {
+    let mut print = |note: Note| match note {
+        Note::Did(line) | Note::Info(line) => println!("{line}"),
+        Note::Warn(line) => eprintln!("{line}"),
+    };
+    if let Where::Manual = up_with(slug, &mut print)? {
+        print_manual_layout(slug);
+    }
+    Ok(())
+}
+
+/// A line `up` reports: what it did, what it didn't and why (no layout, say), or a warning
+/// (stderr on the command line).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Note {
+    Did(String),
+    Info(String),
+    Warn(String),
+}
+
+/// Where `up` put the layout (§9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Where {
+    /// A Rex session; `shown`: Rex switched to it.
+    Rex {
+        shown: bool,
+    },
+    Tmux,
+    /// Neither: the user runs the pane and the board (the reason is in the notes).
+    Manual,
+}
+
+/// `up`, reporting through `note` instead of printing, for the launcher (§10a).
+pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
     let dir = project_dir(slug);
     let config = ProjectConfig::load(&dir.join("project.toml"))
         .with_context(|| format!("no usable chief project {slug:?}; create it with chief init"))?;
-    let claude = claude_for(&config);
+    if let Some(n) = claude::account_note(&config.slug, config.claude_config_dir.as_deref()) {
+        note(Note::Warn(n));
+    }
+    let claude = Claude::for_account(config.claude_config_dir.clone());
     claude.check_version()?;
     let exe = generated::chief_exe()?;
     if generated::in_cargo_target(&exe) {
-        eprintln!(
+        note(Note::Warn(format!(
             "warning: chief runs from {}, inside a cargo target/ folder: `cargo clean` would \
              disable chief's hooks and message guard. Install with `cargo install --path .`.",
             exe.display()
-        );
+        )));
     }
     let env = generated::passthrough_env(config.claude_config_dir.as_deref());
     generated::write_all(&dir, &config, &exe, &env)?;
@@ -381,13 +371,15 @@ pub fn up(slug: &str) -> Result<()> {
         db::register_project(&conn, slug, &dir, db::now_ms())?;
     }
     let trust_config = claude.trust_config();
-    let (row, action) = ensure_coordinator(&conn, &claude, &config, &dir, &trust_config)?;
+    let mut warn = |line: String| note(Note::Warn(line));
+    let (row, action) =
+        ensure_coordinator(&conn, &claude, &config, &dir, &trust_config, &mut warn)?;
     let verb = match action {
         CoordinatorAction::Started => "started",
         CoordinatorAction::Respawned => "respawned",
         CoordinatorAction::Running => "already running",
     };
-    println!("Coordinator {} {verb}.", row.name);
+    note(Note::Did(format!("Coordinator {} {verb}.", row.name)));
 
     let label = layout::session_label(slug);
     let rex = Rex::from_env();
@@ -400,45 +392,49 @@ pub fn up(slug: &str) -> Result<()> {
         Opened::Repaired => "repaired",
         Opened::Reused => "already open",
     };
-    match rex.check() {
+    let shown = match rex.check() {
         Ok(()) => match open(&rex, db::get_rex_session(&conn, slug)?) {
             Ok(opened) => {
                 db::set_rex_session(&conn, slug, Some(&opened.session.0))?;
-                println!("Rex session {label} {}.", done(&opened));
+                note(Note::Did(format!("Rex session {label} {}.", done(&opened))));
                 if !opened.shown {
-                    println!(
+                    note(Note::Info(format!(
                         "Rex didn't switch to it (that needs exactly one Rex app connected). \
                          Pick {label} in the app, or run: rex -C <app> do session.select \
                          session_id={}",
                         opened.session.0
-                    );
+                    )));
+                }
+                Where::Rex {
+                    shown: opened.shown,
                 }
             }
             Err(e) => {
-                println!("No Rex layout: {e:#}");
-                print_manual_layout(slug);
+                note(Note::Info(format!("No Rex layout: {e:#}")));
+                Where::Manual
             }
         },
         Err(why) => match Tmux::current() {
             Some(tmux) => match open(&tmux, db::get_tmux_window(&conn, slug)?) {
                 Ok(opened) => {
                     db::set_tmux_window(&conn, slug, Some(&opened.session.0))?;
-                    println!("tmux window {label} {}.", done(&opened));
+                    note(Note::Did(format!("tmux window {label} {}.", done(&opened))));
+                    Where::Tmux
                 }
                 Err(e) => {
-                    println!("No tmux layout: {e:#}");
-                    print_manual_layout(slug);
+                    note(Note::Info(format!("No tmux layout: {e:#}")));
+                    Where::Manual
                 }
             },
             None => {
-                println!(
+                note(Note::Info(format!(
                     "No layout: Rex isn't available ({why:#}) and this terminal isn't inside tmux."
-                );
-                print_manual_layout(slug);
+                )));
+                Where::Manual
             }
         },
-    }
-    Ok(())
+    };
+    Ok(shown)
 }
 
 /// Without a multiplexer the user makes the layout: any two terminals or splits work, since the
@@ -458,6 +454,7 @@ pub fn ensure_coordinator(
     config: &ProjectConfig,
     dir: &Path,
     trust_config: &Path,
+    warn: &mut dyn FnMut(String),
 ) -> Result<(SessionRow, CoordinatorAction)> {
     let slug = config.slug.as_str();
     let name = names::coordinator_name(slug);
@@ -472,8 +469,12 @@ pub fn ensure_coordinator(
         return Ok((row, CoordinatorAction::Respawned));
     }
 
+    // chief made this folder, so it marks it trusted itself (§3 "Trust"); projects from before
+    // that, or a trust Claude Code dropped, get the same.
     if !claude::is_trusted_in(trust_config, dir)? {
-        return Err(ClaudeError::NotTrusted(dir.to_path_buf()).into());
+        claude::mark_trusted(trust_config, dir).map_err(|e| {
+            anyhow::Error::new(ClaudeError::NotTrusted(dir.to_path_buf())).context(format!("{e:#}"))
+        })?;
     }
     let live = claude.agents()?;
     // A row without a short id is left by a spawn chief couldn't confirm: adopt its session, but
@@ -483,12 +484,12 @@ pub fn ensure_coordinator(
         None => claude::started_session(&live, &name, &[], dir),
     });
     if let Some(agent) = leftover {
-        eprintln!(
+        warn(format!(
             "warning: adopting {name} ({}), which an earlier chief up started without confirming",
             agent.id.as_deref().unwrap_or_default()
-        );
+        ));
         store_ids(conn, &name, agent.id.as_deref(), Some(agent))?;
-        return ensure_coordinator(conn, claude, config, dir, trust_config);
+        return ensure_coordinator(conn, claude, config, dir, trust_config, warn);
     }
     if live
         .iter()
@@ -525,7 +526,7 @@ pub fn ensure_coordinator(
         Ok(short_id) => {
             let resolved = claude.resolve_session(&short_id, RESOLVE_TIMEOUT);
             if let Err(e) = &resolved {
-                eprintln!("warning: {e:#}");
+                warn(format!("warning: {e:#}"));
             }
             (Some(short_id), resolved.ok())
         }
@@ -540,10 +541,10 @@ pub fn ensure_coordinator(
         // row would make the next `up` refuse the name as taken.
         Err(e) => match claude.find_started(&name, &live, dir, RESOLVE_TIMEOUT) {
             Ok(Some(agent)) => {
-                eprintln!(
+                warn(format!(
                     "warning: `claude --bg` reported a failure, but {name} started anyway, so \
                      chief kept it. The failure: {e:#}"
-                );
+                ));
                 (agent.id.clone(), Some(agent))
             }
             Ok(None) => {
@@ -648,58 +649,7 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     if db::project_dir(&conn, slug)?.is_none() {
         bail!("no chief project {slug:?}");
     }
-    let mut failed = 0;
-    let label = layout::session_label(slug);
-    let rex_session = db::get_rex_session(&conn, slug)?.map(SessionRef);
-    let tmux_window = db::get_tmux_window(&conn, slug)?.map(SessionRef);
-    if rex_session.is_none() && tmux_window.is_none() {
-        println!("No layout of chief's is open.");
-    }
-    if let Some(ours) = &rex_session {
-        match layout::close(&Rex::from_env(), Some(ours)) {
-            Ok(Closed::Killed(_)) => {
-                db::set_rex_session(&conn, slug, None)?;
-                println!("Closed Rex session {label}.");
-            }
-            Ok(Closed::Blocks(_)) => println!(
-                "Closed chief's blocks in Rex session {label}; it holds other blocks too, so it \
-                 stays open."
-            ),
-            Ok(Closed::Nothing) => {
-                db::set_rex_session(&conn, slug, None)?;
-                println!("No Rex session {label} was open.");
-            }
-            Err(e) => {
-                failed += 1;
-                println!("Rex session {label} not closed: {e:#}");
-            }
-        }
-    }
-    if let Some(ours) = &tmux_window {
-        // The stored id names the server, so this works from any terminal.
-        let closed = match Tmux::for_layout(ours) {
-            Some(tmux) => layout::close(&tmux, Some(ours)),
-            None => Ok(Closed::Nothing),
-        };
-        match closed {
-            Ok(Closed::Killed(_)) => {
-                db::set_tmux_window(&conn, slug, None)?;
-                println!("Closed tmux window {label}.");
-            }
-            Ok(Closed::Blocks(_)) => println!(
-                "Closed chief's panes in tmux window {label}; it holds other panes too, so it \
-                 stays open."
-            ),
-            Ok(Closed::Nothing) => {
-                db::set_tmux_window(&conn, slug, None)?;
-                println!("No tmux window {label} was open.");
-            }
-            Err(e) => {
-                failed += 1;
-                println!("tmux window {label} not closed: {e:#}");
-            }
-        }
-    }
+    let mut failed = close_layout(&conn, slug, &mut |line| println!("{line}"))?;
     db::set_pane_showing(&conn, slug, None)?;
     // The next `chief up` starts on the coordinator: a pane that went back to the thread it last
     // showed would wake it right after `--stop-threads` stopped it.
@@ -749,6 +699,64 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
         bail!("chief down {slug} didn't finish cleanly");
     }
     Ok(())
+}
+
+/// Closes the layout `chief up` opened (Rex session or tmux window, §9), saying what it did
+/// through `say`; how many closes failed. Sessions are left alone.
+pub fn close_layout(conn: &Connection, slug: &str, say: &mut dyn FnMut(String)) -> Result<usize> {
+    let mut failed = 0;
+    let label = layout::session_label(slug);
+    let rex_session = db::get_rex_session(conn, slug)?.map(SessionRef);
+    let tmux_window = db::get_tmux_window(conn, slug)?.map(SessionRef);
+    if rex_session.is_none() && tmux_window.is_none() {
+        say("No layout of chief's is open.".into());
+    }
+    if let Some(ours) = &rex_session {
+        match layout::close(&Rex::from_env(), Some(ours)) {
+            Ok(Closed::Killed(_)) => {
+                db::set_rex_session(conn, slug, None)?;
+                say(format!("Closed Rex session {label}."));
+            }
+            Ok(Closed::Blocks(_)) => say(format!(
+                "Closed chief's blocks in Rex session {label}; it holds other blocks too, so it \
+                 stays open."
+            )),
+            Ok(Closed::Nothing) => {
+                db::set_rex_session(conn, slug, None)?;
+                say(format!("No Rex session {label} was open."));
+            }
+            Err(e) => {
+                failed += 1;
+                say(format!("Rex session {label} not closed: {e:#}"));
+            }
+        }
+    }
+    if let Some(ours) = &tmux_window {
+        // The stored id names the server, so this works from any terminal.
+        let closed = match Tmux::for_layout(ours) {
+            Some(tmux) => layout::close(&tmux, Some(ours)),
+            None => Ok(Closed::Nothing),
+        };
+        match closed {
+            Ok(Closed::Killed(_)) => {
+                db::set_tmux_window(conn, slug, None)?;
+                say(format!("Closed tmux window {label}."));
+            }
+            Ok(Closed::Blocks(_)) => say(format!(
+                "Closed chief's panes in tmux window {label}; it holds other panes too, so it \
+                 stays open."
+            )),
+            Ok(Closed::Nothing) => {
+                db::set_tmux_window(conn, slug, None)?;
+                say(format!("No tmux window {label} was open."));
+            }
+            Err(e) => {
+                failed += 1;
+                say(format!("tmux window {label} not closed: {e:#}"));
+            }
+        }
+    }
+    Ok(failed)
 }
 
 /// Prints the board as text, grouped as on the board: one project, or all of them.

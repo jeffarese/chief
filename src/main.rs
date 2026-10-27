@@ -9,16 +9,20 @@ use chief::state::Role;
 #[command(
     name = "chief",
     version,
-    about = "Local Claude Projects: a coordinator, threads and a board"
+    about = "Local Claude Projects: a coordinator, threads and a board",
+    long_about = "Local Claude Projects: a coordinator, threads and a board.\n\nRun `chief` with \
+                  no command to pick a project or create one in a short guided setup."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a project
+    /// Create a project in a short guided setup, then open it
+    New,
+    /// Create a project from the command line
     Init {
         name: String,
         #[arg(long)]
@@ -30,6 +34,8 @@ enum Command {
         #[arg(long)]
         no_trust_prompt: bool,
     },
+    /// Mark every folder the project's sessions need as trusted by Claude Code
+    Trust { slug: String },
     /// Start or revive the coordinator and open the layout
     Up { slug: String },
     /// Close the layout; threads keep running unless --stop-threads
@@ -47,6 +53,9 @@ enum Command {
     Pane {
         #[arg(long)]
         project: String,
+        /// Run as the `main` block of chief's layout: quitting closes the layout
+        #[arg(long, hide = true)]
+        layout: bool,
     },
     /// Hook entry point for Claude Code (reads the payload on stdin)
     Hook {
@@ -163,23 +172,31 @@ fn main() -> Result<()> {
     let cli = Cli::try_parse().unwrap_or_else(|e| argument_error(e));
     // Rust ignores SIGPIPE, so `chief status | head` panicked in println!. Commands people pipe get
     // the usual quiet exit; hooks and the MCP server keep the error path they already handle.
-    if !matches!(cli.command, Command::Hook { .. } | Command::Mcp { .. }) {
+    if !matches!(
+        cli.command,
+        Some(Command::Hook { .. } | Command::Mcp { .. })
+    ) {
         // SAFETY: called before any thread starts; restores the default disposition.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
-    match cli.command {
+    let Some(command) = cli.command else {
+        return chief::launcher::run(false);
+    };
+    match command {
+        Command::New => chief::launcher::run(true),
         Command::Init {
             name,
             goal,
             repos,
             no_trust_prompt,
         } => chief::project::init(&name, goal.as_deref(), &repos, !no_trust_prompt),
+        Command::Trust { slug } => chief::project::trust(&slug),
         Command::Up { slug } => chief::project::up(&slug),
         Command::Down { slug, stop_threads } => chief::project::down(&slug, stop_threads),
         Command::Board { project } => chief::board::run(&project),
-        Command::Pane { project } => chief::pane::run(&project),
+        Command::Pane { project, layout } => chief::pane::run(&project, layout),
         // A hook must never fail the Claude session that called it.
         Command::Hook {
             event,

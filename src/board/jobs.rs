@@ -14,7 +14,7 @@ use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
 use crate::config::ProjectConfig;
 use crate::pr::Gh;
 use crate::tools::{self, NameArgs, ToolCtx};
-use crate::{db, generated, pane, placement, registry};
+use crate::{db, generated, pane, placement, registry, trust};
 
 use super::app::{Action, Msg};
 use super::refresh::Sources;
@@ -87,18 +87,24 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
             generated::rewrite(&src.dir, &config)?;
             Ok(Msg::Saved(config))
         }
-        Action::CheckTrust(config) => {
-            let repos: Vec<_> = config.repos.iter().map(|r| r.path.clone()).collect();
-            let agp = Agp::new(src.agp_bin.clone());
-            Ok(Msg::Trust(Ok(placement::pool_trust(
-                &config.threads,
-                &agp,
-                &repos,
-            )?)))
+        Action::CheckTrust(config) => Ok(Msg::Trust(Ok(pool_trust(src, &config)?))),
+        Action::Trust(pair, config) => {
+            let need = trust::Need::from(pair.as_ref());
+            let text = match need.mark() {
+                Ok(()) => format!("Trusted {}.", need.shown()),
+                Err(e) => format!("Couldn't trust {}: {e:#}", need.shown()),
+            };
+            let check = pool_trust(src, &config).map_err(|e| format!("{e:#}"));
+            Ok(Msg::Trusted { text, check })
         }
         // The runner handles these itself: they need the terminal.
-        Action::Quit | Action::Edit(_) | Action::Trust(_) => Ok(Msg::Notice(String::new())),
+        Action::Quit | Action::Edit(_) => Ok(Msg::Notice(String::new())),
     }
+}
+
+fn pool_trust(src: &Sources, config: &ProjectConfig) -> Result<placement::PoolTrust> {
+    let repos: Vec<_> = config.repos.iter().map(|r| r.path.clone()).collect();
+    placement::pool_trust(&config.threads, &Agp::new(src.agp_bin.clone()), &repos)
 }
 
 fn wake(src: &Sources, name: &str) -> Result<Msg> {

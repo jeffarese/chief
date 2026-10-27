@@ -227,11 +227,6 @@ pub struct Untrusted {
 }
 
 impl Untrusted {
-    /// What the user runs to trust it: Claude's trust prompt, in that account and folder.
-    pub fn command(&self) -> String {
-        agp::trust_command(&self.id, &self.folder)
-    }
-
     /// Whether the account trusts the folder now.
     pub fn trusted(&self) -> Result<bool> {
         claude::is_trusted_in(

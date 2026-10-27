@@ -71,6 +71,69 @@ impl Field {
         }
     }
 
+    /// The heading the field sits under on the screen.
+    pub fn section(self) -> &'static str {
+        match self {
+            Field::Goal
+            | Field::Repo(_)
+            | Field::AddRepo
+            | Field::DefaultRepo
+            | Field::EditInstructions
+            | Field::EditMemory
+            | Field::Notify => "Project",
+            Field::CoordinatorModel | Field::CoordinatorEffort => "Coordinator",
+            Field::ThreadModel
+            | Field::ThreadEffort
+            | Field::PermissionMode
+            | Field::MaxParallel
+            | Field::Cleanup => "Threads",
+            Field::Account
+            | Field::ThreadAccounts
+            | Field::MaxUsage
+            | Field::PoolTrust
+            | Field::Untrusted(_) => "Accounts",
+            Field::Save => "",
+        }
+    }
+
+    /// One line on what the field does, shown under the form for the field under the cursor.
+    pub fn help(self) -> &'static str {
+        match self {
+            Field::Goal => "What the project is for. The coordinator and every thread read it.",
+            Field::Repo(_) => "A repository threads work in. d removes it.",
+            Field::AddRepo => "Add a repository folder by path (~ works).",
+            Field::DefaultRepo => "Where a thread works when the coordinator names no repo.",
+            Field::EditInstructions => {
+                "The standing brief every session gets: conventions, commands, constraints."
+            }
+            Field::EditMemory => "What the coordinator remembers across conversations.",
+            Field::Notify => "macOS notifications when a thread needs you or finishes.",
+            Field::CoordinatorModel => {
+                "Model of the session you talk to. Applies on its next start."
+            }
+            Field::CoordinatorEffort => {
+                "How hard the coordinator thinks. Applies on its next start."
+            }
+            Field::ThreadModel => "Model of each new thread.",
+            Field::ThreadEffort => "How hard each new thread thinks.",
+            Field::PermissionMode => "What new threads may do without asking you.",
+            Field::MaxParallel => "How many threads the coordinator runs at once (a guideline).",
+            Field::Cleanup => {
+                "merged: remove a thread's worktree and session once its PR merges. manual: x does."
+            }
+            Field::Account => "The Claude Code account the project runs in. Fixed at creation.",
+            Field::ThreadAccounts => {
+                "agp accounts threads may run in: auto = the whole pool, empty = this account only."
+            }
+            Field::MaxUsage => "A pool account at or over this usage takes no new thread.",
+            Field::PoolTrust => "Check that every pool account trusts every repo.",
+            Field::Untrusted(_) => {
+                "Enter trusts this repo in that account, as Claude's prompt would."
+            }
+            Field::Save => "Write project.toml. Ctrl+S saves from anywhere.",
+        }
+    }
+
     fn is_text(self) -> bool {
         matches!(
             self,
@@ -149,39 +212,45 @@ impl SettingsForm {
         self.cursor = self.cursor.min(self.fields().len() - 1);
     }
 
-    /// A trust fix ran on the terminal (`text` says how it went): check again.
-    pub fn trust_ran(&mut self, text: String) -> Action {
-        self.message = Some(text);
-        self.trust = TrustCheck::Checking;
-        Action::CheckTrust(Box::new(self.draft.clone()))
+    /// Marking a pair trusted went as `text` says, and the pool was checked again.
+    pub fn trust_marked(&mut self, text: String, check: Result<PoolTrust, String>) {
+        self.trust_checked(check);
+        if self.message.is_none() {
+            self.message = Some(text);
+        }
     }
 
+    /// In screen order: by section, Save last.
     pub fn fields(&self) -> Vec<Field> {
-        let mut fields = vec![
-            Field::Goal,
+        let mut fields = vec![Field::Goal];
+        fields.extend((0..self.draft.repos.len()).map(Field::Repo));
+        fields.extend([
+            Field::AddRepo,
+            Field::DefaultRepo,
+            Field::EditInstructions,
+            Field::EditMemory,
+            Field::Notify,
             Field::CoordinatorModel,
             Field::CoordinatorEffort,
             Field::ThreadModel,
             Field::ThreadEffort,
             Field::PermissionMode,
             Field::MaxParallel,
+            Field::Cleanup,
+            Field::Account,
             Field::ThreadAccounts,
             Field::MaxUsage,
-            Field::DefaultRepo,
-            Field::Cleanup,
-            Field::Notify,
-            Field::Account,
             Field::PoolTrust,
-        ];
-        fields.extend((0..self.untrusted().len()).map(Field::Untrusted));
-        fields.extend((0..self.draft.repos.len()).map(Field::Repo));
-        fields.extend([
-            Field::AddRepo,
-            Field::EditInstructions,
-            Field::EditMemory,
-            Field::Save,
         ]);
+        fields.extend((0..self.untrusted().len()).map(Field::Untrusted));
+        fields.push(Field::Save);
         fields
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        let last = self.fields().len() as isize - 1;
+        self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
+        self.show_fix();
     }
 
     pub fn current(&self) -> Field {
@@ -253,7 +322,13 @@ impl SettingsForm {
             Field::Repo(i) => c
                 .repos
                 .get(i)
-                .map(|r| format!("{} {}", r.name, r.path.display()))
+                .map(|r| {
+                    format!(
+                        "{} {}",
+                        r.name,
+                        crate::tui::home_relative(&r.path.display().to_string())
+                    )
+                })
                 .unwrap_or_default(),
             Field::AddRepo | Field::EditInstructions | Field::EditMemory | Field::Save => {
                 String::new()
@@ -278,6 +353,9 @@ impl SettingsForm {
         if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.leaving = false;
         }
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.activate(Field::Save);
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 if self.dirty() && !self.leaving {
@@ -289,14 +367,8 @@ impl SettingsForm {
                     return Outcome::Close;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor = self.cursor.saturating_sub(1);
-                self.show_fix();
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(self.fields().len() - 1);
-                self.show_fix();
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Left | KeyCode::Char('h') => self.cycle(field, -1),
             KeyCode::Right | KeyCode::Char('l') => self.cycle(field, 1),
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
@@ -316,8 +388,9 @@ impl SettingsForm {
             && let Some(u) = self.untrusted().get(i)
         {
             self.message = Some(format!(
-                "Enter opens Claude there to trust it: {}",
-                u.command()
+                "Enter trusts {} in {}, as accepting Claude's trust prompt there would.",
+                u.folder.display(),
+                u.label
             ));
         }
     }
@@ -344,8 +417,12 @@ impl SettingsForm {
                 self.trust = TrustCheck::Checking;
                 Outcome::Run(Action::CheckTrust(Box::new(self.draft.clone())))
             }
-            Field::Untrusted(i) => match self.untrusted().get(i) {
-                Some(u) => Outcome::Run(Action::Trust(Box::new(u.clone()))),
+            Field::Untrusted(i) => match self.untrusted().get(i).cloned() {
+                Some(u) => {
+                    self.message = Some(format!("Trusting {} in {}…", u.folder.display(), u.label));
+                    self.trust = TrustCheck::Checking;
+                    Outcome::Run(Action::Trust(Box::new(u), Box::new(self.draft.clone())))
+                }
                 None => Outcome::Stay,
             },
             Field::EditInstructions => Outcome::Run(Action::Edit(self.dir.join("instructions.md"))),
@@ -653,23 +730,25 @@ mod tests {
         assert_eq!(f.current(), Field::Untrusted(0));
         assert_eq!(
             f.message.as_deref(),
-            Some("Enter opens Claude there to trust it: cd /r/web && agp exec pb2 -- claude")
+            Some("Enter trusts /r/web in PB2, as accepting Claude's trust prompt there would.")
         );
+        // Enter is the yes: the runner marks it on a worker, then checks again.
         assert_eq!(
             f.on_key(key(KeyCode::Enter)),
-            Outcome::Run(Action::Trust(Box::new(pair("PB2", "/r/web"))))
-        );
-
-        // After the fix runs, the check runs again.
-        assert_eq!(
-            f.trust_ran("PB2 trusts /r/web now.".into()),
-            Action::CheckTrust(Box::new(f.draft.clone()))
+            Outcome::Run(Action::Trust(
+                Box::new(pair("PB2", "/r/web")),
+                Box::new(f.draft.clone())
+            ))
         );
         assert_eq!(f.value(Field::PoolTrust), "checking…");
-        f.trust_checked(Ok(PoolTrust {
-            checked: vec!["PB2".into()],
-            ..PoolTrust::default()
-        }));
+        f.trust_marked(
+            "Trusted /r/web (in PB2).".into(),
+            Ok(PoolTrust {
+                checked: vec!["PB2".into()],
+                ..PoolTrust::default()
+            }),
+        );
+        assert_eq!(f.message.as_deref(), Some("Trusted /r/web (in PB2)."));
         assert_eq!(f.value(Field::PoolTrust), "trusted in PB2");
         assert!(!f.fields().contains(&Field::Untrusted(0)));
         assert!(f.cursor < f.fields().len());

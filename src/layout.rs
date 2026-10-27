@@ -65,7 +65,7 @@ fn main_spec(slug: &str, dir: &Path, exe: &Path, env: &[(String, String)]) -> Bl
         anchor: None,
         ratio: 100,
         cwd: Some(dir.to_path_buf()),
-        command: chief_command(exe, env, &["pane", "--project", slug]),
+        command: chief_command(exe, env, &["pane", "--project", slug, "--layout"]),
         focus: true,
     }
 }
@@ -352,6 +352,12 @@ mod tests {
             .to_vec()
     }
 
+    fn pane_cmd() -> Vec<String> {
+        let mut cmd = cmd("pane");
+        cmd.push("--layout".into());
+        cmd
+    }
+
     #[test]
     fn creates_main_then_board_beside_it() {
         let mux = FakeMux {
@@ -366,7 +372,7 @@ mod tests {
             anchor: None,
             ratio: 100,
             cwd: Some(PathBuf::from(DIR)),
-            command: cmd("pane"),
+            command: pane_cmd(),
             focus: true,
         };
         let board = BlockSpec {

@@ -15,15 +15,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 
-use crate::agp::Agp;
 use crate::config::ProjectConfig;
 use crate::text::shell_quote;
-use crate::{db, paths, placement};
+use crate::{db, paths, tui};
 
 use app::{Action, App, Msg};
 use refresh::Sources;
@@ -56,13 +51,11 @@ pub fn run(project: &str) -> Result<()> {
     let refresher = refresh::spawn(src.clone(), tx.clone());
     let mut app = App::new(project, dir, config, db::now_ms());
 
-    // `init` enters the alternate screen and raw mode and installs a panic hook that restores
-    // the terminal before the panic message prints.
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &rx, &src, |action| {
+    let mut terminal = tui::init();
+    let result = event_loop(&mut terminal, &mut app, &rx, |action| {
         jobs::spawn(src.clone(), action, tx.clone(), refresher.kicker())
     });
-    ratatui::restore();
+    tui::restore();
     result
 }
 
@@ -70,7 +63,6 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     rx: &mpsc::Receiver<Msg>,
-    src: &Sources,
     spawn: impl Fn(Action),
 ) -> Result<()> {
     loop {
@@ -78,59 +70,25 @@ fn event_loop(
         terminal.draw(|f| ui::draw(f, app))?;
         if event::poll(POLL)? {
             // Resize needs nothing: the next draw uses the new size.
-            if let Event::Key(key) = event::read()? {
-                for action in app.on_key(key) {
-                    match action {
-                        Action::Quit => return Ok(()),
-                        Action::Edit(path) => {
-                            let msg = edit(terminal, &path);
-                            app.status = Some(msg);
-                        }
-                        Action::Trust(pair) => {
-                            let msg = trust(terminal, src, &pair);
-                            if let Some(again) = app.trust_ran(msg) {
-                                spawn(again);
-                            }
-                        }
-                        other => spawn(other),
+            let actions = match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
+                _ => Vec::new(),
+            };
+            for action in actions {
+                match action {
+                    Action::Quit => return Ok(()),
+                    Action::Edit(path) => {
+                        let msg = edit(terminal, &path);
+                        app.status = Some(msg);
                     }
+                    other => spawn(other),
                 }
             }
         }
         while let Ok(msg) = rx.try_recv() {
             app.apply(msg);
         }
-    }
-}
-
-/// Runs `cmd` on this terminal: leaves the alternate screen and raw mode, waits, takes the
-/// terminal back.
-fn on_terminal(
-    terminal: &mut DefaultTerminal,
-    cmd: &mut Command,
-) -> std::io::Result<std::process::ExitStatus> {
-    let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-    let status = cmd.status();
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
-    let _ = enable_raw_mode();
-    let _ = terminal.clear();
-    status
-}
-
-/// Claude's trust prompt for a pool account and folder (`agp exec <id> -- claude` there), then
-/// whether it took. Returns a status line.
-fn trust(terminal: &mut DefaultTerminal, src: &Sources, pair: &placement::Untrusted) -> String {
-    let mut cmd =
-        Agp::new(src.agp_bin.clone()).interactive(&pair.id, &src.claude_bin, &pair.folder);
-    let shown = format!("{} in {}", pair.label, pair.folder.display());
-    match on_terminal(terminal, &mut cmd) {
-        Err(e) => format!("Could not run agp exec {}: {e}", pair.id),
-        Ok(_) => match pair.trusted() {
-            Ok(true) => format!("Trusted: {shown}."),
-            Ok(false) => format!("Still not trusted: {shown}."),
-            Err(e) => format!("Couldn't read the trust of {shown}: {e:#}"),
-        },
     }
 }
 
@@ -144,12 +102,12 @@ fn edit(terminal: &mut DefaultTerminal, path: &Path) -> String {
         let _ = std::fs::create_dir_all(dir);
     }
     // Through sh so an EDITOR with arguments (`code -w`) works.
-    let status = on_terminal(
-        terminal,
+    let status = tui::suspended(terminal, || {
         Command::new("sh")
             .arg("-c")
-            .arg(format!("{editor} {}", shell_quote(&path.to_string_lossy()))),
-    );
+            .arg(format!("{editor} {}", shell_quote(&path.to_string_lossy())))
+            .status()
+    });
     match status {
         Ok(s) if s.success() => format!("Edited {}.", file_label(path)),
         Ok(s) => format!("{editor} exited with {s}."),

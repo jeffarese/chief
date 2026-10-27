@@ -37,16 +37,22 @@ path, and `cargo clean` would switch them off (chief warns about this).
 ## Quick start
 
 ```sh
-chief init "Payments latency" --goal "Hold p95 under 200 ms" --repo ~/workspace/payments-api
-chief up payments-latency
+cd ~/workspace/payments-api
+chief
 ```
 
-`init` creates the project in `~/.local/share/chief/projects/<slug>/` and checks that Claude Code
-trusts the project folder and each repo; background sessions refuse untrusted folders. If one isn't
-trusted, it offers to open Claude there so you can accept the trust prompt.
+The first time, `chief` walks you through a new project in four short steps: a name and a goal,
+the repositories its threads work in (the one you ran it from is listed already), the models,
+and a review. Background sessions refuse folders Claude Code doesn't trust, so the review lists
+any repo that isn't trusted yet and offers to trust it, as accepting Claude's trust prompt would.
+Enter creates the project in `~/.local/share/chief/projects/<slug>/`, starts its coordinator and
+opens the layout: the conversation on the left, the board on the right. Next time, `chief` lists
+your projects (with what needs you) and Enter opens one.
 
-`up` starts the coordinator (or revives it) and opens the layout: the conversation on the left, the
-board on the right (or tells you how to open it yourself). Then just talk: ask questions, hand over
+The same from a script: `chief init "Payments latency" --goal "…" --repo ~/workspace/payments-api`,
+then `chief up payments-latency`.
+
+Then just talk: ask questions, hand over
 tasks, send follow-ups. The coordinator
 answers quick questions itself, starts a thread per piece of work, sends follow-ups to the thread
 that owns the work (waking it first if it's asleep), and posts a short update when a thread
@@ -74,14 +80,17 @@ thread, whatever terminal it runs in. `chief down` closes only a layout `chief u
 
 ## The board
 
-Groups, in order: **Waiting on you** (a permission prompt or a question), **Working**, **Ready for
-review** (open pull request), **Landing** (approved pull request), **Idle** (marked *asleep* when its
-process has ended), **Failed**, **Resolved** (hidden until you press `R`).
+The coordinator is the first row, then the threads by group, in order: **Waiting on you** (a
+permission prompt or a question), **Working**, **Ready for review** (open pull request), **Landing**
+(approved pull request), **Idle** (marked *asleep* when its process has ended), **Failed**,
+**Resolved** (hidden until you press `R`). `▸` marks what the left pane shows. The bottom line
+always lists the keys that work on the selection, and `?` explains every mark. The mouse works
+too: click to select, click again to show, scroll to move.
 
 | Key | Does |
 | --- | --- |
-| ↑ ↓ / j k, g G | Move; first / last |
-| Enter | Show the selected thread in the left pane (answer its prompt, talk to it directly) |
+| ↑ ↓ / j k, g G | Move; first (the coordinator) / last |
+| Enter | Show the selection in the left pane (answer a thread's prompt, talk to it directly) |
 | Esc / c | Back to the coordinator |
 | w | Wake an asleep thread |
 | r | Resolve or reopen |
@@ -92,12 +101,15 @@ process has ended), **Failed**, **Resolved** (hidden until you press `R`).
 | ? | Help |
 | q | Quit the board (the layout stays) |
 
-In the left pane, Claude's own Ctrl+Z detaches too; chief re-attaches to whatever the board
-selected.
+Leaving Claude in the left pane (Ctrl+Z, or Ctrl+C out of its agent view) brings you to chief's
+own screen: ⏎ goes back, a pick on the board shows that instead, and `q` closes the layout. The
+coordinator and threads keep running in the background; `chief` or `chief up <slug>` opens the
+layout again.
 
 ## Settings
 
-`s` on the board edits `project.toml`: the goal, the coordinator's model and effort (default Opus,
+`s` on the board edits `project.toml`, in sections, with a line on what each field does (Ctrl+S
+saves): the goal, the coordinator's model and effort (default Opus,
 low: it routes, it doesn't do the work), the threads' model, effort and permission mode (default
 Sonnet, high, `auto`), how many threads to run at once, the default repo, the repos, cleanup, and
 notifications. It also opens `instructions.md` (a standing brief for the coordinator and every new
@@ -117,8 +129,8 @@ pool; `[]` keeps threads on the project's account) and `max_usage` skips account
 5-hour or weekly percentage. Ask the coordinator for a specific account and it pins the thread
 there. A thread stays in the account it started in; the board tags it with the account's label.
 
-Each account trusts folders separately, so `chief init` and the settings screen ("Account trust")
-check every repo in every pool account and offer to open Claude there to accept the prompt. A
+Each account trusts folders separately, so `chief init`, the new-project wizard and the settings
+screen ("Account trust") check every repo in every pool account and offer to trust it there. A
 thread never starts in an account that doesn't trust its repo. Without agp, threads use the
 project's account.
 
@@ -151,7 +163,10 @@ readable.
   background command ends, so its work would stop half done. chief denies a subagent's background
   commands and tells it to run them in the foreground (up to 10 minutes); longer ones are left to
   the thread itself.
-- **Trust.** chief never edits Claude Code's trust settings; it only reads them.
+- **Trust.** chief marks a folder trusted in an account's `.claude.json` only after you say yes
+  (the wizard's checkbox, `init`'s question, `chief trust <slug>`, Enter in settings), writing
+  exactly what accepting Claude's trust prompt writes and keeping the rest of the file. The one
+  folder it trusts without asking is the project folder it created itself.
 - Threads run with the permission mode you choose (default `auto`); permission prompts show as
   Waiting on you, and you answer them by opening the thread.
 
@@ -159,7 +174,10 @@ readable.
 
 | Command | Does |
 | --- | --- |
-| `chief init <name> [--goal …] [--repo PATH…]` | Create a project |
+| `chief` | Pick a project, or create one in a guided setup, and open it |
+| `chief new` | Straight to the guided setup |
+| `chief init <name> [--goal …] [--repo PATH…]` | Create a project from a script |
+| `chief trust <slug>` | Trust every folder the project's sessions need |
 | `chief up <slug>` | Start or revive the coordinator and open the layout |
 | `chief down <slug> [--stop-threads]` | Close the layout and stop the coordinator |
 | `chief pane --project <slug>` | The left pane on its own, for a layout of your own |

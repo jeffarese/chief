@@ -4,7 +4,9 @@
 //! its `claude attach` with SIGTERM, undoes the screen modes the killed client left behind, and
 //! attaches to the new target. That needs no terminal multiplexer.
 //!
-//! The user can still detach by hand with Ctrl+Z inside attach. If a Ctrl+Z lands while chief
+//! The user can still leave by hand: Ctrl+Z inside attach, or quitting Claude's agent view. The
+//! pane then says so and waits for ⏎, a board selection or `q`, rather than attaching again,
+//! which would put the user straight back in with no way out. If a Ctrl+Z lands while chief
 //! itself has the terminal, the line discipline would turn it into SIGTSTP and freeze the pane.
 //! So chief keeps the terminal in raw mode (no signal keys) whenever it is in the foreground and
 //! hands it to attach with signal keys still off, so a Ctrl+Z that lands before Claude's UI is up
@@ -29,6 +31,7 @@ use rusqlite::Connection;
 use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
+use crate::state::Role;
 use crate::{accounts, names, paths, proc, project};
 
 /// How often a failed attach is retried.
@@ -49,6 +52,9 @@ const TERMINAL_RESET: &str = "\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?10
                               \x1b[?2004l\x1b[?1004l\x1b[0m\x1b[2J\x1b[H";
 /// How often an unusable project.toml is read again.
 const CONFIG_RETRY: Duration = Duration::from_secs(5);
+/// After the user leaves a session, keys this soon are still the ones that closed Claude (a
+/// third Ctrl+C), not an answer to the pane.
+const SETTLE: Duration = Duration::from_millis(300);
 
 /// Set by SIGHUP or SIGTERM.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
@@ -93,7 +99,9 @@ fn catch(signals: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
     }
 }
 
-pub fn run(project: &str) -> Result<()> {
+/// `layout`: the pane is the `main` block of the layout `chief up` opened, so quitting closes
+/// that layout (the board with it) instead of leaving a dead block beside it.
+pub fn run(project: &str, layout: bool) -> Result<()> {
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, project)?.is_none() {
         bail!("no chief project {project:?}");
@@ -107,11 +115,39 @@ pub fn run(project: &str) -> Result<()> {
     if let Some(started) = proc::start_time(me) {
         db::set_pane_process(&conn, project, me, &started)?;
     }
-    let result = pane_loop(&conn, project, &tty);
+    let result = pane_loop(&conn, project, &tty, layout);
     let _ = db::set_pane_showing(&conn, project, None);
     let _ = db::clear_pane_process_if(&conn, project, me);
     drop(tty);
+    // The user quit (a hangup means the layout is closing already). Closing it hangs up this
+    // terminal too, so it comes last.
+    if result.is_ok() && layout && !HUNG_UP.load(Ordering::SeqCst) {
+        project::close_layout(&conn, project, &mut |line| println!("{line}"))?;
+    }
     result
+}
+
+/// What the pane shows once the user left `name` by hand.
+fn left_lines(name: &str, coordinator: bool, layout: bool) -> Vec<String> {
+    let what = if coordinator {
+        format!("the coordinator ({name})")
+    } else {
+        format!("thread {name}")
+    };
+    vec![
+        format!("chief · you left {what}. It keeps running in the background."),
+        String::new(),
+        if layout {
+            "  ⏎  back to it, or pick a thread on the board".into()
+        } else {
+            "  ⏎  back to it".into()
+        },
+        if layout {
+            "  q  close chief's layout (sessions keep running)".into()
+        } else {
+            "  q  quit (sessions keep running)".into()
+        },
+    ]
 }
 
 /// The session the pane should show: `pane_target`, or the coordinator when it is NULL or names
@@ -149,7 +185,7 @@ fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
     })
 }
 
-fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
+fn pane_loop(conn: &Connection, project: &str, tty: &Tty, layout: bool) -> Result<()> {
     let dir = project::project_dir(project);
     loop {
         if HUNG_UP.load(Ordering::SeqCst) {
@@ -240,6 +276,18 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty) -> Result<()> {
             if tty.quit_pressed(RETRY)? {
                 return Ok(());
             }
+            continue;
+        }
+
+        // The user left by hand: attaching again at once would put them straight back in.
+        let coordinator = row.role == Role::Coordinator.as_str();
+        let lines = left_lines(&name, coordinator, layout);
+        tty.say(&lines[0])?;
+        for line in &lines[1..] {
+            tty.note(line)?;
+        }
+        if tty.pick()? == Pick::Quit {
+            return Ok(());
         }
     }
 }
@@ -402,6 +450,12 @@ fn end_child(pid: libc::pid_t, signal: libc::c_int) -> ExitStatus {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Pick {
+    Back,
+    Quit,
+}
+
 /// The pane's terminal while chief has it: raw mode (Ctrl+Z and Ctrl+C are plain bytes) and
 /// SIGTSTP ignored. Keeps the mode the pane started in, to hand over and restore.
 struct Tty {
@@ -462,6 +516,36 @@ impl Tty {
         Ok(())
     }
 
+    /// Waits for the user's answer after they left a session: ⏎ or a board selection (a switch
+    /// request) attaches again, `q` or Ctrl+C quits. Keys in the first `SETTLE` are dropped.
+    fn pick(&self) -> Result<Pick> {
+        let settle = Instant::now() + SETTLE;
+        loop {
+            if HUNG_UP.load(Ordering::SeqCst) {
+                return Ok(Pick::Quit);
+            }
+            if SWITCH.swap(false, Ordering::SeqCst) {
+                return Ok(Pick::Back);
+            }
+            // Short polls: a switch request only sets a flag.
+            if !event::poll(WAIT_TICK * 4)? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press || Instant::now() < settle {
+                continue;
+            }
+            match (key.code, key.modifiers) {
+                (KeyCode::Enter, _) => return Ok(Pick::Back),
+                (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(Pick::Quit),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(Pick::Quit),
+                _ => {}
+            }
+        }
+    }
+
     /// Reads keys for `wait`, then whatever is still queued; true when `q` was pressed. Other
     /// keys are dropped.
     fn quit_pressed(&self, wait: Duration) -> Result<bool> {
@@ -497,18 +581,17 @@ impl Drop for Tty {
 
 /// Asks the project's main pane to show `ui_state.pane_target` now. The board writes the target
 /// first, then calls this. It sends SIGUSR1 to the `chief pane` process, which ends its
-/// `claude attach` and attaches to the new target (§9), in whatever terminal it runs. Does
-/// nothing when the pane already shows the target, when it is between attaches (it reads the
-/// target before its next attach), or when no pane is recorded. A recorded pid whose start time
+/// `claude attach` and attaches to the new target (§9), in whatever terminal it runs. A pane
+/// that shows nothing gets the signal too: it may be waiting after the user left a session, and
+/// between attaches the pane drops a request for the target it is about to attach. Does nothing
+/// when the pane already shows the target or when no pane is recorded. A recorded pid whose start time
 /// no longer matches belongs to a pane that is gone, and may be another process's by now: it is
 /// never signalled, and the record is cleared.
 pub fn request_switch(conn: &Connection, project: &str) -> Result<()> {
-    let Some(showing) = db::get_pane_showing(conn, project)? else {
-        return Ok(());
-    };
+    let showing = db::get_pane_showing(conn, project)?;
     let target =
         db::get_pane_target(conn, project)?.unwrap_or_else(|| names::coordinator_name(project));
-    if showing == target {
+    if showing.as_deref() == Some(target.as_str()) {
         return Ok(());
     }
     let Some((pid, started)) = db::get_pane_process(conn, project)? else {
@@ -655,6 +738,27 @@ mod tests {
         db::set_pane_target(&conn, "demo", None).unwrap();
         request_switch(&conn, "demo").unwrap();
         assert_eq!(ended_by(&mut pane), Some(libc::SIGUSR1));
+
+        // Showing nothing: waiting after the user left, even the target it left.
+        let mut pane = fake_pane(&conn);
+        db::set_pane_showing(&conn, "demo", None).unwrap();
+        request_switch(&conn, "demo").unwrap();
+        assert_eq!(ended_by(&mut pane), Some(libc::SIGUSR1));
+    }
+
+    #[test]
+    fn leaving_says_how_to_go_back_or_quit() {
+        let lines = left_lines("chief-demo", true, true);
+        assert_eq!(
+            lines[0],
+            "chief · you left the coordinator (chief-demo). It keeps running in the background."
+        );
+        assert!(lines[2].contains("pick a thread on the board"));
+        assert!(lines[3].contains("close chief's layout"));
+        let lines = left_lines("demo-a-1111", false, false);
+        assert!(lines[0].contains("you left thread demo-a-1111"));
+        assert_eq!(lines[2], "  ⏎  back to it");
+        assert_eq!(lines[3], "  q  quit (sessions keep running)");
     }
 
     #[test]
@@ -666,9 +770,6 @@ mod tests {
         request_switch(&conn, "demo").unwrap();
         db::set_pane_showing(&conn, "demo", Some("demo-a-1111")).unwrap();
         db::set_pane_target(&conn, "demo", Some("demo-a-1111")).unwrap();
-        request_switch(&conn, "demo").unwrap();
-        // Between attaches.
-        db::set_pane_showing(&conn, "demo", None).unwrap();
         request_switch(&conn, "demo").unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(pane.try_wait().unwrap(), None, "never signalled");

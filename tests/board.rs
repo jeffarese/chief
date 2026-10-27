@@ -448,6 +448,21 @@ fn checks_which_repos_the_pool_trusts() {
     );
     assert!(found.errors.is_empty(), "{:?}", found.errors);
 
+    // Enter on the pair is the yes: the worker marks it in that account's file, then checks again.
+    let pair = found.untrusted[0].clone();
+    let Msg::Trusted { text, check: again } = jobs::run(
+        &env.src,
+        Action::Trust(Box::new(pair), Box::new(config.clone())),
+    ) else {
+        panic!("trusted")
+    };
+    assert_eq!(
+        text,
+        format!("Trusted {} (in PB2).", env.git.repo.display())
+    );
+    assert!(chief::claude::is_trusted_in(&cpb.join(".claude.json"), &env.git.repo).unwrap());
+    assert_eq!(again.unwrap().untrusted, []);
+
     agp.set("status.exit", "1");
     let Msg::Trust(Err(e)) = check(&env.src) else {
         panic!("failed")

@@ -23,10 +23,15 @@ const THREAD: &str = "demo-a-1111";
 struct Pane {
     child: Child,
     output: Arc<Mutex<Vec<u8>>>,
+    input: std::fs::File,
 }
 
 impl Pane {
     fn start(home: &Home) -> Pane {
+        Pane::start_with(home, &[])
+    }
+
+    fn start_with(home: &Home, extra: &[&str]) -> Pane {
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize {
             ws_row: 24,
@@ -48,7 +53,9 @@ impl Pane {
         // SAFETY: fresh descriptors from openpty, owned once each.
         let (master, slave) =
             unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        let mut cmd = home.command(&["pane", "--project", "demo"]);
+        let mut args = vec!["pane", "--project", "demo"];
+        args.extend(extra);
+        let mut cmd = home.command(&args);
         cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -66,6 +73,7 @@ impl Pane {
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = output.clone();
         let mut master = std::fs::File::from(master);
+        let input = master.try_clone().unwrap();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             // Ends with EIO once the pane and its children have closed the pty.
@@ -76,7 +84,21 @@ impl Pane {
                 sink.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
-        Pane { child, output }
+        Pane {
+            child,
+            output,
+            input,
+        }
+    }
+
+    /// Types `keys` into the pane's terminal.
+    fn send(&mut self, keys: &str) {
+        use std::io::Write;
+        self.input.write_all(keys.as_bytes()).unwrap();
+    }
+
+    fn says(&self, text: &str) -> bool {
+        String::from_utf8_lossy(&self.output()).contains(text)
     }
 
     fn pid(&self) -> i32 {
@@ -125,6 +147,14 @@ fn attach_call(home: &Home, short: &str) -> Option<usize> {
         .calls()
         .iter()
         .position(|c| c.len() == 2 && c[0] == "attach" && c[1] == short)
+}
+
+fn attach_calls(home: &Home, short: &str) -> usize {
+    home.fake
+        .calls()
+        .iter()
+        .filter(|c| c.len() == 2 && c[0] == "attach" && c[1] == short)
+        .count()
 }
 
 fn gone(pid: i32) -> bool {
@@ -214,4 +244,85 @@ fn a_switch_ends_attach_and_attaches_to_the_new_target() {
     assert!(gone(second), "its attach was reaped");
     assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
     assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+}
+
+/// Leaving Claude by hand (its Ctrl+Z, or quitting its agent view) doesn't put the user straight
+/// back in: the pane waits for ⏎ or a board selection, and `q` in chief's layout closes it.
+#[test]
+fn leaving_waits_for_the_user_and_q_closes_the_layout() {
+    let home = Home::new();
+    let conn = home.db();
+    home.register("demo");
+    for (name, role, short) in [
+        (COORD, Role::Coordinator, "c0"),
+        (THREAD, Role::Thread, "t1"),
+    ] {
+        let mut row = SessionRow::new(name, "demo", role, 1);
+        row.short_id = Some(short.into());
+        row.session_id = Some(format!("{short}-sid"));
+        db::insert_session(&conn, &row).unwrap();
+    }
+    db::set_rex_session(&conn, "demo", Some("session:7")).unwrap();
+    home.fake
+        .set(
+            "agents.stdout",
+            &json!([
+                agent("c0", "c0-sid", COORD, "done", Some(4001)),
+                agent("t1", "t1-sid", THREAD, "done", Some(4002)),
+            ])
+            .to_string(),
+        )
+        // Each attach ends on its own after a while, as when the user leaves Claude.
+        .set("attach.sleep", "1.2");
+    home.rex
+        .set("list.exit", "0")
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:7", "label": "chief-demo"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
+
+    let mut pane = Pane::start_with(&home, &["--layout"]);
+    wait_for("the coordinator is left", || {
+        pane.says("you left the coordinator (chief-demo)")
+    });
+    assert!(pane.says("pick a thread on the board"));
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(attach_calls(&home, "c0"), 1, "not attached again by itself");
+    assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+
+    pane.send("\r");
+    wait_for("attached again", || attach_calls(&home, "c0") == 2);
+
+    // A board selection while the pane waits attaches it.
+    wait_for("left again", || {
+        db::get_pane_showing(&conn, "demo").unwrap().is_none()
+            && String::from_utf8_lossy(&pane.output())
+                .matches("you left the coordinator")
+                .count()
+                == 2
+    });
+    db::set_pane_target(&conn, "demo", Some(THREAD)).unwrap();
+    chief::pane::request_switch(&conn, "demo").unwrap();
+    wait_for("the thread's attach", || attach_calls(&home, "t1") == 1);
+    wait_for("the thread is left", || {
+        pane.says("you left thread demo-a-1111")
+    });
+
+    assert!(home.rex.calls_of("kill").is_empty());
+    std::thread::sleep(Duration::from_millis(400));
+    pane.send("q");
+    let status = pane.exited().expect("q quits");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        home.rex.calls_of("kill"),
+        [vec!["kill", "session:7", "--autostart=false"]],
+        "the layout closed"
+    );
+    assert_eq!(db::get_rex_session(&conn, "demo").unwrap(), None);
+    assert!(home.fake.calls_of("stop").is_empty(), "no session stopped");
 }

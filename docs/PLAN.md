@@ -262,3 +262,29 @@ idle subagent with a Stop-hook block, a `TaskStop`, and background commands).
    count 12. Then a live run with chief: a thread on another account whose subagent runs a
    foreground test command, checking the board, the coordinator's early notice and the final
    report.
+
+## Onboarding and TUI (built, 2026-10-27)
+
+Problem (user feedback): the TUI didn't follow TUI conventions, and starting was confusing.
+`chief init <name> --goal … --repo …` meant a trust round trip per folder (open `claude`, accept,
+`/exit`), then `chief up <slug>`, and nothing on screen said the left pane was the conversation or
+how to get back to it. Claude Projects gets this right: you set the goal, pick a few settings, and
+you are in the conversation.
+
+1. **`chief` alone is a launcher** (ARCHITECTURE §10a): a list of projects with what needs you,
+   and `+ New project`. With no projects it opens on a four-step wizard (About, Code, Models,
+   Review), which creates the project, trusts what you agreed to and opens the layout, showing
+   each step. The conversation is the coordinator, idle and waiting for you (the user chose no
+   first turn). Without Rex or tmux the launcher runs the pane in its own terminal.
+2. **Trust without the round trip** (§3 "Trust"): chief writes the key Claude's dialog writes,
+   only after a yes (one question in `init`, a checkbox in the wizard, `chief trust <slug>`,
+   Enter in the board's settings). It trusts its own project folder without asking.
+3. **Board** (§10): framed panels, the coordinator as a selectable first row, a key bar that
+   always fits and names what works on the selection, `? help` with a legend of the marks, the
+   mouse, a coordinator detail that says what to do next, settings in sections with a line on each
+   field and Ctrl+S.
+
+Not verified live yet: that a background session accepts a folder chief marked (the key and
+value match what M2b read from Claude's own dialog, but no live session has started in a
+chief-marked folder). Check with `chief new` on a fresh repo: the coordinator must start, and so
+must the first thread.

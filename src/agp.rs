@@ -5,7 +5,7 @@
 //! the binary.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -205,20 +205,6 @@ impl Agp {
             bail!("agp isn't installed");
         };
         Ok(parse_config_dir(&String::from_utf8_lossy(&out.stdout)))
-    }
-
-    /// `agp exec <id> -- <claude>` in `cwd` on this terminal, for the trust prompt.
-    pub fn run_interactive(&self, id: &str, claude: &Path, cwd: &Path) -> Result<ExitStatus> {
-        self.interactive(id, claude, cwd)
-            .status()
-            .with_context(|| format!("running agp exec {id} in {}", cwd.display()))
-    }
-
-    /// The command `run_interactive` runs, for a caller that hands over the terminal itself.
-    pub fn interactive(&self, id: &str, claude: &Path, cwd: &Path) -> Command {
-        let mut cmd = self.exec(id);
-        cmd.arg(claude).current_dir(cwd);
-        cmd
     }
 
     /// `agp exec <id> --`, without this process's `CLAUDE_CONFIG_DIR`: agp leaves it unset for

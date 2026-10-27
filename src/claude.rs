@@ -63,7 +63,8 @@ pub enum RmOutcome {
 pub enum ClaudeError {
     #[error(
         "Claude Code doesn't trust {0} yet, and background sessions refuse untrusted folders. \
-         Run `claude` in that folder once (cd {0} && claude), accept the trust prompt, then try again."
+         Run `chief trust <project>` to mark it trusted, or run `claude` in that folder once \
+         (cd {0} && claude), accept the trust prompt, then try again."
     )]
     NotTrusted(PathBuf),
 }
@@ -189,14 +190,6 @@ impl Claude {
         let args: Vec<OsString> = vec!["agents".into(), "--json".into(), "--all".into()];
         let out = self.run_ok(&args, None, timeout)?;
         parse_agents(&String::from_utf8_lossy(&out.stdout))
-    }
-
-    /// Runs `claude` in `cwd` on this terminal and waits for it to exit (for the trust prompt).
-    pub fn run_interactive(&self, cwd: &Path) -> Result<std::process::ExitStatus> {
-        self.command()
-            .current_dir(cwd)
-            .status()
-            .with_context(|| format!("running {} in {}", self.bin.display(), cwd.display()))
     }
 
     /// Starts a background session and returns its short id.
@@ -660,6 +653,81 @@ pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     }))
 }
 
+/// Marks `path` trusted in `config` the way accepting Claude's trust dialog does:
+/// `projects[<canonical path>].hasTrustDialogAccepted = true`, keeping the rest of the file and
+/// its key order. Only after the user said yes (§3 "Trust"). The file is replaced by a rename in
+/// its own folder, through a symlink to its target, with its permissions kept. Claude Code
+/// rewrites this file itself, so the trust is read back; a write that lost a race is tried once
+/// more.
+pub fn mark_trusted(config: &Path, path: &Path) -> Result<()> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    for _ in 0..2 {
+        write_trust(config, &path)?;
+        if is_trusted_in(config, &path)? {
+            return Ok(());
+        }
+    }
+    bail!(
+        "{} still isn't trusted in {}: Claude Code may have rewritten it meanwhile",
+        path.display(),
+        config.display()
+    )
+}
+
+fn write_trust(config: &Path, path: &Path) -> Result<()> {
+    let target = config
+        .canonicalize()
+        .unwrap_or_else(|_| config.to_path_buf());
+    let (mut json, perms) = match std::fs::read_to_string(&target) {
+        Ok(text) => (
+            serde_json::from_str::<serde_json::Value>(&text)
+                .with_context(|| format!("parsing {}", target.display()))?,
+            std::fs::metadata(&target).ok().map(|m| m.permissions()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (serde_json::json!({}), None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", target.display())),
+    };
+    let Some(root) = json.as_object_mut() else {
+        bail!("{} isn't a JSON object", target.display());
+    };
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(projects) = projects.as_object_mut() else {
+        bail!("{} → projects isn't a JSON object", target.display());
+    };
+    let entry = projects
+        .entry(path.to_string_lossy().into_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(entry) = entry.as_object_mut() else {
+        bail!(
+            "{} → projects → {} isn't a JSON object",
+            target.display(),
+            path.display()
+        );
+    };
+    entry.insert("hasTrustDialogAccepted".into(), true.into());
+
+    let dir = target.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(".claude.json.chief-{}", std::process::id()));
+    let text = serde_json::to_string_pretty(&json)? + "\n";
+    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    let perms = perms.unwrap_or_else(|| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o600)
+    });
+    let renamed = std::fs::set_permissions(&tmp, perms)
+        .and_then(|()| std::fs::rename(&tmp, &target))
+        .with_context(|| format!("replacing {}", target.display()));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
+}
+
 /// `path` and its ancestors up to and including the git repository root, or up to `/` outside a
 /// repository.
 fn trust_scope(path: &Path) -> Vec<&Path> {
@@ -949,6 +1017,67 @@ mod tests {
         );
         assert_eq!(claude.job_state("e5f6"), Some(JobState::default()));
         assert_eq!(claude.job_state("bad"), None);
+    }
+
+    #[test]
+    fn marking_trust_keeps_the_rest_of_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let canon = repo.canonicalize().unwrap();
+        let real = dir.path().join("real.json");
+        std::fs::write(
+            &real,
+            r#"{"zeta": 1, "projects": {"/other": {"allowedTools": [], "hasTrustDialogAccepted": false}}, "alpha": {"b": 2, "a": 1}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        // Dotfiles are often symlinks: the target is replaced, the link kept.
+        let config = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink(&real, &config).unwrap();
+
+        assert!(!is_trusted_in(&config, &repo).unwrap());
+        mark_trusted(&config, &repo).unwrap();
+        assert!(is_trusted_in(&config, &repo).unwrap());
+        assert!(!is_trusted_in(&config, Path::new("/other")).unwrap());
+        assert!(config.symlink_metadata().unwrap().file_type().is_symlink());
+        let text = std::fs::read_to_string(&real).unwrap();
+        let keys: Vec<&str> = ["zeta", "projects", "alpha", "\"b\"", "\"a\""]
+            .into_iter()
+            .collect();
+        let at: Vec<usize> = keys.iter().map(|k| text.find(k).unwrap()).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "order changed:\n{text}");
+        assert!(text.contains("allowedTools"));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        // Marking again changes nothing; an existing entry keeps its other keys.
+        mark_trusted(&config, &canon).unwrap();
+        mark_trusted(&config, Path::new("/")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(
+            json["projects"]["/other"]["allowedTools"],
+            serde_json::json!([])
+        );
+        assert_eq!(json["projects"]["/"]["hasTrustDialogAccepted"], true);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("chief-"))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        // A missing file is created private; one chief can't read is left alone.
+        let fresh = dir.path().join("fresh/.claude.json");
+        mark_trusted(&fresh, &repo).unwrap();
+        assert!(is_trusted_in(&fresh, &repo).unwrap());
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, "{ not json").unwrap();
+        assert!(mark_trusted(&broken, &repo).is_err());
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ not json");
     }
 
     #[test]

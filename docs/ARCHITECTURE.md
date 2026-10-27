@@ -167,7 +167,10 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 
 | Command | Started by | Job |
 | --- | --- | --- |
+| `chief` | you | The launcher (§10a): pick a project or create one in a guided setup, then open it |
+| `chief new` | you | The launcher, straight to the new-project wizard |
 | `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
+| `chief trust <slug>` | you | Mark every folder the project's sessions need as trusted (§3 "Trust") |
 | `chief up <slug>` | you | Start or revive the coordinator, open the layout (Rex, tmux, or say how) |
 | `chief down <slug> [--stop-threads]` | you | Close the layout; threads keep running unless asked |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
@@ -186,23 +189,28 @@ coordinator's context at 5 s.
 
 `chief init` validates first (Claude Code version, name → slug with ≥1 letter or digit, slug not
 taken, every `--repo` an existing folder, stored canonical and named after its folder with `-2`, `-3`
-… on a clash) and leaves nothing behind on failure. It then lists every folder Claude Code doesn't
-trust yet: the project folder always, plus untrusted repos. When stdin and stdout are terminals
-(and without `--no-trust-prompt`) it asks for each "Open Claude there now to trust it? [Y/n]" and
-runs `claude` interactively there (accept the prompt, then `/exit` or Ctrl+C twice), then re-checks;
-otherwise it prints `cd <folder> && claude` for each (`cd <folder> && CLAUDE_CONFIG_DIR=<dir>
-claude` for a non-default account). The project belongs to the account `CLAUDE_CONFIG_DIR` names
-when `init` runs (§3); `init` says so for a non-default one. With agp (§7 "Thread account"), it
-then checks every repo in every account of the pool (`placement::pool_trust`: the accounts
-`[threads] accounts` allows that agp has `in_pool`, limited ones included), says "Threads can also
-run in these agp accounts: <labels>.", and lists each pair not trusted yet ("<label> doesn't
-trust <repo>"), leaving out the project's own account (listed above); on a terminal it asks
-"Open Claude in <repo> in <label> now to trust it? [Y/n]" and runs `agp exec <id> -- claude`
-there, then re-checks that account's `.claude.json`; otherwise it prints `cd <repo> && agp exec
-<id> -- claude` for each. An account agp can't name a folder for is listed as not checked; a
-failing `agp status` is one line, and `init` still succeeds.
+… on a clash) and leaves nothing behind on failure. The project belongs to the account
+`CLAUDE_CONFIG_DIR` names when `init` runs (§3); `init` says so for a non-default one. It then
+handles trust (§3 "Trust", `trust::check`): it marks the project folder trusted without asking
+(`Trusted <dir>.`), since chief made it. With agp (§7 "Thread account") it checks every repo in
+every account of the pool too (`placement::pool_trust`: the accounts `[threads] accounts` allows
+that agp has `in_pool`, limited ones included) and says "Threads can also run in these agp
+accounts: <labels>.". It lists every repo not trusted yet, in the project's account (`  <repo>`)
+and in each pool account but the project's own (`  <repo> (in <label>)`). When stdin and stdout
+are terminals (and without `--no-trust-prompt`) it asks once, "Trust them now, as accepting
+Claude's trust prompt would? [Y/n]", and marks them all, one `Trusted …` line each; otherwise it
+prints `To trust them later: chief trust <slug>`. An account agp can't name a folder for is
+listed as not checked; a failing `agp status` is one line, and `init` still succeeds. It ends with
+`Next: chief up <slug> (or run chief and pick it)`.
 
-`chief up` loads project.toml, checks the version in the project's account (§3), rewrites
+`chief trust <slug>` marks every folder `trust::check` lists for the project (its own folder, then
+the repos in each account), one `Trusted …` or `Couldn't trust …` line each; running it is the
+yes. With nothing left it prints `Every folder of <slug> is trusted already.`; any failure makes it
+exit non-zero after the rest.
+
+`chief up` (`project::up`, which prints what `project::up_with` reports: lines on stdout,
+warnings on stderr; the launcher shows the same reports in its window) loads project.toml, checks
+the version in the project's account (§3), rewrites
 `generated/*`, runs the coordinator step (§7), then opens the layout (§9): with Rex when it is
 installed and its server runs (`rex list` succeeds), storing the session id in
 `ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux window, storing it
@@ -302,6 +310,21 @@ account the project uses (the project's, plus the account of every thread not cl
 account's folder. This holds for the board, `list_threads`, the coordinator's context, `chief
 status`, `chief gc` and `chief down`; a command about one thread (wake, cleanup, the pane)
 lists only that thread's account.
+
+**Trust.** Background sessions refuse folders their account doesn't trust (§1). chief marks
+a folder trusted the way accepting Claude's trust dialog records it (`claude::mark_trusted`):
+`projects[<canonical path>].hasTrustDialogAccepted = true` in the account's `.claude.json`
+(`claude_config_path`), keeping every other key, value and the key order (serde_json's
+`preserve_order`). It writes a temporary file beside the target (through a symlink, to the
+symlink's target), gives it the target's permissions (0600 for a new file), renames it over, then
+reads the trust back; Claude Code rewrites this file itself, so a write that lost that race is tried
+once more before it fails. A file that doesn't parse is never replaced. chief marks only after a
+yes: its own project folder needs none (chief made it, and the coordinator runs there), so `init`,
+the wizard and `up` (`ensure_coordinator`, before a first spawn, for projects made before this)
+mark it themselves; the user's repos only after the one question in `init`, the wizard's
+checkbox, `chief trust`, or Enter on an untrusted pair in the board's settings. `trust::check`
+lists what a project needs: the project folder, each repo in the project's account, and each repo
+in every agp pool account but the project's own (§7 "Thread account").
 
 - `*-settings.json`: `{"hooks": {...}}` in Claude Code's format, one command per event:
   SessionStart, UserPromptSubmit, PreToolUse (matcher `*`), PreToolUse (matcher
@@ -461,7 +484,7 @@ CREATE TABLE guard_denials (
 CREATE TABLE ui_state (
   project_slug TEXT PRIMARY KEY,
   pane_target  TEXT,                      -- session name the left pane should show
-  pane_showing TEXT,                      -- session `chief pane` is attached to now; NULL between attaches (migration 5)
+  pane_showing TEXT,                      -- session `chief pane` is attached to now; NULL between attaches or after the user left (migration 5)
   rex_session  TEXT,                      -- id of the Rex session `chief up` created, §9 (migration 8)
   pane_pid     INTEGER,                   -- the running `chief pane`, which the board signals to switch, §9 (migration 9)
   pane_started TEXT,                      -- that process's start time, proving the pid is still it (migration 9)
@@ -885,7 +908,8 @@ Parse `backgrounded · <short-id>` from stdout (error if missing, include stderr
 `sessionId` from `claude agents --json --all` (retry up to 5 s). List flags (`--add-dir`,
 `--disallowedTools`) are repeated once per value, and empty optionals are left out. The command runs
 with stdin closed; "Workspace not trusted" in its output becomes `ClaudeError::NotTrusted(cwd)`,
-whose message says to run `claude` in that folder once and accept the trust prompt.
+whose message says to run `chief trust <project>`, or `claude` in that folder once and accept the
+trust prompt.
 
 Every external command chief waits on (`claude`, `git`, `gh`, `rex`) runs through
 `proc::output_with_timeout`, and its timeout is a real bound: the child leads its own process
@@ -905,7 +929,7 @@ the way counts. It reads the config file of the account the session runs in (§3
 ### Coordinator spawn (`chief up`)
 
 ```
-cwd  = <dir>   (must be trusted; `chief init` tells you how)
+cwd  = <dir>   (must be trusted; chief marks it, §3 "Trust")
 name = chief-<slug>
 claude --bg --name chief-<slug> --model <m> --effort <e> --permission-mode auto
        --settings <dir>/generated/coordinator-settings.json   (hooks + "worktree": {"bgIsolation": "none"})
@@ -923,8 +947,9 @@ can edit only `memory/` and `instructions.md` (settings are the user's: the boar
 file itself). `SendMessage` goes through the guard; its chief MCP tools run without prompts.
 
 No prompt: it waits for you. Started when it has no row or no `short_id` (the project folder must be
-trusted, and no other live session may already use the name). A failed spawn is handled as a
-thread's is (above): a session that started anyway is adopted, with a warning on stderr; a row it
+trusted, and chief marks it first when it isn't; no other live session may already use the name).
+A failed spawn is handled as a thread's is (above): a session that started anyway is adopted, with a
+warning (stderr from the command line); a row it
 inserted is removed only when listings show no such session, and kept when chief can't tell. A
 kept row (no `short_id`) is adopted by the next `up` when `claude agents` lists its session (by
 `session_id` if a hook stored one, else a background session with exactly the name whose `cwd`
@@ -994,7 +1019,8 @@ any two terminals or splits work. `chief up` opens it for the user with the firs
 2. tmux, when `$TMUX` is set (chief runs inside tmux): a tmux window, below.
 3. Neither: it prints why and the two commands, `chief pane --project <slug>` and
    `chief board --project <slug>`, to run side by side (two windows, iTerm or Ghostty splits,
-   anything). `chief down` has nothing to close then.
+   anything). `chief down` has nothing to close then. From the launcher (§10a), Enter runs the
+   pane in the launcher's own terminal instead, after printing the board's command.
 
 `src/mux/mod.rs` defines a backend-neutral trait (block ids are unique across sessions):
 
@@ -1044,7 +1070,8 @@ can't change, unlike the pane title) and `remain-on-exit on` (kept open, like Re
 `kill-window`.
 
 `src/layout.rs` builds the layout over any `Mux`: session `chief-<slug>`, block `main` running
-`chief pane --project <slug>`, block `board` split right of it at 32 % running
+`chief pane --project <slug> --layout` (the hidden flag: quitting the pane closes the layout, see
+below), block `board` split right of it at 32 % running
 `chief board --project <slug>`, both with the project folder as cwd. Each command is the canonical
 chief path, behind `env K=V…` with the §3 passthrough variables when any is set. `open`:
 
@@ -1093,9 +1120,19 @@ macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
    (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 0. An attach ended for a
    switch goes straight back to 0.
+6. Any other attach ended because the user left Claude by hand (its Ctrl+Z, or Ctrl+C out of
+   its agent view). Attaching again at once would put them straight back in with no way out, so
+   the pane prints `chief · you left the coordinator (<name>). It keeps running in the
+   background.` (or `thread <name>`), then `⏎ back to it` (`, or pick a thread on the board` in
+   the layout) and `q close chief's layout (sessions keep running)` (`q quit …` outside it), and
+   waits: ⏎ or a switch request (SIGUSR1, below) goes back to 0; `q`, Ctrl+C or a hangup ends the
+   loop. Keys in the first 300 ms are dropped: a third Ctrl+C meant for Claude isn't an answer.
 
 `q` while chief has the terminal ends the loop; so does the block being closed or the session
-killed. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
+killed. With `--layout` a `q` (not a hangup) then closes the layout as `chief down` does
+(`project::close_layout`: the Rex session, or the tmux window, or just chief's two blocks when
+the user added others), after the pane cleared its rows and restored the terminal, since closing
+hangs up the pane's own terminal; no session stops. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
 `claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
 `SA_RESTART`, so the default action can't end it before cleanup: the wait sees the flag, passes
 SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either way; the loop
@@ -1103,7 +1140,7 @@ then stops. On exit `pane_showing` is cleared (a stale one would keep §12 clean
 thread).
 
 Ctrl+Z: the user can detach by hand with Claude's own Ctrl+Z inside `claude attach`; the loop then
-attaches to the current target. While chief itself has the terminal, the terminal is in raw mode
+waits as in step 6. While chief itself has the terminal, the terminal is in raw mode
 (ISIG off), so Ctrl+Z, Ctrl+C and other keys are plain bytes chief reads and drops (only `q`
 counts). Attach starts with ISIG still off, so a Ctrl+Z that arrives before Claude's UI is up
 stays queued as input; Claude reads it once it takes the terminal and detaches. In case a SIGTSTP
@@ -1114,8 +1151,11 @@ command as the leader of its own session, an orphaned process group, so the kern
 terminal stop signals there anyway (verified in M4: with ISIG on, `^Z` echoes and nothing stops).
 
 Board switching works in any terminal, with or without a multiplexer: write `pane_target`, then
-`pane::request_switch(conn, slug)`. When `pane_showing` is NULL (between attaches, or no pane) or
-equals the target (NULL target = the coordinator's name), or no pane is recorded, do nothing.
+`pane::request_switch(conn, slug)`. When `pane_showing` equals the target (NULL target = the
+coordinator's name), or no pane is recorded, do nothing. A NULL `pane_showing` is signalled too:
+the pane may be waiting after the user left (step 6), where the signal attaches the target, even
+the one just left; between attaches the flag stays set and the next wait drops it when the target
+is the one being attached.
 Otherwise check that the recorded pid's start time still matches `pane_started`; if not, the pane
 is gone and the pid may be another process's by now, so clear the record (only while it holds that
 pid) and send nothing. Else send it SIGUSR1. The pane catches SIGUSR1 like SIGHUP (a handler that
@@ -1154,28 +1194,41 @@ are tested without a terminal (`TestBackend`).
   (no `gh`, not logged in, no GitHub remote) stays in the status line; blocked and error counts
   prefix it (`PR 1 blocked, 2 errors · …`). At start the board deletes `events` older than 30 days
   (`db::prune_events`).
-- Layout, designed for a 40–70 column pane and usable down to 30: header (project name, goal,
-  `coordinator: <state>` with the guard denial count when > 0); the groups in §5 order with counts,
-  empty groups hidden, "No threads yet" when there are none, Resolved collapsed by default
-  (`Resolved N · R shows`). When the list doesn't fit, its last line says what is below
-  (`↓ N more`, plus `· Resolved N · R shows` for a collapsed header under the fold; `↑ more above` at
-  the bottom). A row is `<target mark><glyph> <title or name>  <tags>`, cut to the
-  width with an ellipsis and never wrapped; the title gives way first so tags stay readable. Tags:
+- Look (`src/tui.rs`, shared with the launcher): rounded panels with a bold title, a one-column
+  margin inside when the panel has 34 columns to spare, one accent colour (cyan) for focus, keys
+  and marks, the selection in reverse video across the width. The last line is always the key
+  bar: the keys that act on the selection, most useful first, each `key what` with the key in
+  the accent colour, whole hints only, `? help` kept at the end when the rest doesn't fit. Above
+  it, when there is one, the status line: a running worker, else the last action's result
+  (cleared by the next key), else refresh errors, else the PR hint.
+- Layout, designed for a 40–70 column pane and usable down to 30: a panel titled with the project
+  name holds the goal (one dim line), then the coordinator's row, then the groups in §5 order
+  (`<label> · <count>`, Waiting in bold red), empty groups hidden, "No threads yet" when there
+  are none, Resolved collapsed by default (`Resolved · N · R shows`). When the list doesn't fit,
+  its last line says what is below (`↓ N more`, plus `· Resolved N · R shows` for a collapsed
+  header under the fold; `↑ more above` at the bottom); while the selection is on the first page
+  the list starts at the top. The coordinator's row is `<target mark>◉ Coordinator  <state>`
+  with the guard denial count when > 0 (`asleep · 2 guard denials`). A thread's row is
+  `<target mark><glyph> <title or name>  <tags>`, cut to the width with an ellipsis and never
+  wrapped; the title gives way first so tags stay readable. Tags:
   waiting reason, background work unless resolved (`1 subagent, 2 background commands`, §5),
   `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`), `cleanup blocked`, `cleaned up`, then the agp label of the account it runs in (`PB2`; none for a
   thread in the project's account without agp, §7 "Thread account"). Detail panel for the
-  selection (title, name, group and reason or resolved reason, `· <background work> running`,
-  asleep, branch, PR URL, model ·
-  effort, `account <label>`, last activity, cleanup state, the last
-  report wrapped): below the list when the body has ≥ 16 lines (the list takes what it needs up to
-  3/5), otherwise Tab swaps the list for it. One status line: a running worker, else the last
-  action's result (cleared by the next key), else refresh errors, else the PR hint, else key help.
+  selection, titled with the thread's title (name, group and reason or resolved reason,
+  `· <background work> running`, asleep, branch, PR URL, model · effort, `account <label>`, last
+  activity, cleanup state, the last report wrapped), or "Coordinator" (its state, model ·
+  effort, last activity, and what to do next: with no threads, "Tell the coordinator what you want
+  done, in the main pane…"): below the list when the body has ≥ 16 lines (the list takes what it
+  needs up to 3/5), otherwise Tab swaps the list for it.
   Colours: a fixed palette that reads on dark and light terminals (Waiting bold red with `!`,
   Working green `●`, Review blue `◆`, Landing magenta `▲`, Idle default `○`, Failed red `✗`,
-  Resolved dim `✓`). `▸` marks what the main pane shows: a thread row, or the coordinator line.
-- Keys: ↑/↓ or j/k move over threads (headers skipped; g/G first/last); Enter shows the selected
-  thread in the main pane (refused for a cleaned one or one removed outside chief); Esc or c
-  shows the coordinator; w wake (`tools::wake_thread`, refused for cleaned or removed); r resolve
+  Resolved dim `✓`). `▸` marks what the main pane shows: a thread's row, or the coordinator's.
+- Keys: ↑/↓ or j/k move over the coordinator's row and the threads (headers skipped; g/G
+  first/last). The first threads to show take the selection from a coordinator selected only
+  because there were none; one the user selected stays selected across refreshes. Enter shows the
+  selection in the main pane (a thread: refused for a cleaned one or one removed outside chief);
+  Esc or c shows the coordinator from anywhere; on the coordinator's row the thread keys (w, r,
+  o, x) say they act on a thread; w wake (`tools::wake_thread`, refused for cleaned or removed); r resolve
   or reopen (`registry::set_resolved`, reason `user`; reopening a cleaned or removed thread is
   refused with its message); o open the PR URL
   (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
@@ -1185,12 +1238,23 @@ are tested without a terminal (`TestBackend`).
   with a wrong name clears the input; Esc cancels); if it lists nothing or fails (`claude rm`
   refused over work chief can't see), "Cleanup blocked" says `Cleanup blocked: <why>.` and why no
   discard is offered, and any key closes it; R show or hide resolved; Tab detail on
-  short terminals; s settings; ? help (any key closes); q or Ctrl+C quit the board only. Wake and
-  cleanup run one at a time on a worker thread ("waking …" in the status line).
+  short terminals; s settings; ? help (the keys, then what each mark and glyph means; any key or
+  click closes); q or Ctrl+C quit the board only. Wake and cleanup run one at a time on a worker
+  thread ("waking …" in the status line).
+- Mouse: a click selects a row (the coordinator or a thread), a click on the selected row is Enter,
+  a click on the Resolved header is R, the wheel moves the selection. Each frame records which
+  screen row holds what (`App::hits`) for this. In settings a click puts the cursor on a field and
+  the wheel moves it.
 - Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
   `pane::request_switch`, which signals the running `chief pane` unless it already shows the
   target or no pane runs (§9).
-- Settings screen (`s`) edits a draft of `project.toml`: goal, coordinator model and effort, thread
+- Settings screen (`s`), a panel titled `Settings · <name>` (`· unsaved` while the draft differs),
+  edits a draft of `project.toml` in four sections: Project (goal, the repos, add repo, default
+  repo, the two files, notify), Coordinator (model, effort), Threads (model, effort, permission
+  mode, max_parallel, cleanup) and Accounts (the account, thread accounts, max usage, account
+  trust and its untrusted pairs), then Save. Under the form one line says what the field under the
+  cursor does (`Field::help`), unless a message replaces it; Ctrl+S saves from any field. The
+  fields: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, thread accounts (`[threads] accounts`, ids split
   on commas or spaces, empty = `[]`, shown "(none: the project's account)"), max usage (a percent
   1–100, empty = none), default repo, cleanup (merged/manual),
@@ -1202,9 +1266,8 @@ are tested without a terminal (`TestBackend`).
   own account included when it is in the pool): its value says `checking…`, `trusted in <labels>`,
   `N untrusted · checked <labels>`, "no agp pool: threads use the project's account", or why the check
   failed (accounts it couldn't check go in the message). Each untrusted pair gets a line
-  (`untrusted  <label> · <repo>`); on it the message shows the fix and Enter runs `agp exec <id> --
-  claude` in that repo on the board's terminal (as for the editor, below), then says whether it
-  took and checks again. Efforts, modes,
+  (`untrusted  <label> · <repo>`); on it the message says what Enter does, and Enter marks that
+  repo trusted in that account (§3 "Trust") on a worker, then checks again (`Msg::Trusted`). Efforts, modes,
   default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal, max_parallel, thread
   accounts and max usage are free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
   errors shown in the form), writes with `save`, regenerates `generated/*`, and says "Saved. New
@@ -1212,12 +1275,61 @@ are tested without a terminal (`TestBackend`).
   with unsaved changes asks for a second Esc. Two entries open `instructions.md` and
   `memory/MEMORY.md` in `$EDITOR` (run through `sh -c`, so arguments work; fallback `vi`): the
   board leaves the alternate screen and raw mode, runs the editor on the same TTY, and restores.
-- Terminal: `ratatui::init` (alternate screen, raw mode, a panic hook that restores the terminal);
-  restored on quit and on error; input is polled every 100 ms, results are drained between frames,
+- Terminal: `tui::init`, which is `ratatui::init` (alternate screen, raw mode, a panic hook that
+  restores the terminal) plus mouse reporting, which its own panic hook turns off too; restored on
+  quit and on error; the editor gets the terminal through `tui::suspended` (mouse, alternate screen
+  and raw mode off, then back). Input is polled every 100 ms, results are drained between frames,
   and resizes take effect on the next frame.
 - A thread with `cleanup_blocked` shows a "cleanup blocked" tag (the reason in the detail); a
   cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread
   and for one removed outside chief.
+
+## 10a. Launcher
+
+`chief` with no command (`src/launcher/`): `app.rs` holds the state and turns keys and clicks into
+actions, `ui.rs` draws it, `wizard.rs` is the new-project wizard, `mod.rs` runs the loop and the
+worker. It needs a terminal on stdin and stdout; otherwise it fails with "chief needs a terminal;
+`chief --help` lists the commands for scripts". The look is the board's (§10 "Look"): one card,
+at most 76 columns wide, centred, a line below the top, as tall as its content, the key bar right
+under it.
+
+- Project list (`Your projects`): each registered project's name in bold with a summary at the
+  right, from project.toml and its stored rows only, so it opens at once (`1 waiting · 2 working`,
+  in red while one waits; `no threads yet`; `all resolved`; `can't read project.toml: …`), and its
+  goal dim below. Then `+ New project`. ↑/↓, j/k, g/G and the wheel move; Enter or a click on the
+  selection opens the selected project, or the wizard on `+ New project`; n starts the wizard from
+  anywhere; ? explains what chief does and the keys; q or Esc quits. With no projects the
+  launcher opens on the wizard, and Esc from its first step quits. `chief new` opens on the
+  wizard too.
+- Wizard, four steps, `New project · step N of 4` with `✓ About  ● Code  ○ Models  ○ Review`
+  below the title. Esc (or Shift+Tab) goes back a step and keeps what was typed; on the first step
+  it cancels.
+  1. About: Name (required; its slug shows under it; Enter refuses an empty name, one with no
+     letter or digit, and a slug a project has, `project::slug_taken`) and Goal (optional). Tab or
+     ↑/↓ switch fields; Enter on the name moves to the goal, Enter on the goal goes on.
+  2. Code: the repository folders threads work in, starting with the git repository the launcher
+     runs in (the folder holding `.git` above its cwd), if any. Type a path (`~` works; Tab
+     completes the last folder name, or the prefix the matches share) and Enter adds it,
+     canonical; a missing folder or one listed already says so. ↑ selects listed folders, d
+     removes one. Enter with nothing typed goes on; none is fine.
+  3. Models: coordinator model and effort, thread model and effort (←/→ cycle `opus`, `sonnet`,
+     `haiku` and §3's efforts), defaults from `ProjectConfig::new`, a line on what each does, and
+     a note that the rest is on the board (s).
+  4. Review: name and slug, goal, code, models; when the project's account (this process's
+     `CLAUDE_CONFIG_DIR`, as for `init`) doesn't trust some repos, lists them with
+     `[x] Trust them, as accepting Claude's trust prompt would` (Space toggles). Enter creates.
+- Creating (`launcher::create`, on a worker): `project::create_with` (`init`'s validation and
+  files, with the wizard's models and efforts), then `trust::check`: the project folder is
+  marked, and the repos in every account when the box was ticked (else a warning names
+  `chief trust <slug>`); then `project::up_with`. Opening a listed project runs `up_with` alone.
+  The "Starting <name>" card shows each report as it comes (`✓` done, `!` warning) under a
+  spinner, then where the conversation is: Rex (`Open in Rex session chief-<slug>: the
+  conversation with the coordinator on the left, its threads on the right.`, or to switch to it in
+  the app when Rex couldn't), tmux likewise, or neither: Enter leaves the launcher, prints
+  `chief board --project <slug>` to run elsewhere, and runs `chief pane` in this terminal (§9).
+  A failure shows in red; before the project existed (`Msg::Created`), Enter goes back to the
+  wizard as it was, after it back to the list. The list is re-read once a project is made or
+  opened. q quits at any time; the worker's session keeps starting.
 
 ## 11. Testing
 
@@ -1247,6 +1359,9 @@ are tested without a terminal (`TestBackend`).
   `$CLAUDE_CONFIG_DIR/fake-<key>.stdout[.<k>]` before its own canned output, so each account has
   its own sessions. It numbers calls with exclusive creates, since chief lists several accounts
   at once (§3).
+- The launcher's wizard and screens are tested without a terminal (a `Probe` answers its slug and
+  trust checks); its create step runs end to end against the fake in `tests/launcher.rs`, a test
+  binary with one test, since that step reads chief's environment variables in-process.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
 
 ## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)

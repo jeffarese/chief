@@ -68,23 +68,36 @@ fn init_creates_the_project() {
         text.contains("Created project \"Payments Latency\" (payments-latency)"),
         "{text}"
     );
-    // stdin isn't a terminal: no prompt, just the commands.
+    // chief made the project folder, so it trusts it without asking (§3 "Trust").
+    assert!(
+        text.contains(&format!("Trusted {}.", dir.display())),
+        "{text}"
+    );
+    assert!(chief::claude::is_trusted_in(&home.trust, &dir).unwrap());
+    // The user's untrusted repo is listed; stdin isn't a terminal, so no prompt, just the fix.
     assert!(!text.contains("[Y/n]"), "{text}");
+    assert!(text.contains(&format!("\n  {}\n", b.display())), "{text}");
+    assert!(!text.contains(&format!("\n  {}\n", a.display())), "{text}");
+    assert!(!chief::claude::is_trusted_in(&home.trust, &b).unwrap());
     assert!(
-        text.contains(&format!("cd {} && claude", dir.display())),
+        text.contains("To trust them later: chief trust payments-latency"),
         "{text}"
     );
     assert!(
-        text.contains(&format!("cd {} && claude", b.display())),
+        text.ends_with("Next: chief up payments-latency (or run chief and pick it)\n"),
         "{text}"
     );
-    assert!(
-        !text.contains(&format!("cd {} && claude", a.display())),
-        "{text}"
-    );
-    assert!(
-        text.ends_with("Next: chief up payments-latency\n"),
-        "{text}"
+
+    // `chief trust` is the yes: it marks the rest, and says when nothing is left.
+    let out = home.run(&["trust", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), format!("Trusted {}.\n", b.display()));
+    assert!(chief::claude::is_trusted_in(&home.trust, &b).unwrap());
+    assert!(chief::claude::is_trusted_in(&home.trust, &a).unwrap());
+    let out = home.run(&["trust", SLUG], "");
+    assert_eq!(
+        stdout(&out),
+        "Every folder of payments-latency is trusted already.\n"
     );
 
     let config = ProjectConfig::load(&dir.join("project.toml")).unwrap();
@@ -169,8 +182,8 @@ fn init_creates_the_project() {
 }
 
 /// With agp, threads may run in any pool account, each with its own trust (§3): `init` lists
-/// every (account, repo) pair that isn't trusted yet with the command that fixes it, leaving out
-/// the project's own account (listed as before) and accounts outside the pool.
+/// every (account, repo) pair that isn't trusted yet, leaving out the project's own account
+/// (listed as before) and accounts outside the pool; `chief trust` marks them.
 #[test]
 fn init_checks_trust_in_every_pool_account() {
     let home = Home::new();
@@ -199,26 +212,32 @@ fn init_checks_trust_in_every_pool_account() {
         text.contains("Threads can also run in these agp accounts: Main, PB2, PB3."),
         "{text}"
     );
-    let fix = format!("cd {} && agp exec cpb -- claude", b.display());
     assert!(
-        text.contains(&format!("PB2 doesn't trust {}", b.display())),
+        text.contains(&format!("  {} (in PB2)\n", b.display())),
         "{text}"
     );
-    assert!(text.contains(&format!("  {fix}")), "{text}");
     assert!(
-        !text.contains(&format!("PB2 doesn't trust {}\n", a.display())),
+        !text.contains(&format!("  {} (in PB2)", a.display())),
         "{text}"
     );
-    assert!(!text.contains("PB3 doesn't trust"), "{text}");
+    assert!(!text.contains("(in PB3)"), "{text}");
     assert!(!text.contains("PB4"), "not in the pool: {text}");
     assert!(
-        !text.contains("Main doesn't trust"),
+        !text.contains("(in Main)"),
         "the project's own account: {text}"
     );
     assert!(
-        text.ends_with("Next: chief up payments-latency\n"),
+        text.contains("To trust them later: chief trust payments-latency"),
         "{text}"
     );
+    let out = home.run(&["trust", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("Trusted {} (in PB2).", b.display())),
+        "{}",
+        stdout(&out)
+    );
+    assert!(chief::claude::is_trusted_in(&cpb.join(".claude.json"), &b).unwrap());
 
     // A project on an agp account: agp runs without this shell's CLAUDE_CONFIG_DIR, so the
     // default account's folder is never taken for the project's.
@@ -251,11 +270,11 @@ fn init_checks_trust_in_every_pool_account() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(
-        text.contains(&format!("Main doesn't trust {}", a.display())),
+        text.contains(&format!("  {} (in Main)", a.display())),
         "{text}"
     );
     assert!(
-        !text.contains("PB3 doesn't trust"),
+        !text.contains("(in PB3)"),
         "the project's own account: {text}"
     );
     let execs: Vec<_> = agp
@@ -302,19 +321,14 @@ fn init_follows_claude_config_dir() {
     let dir = project_dir(&home);
     let config = ProjectConfig::load(&dir.join("project.toml")).unwrap();
     assert_eq!(config.claude_config_dir.as_deref(), Some(account.as_path()));
-    // Only the new project folder is untrusted; the repos are trusted in the account's file.
-    // Trusting it means running Claude in that account.
-    let in_account = |folder: &Path| {
-        format!(
-            "cd {} && CLAUDE_CONFIG_DIR={} claude",
-            folder.display(),
-            account.display()
-        )
-    };
-    assert!(text.contains(&in_account(&dir)), "{text}");
-    for repo in [&a, &b] {
-        assert!(!text.contains(&in_account(repo)), "{text}");
-    }
+    // Only the new project folder was untrusted, and chief trusts it in the account's own file;
+    // the repos are trusted there already.
+    assert!(
+        text.contains(&format!("Trusted {}.", dir.display())),
+        "{text}"
+    );
+    assert!(chief::claude::is_trusted_in(&account.join(".claude.json"), &dir).unwrap());
+    assert!(!text.contains("chief trust"), "{text}");
     assert!(
         home.fake
             .accounts()
@@ -739,18 +753,8 @@ fn up_starts_then_leaves_then_respawns_the_coordinator() {
     assert!(init(&home, &a, &b).status.success());
     let dir = project_dir(&home);
 
-    // The project folder isn't trusted yet.
-    let out = home.run(&["up", SLUG], "");
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("accept the trust prompt"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(home.fake.calls_of("--bg").is_empty());
-    assert!(db::get_coordinator(&home.db(), SLUG).unwrap().is_none());
-
-    trust_file(&home.trust, &[&dir]);
+    // A project from before chief trusted its own folder: `up` trusts it first.
+    trust_file(&home.trust, &[]);
     let name = "chief-payments-latency";
     let awake = agent("c0ffee", "coord-sid", name, "done", Some(74112));
     home.fake
@@ -762,6 +766,7 @@ fn up_starts_then_leaves_then_respawns_the_coordinator() {
         .set("agents.stdout", &json!([awake]).to_string());
     let out = home.run(&["up", SLUG], "");
     assert!(out.status.success(), "{}", stderr(&out));
+    assert!(chief::claude::is_trusted_in(&home.trust, &dir).unwrap());
     let text = stdout(&out);
     assert!(
         text.contains("Coordinator chief-payments-latency started."),
@@ -1165,6 +1170,7 @@ fn up_opens_then_reuses_the_rex_layout() {
     .to_vec();
     new.extend(["--keep-open", "--json", "--"].map(String::from));
     new.extend(block_command(&home, "pane"));
+    new.push("--layout".into());
     let mut run = [
         "run",
         "--autostart=false",
@@ -1335,6 +1341,7 @@ fn up_opens_a_tmux_window_and_down_closes_it() {
         "--",
     ]);
     new.extend(block_command(&home, "pane"));
+    new.push("--layout".into());
     let mut split = strings(&[
         "split-window",
         "-h",
@@ -1631,4 +1638,19 @@ fn down_closes_the_layout_and_stops_sessions() {
         db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
         Some("session:7")
     );
+}
+
+/// `chief` alone is the launcher (§10a); without a terminal it says so instead of drawing.
+#[test]
+fn the_launcher_needs_a_terminal() {
+    let home = Home::new();
+    for args in [&[][..], &["new"][..]] {
+        let out = home.run(args, "");
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("chief needs a terminal"),
+            "{}",
+            stderr(&out)
+        );
+    }
 }

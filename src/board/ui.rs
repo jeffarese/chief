@@ -1,19 +1,19 @@
-//! Drawing the board. It lives in a narrow right-hand pane, so every line is cut to the width with
-//! an ellipsis (never wrapped) except the detail panel's text.
+//! Drawing the board. It lives in a narrow right-hand pane, so every list line is cut to the width
+//! with an ellipsis (never wrapped); the detail panel's text wraps.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use unicode_width::UnicodeWidthChar;
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use crate::db::SessionRow;
 use crate::registry;
 use crate::state::Group;
 use crate::text::ago;
+use crate::tui::{self, bold, cols, dim, key_bar, panel, tail, truncate};
 
-use super::app::{App, Confirm, Item, Screen, group_of};
+use super::app::{App, Confirm, Hit, Item, Screen, group_of};
 use super::settings::{Field, SettingsForm};
 
 /// Below this many body lines the detail panel replaces the list (Tab) instead of sharing.
@@ -21,18 +21,27 @@ const SPLIT_MIN_BODY: u16 = 16;
 const TARGET_MARK: &str = "▸";
 
 pub const HELP: &[(&str, &str)] = &[
-    ("↑↓ j k", "move"),
-    ("Enter", "show thread in main pane"),
-    ("Esc c", "show coordinator"),
-    ("w", "wake (respawn) thread"),
+    ("↑↓ j k", "move (or the mouse wheel)"),
+    ("⏎ click", "show it in the main pane"),
+    ("Esc c", "back to the coordinator"),
+    ("w", "wake (respawn) a thread"),
     ("r", "resolve / reopen"),
-    ("o", "open pull request"),
-    ("x", "clean up resolved thread"),
+    ("o", "open the pull request"),
+    ("x", "clean up a resolved thread"),
     ("R", "show / hide resolved"),
     ("Tab", "detail (short terminals)"),
     ("s", "settings"),
-    ("?", "this help"),
     ("q", "quit the board"),
+];
+
+const LEGEND: &[(Group, &str)] = &[
+    (Group::Waiting, "waiting on you"),
+    (Group::Working, "working"),
+    (Group::Review, "ready for review"),
+    (Group::Landing, "landing"),
+    (Group::Idle, "idle"),
+    (Group::Failed, "failed"),
+    (Group::Resolved, "resolved"),
 ];
 
 fn style_of(group: Group) -> Style {
@@ -58,58 +67,6 @@ fn glyph(group: Group) -> &'static str {
         Group::Failed => "✗",
         Group::Resolved => "✓",
     }
-}
-
-fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
-}
-
-/// Cuts `s` to `width` terminal columns, ending in "…" when cut.
-pub fn truncate(s: &str, width: usize) -> String {
-    let full: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
-    if full <= width {
-        return s.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w > width - 1 {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out.push('…');
-    out
-}
-
-/// Cuts `s` from the left to `width` columns, so text being typed shows its end (the cursor).
-fn tail(s: &str, width: usize) -> String {
-    if cols(s) <= width {
-        return s.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut kept = Vec::new();
-    let mut used = 1;
-    for c in s.chars().rev() {
-        let w = c.width().unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        kept.push(c);
-        used += w;
-    }
-    std::iter::once('…').chain(kept.into_iter().rev()).collect()
-}
-
-fn cols(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
 /// Short tags after a thread's title.
@@ -159,14 +116,18 @@ pub fn display_title(row: &SessionRow) -> String {
         .unwrap_or_else(|| row.name.clone())
 }
 
-/// `▸● Title  asleep · PR open`, cut to `width`. The title gives way first, down to a few
-/// columns, so the tags stay readable.
-fn thread_line(row: &SessionRow, width: usize, selected: bool, target: bool) -> Line<'static> {
-    let group = group_of(row);
-    let mark = if target { TARGET_MARK } else { " " };
-    let tags = tags(row).join(" · ");
+/// `<mark><glyph> <title>  <tags>`, cut to `width`; the title gives way first, down to a few
+/// columns, so the tags stay readable. The selected line is highlighted across the width.
+fn row_line(
+    mark: bool,
+    glyph: Span<'static>,
+    title: String,
+    title_style: Style,
+    tags: String,
+    width: usize,
+    selected: bool,
+) -> Line<'static> {
     let avail = width.saturating_sub(3);
-    let title = display_title(row);
     let title_room = if tags.is_empty() {
         avail
     } else {
@@ -175,17 +136,13 @@ fn thread_line(row: &SessionRow, width: usize, selected: bool, target: bool) -> 
     let title = truncate(&title, title_room);
     let tag_room = avail.saturating_sub(cols(&title) + 2);
     let mut spans = vec![
-        Span::raw(mark.to_string()),
-        Span::styled(glyph(group).to_string(), style_of(group)),
-        Span::raw(" "),
         Span::styled(
-            title,
-            if group == Group::Resolved {
-                dim()
-            } else {
-                Style::new()
-            },
+            if mark { TARGET_MARK } else { " " }.to_string(),
+            Style::new().fg(tui::ACCENT),
         ),
+        glyph,
+        Span::raw(" "),
+        Span::styled(title, title_style),
     ];
     if !tags.is_empty() && tag_room > 1 {
         spans.push(Span::raw("  "));
@@ -196,19 +153,59 @@ fn thread_line(row: &SessionRow, width: usize, selected: bool, target: bool) -> 
         let used: usize = line.spans.iter().map(|s| cols(&s.content)).sum();
         line.spans
             .push(Span::raw(" ".repeat(width.saturating_sub(used))));
-        line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+        line = line.style(tui::selected());
     }
     line
 }
 
+fn thread_line(row: &SessionRow, width: usize, selected: bool, target: bool) -> Line<'static> {
+    let group = group_of(row);
+    let title_style = if group == Group::Resolved {
+        dim()
+    } else {
+        Style::new()
+    };
+    row_line(
+        target,
+        Span::styled(glyph(group).to_string(), style_of(group)),
+        display_title(row),
+        title_style,
+        tags(row).join(" · "),
+        width,
+        selected,
+    )
+}
+
+/// `▸◉ Coordinator  idle · 2 guard denials`: the conversation, always first.
+fn coordinator_line(app: &App, width: usize) -> Line<'static> {
+    let mut tags = coordinator_state(app);
+    if app.denials > 0 {
+        let noun = if app.denials == 1 {
+            "denial"
+        } else {
+            "denials"
+        };
+        tags.push_str(&format!(" · {} guard {noun}", app.denials));
+    }
+    row_line(
+        app.pane_target.is_none(),
+        Span::styled("◉".to_string(), Style::new().fg(tui::ACCENT)),
+        "Coordinator".to_string(),
+        bold(),
+        tags,
+        width,
+        app.on_coordinator,
+    )
+}
+
 fn header_line(group: Group, count: usize, collapsed: bool, width: usize) -> Line<'static> {
-    let mut text = format!("{} {count}", group.label());
+    let mut text = format!("{} · {count}", group.label());
     if collapsed {
         text.push_str(" · R shows");
     }
     let style = match group {
         Group::Waiting => style_of(group),
-        _ => Style::new().add_modifier(Modifier::BOLD),
+        _ => bold(),
     };
     Line::styled(truncate(&text, width), style)
 }
@@ -227,38 +224,9 @@ pub fn coordinator_state(app: &App) -> String {
     }
 }
 
-fn header(app: &App, width: usize, room: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::styled(
-        truncate(&app.config.name, width),
-        Style::new().add_modifier(Modifier::BOLD),
-    )];
-    if let Some(goal) = app.config.goal.as_deref().filter(|g| !g.trim().is_empty()) {
-        lines.push(Line::styled(truncate(goal, width), dim()));
-    }
-    let mark = if app.pane_target.is_none() {
-        TARGET_MARK
-    } else {
-        " "
-    };
-    let mut coord = format!("{mark}coordinator: {}", coordinator_state(app));
-    if app.denials > 0 {
-        let noun = if app.denials == 1 {
-            "denial"
-        } else {
-            "denials"
-        };
-        coord.push_str(&format!(" · {} guard {noun}", app.denials));
-    }
-    lines.push(Line::raw(truncate(&coord, width)));
-    // On a tiny terminal keep the name and the coordinator line.
-    if lines.len() as u16 > room && lines.len() == 3 {
-        lines.remove(1);
-    }
-    lines.truncate(room as usize);
-    lines
-}
-
-fn status_line(app: &App, width: usize) -> Line<'static> {
+/// The line above the key bar: a running worker, else the last action's result, else refresh
+/// errors, else the PR hint. None: the key bar alone.
+fn status_line(app: &App, width: usize) -> Option<Line<'static>> {
     let mut prefix = String::new();
     if app.pr.blocked > 0 || app.pr.errors > 0 {
         let mut parts = Vec::new();
@@ -283,36 +251,101 @@ fn status_line(app: &App, width: usize) -> Line<'static> {
         )
     } else if let Some(hint) = &app.pr_hint {
         (hint.clone(), dim())
+    } else if prefix.is_empty() {
+        return None;
     } else {
-        (
-            "⏎ show · w wake · r resolve · x clean · s settings · ? help · q quit".to_string(),
-            dim(),
-        )
+        (String::new(), dim())
     };
     let text = format!(
         "{prefix}{}",
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     );
-    Line::styled(truncate(&text, width), style)
+    Some(Line::styled(
+        truncate(text.trim_end_matches(" · "), width),
+        style,
+    ))
+}
+
+/// The keys that do something for the selection, most useful first; help always ends it.
+fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("⏎", "show")];
+    match app.selected_row() {
+        None => keys.push(("s", "settings")),
+        Some(row) => {
+            keys.push(("Esc", "coordinator"));
+            if row.resolved {
+                keys.push(("r", "reopen"));
+                if row.cleaned_at.is_none() {
+                    keys.push(("x", "clean up"));
+                }
+            } else {
+                keys.push(("r", "resolve"));
+                keys.push(("w", "wake"));
+            }
+            if row.pr_url.is_some() {
+                keys.push(("o", "PR"));
+            }
+        }
+    }
+    keys.push(("?", "help"));
+    keys
+}
+
+/// The key bar with `?` kept at the end when the rest doesn't fit.
+fn keys_line(keys: &[(&str, &str)], width: usize) -> Line<'static> {
+    let full = key_bar(keys, width);
+    let shown: usize = full.spans.iter().map(|s| cols(&s.content)).sum();
+    let all: usize = keys
+        .iter()
+        .map(|(k, w)| cols(k) + 1 + cols(w))
+        .sum::<usize>()
+        + 2 * keys.len().saturating_sub(1);
+    if shown == all || keys.len() < 2 {
+        return full;
+    }
+    let (last, rest) = keys.split_last().unwrap_or((&("", ""), &[]));
+    let room = width.saturating_sub(cols(last.0) + 1 + cols(last.1) + 2);
+    let mut line = key_bar(rest, room);
+    let sep = if line.spans.is_empty() { "" } else { "  " };
+    line.spans.push(Span::raw(sep));
+    line.spans.extend(key_bar(&[*last], width).spans);
+    line
 }
 
 fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label} "), dim()),
+            Span::raw(value),
+        ])
+    };
     let Some(row) = app.selected_row() else {
-        let text = if app.threads.is_empty() {
-            "Ask the coordinator for work; its threads show up here."
+        let mut lines = vec![Line::styled(coordinator_state(app), Style::new())];
+        if let Some(c) = &app.coordinator {
+            if let Some(m) = c.model.as_deref() {
+                let effort = c
+                    .effort
+                    .as_deref()
+                    .map(|e| format!(" · {e}"))
+                    .unwrap_or_default();
+                lines.push(field("model", format!("{m}{effort}")));
+            }
+            lines.push(field("active", ago(app.now, c.last_activity_at)));
+        }
+        lines.push(Line::raw(""));
+        let guide = if app.threads.is_empty() {
+            "No threads yet. Tell the coordinator what you want done, in the main pane. It splits \
+             the work into threads that run in the background; they show up here, grouped by \
+             what they need from you."
         } else {
-            "No thread selected."
+            "The conversation in the main pane. ⏎ on a thread shows that thread there instead; Esc \
+             comes back here."
         };
-        return vec![Line::styled(text, dim())];
+        lines.push(Line::styled(guide, dim()));
+        return lines;
     };
     let group = group_of(row);
-    let mut lines = vec![
-        Line::styled(
-            display_title(row),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(truncate(&row.name, width), dim()),
-    ];
+    let mut lines = vec![Line::styled(truncate(&row.name, width), dim())];
     let mut state = group.label().to_string();
     if let Some(r) = &row.waiting_reason {
         state.push_str(&format!(": {r}"));
@@ -329,12 +362,6 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
         state.push_str(" · asleep");
     }
     lines.push(Line::styled(state, style_of(group)));
-    let field = |label: &str, value: String| {
-        Line::from(vec![
-            Span::styled(format!("{label} "), dim()),
-            Span::raw(value),
-        ])
-    };
     if let Some(b) = &row.branch {
         lines.push(field("branch", b.clone()));
     }
@@ -371,6 +398,7 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    app.hits.borrow_mut().clear();
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -379,20 +407,22 @@ pub fn draw(f: &mut Frame, app: &App) {
         return;
     }
     let width = area.width as usize;
-    let head = header(app, width, (area.height.saturating_sub(2) / 3).clamp(1, 3));
-    let [head_area, body, foot] = Layout::vertical([
-        Constraint::Length(head.len() as u16),
+    let status = status_line(app, width);
+    let [body, status_area, foot] = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(u16::from(status.is_some() && area.height > 2)),
         Constraint::Length(1),
     ])
     .areas(area);
-    f.render_widget(Paragraph::new(head), head_area);
-    f.render_widget(Paragraph::new(status_line(app, width)), foot);
+    if let Some(line) = status {
+        f.render_widget(Paragraph::new(line), status_area);
+    }
+    f.render_widget(Paragraph::new(keys_line(&board_keys(app), width)), foot);
 
     if body.height >= SPLIT_MIN_BODY {
         // The list takes what it needs up to 3/5 of the body; the detail gets the rest.
-        let wanted = if app.loaded { app.items().len() } else { 1 } as u16;
-        let list_h = wanted.clamp(3, body.height * 3 / 5);
+        let wanted = if app.loaded { app.items().len() } else { 1 } as u16 + goal_lines(app) + 2;
+        let list_h = wanted.clamp(5, body.height * 3 / 5);
         let [list_area, detail_area] =
             Layout::vertical([Constraint::Length(list_h), Constraint::Min(0)]).areas(body);
         draw_list(f, list_area, app);
@@ -410,45 +440,93 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
+fn goal_lines(app: &App) -> u16 {
+    u16::from(
+        app.config
+            .goal
+            .as_deref()
+            .is_some_and(|g| !g.trim().is_empty()),
+    )
+}
+
+/// The project's panel: its goal, the coordinator, then the threads by group.
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
-    if area.height == 0 {
+    // Too small for a frame: the bare list.
+    let framed = area.height >= 4 && area.width >= 12;
+    let inner = if framed {
+        let block = panel(&app.config.name, true);
+        let inner = tui::inside(&block, area);
+        f.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
+    if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let width = area.width as usize;
+    let width = inner.width as usize;
+    let mut lines: Vec<(Line, Option<Hit>)> = Vec::new();
+    if let Some(goal) = app.config.goal.as_deref().filter(|g| !g.trim().is_empty())
+        && inner.height >= 3
+    {
+        lines.push((Line::styled(truncate(goal, width), dim()), None));
+    }
+    let fixed = lines.len();
     if !app.loaded {
-        f.render_widget(Paragraph::new(Line::styled("Loading…", dim())), area);
+        lines.push((Line::styled("Loading…", dim()), None));
+        f.render_widget(
+            Paragraph::new(lines.into_iter().map(|(l, _)| l).collect::<Vec<_>>()),
+            inner,
+        );
         return;
     }
     let items = app.items();
-    let selected = app.selected.as_deref();
+    let selected = (!app.on_coordinator)
+        .then_some(app.selected.as_deref())
+        .flatten();
     let target = app.pane_target.as_deref();
     let mut sel_index = None;
-    let lines: Vec<Line> = items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| match item {
+    let mut list: Vec<(Line, Option<Hit>)> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        list.push(match item {
+            Item::Coordinator => {
+                if app.on_coordinator {
+                    sel_index = Some(i);
+                }
+                (coordinator_line(app, width), Some(Hit::Coordinator))
+            }
             Item::Header {
                 group,
                 count,
                 collapsed,
-            } => header_line(*group, *count, *collapsed, width),
+            } => (
+                header_line(*group, *count, *collapsed, width),
+                (*group == Group::Resolved).then_some(Hit::Resolved),
+            ),
             Item::Thread(row) => {
                 let is_sel = Some(row.name.as_str()) == selected;
                 if is_sel {
                     sel_index = Some(i);
                 }
-                thread_line(row, width, is_sel, Some(row.name.as_str()) == target)
+                (
+                    thread_line(row, width, is_sel, Some(row.name.as_str()) == target),
+                    Some(Hit::Thread(row.name.clone())),
+                )
             }
-            Item::Empty => Line::styled(truncate("No threads yet", width), dim()),
-        })
-        .collect();
+            Item::Empty => (Line::styled(truncate("No threads yet", width), dim()), None),
+        });
+    }
     // When the list overflows, the last line says what is below, so a collapsed Resolved header
     // past the fold is not invisible.
-    let overflow = lines.len() > area.height as usize && area.height > 1;
-    let h = area.height as usize - usize::from(overflow);
-    let mut top = app.scroll.get().min(lines.len().saturating_sub(h));
+    let room = (inner.height as usize).saturating_sub(fixed);
+    let overflow = list.len() > room && room > 1;
+    let h = room - usize::from(overflow);
+    let mut top = app.scroll.get().min(list.len().saturating_sub(h));
     if let Some(s) = sel_index {
-        if s < top {
+        if s < h {
+            // The first page holds it: show the coordinator and the first header too.
+            top = 0;
+        } else if s < top {
             // Show the group header above the first row of a group when scrolling up.
             top = s.saturating_sub(1);
         } else if s >= top + h {
@@ -457,11 +535,20 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     }
     app.scroll.set(top);
     let below = items.get(top + h..).unwrap_or_default();
-    let mut shown: Vec<Line> = lines.into_iter().skip(top).take(h).collect();
+    lines.extend(list.into_iter().skip(top).take(h));
     if overflow {
-        shown.push(more_line(below, width));
+        lines.push((more_line(below, width), None));
     }
-    f.render_widget(Paragraph::new(shown), area);
+    let mut hits = app.hits.borrow_mut();
+    for (i, (_, hit)) in lines.iter().enumerate() {
+        if let Some(hit) = hit {
+            hits.push((inner.y + i as u16, hit.clone()));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines.into_iter().map(|(l, _)| l).collect::<Vec<_>>()),
+        inner,
+    );
 }
 
 /// `↓ 3 more · Resolved 2 · R shows` for the items under the fold.
@@ -492,53 +579,72 @@ fn more_line(below: &[Item], width: usize) -> Line<'static> {
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .border_style(dim())
-        .title(Span::styled(" detail ", dim()));
-    let inner = block.inner(area);
+    let title = match app.selected_row() {
+        Some(row) => display_title(row),
+        None => "Coordinator".to_string(),
+    };
+    let block = panel(
+        &truncate(&title, (area.width as usize).saturating_sub(4)),
+        false,
+    );
+    let inner = tui::inside(&block, area);
     f.render_widget(block, area);
     let lines = detail(app, inner.width as usize);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-/// A box centred in `area`, at most `w`×`h`, never larger than `area`.
-fn centred(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width);
-    let h = h.min(area.height);
-    Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
-    }
-}
-
 fn draw_help(f: &mut Frame, area: Rect) {
-    let rect = centred(area, 44, HELP.len() as u16 + 2);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered().title(" keys · any key closes ");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    let width = inner.width as usize;
-    let lines: Vec<Line> = HELP
+    let mut lines: Vec<Line> = HELP
         .iter()
         .map(|(k, what)| {
-            let text = format!("{k:<7} {what}");
-            Line::raw(truncate(&text, width))
+            Line::from(vec![
+                Span::styled(format!("{k:<8}"), Style::new().fg(tui::ACCENT)),
+                Span::raw(*what),
+            ])
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("What the marks mean", bold()));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{TARGET_MARK:<8}"), Style::new().fg(tui::ACCENT)),
+        Span::raw("shown in the main pane"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<8}", "◉"), Style::new().fg(tui::ACCENT)),
+        Span::raw("the coordinator"),
+    ]));
+    lines.extend(LEGEND.iter().map(|(group, what)| {
+        Line::from(vec![
+            Span::styled(format!("{:<8}", glyph(*group)), style_of(*group)),
+            Span::raw(*what),
+        ])
+    }));
+    let rect = tui::centred(area, 46, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    let block = panel("Help · any key closes", true);
+    let inner = tui::inside(&block, rect);
+    f.render_widget(block, rect);
+    let width = inner.width as usize;
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .map(|l| {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            if cols(&text) <= width {
+                l
+            } else {
+                Line::raw(truncate(&text, width))
+            }
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
-    let rect = centred(area, area.width, area.height);
+    let rect = tui::centred(area, area.width, area.height);
     f.render_widget(Clear, rect);
     if c.confirmed.is_none() {
         // chief can't list what a discard would lose, so there is nothing to confirm.
-        let block = Block::bordered()
-            .border_style(Style::new().fg(Color::Yellow))
-            .title(" Cleanup blocked ");
+        let block = panel("Cleanup blocked", true).border_style(Style::new().fg(Color::Yellow));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let [text_area, foot] =
@@ -546,17 +652,12 @@ fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
         let text: Vec<Line> = c.loss.lines().map(|l| Line::raw(l.to_string())).collect();
         f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), text_area);
         f.render_widget(
-            Paragraph::new(Line::styled(
-                "Any key closes.",
-                Style::new().add_modifier(Modifier::BOLD),
-            )),
+            Paragraph::new(Line::styled("Any key closes.", bold())),
             foot,
         );
         return;
     }
-    let block = Block::bordered()
-        .border_style(Style::new().fg(Color::Red))
-        .title(" Discard unsaved work? ");
+    let block = panel("Discard unsaved work?", true).border_style(Style::new().fg(Color::Red));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     // The prompt and the input sit on fixed lines at the bottom; only the loss text is cut.
@@ -574,7 +675,7 @@ fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
                 "Type {} and press Enter to discard it and clean up. Esc cancels.",
                 c.name
             ),
-            Style::new().add_modifier(Modifier::BOLD),
+            bold(),
         ))
         .wrap(Wrap { trim: true }),
         prompt_area,
@@ -583,93 +684,160 @@ fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     f.render_widget(Paragraph::new(input), input_area);
 }
 
+fn settings_keys(form: &SettingsForm) -> Vec<(&'static str, &'static str)> {
+    if form.editing.is_some() {
+        return vec![("⏎", "apply"), ("Esc", "cancel"), ("^U", "clear")];
+    }
+    let mut keys = match form.current() {
+        Field::Repo(_) => vec![("d", "remove")],
+        Field::Untrusted(_) => vec![("⏎", "trust it")],
+        Field::CoordinatorEffort
+        | Field::ThreadEffort
+        | Field::PermissionMode
+        | Field::DefaultRepo
+        | Field::Cleanup
+        | Field::Notify
+        | Field::MaxParallel => vec![("←→", "change")],
+        Field::PoolTrust => vec![("⏎", "check")],
+        Field::EditInstructions | Field::EditMemory => vec![("⏎", "open in $EDITOR")],
+        Field::AddRepo => vec![("⏎", "add")],
+        Field::Save => vec![("⏎", "save")],
+        Field::Account => vec![],
+        _ => vec![("⏎", "edit")],
+    };
+    keys.extend([("^S", "save"), ("Esc", "back")]);
+    keys
+}
+
 fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
-    let width = area.width as usize;
-    let [head, body, msg, foot] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(if area.height >= 8 { 2 } else { 1 }),
-        Constraint::Length(1),
-    ])
-    .areas(area);
     let title = format!(
         "Settings · {}{}",
         app.config.name,
         if form.dirty() { " · unsaved" } else { "" }
     );
-    f.render_widget(
-        Paragraph::new(Line::styled(
-            truncate(&title, width),
-            Style::new().add_modifier(Modifier::BOLD),
-        )),
-        head,
-    );
+    let framed = area.height >= 6 && area.width >= 12;
+    let (inner, foot) = if framed {
+        let [panel_area, foot] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        let block = panel(
+            &truncate(&title, (area.width as usize).saturating_sub(4)),
+            true,
+        );
+        let inner = tui::inside(&block, panel_area);
+        f.render_widget(block, panel_area);
+        (inner, foot)
+    } else {
+        let [head, inner, foot] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        f.render_widget(
+            Paragraph::new(Line::styled(truncate(&title, area.width as usize), bold())),
+            head,
+        );
+        (inner, foot)
+    };
+    let width = inner.width as usize;
+    let note_h = if inner.height >= 10 {
+        2
+    } else {
+        u16::from(inner.height >= 4)
+    };
+    let [body, note] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(note_h)]).areas(inner);
 
     let fields = form.fields();
     let label_w = (width / 2).min(19);
-    let lines: Vec<Line> = fields
-        .iter()
+    let mut lines: Vec<(Line, Option<usize>)> = Vec::new();
+    let mut cursor_line = 0;
+    let mut section = "";
+    for (i, field) in fields.iter().enumerate() {
+        if field.section() != section {
+            section = field.section();
+            if !lines.is_empty() {
+                lines.push((Line::raw(""), None));
+            }
+            if !section.is_empty() {
+                lines.push((
+                    Line::styled(
+                        truncate(section, width),
+                        Style::new().fg(tui::ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    None,
+                ));
+            }
+        }
+        let current = i == form.cursor;
+        if current {
+            cursor_line = lines.len();
+        }
+        let value = match (&form.editing, current) {
+            (Some(text), true) => format!("{text}▏"),
+            _ => form.value(*field),
+        };
+        let label = match field {
+            Field::Repo(_) => "repo",
+            Field::Untrusted(_) => "untrusted",
+            other => other.label(),
+        };
+        let text = if value.is_empty() {
+            format!(" {label}")
+        } else {
+            format!(" {:<label_w$} {value}", truncate(label, label_w))
+        };
+        let text = if current && form.editing.is_some() {
+            tail(&text, width)
+        } else {
+            truncate(&text, width)
+        };
+        let mut style = Style::new();
+        if matches!(field, Field::Save) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if current {
+            style = tui::selected();
+        }
+        let used = cols(&text);
+        let text = if current {
+            format!("{text}{}", " ".repeat(width.saturating_sub(used)))
+        } else {
+            text
+        };
+        lines.push((Line::styled(text, style), Some(i)));
+    }
+    let h = body.height as usize;
+    // Keep the cursor's section heading in view when it fits.
+    let top = cursor_line.saturating_sub(h.saturating_sub(1));
+    let mut hits = app.hits.borrow_mut();
+    let shown: Vec<Line> = lines
+        .into_iter()
+        .skip(top)
+        .take(h)
         .enumerate()
-        .map(|(i, field)| {
-            let current = i == form.cursor;
-            let value = match (&form.editing, current) {
-                (Some(text), true) => format!("{text}▏"),
-                _ => form.value(*field),
-            };
-            let label = match field {
-                Field::Repo(_) => "  repo",
-                Field::Untrusted(_) => "  untrusted",
-                other => other.label(),
-            };
-            let text = if value.is_empty() {
-                label.to_string()
-            } else {
-                format!("{:<label_w$} {value}", truncate(label, label_w))
-            };
-            let text = if current && form.editing.is_some() {
-                tail(&text, width)
-            } else {
-                truncate(&text, width)
-            };
-            let mut style = Style::new();
-            if matches!(field, Field::Save) {
-                style = style.add_modifier(Modifier::BOLD);
+        .map(|(row, (line, field))| {
+            if let Some(i) = field {
+                hits.push((body.y + row as u16, Hit::Field(i)));
             }
-            if current {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-            Line::styled(text, style)
+            line
         })
         .collect();
-    let h = body.height as usize;
-    let top = form.cursor.saturating_sub(h.saturating_sub(1));
-    f.render_widget(
-        Paragraph::new(lines.into_iter().skip(top).take(h).collect::<Vec<_>>()),
-        body,
-    );
+    f.render_widget(Paragraph::new(shown), body);
 
-    if let Some(m) = &form.message {
-        let style = if m.starts_with("Not saved") || m.contains("doesn't exist") {
-            Style::new().fg(Color::Red)
-        } else {
-            Style::new()
-        };
-        f.render_widget(
-            Paragraph::new(Line::styled(m.clone(), style)).wrap(Wrap { trim: true }),
-            msg,
-        );
-    }
-    let help = if form.editing.is_some() {
-        "type · ⏎ apply · Esc cancel · ^U clear"
-    } else {
-        match form.current() {
-            Field::Repo(_) => "d remove · ↑↓ move · Esc back",
-            Field::Untrusted(_) => "⏎ open Claude there to trust it · ↑↓ move · Esc back",
-            _ => "↑↓ move · ←→ change · ⏎ edit/run · Esc back",
+    let (text, style) = match &form.message {
+        Some(m) if m.starts_with("Not saved") || m.contains("doesn't exist") => {
+            (m.clone(), Style::new().fg(Color::Red))
         }
+        Some(m) => (m.clone(), Style::new()),
+        None => (form.current().help().to_string(), dim()),
     };
     f.render_widget(
-        Paragraph::new(Line::styled(truncate(help, width), dim())),
+        Paragraph::new(Line::styled(text, style)).wrap(Wrap { trim: true }),
+        note,
+    );
+    f.render_widget(
+        Paragraph::new(keys_line(&settings_keys(form), area.width as usize)),
         foot,
     );
 }
@@ -677,11 +845,12 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::app::Action;
     use crate::board::app::Msg;
     use crate::board::app::tests::{NOW, app_with, ch, key, thread};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -732,17 +901,18 @@ mod tests {
         let mut app = busy_board();
         app.on_key(ch('j'));
         app.on_key(ch('j'));
-        let out = render(&app, 40, 24);
+        // Inside the panel's frame and margin the list is 40 columns wide.
+        let out = render(&app, 44, 24);
         for want in [
-            "Demo",
+            "╭ Demo ",
             "Ship it",
-            "▸coordinator: asleep · 2 guard denials",
-            "Waiting on you 1",
+            "▸◉ Coordinator  asleep · 2 guard denials",
+            "Waiting on you · 1",
             "Approve the migration  permission",
-            "Working 1",
-            "Ready for review 1",
+            "Working · 1",
+            "Ready for review · 1",
             "Speed up che…  asleep · PR open · PB2",
-            "Resolved 1 · R shows",
+            "Resolved · 1 · R shows",
             "branch",
             "https://github.com/o/r/pull/42",
             "sonnet · high",
@@ -754,11 +924,11 @@ mod tests {
         assert!(!out.contains("Old work"), "resolved collapsed:\n{out}");
         // The long title is cut, never wrapped.
         let long = out.lines().find(|l| l.contains("A very long")).unwrap();
-        assert!(long.ends_with('…'), "{long:?}");
-        assert!(cols(long) <= 40);
+        assert!(long.trim_end_matches(['│', ' ']).ends_with('…'), "{long:?}");
+        assert!(cols(long) <= 44);
         assert!(!out.contains("honestly"));
         for line in out.lines() {
-            assert!(cols(line) <= 40, "{line:?}");
+            assert!(cols(line) <= 44, "{line:?}");
         }
     }
 
@@ -766,7 +936,7 @@ mod tests {
     fn short_board_says_what_is_below_the_fold() {
         let app = busy_board();
         let out = render(&app, 40, 8);
-        assert!(out.contains("↓ 1 more · Resolved 1 · R shows"), "{out}");
+        assert!(out.contains("↓ 2 more · Resolved 1 · R shows"), "{out}");
         assert!(!out.contains("Old work"), "{out}");
         for line in out.lines() {
             assert!(cols(line) <= 40, "{line:?}");
@@ -793,7 +963,8 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         let out = render(&app, 40, 24);
         assert!(out.contains("▸! Approve the migration"), "{out}");
-        assert!(out.contains(" coordinator: asleep"), "{out}");
+        assert!(out.contains(" ◉ Coordinator  asleep"), "{out}");
+        assert!(!out.contains("▸◉"), "{out}");
     }
 
     #[test]
@@ -808,7 +979,7 @@ mod tests {
         app.on_key(key(KeyCode::Tab));
         let out = render(&app, 30, 10);
         assert!(out.contains("demo-perm-1a2b"), "{out}");
-        assert!(!out.contains("Working 1"), "{out}");
+        assert!(!out.contains("Working · 1"), "{out}");
         for screen in ['?', 's'] {
             let mut app = busy_board();
             app.on_key(ch(screen));
@@ -847,7 +1018,10 @@ mod tests {
         let app = app_with(vec![]);
         let out = render(&app, 40, 24);
         assert!(out.contains("No threads yet"), "{out}");
-        assert!(out.contains("Ask the coordinator"), "{out}");
+        // The coordinator is selected, and its detail says how to start.
+        assert!(out.contains("╭ Coordinator "), "{out}");
+        assert!(out.contains("Tell the coordinator"), "{out}");
+        assert!(out.contains("⏎ show  s settings  ? help"), "{out}");
     }
 
     #[test]
@@ -872,13 +1046,31 @@ mod tests {
     fn settings_screen_renders_fields() {
         let mut app = busy_board();
         app.on_key(ch('s'));
-        let out = render(&app, 40, 24);
-        for want in ["Settings · Demo", "Coordinator model", "opus", "Save"] {
+        let out = render(&app, 48, 40);
+        for want in [
+            "Settings · Demo",
+            "Project",
+            "Coordinator",
+            "Coordinator model",
+            "opus",
+            "Accounts",
+            "Save",
+            "What the project is for",
+            "⏎ edit  ^S save  Esc back",
+        ] {
             assert!(out.contains(want), "missing {want:?}\n{out}");
         }
         app.on_key(key(KeyCode::Enter));
-        let out = render(&app, 40, 24);
+        let out = render(&app, 48, 40);
         assert!(out.contains("Ship it▏"), "{out}");
+        assert!(out.contains("⏎ apply  Esc cancel"), "{out}");
+        // The cursor stays in view on a short screen.
+        app.on_key(key(KeyCode::Esc));
+        for _ in 0..30 {
+            app.on_key(ch('j'));
+        }
+        let out = render(&app, 40, 14);
+        assert!(out.contains(" Save"), "{out}");
     }
 
     /// §5 "Background work": its own turn may have ended, so the tag says what still runs.
@@ -893,6 +1085,75 @@ mod tests {
         );
         row.resolved = true;
         assert!(!tags(&row).iter().any(|t| t.contains("subagent")));
+    }
+
+    /// The key bar names what works on the selection, and always keeps `? help`.
+    #[test]
+    fn the_key_bar_follows_the_selection() {
+        let mut app = busy_board();
+        let out = render(&app, 70, 24);
+        assert!(
+            out.contains("⏎ show  Esc coordinator  r resolve  w wake  ? help"),
+            "{out}"
+        );
+        let out = render(&app, 30, 24);
+        let foot = out.lines().last().unwrap();
+        assert!(foot.ends_with("? help"), "{foot:?}");
+        app.on_key(ch('g'));
+        assert!(app.on_coordinator);
+        assert!(render(&app, 70, 24).contains("⏎ show  s settings  ? help"));
+        app.on_key(ch('R'));
+        app.on_key(ch('G'));
+        let out = render(&app, 70, 30);
+        assert!(out.contains("r reopen  x clean up"), "{out}");
+    }
+
+    #[test]
+    fn clicks_select_then_show() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut app = busy_board();
+        let out = render(&app, 40, 24);
+        let y = |text: &str| out.lines().position(|l| l.contains(text)).unwrap() as u16;
+        assert!(app.on_mouse(click(y("Speed up"))).is_empty());
+        assert_eq!(app.selected.as_deref(), Some("demo-pr-5e6f"));
+        assert_eq!(
+            app.on_mouse(click(y("Speed up"))),
+            [Action::Show(Some("demo-pr-5e6f".into()))]
+        );
+        app.on_mouse(click(y("Coordinator")));
+        assert!(app.on_coordinator);
+        assert_eq!(app.on_mouse(click(y("Coordinator"))), [Action::Show(None)]);
+        // The collapsed Resolved header opens; the wheel moves the selection.
+        app.on_mouse(click(y("Resolved · 1")));
+        assert!(app.show_resolved);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            ..click(0)
+        });
+        assert_eq!(app.selected.as_deref(), Some("demo-perm-1a2b"));
+        // A click where nothing is drawn does nothing.
+        assert!(app.on_mouse(click(200)).is_empty());
+    }
+
+    #[test]
+    fn help_explains_the_marks() {
+        let mut app = busy_board();
+        app.on_key(ch('?'));
+        let out = render(&app, 50, 30);
+        for want in [
+            "shown in the main pane",
+            "the coordinator",
+            "waiting on you",
+            "resolved",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
     }
 
     #[test]
