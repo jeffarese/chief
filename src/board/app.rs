@@ -175,6 +175,8 @@ pub struct App {
     pub scroll: Cell<usize>,
     /// Screen row → what is drawn there, from the last frame, for the mouse.
     pub hits: RefCell<Vec<(u16, Hit)>>,
+    /// Drawn beside its conversation in the built-in layout (§9), which takes Ctrl+\.
+    pub embedded: bool,
 }
 
 impl App {
@@ -204,6 +206,7 @@ impl App {
             now,
             scroll: Cell::new(0),
             hits: RefCell::new(Vec::new()),
+            embedded: false,
         }
     }
 

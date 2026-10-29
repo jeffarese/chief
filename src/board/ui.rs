@@ -287,6 +287,9 @@ fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             }
         }
     }
+    if app.embedded {
+        keys.push(("^\\", "conversation"));
+    }
     keys.push(("?", "help"));
     keys
 }
@@ -397,7 +400,12 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
+    draw_in(f, f.area(), app);
+}
+
+/// The board in `area` of the frame: all of it for `chief board`, the right side in the built-in
+/// layout. Mouse hits are recorded by row, so `area` spans the frame's height.
+pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
     app.hits.borrow_mut().clear();
     if area.width == 0 || area.height == 0 {
         return;
