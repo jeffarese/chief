@@ -72,7 +72,7 @@ pub fn run(new: bool) -> Result<()> {
     let mut app = Launcher::new(entries()?, cwd, new);
     let (tx, rx) = mpsc::channel();
 
-    let mut terminal = tui::init();
+    let mut terminal = tui::init()?;
     let exit = (|| -> Result<Option<(String, OnQuit)>> {
         loop {
             terminal.draw(|f| ui::draw(f, &app))?;
@@ -143,7 +143,11 @@ fn spawn(
         let mut send = |msg: Msg| {
             let _ = tx.send(msg);
         };
-        let result = job(&mut send).map_err(|e| format!("{e:#}"));
+        // A panic must still end the Starting card's spinner.
+        let result = match tui::catch(|| job(&mut send)) {
+            Ok(done) => done.map_err(|e| format!("{e:#}")),
+            Err(panic) => Err(format!("Starting crashed: {panic}")),
+        };
         send(Msg::Done(result));
     });
 }
@@ -201,4 +205,27 @@ pub fn create(draft: &Draft, send: &mut dyn FnMut(Msg)) -> Result<Where> {
         }));
     }
     open(&config.slug, send)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worker that panics still sends Done, so the Starting card stops spinning and says why.
+    #[test]
+    fn a_panicking_worker_still_finishes() {
+        let (tx, rx) = mpsc::channel();
+        spawn(tx, |send| {
+            send(Msg::Note(Note::Did("Created project.".into())));
+            panic!("boom")
+        });
+        let msgs: Vec<Msg> = rx.iter().collect();
+        assert_eq!(
+            msgs,
+            [
+                Msg::Note(Note::Did("Created project.".into())),
+                Msg::Done(Err("Starting crashed: boom".into())),
+            ]
+        );
+    }
 }

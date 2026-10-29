@@ -7,6 +7,7 @@ pub mod refresh;
 pub mod settings;
 pub mod ui;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -27,6 +28,9 @@ use refresh::Sources;
 const POLL: Duration = Duration::from_millis(100);
 
 pub fn run(project: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("chief board needs a terminal");
+    }
     let dir = crate::project::project_dir(project);
     let config = ProjectConfig::load(&dir.join("project.toml"))
         .with_context(|| format!("no usable chief project {project:?}"))?;
@@ -51,9 +55,13 @@ pub fn run(project: &str) -> Result<()> {
     let refresher = refresh::spawn(src.clone(), tx.clone());
     let mut app = App::new(project, dir, config, db::now_ms());
 
-    let mut terminal = tui::init();
-    let result = event_loop(&mut terminal, &mut app, &rx, |action| {
-        jobs::spawn(src.clone(), action, tx.clone(), refresher.kicker())
+    let shows = jobs::spawn_shows(src.clone(), tx.clone(), refresher.kicker());
+    let mut terminal = tui::init()?;
+    let result = event_loop(&mut terminal, &mut app, &rx, |action| match action {
+        Action::Show(target) => {
+            let _ = shows.send(target);
+        }
+        other => jobs::spawn(src.clone(), other, tx.clone(), refresher.kicker()),
     });
     tui::restore();
     result
@@ -80,7 +88,7 @@ fn event_loop(
                     Action::Quit => return Ok(()),
                     Action::Edit(path) => {
                         let msg = edit(terminal, &path);
-                        app.status = Some(msg);
+                        app.say(msg);
                     }
                     other => spawn(other),
                 }

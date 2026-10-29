@@ -1212,14 +1212,18 @@ are tested without a terminal (`TestBackend`).
   bar: the keys that act on the selection, most useful first, each `key what` with the key in
   the accent colour, whole hints only, `? help` kept at the end when the rest doesn't fit. Above
   it, when there is one, the status line: a running worker, else the last action's result
-  (cleared by the next key), else refresh errors, else the PR hint.
+  (cleared by the next key), else refresh errors, else the PR hint. Widths are counted per
+  grapheme, as ratatui draws them (an emoji with a variation selector or a joiner is one). In
+  messages, the home folder shows as `~` only where a path starts (the start of the text, or
+  after whitespace, a quote or `(`), never inside a longer path such as `/private/tmp/…`.
 - Layout, designed for a 40–70 column pane and usable down to 30: a panel titled with the project
   name holds the goal (one dim line), then the coordinator's row, then the groups in §5 order
   (`<label> · <count>`, Waiting in bold red), empty groups hidden, "No threads yet" when there
   are none, Resolved collapsed by default (`Resolved · N · R shows`). When the list doesn't fit,
   its last line says what is below (`↓ N more`, plus `· Resolved N · R shows` for a collapsed
   header under the fold; `↑ more above` at the bottom); while the selection is on the first page
-  the list starts at the top. The coordinator's row is `<target mark>◉ Coordinator  <state>`
+  the list starts at the top, and scrolling up shows a group's header with its first row when
+  both fit. The selection is always in view. The coordinator's row is `<target mark>◉ Coordinator  <state>`
   with the guard denial count when > 0 (`asleep · 2 guard denials`). A thread's row is
   `<target mark><glyph> <title or name>  <tags>`, cut to the width with an ellipsis and never
   wrapped; the title gives way first so tags stay readable. Tags:
@@ -1242,30 +1246,38 @@ are tested without a terminal (`TestBackend`).
   Esc or c shows the coordinator from anywhere; on the coordinator's row the thread keys (w, r,
   o, x) say they act on a thread; w wake (`tools::wake_thread`, refused for cleaned or removed); r resolve
   or reopen (`registry::set_resolved`, reason `user`; reopening a cleaned or removed thread is
-  refused with its message); o open the PR URL
+  refused with its message; the row flips on the board at once, so a second r before the
+  refresh undoes the first rather than sending it again); o open the PR URL
   (`open` on macOS, `xdg-open` elsewhere, output discarded); x clean up, only for a resolved,
   uncleaned thread: `cleanup::clean(Safe)`. When blocked, a fresh `cleanup::inspect` decides the
   modal: if it lists the loss, "Discard unsaved work?" shows why plus `cleanup::render_loss` and
   runs `clean(Discard(<that inspection>))` only after the thread's name is typed exactly (Enter
   with a wrong name clears the input; Esc cancels); if it lists nothing or fails (`claude rm`
   refused over work chief can't see), "Cleanup blocked" says `Cleanup blocked: <why>.` and why no
-  discard is offered, and any key closes it; R show or hide resolved; Tab detail on
+  discard is offered, and any key closes it. A modal that comes while settings is open waits
+  until settings closes (the form's message says so), so it never throws a draft away; R show or
+  hide resolved; Tab detail on
   short terminals; s settings; ? help (the keys, then what each mark and glyph means; any key or
   click closes); q or Ctrl+C quit the board only. Wake and cleanup run one at a time on a worker
-  thread ("waking …" in the status line).
+  thread ("waking …" in the status line). Shows run in order on one worker of their own: picks
+  that queue up while one runs are skipped for the newest, so the main pane ends on the last
+  pick.
 - Mouse: a click selects a row (the coordinator or a thread), a click on the selected row is Enter,
   a click on the Resolved header is R, the wheel moves the selection. Each frame records which
   screen row holds what (`App::hits`) for this. In settings a click puts the cursor on a field and
-  the wheel moves it.
+  the wheel moves it, except while a field is being typed into: then the mouse does nothing.
 - Showing a thread: write `ui_state.pane_target` (NULL for the coordinator), then call
   `pane::request_switch`, which signals the running `chief pane` unless it already shows the
   target or no pane runs (§9).
 - Settings screen (`s`), a panel titled `Settings · <name>` (`· unsaved` while the draft differs),
-  edits a draft of `project.toml` in four sections: Project (goal, the repos, add repo, default
+  edits a draft of `project.toml`, read again each time the screen opens so a save keeps edits
+  made by hand while the board ran (the board's name and goal follow them; if it can't be read,
+  the form says so and starts from the board's copy), in four sections: Project (goal, the repos, add repo, default
   repo, the two files, notify), Coordinator (model, effort), Threads (model, effort, permission
   mode, max_parallel, cleanup) and Accounts (the account, thread accounts, max usage, account
   trust and its untrusted pairs), then Save. Under the form one line says what the field under the
-  cursor does (`Field::help`), unless a message replaces it; Ctrl+S saves from any field. The
+  cursor does (`Field::help`), unless a message replaces it; Ctrl+S saves from any field (in a
+  text field being edited, it applies the text first; a bad value stays open with why). The
   fields: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, thread accounts (`[threads] accounts`, ids split
   on commas or spaces, empty = `[]`, shown "(none: the project's account)"), max usage (a percent
@@ -1279,19 +1291,33 @@ are tested without a terminal (`TestBackend`).
   `N untrusted · checked <labels>`, "no agp pool: threads use the project's account", or why the check
   failed (accounts it couldn't check go in the message). Each untrusted pair gets a line
   (`untrusted  <label> · <repo>`); on it the message says what Enter does, and Enter marks that
-  repo trusted in that account (§3 "Trust") on a worker, then checks again (`Msg::Trusted`). Efforts, modes,
+  repo trusted in that account (§3 "Trust") on a worker, then checks again (`Msg::Trusted`).
+  While a check runs, the last check's pairs stay listed and the cursor stays where it was;
+  Enter on a pair or on "Account trust" then says to wait. Efforts, modes,
   default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal, max_parallel, thread
-  accounts and max usage are free text (Enter edits, Enter applies, Esc cancels). Save validates (`ProjectConfig::validate`,
+  accounts and max usage are free text (Enter edits, Enter applies, Esc cancels; the edit
+  belongs to the field it was opened on, which Enter writes whatever the cursor is on). Save validates (`ProjectConfig::validate`,
   errors shown in the form), writes with `save`, regenerates `generated/*`, and says "Saved. New
-  threads use these settings; the coordinator's model and effort apply on its next start." Esc
+  threads use these settings; the coordinator's model and effort apply on its next start." When
+  `generated/*` can't be rewritten after project.toml was written, the save still counts:
+  "Saved, but generated/* wasn't rewritten: <why>…" (red). `Msg::Saved` carries the draft that
+  was sent, so edits made while the save ran stay in the draft, unsaved. Esc
   with unsaved changes asks for a second Esc. Two entries open `instructions.md` and
   `memory/MEMORY.md` in `$EDITOR` (run through `sh -c`, so arguments work; fallback `vi`): the
-  board leaves the alternate screen and raw mode, runs the editor on the same TTY, and restores.
-- Terminal: `tui::init`, which is `ratatui::init` (alternate screen, raw mode, a panic hook that
-  restores the terminal) plus mouse reporting, which its own panic hook turns off too; restored on
-  quit and on error; the editor gets the terminal through `tui::suspended` (mouse, alternate screen
-  and raw mode off, then back). Input is polled every 100 ms, results are drained between frames,
-  and resizes take effect on the next frame.
+  board leaves the alternate screen and raw mode, runs the editor on the same TTY, and restores;
+  what the editor run reports shows in the form's message.
+- Terminal: `chief board` needs a terminal on stdin and stdout; otherwise it fails with "chief
+  board needs a terminal". `tui::init` sets up the alternate screen, raw mode and mouse reporting
+  itself, not with `ratatui::init`, whose panic hook restores the terminal for a panic on any
+  thread: chief's hook restores it only for a panic on the thread that called `init`. A worker's
+  panic is not printed while the UI runs (it would land mid-screen); the worker runs under
+  `tui::catch`, which turns it into the worker's failure message (`Waking <name> crashed: <panic>
+  at <file:line>`, a save's `Not saved: …`, a trust check's failure), so `busy` and `checking…`
+  always end. A refresh thread that panics says `refresh crashed: …; trying again` in the status
+  line and starts its loop again after its interval. The terminal is restored on quit and on
+  error; the editor gets it through `tui::suspended` (mouse, alternate screen and raw mode off,
+  then back). Input is polled every 100 ms, results are drained between frames, and resizes take
+  effect on the next frame.
 - A thread with `cleanup_blocked` shows a "cleanup blocked" tag (the reason in the detail); a
   cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread
   and for one removed outside chief.
@@ -1302,8 +1328,12 @@ are tested without a terminal (`TestBackend`).
 actions, `ui.rs` draws it, `wizard.rs` is the new-project wizard, `mod.rs` runs the loop and the
 worker. It needs a terminal on stdin and stdout; otherwise it fails with "chief needs a terminal;
 `chief --help` lists the commands for scripts". The look is the board's (§10 "Look"): one card,
-at most 76 columns wide, centred, a line below the top, as tall as its content, the key bar right
-under it.
+at most 76 columns wide, centred, a line below the top, as tall as its content (wrapped lines
+counted as the drawing wraps them), the key bar right under it. On a short terminal a card's
+last lines (what Enter does, the trust box, the result or failure) stay whole at its bottom;
+the lines above are cut from the top, under `↑ more above`, so the newest notes and the folders
+next to the trust box are the ones that show. The terminal and worker panics are handled as on
+the board (§10 "Terminal"): a worker that panics ends the card with `Starting crashed: …`.
 
 - Project list (`Your projects`): each registered project's name in bold with a summary at the
   right, from project.toml and its stored rows only, so it opens at once (`1 waiting · 2 working`,
@@ -1321,7 +1351,9 @@ under it.
      ↑/↓ switch fields; Enter on the name moves to the goal, Enter on the goal goes on.
   2. Code: the repository folders threads work in, starting with the git repository the launcher
      runs in (the folder holding `.git` above its cwd), if any. Type a path (`~` works; Tab
-     completes the last folder name, or the prefix the matches share) and Enter adds it,
+     completes the last folder name, or the prefix the matches share, `~` alone to `~/`; when
+     nothing matches it says so, and when several share nothing longer it says how many; ^W
+     drops the last folder name, the one before a trailing `/` too; ^U clears) and Enter adds it,
      canonical; a missing folder or one listed already says so. ↑ selects listed folders, d
      removes one. Enter with nothing typed goes on; none is fine.
   3. Models: coordinator model and effort, thread model and effort (←/→ cycle `opus`, `sonnet`,
