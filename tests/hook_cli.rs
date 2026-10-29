@@ -428,6 +428,138 @@ fn guard_denies_at_its_deadline() {
     assert!(error_log(home.path()).contains("didn't decide within 1s"));
 }
 
+/// The watchdog also covers a `claude agents` that hangs, whose own bound (10 s) is longer than
+/// a shortened deadline.
+#[test]
+fn guard_denies_at_its_deadline_while_the_listing_hangs() {
+    let home = guarded_home();
+    home.fake.set("agents.sleep", "30");
+    let start = std::time::Instant::now();
+    let out = home
+        .command(&[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ])
+        .env("CHIEF_GUARD_DEADLINE_MS", "1000")
+        .output_with_stdin(&send("demo-a-1111"));
+    let took = start.elapsed();
+    // The guard exited at its deadline and left the hanging listing behind: stop it.
+    let listing = home
+        .fake
+        .calls()
+        .iter()
+        .position(|c| c.first().map(String::as_str) == Some("agents"))
+        .expect("the guard listed the sessions");
+    let pid = home.fake.pid(listing);
+    assert!(
+        Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(took < std::time::Duration::from_secs(4), "took {took:?}");
+    let reason = deny_reason(&out).unwrap();
+    assert!(reason.contains("didn't decide within 1s"), "{reason}");
+    assert!(error_log(home.path()).contains("didn't decide within 1s"));
+}
+
+/// A guard that fails after reading the payload records the call it blocked: the tool, the
+/// target and the caller.
+#[test]
+fn a_failed_guard_records_what_it_knows() {
+    let home = guarded_home();
+    home.fake
+        .set("agents.exit", "1")
+        .set("agents.stderr", "supervisor down");
+    let out = home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        &send("demo-a-1111"),
+    );
+    assert!(deny_reason(&out).unwrap().contains("supervisor down"));
+    let out = home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        "{not json",
+    );
+    assert!(deny_reason(&out).is_some());
+    let rows: Vec<(Option<String>, String, Option<String>)> = home
+        .db()
+        .prepare("SELECT session_name, tool, target FROM guard_denials ORDER BY ts, rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                Some("chief-demo".to_string()),
+                "SendMessage".to_string(),
+                Some("demo-a-1111".to_string())
+            ),
+            (None, "unknown".to_string(), None),
+        ]
+    );
+}
+
+/// A thread caller chief doesn't know (its session id after `/clear`) while a thread runs in
+/// another account: placed by its transcript's folder, and kept from its coordinator's name
+/// when that doesn't place it (§6).
+#[test]
+fn the_guard_places_an_unknown_thread_by_its_transcript() {
+    let home = guarded_home();
+    let cpb = common::account(home.path(), "claude-cpb");
+    {
+        let mut t = SessionRow::new("demo-far-3333", "demo", Role::Thread, db::now_ms());
+        t.session_id = Some("far-sid".into());
+        common::in_account(&mut t, "cpb", "PB2", Some(&cpb));
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    common::account_agents(&cpb, &[]);
+    let from_new = |transcript: Option<&Path>| {
+        let mut payload = serde_json::json!({
+            "session_id": "new-sid",
+            "tool_name": "SendMessage",
+            "tool_input": {"to": "chief-demo", "message": "done"},
+        });
+        if let Some(t) = transcript {
+            payload["transcript_path"] = t.to_string_lossy().into();
+        }
+        deny_reason(&home.run(
+            &["hook", "guard", "--project", "demo", "--role", "thread"],
+            &payload.to_string(),
+        ))
+    };
+    // The project's account is the default one, whose folder is the fake's.
+    let here = home.fake.config_dir().join("projects/-repo/new-sid.jsonl");
+    assert_eq!(from_new(Some(&here)), None);
+    let there = cpb.join("projects/-repo/new-sid.jsonl");
+    let reason = from_new(Some(&there)).unwrap();
+    assert!(reason.contains("another Claude account (PB2)"), "{reason}");
+    let reason = from_new(None).unwrap();
+    assert!(reason.contains("can't tell whether you run in"), "{reason}");
+    assert!(reason.contains("from=\"uds:"), "{reason}");
+}
+
 fn send(to: &str) -> String {
     serde_json::json!({
         "session_id": "coord-sid",

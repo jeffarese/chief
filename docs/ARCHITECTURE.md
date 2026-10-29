@@ -715,12 +715,21 @@ machines, cloud sessions, other accounts, Remote Control, other sessions' teamma
 subagents) match nothing and are denied. A session's own subagents are the one exception
 ("Subagents" below).
 
+Lookalikes count as taken. Wherever the guard asks whether another session has a name (the
+identity check's "no other entry carries that name" below, a subagent's name or agent id, and an
+Agent call's `name`, "Subagents" below), it compares the names' lookalike forms
+(`guard::lookalike`: format characters such as U+200B–U+200F, U+2060–U+2064, U+FEFF and the soft
+hyphen, and variation selectors, removed; then trimmed and lowercased). If Claude Code ever
+matched names loosely, a lookalike could reach the other session, so this only ever adds a
+denial; what the guard allows is still matched byte for byte.
+
 Reachable (the identity check, for a thread under its name and for the coordinator under
 `chief-<slug>`): the snapshot entry for the row's `session_id` (its `short_id` while the
 `session_id` is unresolved; never an entry found by name) has a pid and carries exactly that name,
-and no other snapshot entry, in any state, carries that name. Otherwise it is asleep (no entry, or
-no pid), renamed (the entry carries another name, so the name may reach someone else), or
-ambiguous (another entry carries the name too). A coordinator with no row counts as not running.
+and no other snapshot entry, in any state, carries that name or a lookalike of it. Otherwise it is
+asleep (no entry, or no pid), renamed (the entry carries another name, so the name may reach
+someone else), or ambiguous (another entry carries the name or a lookalike too). A coordinator
+with no row counts as not running.
 
 Threads in another account than the project's (§3). The coordinator's account (the project's)
 can't reach them by name (§1: the name reaches nothing there, or a session of that account), so
@@ -738,6 +747,21 @@ than your coordinator, and chief-<slug>'s name doesn't reach across accounts. To
 from it, send your reply to the exact `from="uds:…"` address in that message's header. Otherwise
 just finish your turn: …"; the coordinator's exact socket address is allowed as for any thread,
 checked in the coordinator's (the project's) account's listing.
+
+A thread caller whose `session_id` matches no row (its new id after `/clear`, before a hook or a
+sync stores it) is placed by the payload's `transcript_path`, which Claude Code keeps in the
+session's account folder (`<folder>/projects/…`; for the default account `~/.claude`, or
+`$CHIEF_CLAUDE_DIR` in tests): `..` components never match, and folders are also compared
+canonically. When no thread of the project that isn't cleaned up runs in another account
+(resolved and removed ones count: their sessions may still run), the caller runs in the
+project's account, as before. Otherwise a transcript under the project's account folder places
+it there; one under the folder of a thread's account places it in that account (the denial
+above); anything else, or no transcript, leaves it unknown, and `chief-<slug>` → deny: "chief
+doesn't know your session yet, so it can't tell whether you run in your coordinator's Claude
+account, and chief-<slug>'s name doesn't reach across accounts. To answer a message from it, …";
+the coordinator's exact socket address is allowed as for any thread. A transcript only ever
+moves a caller chief doesn't know from the project's account to another or to unknown: a
+caller matched by `session_id` keeps its row's account.
 
 Socket addresses are accepted only in the exact form Claude Code gives a session's socket (§1, the
 `from` of every cross-session message): `uds:/tmp/cc-socks/<pid>.sock`, the pid in decimal with no
@@ -760,15 +784,18 @@ subagents when the payload has a non-empty `agent_id`, which Claude Code sets, n
 
 - From a subagent: `to` exactly `team-lead` or `main` → allow.
 - From the session or one of its subagents: `to` exactly the agent id of one of the caller's
-  recorded subagents → allow (no session answers to an agent id). `to` exactly a recorded name →
-  allow, unless another session answers to that name: the coordinator (`chief-<slug>`), any
-  thread of the project (any state), or a session in the guard's fresh `claude agents` of the
-  project's account and of the caller's own (a thread in another account, §3) → deny: "<to> is
-  also the name of another Claude session, so a message to <to> could reach it instead of your
-  subagent. Message the subagent by its agent id <id>." A listing that couldn't be taken → deny,
-  saying so, with the same advice (the project's account failing is a guard failure, as always).
-  In-process names win only while the subagent lives in this process (§1), so a name another
-  session has could reach that session.
+  recorded subagents → allow, unless another session answers to it (below; no session should,
+  but one named like the id could get the message) → deny: "<to> is your subagent's agent id,
+  but another Claude session has that name too, …; message not sent." A missing listing doesn't
+  deny an agent id. `to` exactly a recorded name → allow, unless another session answers to that
+  name (or a lookalike of it, above): the coordinator (`chief-<slug>`), any thread of the project
+  (any state), or a session in the guard's fresh `claude agents` of the project's account and of
+  the caller's own (a thread in another account, §3) → deny: "<to> is also the name of another
+  Claude session, so a message to <to> could reach it instead of your subagent. Message the
+  subagent by its agent id <id>." A listing that couldn't be taken → deny, saying so, with the
+  same advice (the project's account failing is a guard failure, as always). In-process names
+  win only while the subagent lives in this process (§1), so a name another session has could
+  reach that session.
 - A name or id that isn't plain (letters, digits, `-`, `_`, `.`), and the names `team-lead` and
   `main`, are never taken as a subagent's address: Claude Code could read `uds:…`, a ` [ref]` or
   the lead's own names as something else. Deny, saying to use the agent id.
@@ -778,9 +805,9 @@ subagents when the payload has a non-empty `agent_id`, which Claude Code sets, n
 - Never another session's subagents: only the caller's own records are read. A `[ref]` matches no
   record and stays denied, with the bare-name advice.
 
-At spawn, an `Agent` call whose `tool_input.name` exactly equals the coordinator's name, the name
-of any thread of the project (any state, from the database), or a session in the fresh listings
-of the project's account and the caller's own is denied: "A Claude session is already named
+At spawn, an `Agent` call whose `tool_input.name` equals (or is a lookalike of, above) the
+coordinator's name, the name of any thread of the project (any state, from the database), or a
+session in the fresh listings of the project's account and the caller's own is denied: "A Claude session is already named
 <name>, and a subagent named <name> would get the messages meant for it. Pick another name for the
 subagent." In-process names win (§1), so that subagent would silently take the other session's
 messages. An Agent call without a `name`, with an empty one, or with a free one is allowed. When a
@@ -805,7 +832,7 @@ Time budget. When Claude Code's hook timeout fires it cancels the command and th
 explicitly (§3). Inside, `claude agents` is bounded at 10 s (a real bound, §7), and a watchdog
 denies at 20 s whatever the guard is still doing: "chief's message guard didn't decide within 20s,
 so the message is blocked. Try again; if it keeps happening, check <hook error log>." That covers
-SQLite busy waits, which are bounded only per statement (5 s, §4; the guard opens the database,
+a hanging `claude agents` together with the rest, and SQLite busy waits, which are bounded only per statement (5 s, §4; the guard opens the database,
 which runs the migration check, reads the rows, and inserts at most one denial). The watchdog's
 denial is logged to the hook error log, not to `guard_denials`: the database may be what is stuck.
 `CHIEF_GUARD_DEADLINE_MS` shortens the deadline for tests (it can only deny sooner).
@@ -814,7 +841,9 @@ Every deny writes a `guard_denials` row (caller matched by `session_id`, `target
 an Agent call's `name`) and
 returns the PreToolUse deny JSON above; an allow prints nothing. If the guard itself fails (bad
 payload, DB or `claude agents` error, or a panic), it denies with the error as the reason (fail
-closed), logs the error, and records the denial if the DB opens.
+closed), logs the error, and records the denial if the DB opens, with what the payload gives: the
+tool, the target and the caller (by `session_id`, when its row can be read); a payload that
+doesn't parse, or has no `tool_name`, is recorded as tool `unknown` with no target.
 
 ## 7. Coordinator MCP tools (`chief mcp --project <slug>`)
 
@@ -822,10 +851,10 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 
 | Tool | Input | Does |
 | --- | --- | --- |
-| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?`, `account?` (an agp id or label from the pool, only when the user asks) | Picks the thread's account (below), which also checks trust of the repo path there, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread in that account, resolves its ids. Returns `{name, short_id, repo, model, effort, account, address, next}` (`account` the agp label, null for the project's account), plus `account_note` when the choice skipped accounts or fell back, and `warning` when it adopted a session whose spawn reported a failure |
+| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?`, `account?` (an agp id or label from the pool, only when the user asks) | Picks the thread's account (below), which also checks trust of the repo path there, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread in that account, resolves its ids. Returns `{name, short_id, repo, model, effort, account, address, next}` (`account` the agp label, null for the project's account), plus `account_note` when the choice skipped accounts or fell back, and `warning` when it kept a session whose spawn reported a failure (adopted from a listing, or already attached by its hooks: `short_id` null then) or couldn't store the started session's ids |
 | `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` in every account the project uses (stored rows plus a `warning` naming what failed), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, running, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`, `account`, `address`; `running` is its background work (§5), e.g. `"1 subagent"`, or null. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text; with background work (§5) also `running` and a `note` that the thread isn't finished and reports when it is |
-| `wake_thread` | `name` | Refreshes from its own account; if no live pid: `claude respawn <short_id>` there, poll its account's `claude agents` up to 20 s for a pid. Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there). A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
+| `wake_thread` | `name` | Refreshes from its own account; if no live pid: `claude respawn <short_id>` there, poll its account's `claude agents` up to 20 s for a pid (each poll bounded by the time left, so a hanging listing ends the wait at 20 s; database busy waits are bounded only per statement, §4). Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there). A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
@@ -846,10 +875,24 @@ exactly the new name, whose `cwd` is the folder the spawn ran in (compared canon
 pre-spawn snapshot didn't list is adopted (its short id, session id and pid are stored) and the
 call succeeds with a `warning` that quotes the failure. A session with that name in another
 folder is someone else's (another chief home's, or the user's own). When listings
-succeed without it, the row is deleted and the error returned. When every listing fails, chief
-can't tell: the row is kept without a short id (hooks attach it by title if the session did start)
-and the error says so. Failing to resolve the session id is not an error (hooks match by title,
-sync by short id). `next` is
+succeed without it, chief reads the row first: a `session_id` there means a hook of the session
+already attached it (only a running session's hooks store one, §4), so it started, and the row is
+kept and the call succeeds with `short_id` null and a `warning` that quotes the failure (sync
+then matches it by session id). Otherwise the row is deleted and the error returned; a row that
+can't be read is kept, and the error says so. (The read and the delete are two statements: a
+hook that attaches the row between them loses it, as before this check.) When every listing
+fails, chief can't tell: the row is kept without a short id (hooks attach it by title if the
+session did start) and the error says so. Failing to resolve the session id is not an error
+(hooks match by title, sync by short id). Once the spawn returned an id (or a session was
+adopted), the session runs, so nothing after it fails the call, which the coordinator could
+retry into a duplicate: a database error while storing the ids (`database is locked`, say) is
+logged and the call succeeds with a `warning` that says not to start it again; the row is kept
+for hooks to attach by name, and the reply is built from what chief knows. A call the client
+cancels (MCP `notifications/cancelled`, or the server shutting down) starts nothing: rmcp cancels
+the request's token but lets the handler run on the blocking pool, so `start_thread` checks the
+token right before the spawn, deletes its row and returns "start_thread was cancelled …". After
+the spawn a cancellation changes nothing: the thread runs and its row stays. The other tools
+don't check it: none of them starts anything. `next` is
 a literal SendMessage input with no `message` key, `{"to": "<address>", "notify_when_idle": true}`
 (verified: omitting `message` is a valid pure subscription): the coordinator subscribes right after
 starting a thread, which is how it hears the thread finished. (M5 live run: told "with no message",
@@ -874,7 +917,8 @@ every thread runs in the project's account, as before. Otherwise `start_thread` 
 `agp status --json` (bounded, 15 s) and takes the pool: the Claude accounts agp has `in_pool`
 that `accounts` allows (`"auto"`: all of them; else the listed profile ids). The coordinator's
 own account needn't be in it. No pool account allowed: the project's account, silently. Of the
-pool, the usable accounts are those not `limited`, with 5-hour and weekly utilization below
+pool, the usable accounts are those not `limited` (an object, or `true`; `null` and `false` are
+not limits), with 5-hour and weekly utilization below
 `max_usage` when it is set, best agp `score` first (`agp pick` ignores `--accounts`/`--exclude`,
 §1, so chief never asks it). For each in turn chief asks agp for its folder (`agp exec <id> --
 sh -c 'printf %s "${CLAUDE_CONFIG_DIR-}"'`; empty = the default account; every `agp exec` runs
@@ -1019,7 +1063,9 @@ Waiting on you:
 ```
 
 The whole context stays under 8 KB: previews shrink first (200, 100, 40, none), then memory is cut
-with a marker, then the board itself.
+with a marker, then the board itself. The memory marker (36 bytes) takes the place of `(empty)`
+(7 bytes), so it is used only when the cut context fits; a board that leaves less room than that
+is cut instead, and memory is left out.
 
 ## 9. Layout (`chief up`: Rex, tmux, or the user's own)
 

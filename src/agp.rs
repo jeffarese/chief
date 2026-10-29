@@ -100,7 +100,8 @@ pub fn parse_status(json: &str) -> Result<Vec<Account>> {
                 seven_day: utilization("seven_day"),
                 label: v.label.clone().unwrap_or_default(),
                 in_pool: v.in_pool,
-                limited: !v.limited.is_null(),
+                // agp gives the limit as an object; `false` means none.
+                limited: matches!(v.limited, Value::Object(_) | Value::Bool(true)),
                 score: v.score,
                 id: v.profile_id,
             }
@@ -304,6 +305,14 @@ mod tests {
         assert!(all[0].limited);
         assert_eq!((all[0].five_hour, all[1].limited), (None, false));
         assert_eq!(all[1].shown(), "bare");
+
+        // A limit is an object (or true); false and other values aren't one.
+        let limited = |value: &str| {
+            let json = format!(r#"{{"views": [{{"profile_id": "a", "limited": {value}}}]}}"#);
+            parse_status(&json).unwrap()[0].limited
+        };
+        assert!(limited(r#"{"until": 5}"#) && limited("true"));
+        assert!(!limited("false") && !limited("null") && !limited("0") && !limited(r#""""#));
     }
 
     #[test]

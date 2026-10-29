@@ -44,14 +44,22 @@ pub fn run(event: &str, project: &str, role: Role) {
     if event == "guard" {
         start_guard_watchdog(project, guard_deadline());
     }
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| dispatch(event, project, role)));
+    // Read here, not in `dispatch`: a guard that fails still records what the payload says.
+    let mut input = String::new();
+    let read = std::io::stdin()
+        .read_to_string(&mut input)
+        .context("reading the hook payload");
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        read?;
+        dispatch(event, project, role, &input)
+    }));
     let (out, error) = match result {
         Ok(Ok(out)) => (out, None),
         Ok(Err(e)) => (None, Some(format!("{e:#}"))),
         Err(panic) => (None, Some(format!("panic: {}", panic_message(&*panic)))),
     };
     let out = match (&error, event) {
-        (Some(error), "guard") => Some(guard_failed(project, error)),
+        (Some(error), "guard") => Some(guard_failed(project, &input, error)),
         _ => out,
     };
     answer(out.as_deref());
@@ -104,15 +112,11 @@ fn start_guard_watchdog(project: &str, deadline: Duration) {
 }
 
 /// Routes an event; the returned text goes to stdout.
-fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .context("reading the hook payload")?;
+fn dispatch(event: &str, project: &str, role: Role, input: &str) -> Result<Option<String>> {
     if event == "guard" {
-        return guard(project, role, &input);
+        return guard(project, role, input);
     }
-    let payload: Value = serde_json::from_str(&input).context("parsing the hook payload")?;
+    let payload: Value = serde_json::from_str(input).context("parsing the hook payload")?;
     let conn = db::open(&paths::db())?;
     let ctx = Ctx {
         project,
@@ -258,6 +262,10 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     let conn = db::open(&paths::db())?;
     let rows = db::list_sessions(&conn, project, None)?;
     let caller_sid = payload.get("session_id").and_then(Value::as_str);
+    let transcript = payload
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(Path::new);
     let teammates = match call.tool {
         "SendMessage" => caller_teammates(&conn, &rows, caller_sid)?,
         _ => Vec::new(),
@@ -281,11 +289,8 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
         };
         let mate_named = |to: &str| teammates.iter().any(|t| t.name.as_deref() == Some(to));
         if spawn_name.is_some() || send_to.is_some_and(mate_named) {
-            want(caller_account(
-                &rows,
-                caller_sid,
-                project_account.as_deref(),
-            ));
+            let place = caller_place(&rows, caller_sid, transcript, project_account.as_deref());
+            want(place.account(project_account.as_deref()));
         }
         if role == Role::Coordinator
             && let Some(to) = send_to
@@ -331,6 +336,7 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
             snapshot: &snapshot,
             others: &others,
             caller: caller_sid,
+            transcript,
         },
         &teammates,
     );
@@ -406,18 +412,89 @@ pub fn caller_teammates(
     }
 }
 
-/// The account where a name the caller sends reaches sessions (§1): a thread's own, else the
-/// project's.
-fn caller_account(
-    rows: &[SessionRow],
+/// The account the calling session runs in (§3, §6), where the names it sends reach sessions
+/// (§1).
+#[derive(Debug, Clone, Copy)]
+enum Place<'r> {
+    /// The project's: the coordinator, or a caller chief doesn't know while every thread that
+    /// may still run is there.
+    Project,
+    /// The account of this thread: the caller itself, or a thread in the account whose folder
+    /// holds the caller's transcript.
+    Of(&'r SessionRow),
+    /// A caller chief doesn't know, while threads of the project run in other accounts.
+    Unknown,
+}
+
+impl Place<'_> {
+    /// Where its names reach sessions, as far as chief can tell: the project's when unknown.
+    fn account(&self, project: Option<&Path>) -> Option<std::path::PathBuf> {
+        match self {
+            Place::Of(row) => row.account(project),
+            Place::Project | Place::Unknown => project.map(Path::to_path_buf),
+        }
+    }
+}
+
+/// Where the session calling the guard runs: a registered thread's own account, the project's
+/// for the coordinator. A caller that matches no row (a thread whose session id changed with
+/// `/clear`, before a hook or a sync stores the new one) is placed by its `transcript_path`,
+/// which Claude Code keeps in its account's folder (`<folder>/projects/…`); when that doesn't
+/// place it and a thread of the project that isn't cleaned up runs in another account, it is
+/// Unknown, so the guard won't let it message its coordinator by name (§6).
+fn caller_place<'r>(
+    rows: &'r [SessionRow],
     caller: Option<&str>,
+    transcript: Option<&Path>,
     project: Option<&Path>,
-) -> Option<std::path::PathBuf> {
-    caller
-        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
-        .filter(|r| r.role == Role::Thread.as_str())
-        .map(|r| r.account(project))
-        .unwrap_or_else(|| project.map(Path::to_path_buf))
+) -> Place<'r> {
+    let matched = caller.and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)));
+    if let Some(row) = matched {
+        if row.role == Role::Thread.as_str() {
+            return Place::Of(row);
+        }
+        return Place::Project;
+    }
+    // A removed session can come back (§5), so only cleaned-up threads are out of the question.
+    let elsewhere: Vec<&SessionRow> = rows
+        .iter()
+        .filter(|r| r.role == Role::Thread.as_str() && r.cleaned_at.is_none())
+        .filter(|r| !claude::same_account(r.account(project).as_deref(), project))
+        .collect();
+    if elsewhere.is_empty() {
+        return Place::Project;
+    }
+    let Some(transcript) = transcript else {
+        return Place::Unknown;
+    };
+    if transcript_in(transcript, project) {
+        return Place::Project;
+    }
+    elsewhere
+        .into_iter()
+        .find(|r| transcript_in(transcript, r.account(project).as_deref()))
+        .map_or(Place::Unknown, Place::Of)
+}
+
+/// Whether `transcript` is in `account`'s transcript folder, `<account folder>/projects/`.
+fn transcript_in(transcript: &Path, account: Option<&Path>) -> bool {
+    use std::path::Component;
+    // `starts_with` compares components, and `..` would climb out of the folder.
+    if !transcript.is_absolute() || transcript.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let projects = claude::claude_dir(account).join("projects");
+    if transcript.starts_with(&projects) {
+        return true;
+    }
+    // An account folder given through a symlink, or `/tmp` for `/private/tmp` on macOS.
+    match (
+        transcript.parent().map(Path::canonicalize),
+        projects.canonicalize(),
+    ) {
+        (Some(Ok(folder)), Ok(projects)) => folder.starts_with(projects),
+        _ => false,
+    }
 }
 
 /// `claude` in the project's account (project.toml → `claude_config_dir`), whatever account the
@@ -454,6 +531,7 @@ pub fn guard_decision(
         snapshot,
         others: &[],
         caller: None,
+        transcript: None,
     };
     let call = Call {
         tool,
@@ -473,6 +551,8 @@ pub struct Accounts<'a> {
     pub others: &'a [accounts::Listing],
     /// The calling session's id, from the hook payload.
     pub caller: Option<&'a str>,
+    /// The payload's `transcript_path`, which places a caller chief doesn't know yet.
+    pub transcript: Option<&'a Path>,
 }
 
 /// `guard_decision` with threads in other accounts and the caller's subagents: each thread is
@@ -492,10 +572,7 @@ pub fn guard_decision_in(
         if claude::same_account(account.as_deref(), accounts.project) {
             return None;
         }
-        let label = r
-            .account_shown()
-            .map(str::to_string)
-            .unwrap_or_else(|| claude::account_label(account.as_deref()));
+        let label = shown_account(r, account.as_deref());
         let snapshot = match accounts
             .others
             .iter()
@@ -526,20 +603,20 @@ pub fn guard_decision_in(
         .iter()
         .find(|r| r.role == Role::Coordinator.as_str())
         .map(member);
-    let caller_elsewhere = accounts
-        .caller
-        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
-        .filter(|r| r.role == Role::Thread.as_str())
-        .and_then(|r| {
-            let account = r.account(accounts.project);
-            (!claude::same_account(account.as_deref(), accounts.project)).then(|| {
-                r.account_shown()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| claude::account_label(account.as_deref()))
-            })
-        });
+    let place = caller_place(rows, accounts.caller, accounts.transcript, accounts.project);
     // Where a name from the caller can reach someone (§1): its own account, and the project's.
-    let own = caller_account(rows, accounts.caller, accounts.project);
+    let own = place.account(accounts.project);
+    let caller_label = match place {
+        Place::Of(r) if !claude::same_account(own.as_deref(), accounts.project) => {
+            Some(shown_account(r, own.as_deref()))
+        }
+        _ => None,
+    };
+    let caller_account = match (place, caller_label.as_deref()) {
+        (Place::Unknown, _) => guard::CallerAccount::Unknown,
+        (_, Some(label)) => guard::CallerAccount::Other(label),
+        _ => guard::CallerAccount::Same,
+    };
     let names = |agents: &[AgentRow]| -> Vec<String> {
         agents.iter().filter_map(|a| a.name.clone()).collect()
     };
@@ -568,24 +645,50 @@ pub fn guard_decision_in(
         coordinator: coordinator.as_ref(),
         threads: &threads,
         snapshot: accounts.snapshot,
-        caller_elsewhere: caller_elsewhere.as_deref(),
+        caller_account,
         from_subagent: call.from_subagent,
         teammates,
         listed: &listed,
     })
 }
 
-/// The deny JSON for a guard that couldn't decide, recorded if the database still opens.
-fn guard_failed(project: &str, error: &str) -> String {
+/// A thread's account for messages: its agp label, else the folder.
+fn shown_account(row: &SessionRow, account: Option<&Path>) -> String {
+    row.account_shown()
+        .map(str::to_string)
+        .unwrap_or_else(|| claude::account_label(account))
+}
+
+/// The deny JSON for a guard that couldn't decide, recorded if the database still opens, with
+/// as much of the call as the payload `input` gives: the tool, its target, and the caller when
+/// its row can be read.
+fn guard_failed(project: &str, input: &str, error: &str) -> String {
     let reason = format!("chief's message guard failed, so the message is blocked: {error}");
+    let payload: Option<Value> = serde_json::from_str(input).ok();
+    let call = payload.as_ref().and_then(|p| Call::from_payload(p).ok());
+    let target = call.and_then(|c| match c.tool {
+        "Agent" => c.name,
+        _ => c.to,
+    });
+    let caller_sid = payload
+        .as_ref()
+        .and_then(|p| p.get("session_id"))
+        .and_then(Value::as_str);
     if let Ok(conn) = db::open(&paths::db()) {
+        let caller = caller_sid.and_then(|sid| {
+            let rows = db::list_sessions(&conn, project, None).ok()?;
+            let row = rows
+                .into_iter()
+                .find(|r| r.session_id.as_deref() == Some(sid))?;
+            Some(row.name)
+        });
         let _ = db::insert_guard_denial(
             &conn,
             &db::GuardDenial {
                 project_slug: project.to_string(),
-                session_name: None,
-                tool: "unknown".to_string(),
-                target: None,
+                session_name: caller,
+                tool: call.map_or("unknown", |c| c.tool).to_string(),
+                target: target.map(str::to_string),
                 reason: reason.clone(),
                 ts: db::now_ms(),
             },
@@ -1682,6 +1785,7 @@ mod tests {
                 snapshot: &snapshot,
                 others: &[],
                 caller: sid,
+                transcript: None,
             };
             let call = Call::from_payload(payload).unwrap();
             guard_decision_in("demo", role, &call, &rows, &accounts, &teammates)
@@ -2082,6 +2186,85 @@ mod tests {
             &snap,
         );
         assert!(denied(&d, "recorded"), "{d:?}");
+    }
+
+    /// §6: a thread caller whose session id matches no row (after `/clear`, before a hook or a
+    /// sync stores the new id) is placed by its transcript; while a thread runs in another
+    /// account and the transcript doesn't place it, it can't use its coordinator's name.
+    #[test]
+    fn guard_places_a_caller_it_does_not_know() {
+        let accounts_dir = tempfile::tempdir().unwrap();
+        let project = accounts_dir.path().join("project");
+        let pb2 = accounts_dir.path().join("pb2");
+        let mut rows = guard_rows();
+        let mut far = SessionRow::new("demo-far-3333", "demo", Role::Thread, 0);
+        far.session_id = Some("far-sid".into());
+        far.account_id = Some("pb2".into());
+        far.account_label = Some("PB2".into());
+        far.account_dir = Some(pb2.to_string_lossy().into_owned());
+        rows.push(far);
+        let snap = [agent_row("c1", "c-sid", "chief-demo", Some(100))];
+        let decide = |rows: &[SessionRow], caller: &str, transcript: Option<&Path>, to: &str| {
+            let accounts = Accounts {
+                project: Some(&project),
+                snapshot: &snap,
+                others: &[],
+                caller: Some(caller),
+                transcript,
+            };
+            let call = Call {
+                tool: "SendMessage",
+                to: Some(to),
+                ..Call::default()
+            };
+            guard_decision_in("demo", Role::Thread, &call, rows, &accounts, &[])
+        };
+        let in_project = project.join("projects/-repo/new-sid.jsonl");
+        let in_pb2 = pb2.join("projects/-repo/new-sid.jsonl");
+        let allowed = guard::Decision::Allow;
+
+        // Known callers keep their account, whatever the transcript says.
+        assert_eq!(decide(&rows, "t-sid", Some(&in_pb2), "chief-demo"), allowed);
+        let d = decide(&rows, "far-sid", Some(&in_project), "chief-demo");
+        assert!(denied(&d, "another Claude account (PB2)"), "{d:?}");
+
+        // Unknown: by its transcript's folder.
+        assert_eq!(
+            decide(&rows, "new-sid", Some(&in_project), "chief-demo"),
+            allowed
+        );
+        let d = decide(&rows, "new-sid", Some(&in_pb2), "chief-demo");
+        assert!(denied(&d, "another Claude account (PB2)"), "{d:?}");
+        // Not placed: no transcript, one elsewhere, or one that climbs out of the folder.
+        let nowhere = accounts_dir.path().join("other/projects/x.jsonl");
+        let climbs = project.join("projects/../../pb2/projects/x.jsonl");
+        for transcript in [None, Some(nowhere.as_path()), Some(climbs.as_path())] {
+            let d = decide(&rows, "new-sid", transcript, "chief-demo");
+            assert!(
+                denied(&d, "can't tell whether you run in"),
+                "{transcript:?}: {d:?}"
+            );
+            assert!(denied(&d, "from=\"uds:"), "{d:?}");
+            // Its coordinator's exact address still works.
+            assert_eq!(
+                decide(&rows, "new-sid", transcript, "uds:/tmp/cc-socks/100.sock"),
+                allowed
+            );
+        }
+        // A thread elsewhere that is resolved, or was removed outside chief, may still run.
+        for change in [
+            (|r: &mut SessionRow| r.resolved = true) as fn(&mut SessionRow),
+            |r| r.removed_at = Some(1),
+        ] {
+            let mut rows = rows.clone();
+            change(&mut rows[2]);
+            let d = decide(&rows, "new-sid", None, "chief-demo");
+            assert!(denied(&d, "can't tell"), "{d:?}");
+        }
+        // Once it is cleaned up, every thread that may run is in the project's account.
+        let mut rows = rows.clone();
+        rows[2].cleaned_at = Some(1);
+        assert_eq!(decide(&rows, "new-sid", None, "chief-demo"), allowed);
     }
 
     #[test]
