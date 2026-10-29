@@ -15,7 +15,7 @@ use crate::db::{self, SessionRow};
 use crate::layout::{self, Closed, Opened};
 use crate::mux::rex::Rex;
 use crate::mux::tmux::Tmux;
-use crate::mux::{Mux, SessionRef};
+use crate::mux::{BlockRef, Mux, SessionRef};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
 use crate::{accounts, generated, names, paths, prompts, tools, trust};
@@ -311,18 +311,22 @@ pub enum CoordinatorAction {
     Running,
 }
 
-/// Starts or respawns the coordinator, then opens the layout (§9): with Rex when its server
-/// runs, else in a tmux window when this runs inside tmux, else it prints the two commands to
-/// run side by side.
+/// Starts or respawns the coordinator, then opens the layout (§9): in a Rex block, the board
+/// beside it and the conversation right here; else a Rex session when its server runs, else a
+/// tmux window when this runs inside tmux, else it prints the two commands to run side by side.
 pub fn up(slug: &str) -> Result<()> {
     let mut print = |note: Note| match note {
         Note::Did(line) | Note::Info(line) => println!("{line}"),
         Note::Warn(line) => eprintln!("{line}"),
     };
-    if let Where::Manual = up_with(slug, &mut print)? {
-        print_manual_layout(slug);
+    match up_with(slug, &mut print)? {
+        Where::Here { board } => crate::pane::run(slug, crate::pane::OnQuit::Board(board)),
+        Where::Manual => {
+            print_manual_layout(slug);
+            Ok(())
+        }
+        Where::Rex { .. } | Where::Tmux => Ok(()),
     }
-    Ok(())
 }
 
 /// A line `up` reports: what it did, what it didn't and why (no layout, say), or a warning
@@ -335,8 +339,12 @@ pub enum Note {
 }
 
 /// Where `up` put the layout (§9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Where {
+    /// The board beside this Rex block: the caller runs the pane in this terminal.
+    Here {
+        board: BlockRef,
+    },
     /// A Rex session; `shown`: Rex switched to it.
     Rex {
         shown: bool,
@@ -392,6 +400,28 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
         Opened::Repaired => "repaired",
         Opened::Reused => "already open",
     };
+    // In a Rex block on a terminal: nothing opens elsewhere (and no app needs to switch).
+    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if let Some((session, here)) = Rex::here().filter(|_| terminal) {
+        let beside = rex
+            .check()
+            .and_then(|()| layout::open_beside(&rex, slug, (&dir, &exe, &env), &session, &here));
+        return Ok(match beside {
+            Ok((board, opened)) => {
+                let verb = match opened {
+                    Opened::Created => "opened",
+                    Opened::Repaired => "reopened",
+                    Opened::Reused => "already open",
+                };
+                note(Note::Did(format!("Board {verb} beside this block.")));
+                Where::Here { board }
+            }
+            Err(e) => {
+                note(Note::Info(format!("No board beside this Rex block: {e:#}")));
+                Where::Manual
+            }
+        });
+    }
     let shown = match rex.check() {
         Ok(()) => match open(&rex, db::get_rex_session(&conn, slug)?) {
             Ok(opened) => {

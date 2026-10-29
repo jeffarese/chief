@@ -31,6 +31,8 @@ use rusqlite::Connection;
 use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
+use crate::mux::rex::Rex;
+use crate::mux::{BlockRef, Mux};
 use crate::state::Role;
 use crate::{accounts, names, paths, proc, project};
 
@@ -99,9 +101,19 @@ fn catch(signals: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
     }
 }
 
-/// `layout`: the pane is the `main` block of the layout `chief up` opened, so quitting closes
-/// that layout (the board with it) instead of leaving a dead block beside it.
-pub fn run(project: &str, layout: bool) -> Result<()> {
+/// What the pane closes when it ends, so the board isn't left on its own beside nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnQuit {
+    /// The user runs the board themselves.
+    Nothing,
+    /// The pane is the `main` block of the layout `chief up` opened: a `q` closes that layout.
+    Layout,
+    /// The pane runs in the user's own Rex block, beside this board block (§9): closed when the
+    /// pane ends, the user's block goes back to its shell.
+    Board(BlockRef),
+}
+
+pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, project)?.is_none() {
         bail!("no chief project {project:?}");
@@ -115,20 +127,29 @@ pub fn run(project: &str, layout: bool) -> Result<()> {
     if let Some(started) = proc::start_time(me) {
         db::set_pane_process(&conn, project, me, &started)?;
     }
-    let result = pane_loop(&conn, project, &tty, layout);
+    let result = pane_loop(&conn, project, &tty, &on_quit);
     let _ = db::set_pane_showing(&conn, project, None);
     let _ = db::clear_pane_process_if(&conn, project, me);
     drop(tty);
-    // The user quit (a hangup means the layout is closing already). Closing it hangs up this
-    // terminal too, so it comes last.
-    if result.is_ok() && layout && !HUNG_UP.load(Ordering::SeqCst) {
-        project::close_layout(&conn, project, &mut |line| println!("{line}"))?;
+    match &on_quit {
+        // The user quit (a hangup means the layout is closing already). Closing it hangs up
+        // this terminal too, so it comes last.
+        OnQuit::Layout if result.is_ok() && !HUNG_UP.load(Ordering::SeqCst) => {
+            project::close_layout(&conn, project, &mut |line| println!("{line}"))?;
+        }
+        // Even after a hangup (the user closed this block): a board beside nothing is no use.
+        OnQuit::Board(board) => {
+            if let Err(e) = Rex::from_env().close_block(board) {
+                let _ = writeln!(std::io::stdout(), "chief · the board stays open: {e:#}");
+            }
+        }
+        _ => {}
     }
     result
 }
 
 /// What the pane shows once the user left `name` by hand.
-fn left_lines(name: &str, coordinator: bool, layout: bool) -> Vec<String> {
+fn left_lines(name: &str, coordinator: bool, on_quit: &OnQuit) -> Vec<String> {
     let what = if coordinator {
         format!("the coordinator ({name})")
     } else {
@@ -137,15 +158,14 @@ fn left_lines(name: &str, coordinator: bool, layout: bool) -> Vec<String> {
     vec![
         format!("chief · you left {what}. It keeps running in the background."),
         String::new(),
-        if layout {
-            "  ⏎  back to it, or pick a thread on the board".into()
-        } else {
-            "  ⏎  back to it".into()
+        match on_quit {
+            OnQuit::Nothing => "  ⏎  back to it".into(),
+            _ => "  ⏎  back to it, or pick a thread on the board".into(),
         },
-        if layout {
-            "  q  close chief's layout (sessions keep running)".into()
-        } else {
-            "  q  quit (sessions keep running)".into()
+        match on_quit {
+            OnQuit::Nothing => "  q  quit (sessions keep running)".into(),
+            OnQuit::Layout => "  q  close chief's layout (sessions keep running)".into(),
+            OnQuit::Board(_) => "  q  close chief and its board (sessions keep running)".into(),
         },
     ]
 }
@@ -185,7 +205,7 @@ fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
     })
 }
 
-fn pane_loop(conn: &Connection, project: &str, tty: &Tty, layout: bool) -> Result<()> {
+fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> Result<()> {
     let dir = project::project_dir(project);
     loop {
         if HUNG_UP.load(Ordering::SeqCst) {
@@ -281,7 +301,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, layout: bool) -> Resul
 
         // The user left by hand: attaching again at once would put them straight back in.
         let coordinator = row.role == Role::Coordinator.as_str();
-        let lines = left_lines(&name, coordinator, layout);
+        let lines = left_lines(&name, coordinator, on_quit);
         tty.say(&lines[0])?;
         for line in &lines[1..] {
             tty.note(line)?;
@@ -748,14 +768,14 @@ mod tests {
 
     #[test]
     fn leaving_says_how_to_go_back_or_quit() {
-        let lines = left_lines("chief-demo", true, true);
+        let lines = left_lines("chief-demo", true, &OnQuit::Layout);
         assert_eq!(
             lines[0],
             "chief · you left the coordinator (chief-demo). It keeps running in the background."
         );
         assert!(lines[2].contains("pick a thread on the board"));
         assert!(lines[3].contains("close chief's layout"));
-        let lines = left_lines("demo-a-1111", false, false);
+        let lines = left_lines("demo-a-1111", false, &OnQuit::Nothing);
         assert!(lines[0].contains("you left thread demo-a-1111"));
         assert_eq!(lines[2], "  ⏎  back to it");
         assert_eq!(lines[3], "  q  quit (sessions keep running)");

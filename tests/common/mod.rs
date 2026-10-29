@@ -326,6 +326,9 @@ impl Home {
             // Tests run outside tmux unless they say otherwise, even when cargo runs inside it.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
+            // A run from inside a Rex block would open the board beside it.
+            .env_remove("REX_SESSION")
+            .env_remove("REX_BLOCK")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

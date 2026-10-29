@@ -17,6 +17,12 @@ pub fn session_label(slug: &str) -> String {
     format!("chief-{slug}")
 }
 
+/// The board's block label when it runs beside the user's own block (`open_beside`): unlike
+/// `board` in chief's own session, it must not clash with the user's blocks.
+pub fn board_label(slug: &str) -> String {
+    format!("chief-{slug} board")
+}
+
 /// What `open` found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opened {
@@ -155,13 +161,44 @@ pub fn open(
             }
         },
     };
-    mux.focus(&main_block)?;
+    // Cosmetic, and a client action Rex refuses when several apps are connected: the layout is
+    // there either way, and failing here would lose the session's id.
+    let _ = mux.focus(&main_block);
     let shown = mux.show(&session)?;
     Ok(Layout {
         session,
         opened,
         shown,
     })
+}
+
+/// Inside a Rex block (`here`, in the user's `session`): the board split right of it, so the
+/// block itself shows the conversation and nothing opens elsewhere (§9). A board chief started
+/// beside a block of this session before is reused while it runs, and replaced once ended. Focus
+/// stays where it is.
+pub fn open_beside(
+    mux: &dyn Mux,
+    slug: &str,
+    (dir, exe, env): (&Path, &Path, &[(String, String)]),
+    session: &SessionRef,
+    here: &BlockRef,
+) -> Result<(BlockRef, Opened)> {
+    let label = board_label(slug);
+    let mut opened = Opened::Created;
+    if let Some((block, running)) = block_state(mux, session, &label)? {
+        if running {
+            return Ok((block, Opened::Reused));
+        }
+        mux.close_block(&block)?;
+        opened = Opened::Repaired;
+    }
+    let spec = BlockSpec {
+        label,
+        anchor: Some((here.clone(), Split::Right)),
+        focus: false,
+        ..board_spec(slug, dir, exe, env)
+    };
+    Ok((mux.run_block(session, &spec)?, opened))
 }
 
 /// Closes the project's layout (`ours`): kills the session when it holds only `main` and
@@ -339,6 +376,47 @@ mod tests {
     /// `open` with `s0` stored as chief's session.
     fn open_demo(mux: &FakeMux) -> Layout {
         open_in(mux, Some(&s0()))
+    }
+
+    /// Inside the user's own Rex block b0: the board goes beside it, once.
+    #[test]
+    fn beside_the_users_block_the_board_is_split_off_once() {
+        let mux = FakeMux::with_session("bold-alcove", &[("shell", true), ("logs", true)]);
+        let env = vec![("CHIEF_HOME".to_string(), "/h".to_string())];
+        let paths = (Path::new(DIR), Path::new(EXE), env.as_slice());
+        let here = BlockRef("b0".into());
+        let (board, opened) = open_beside(&mux, "demo", paths, &s0(), &here).unwrap();
+        assert_eq!(opened, Opened::Created);
+        let spec = BlockSpec {
+            label: "chief-demo board".into(),
+            anchor: Some((here.clone(), Split::Right)),
+            ratio: 32,
+            cwd: Some(PathBuf::from(DIR)),
+            command: cmd("board"),
+            focus: false,
+        };
+        assert_eq!(mux.calls(), [Call::Run("s0".into(), spec)]);
+
+        let (again, opened) = open_beside(&mux, "demo", paths, &s0(), &here).unwrap();
+        assert_eq!((again, opened), (board.clone(), Opened::Reused));
+        assert_eq!(mux.calls().len(), 1, "nothing new");
+
+        // Ended (its block kept open): replaced.
+        for s in mux.sessions.borrow_mut().iter_mut() {
+            for b in s.2.iter_mut().filter(|b| b.0 == board.0) {
+                b.2 = false;
+            }
+        }
+        let (_, opened) = open_beside(&mux, "demo", paths, &s0(), &here).unwrap();
+        assert_eq!(opened, Opened::Repaired);
+        assert_eq!(mux.calls()[1], Call::Close(board.0.clone()));
+        assert!(matches!(&mux.calls()[2], Call::Run(..)));
+        assert!(
+            !mux.calls()
+                .iter()
+                .any(|c| matches!(c, Call::Focus(_) | Call::Show(_))),
+            "focus stays put"
+        );
     }
 
     fn open_in(mux: &FakeMux, ours: Option<&SessionRef>) -> Layout {

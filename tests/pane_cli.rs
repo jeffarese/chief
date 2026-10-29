@@ -32,6 +32,13 @@ impl Pane {
     }
 
     fn start_with(home: &Home, extra: &[&str]) -> Pane {
+        let mut args = vec!["pane", "--project", "demo"];
+        args.extend(extra);
+        Pane::spawn(home, &args, &[])
+    }
+
+    /// `chief <args>` on a terminal of its own, with `env` added.
+    fn spawn(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Pane {
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize {
             ws_row: 24,
@@ -53,9 +60,8 @@ impl Pane {
         // SAFETY: fresh descriptors from openpty, owned once each.
         let (master, slave) =
             unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        let mut args = vec!["pane", "--project", "demo"];
-        args.extend(extra);
-        let mut cmd = home.command(&args);
+        let mut cmd = home.command(args);
+        cmd.envs(env.iter().copied());
         cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -325,4 +331,85 @@ fn leaving_waits_for_the_user_and_q_closes_the_layout() {
     );
     assert_eq!(db::get_rex_session(&conn, "demo").unwrap(), None);
     assert!(home.fake.calls_of("stop").is_empty(), "no session stopped");
+}
+
+/// `chief up` inside the user's own Rex block: the board opens beside that block, the
+/// conversation shows in the same terminal, and quitting closes only the board.
+#[test]
+fn up_in_a_rex_block_shows_the_conversation_there() {
+    let home = Home::new();
+    let conn = home.db();
+    home.register("demo");
+    let mut row = SessionRow::new(COORD, "demo", Role::Coordinator, 1);
+    row.short_id = Some("c0".into());
+    row.session_id = Some("c0-sid".into());
+    db::insert_session(&conn, &row).unwrap();
+    home.fake
+        .set(
+            "agents.stdout",
+            &json!([agent("c0", "c0-sid", COORD, "done", Some(4001))]).to_string(),
+        )
+        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("attach.sleep", "1.2");
+    home.rex
+        .set("list.exit", "0")
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:mine", "label": "work"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:shell", "label": "shell"}]}"#,
+        )
+        .set("run.stdout", r#"{"block_ids": ["block:board"]}"#);
+
+    let mut pane = Pane::spawn(
+        &home,
+        &["up", "demo"],
+        &[
+            ("REX_SESSION", "session:mine"),
+            ("REX_BLOCK", "block:shell"),
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while attach_call(&home, "c0").is_none() {
+        if Instant::now() > deadline || pane.child.try_wait().unwrap().is_some() {
+            panic!(
+                "no attach; output: {}\nclaude calls: {:?}\nrex calls: {:?}",
+                String::from_utf8_lossy(&pane.output()),
+                home.fake.calls(),
+                home.rex.calls()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let runs = home.rex.calls_of("run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let run = runs[0].join(" ");
+    assert!(
+        run.contains(
+            "-s session:mine --label chief-demo board --focus=false -b block:shell --split right"
+        ),
+        "{run}"
+    );
+    assert!(run.ends_with("board --project demo"), "{run}");
+    assert!(home.rex.calls_of("new").is_empty(), "no session of its own");
+
+    wait_for("left", || pane.says("close chief and its board"));
+    std::thread::sleep(Duration::from_millis(400));
+    pane.send("q");
+    let status = pane.exited().expect("q quits");
+    assert!(status.success(), "{status:?}");
+    let closes: Vec<_> = home
+        .rex
+        .calls_of("block")
+        .into_iter()
+        .filter(|c| c.get(1).map(String::as_str) == Some("close"))
+        .collect();
+    assert_eq!(
+        closes,
+        [vec!["block", "close", "block:board", "--autostart=false"]],
+        "only the board closed"
+    );
+    assert!(home.rex.calls_of("kill").is_empty());
 }

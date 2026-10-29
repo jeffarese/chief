@@ -96,6 +96,13 @@ impl Rex {
         Ok(out)
     }
 
+    /// The Rex block this process runs in, from the `REX_SESSION` and `REX_BLOCK` Rex sets in
+    /// each block's environment. None outside Rex.
+    pub fn here() -> Option<(SessionRef, BlockRef)> {
+        let var = |name| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Some((SessionRef(var("REX_SESSION")?), BlockRef(var("REX_BLOCK")?)))
+    }
+
     /// Whether Rex is installed and its server running: `rex list` succeeds.
     pub fn check(&self) -> Result<()> {
         self.run(&["list".into(), "--json".into()])?;

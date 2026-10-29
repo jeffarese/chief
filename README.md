@@ -69,6 +69,8 @@ Two panes side by side: `chief pane --project <slug>` on the left shows the coor
 thread you picked, `chief board --project <slug>` on the right. `chief up` opens them with the
 first that applies:
 
+- **Inside a Rex block**: right there. The board opens beside the block you ran `chief` in, and
+  that block shows the conversation; `q` closes the board and gives you your shell back.
 - **Rex**, when it is installed and its server is running: a Rex session `chief-<slug>`.
 - **tmux**, when you run `chief up` inside tmux: a new window `chief-<slug>` in your current
   session, the pane on the left and the board on the right.

@@ -1015,6 +1015,16 @@ The layout is two panes side by side: `chief pane` on the left, `chief board` on
 Nothing in it depends on a multiplexer: the board switches the pane by signalling it (below), so
 any two terminals or splits work. `chief up` opens it for the user with the first that applies:
 
+0. Inside a Rex block (`REX_SESSION` and `REX_BLOCK`, which Rex sets in each block's
+   environment) on a terminal, when `rex list --json` succeeds: the user's own block becomes the
+   conversation. `layout::open_beside` splits a block labelled `chief-<slug> board` right of it
+   at 32 % (`--focus=false`) in the user's session, or reuses one that still runs there (an
+   ended one is closed and replaced); `up_with` returns `Where::Here`, and `chief up` (or the
+   launcher, §10a) then runs `chief pane` in this same terminal with `OnQuit::Board`: when the
+   pane ends, by `q` or a hangup, it closes that board block and the user's block is back at its
+   shell. No session is created, nothing is stored in `ui_state`, and no app has to switch or
+   focus anything, so this works with several Rex apps connected. A failure here prints why and
+   falls back to 3, not to a new session.
 1. Rex, when `rex list --json` succeeds (installed, server running): the Rex session below.
 2. tmux, when `$TMUX` is set (chief runs inside tmux): a tmux window, below.
 3. Neither: it prints why and the two commands, `chief pane --project <slug>` and
@@ -1088,7 +1098,9 @@ chief path, behind `env K=V…` with the §3 passthrough variables when any is s
 only `main` and `board` is killed and the stored id cleared; one that holds other blocks too (the
 user added them) keeps running with those, and only `main` and `board` are closed.
 
-Then focus `main` and `show` the session. When Rex's `show` returns false, `up` prints
+Then focus `main` and `show` the session. Focus is best-effort: Rex refuses it as a client action
+when several apps are connected, and failing there would lose the id of a session just made, so
+the next `up` would make another. When Rex's `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
 
 `chief pane` loop (`src/pane.rs`). On start it catches its signals (below), then records its pid
@@ -1325,7 +1337,8 @@ under it.
   The "Starting <name>" card shows each report as it comes (`✓` done, `!` warning) under a
   spinner, then where the conversation is: Rex (`Open in Rex session chief-<slug>: the
   conversation with the coordinator on the left, its threads on the right.`, or to switch to it in
-  the app when Rex couldn't), tmux likewise, or neither: Enter leaves the launcher, prints
+  the app when Rex couldn't), tmux likewise, in a Rex block (§9 step 0) the launcher leaves at
+  once and runs `chief pane` in its own terminal beside the new board, or neither: Enter leaves the launcher, prints
   `chief board --project <slug>` to run elsewhere, and runs `chief pane` in this terminal (§9).
   A failure shows in red; before the project existed (`Msg::Created`), Enter goes back to the
   wizard as it was, after it back to the list. The list is re-read once a project is made or

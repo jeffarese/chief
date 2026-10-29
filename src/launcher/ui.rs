@@ -15,7 +15,9 @@ use super::app::{Hit, Launcher, Screen, Starting};
 use super::wizard::{Setting, Step, Wizard};
 
 const CARD_WIDTH: u16 = 76;
-const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// A pulsing dot. Not the quarter circles (◐◓◑◒): almost no monospace font has them, and a
+/// terminal that doesn't fall back to another font (Rex's) draws squares.
+const SPINNER: [&str; 4] = ["·", "•", "●", "•"];
 
 thread_local! {
     static FRAME: Cell<usize> = const { Cell::new(0) };
@@ -489,6 +491,11 @@ fn starting_card(s: &Starting) -> Card {
                 Span::styled("Starting the coordinator…", dim()),
             ]));
         }
+        // Only for a moment: the launcher hands this terminal to the conversation.
+        Some(Ok(Where::Here { .. })) => lines.push(Line::styled(
+            "Opening the conversation here, its threads on the right…",
+            bold(),
+        )),
         Some(Ok(Where::Rex { shown: true })) => lines.push(Line::styled(
             format!(
                 "Open in Rex session {label}: the conversation with the coordinator on the left, \

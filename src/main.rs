@@ -196,7 +196,14 @@ fn main() -> Result<()> {
         Command::Up { slug } => chief::project::up(&slug),
         Command::Down { slug, stop_threads } => chief::project::down(&slug, stop_threads),
         Command::Board { project } => chief::board::run(&project),
-        Command::Pane { project, layout } => chief::pane::run(&project, layout),
+        Command::Pane { project, layout } => {
+            let on_quit = if layout {
+                chief::pane::OnQuit::Layout
+            } else {
+                chief::pane::OnQuit::Nothing
+            };
+            chief::pane::run(&project, on_quit)
+        }
         // A hook must never fail the Claude session that called it.
         Command::Hook {
             event,

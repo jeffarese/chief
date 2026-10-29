@@ -29,7 +29,13 @@ fn the_wizard_creates_trusts_and_opens_the_project() {
         ] {
             std::env::set_var(k, v);
         }
-        for k in ["CLAUDE_CONFIG_DIR", "TMUX", "TMUX_PANE"] {
+        for k in [
+            "CLAUDE_CONFIG_DIR",
+            "TMUX",
+            "TMUX_PANE",
+            "REX_SESSION",
+            "REX_BLOCK",
+        ] {
             std::env::remove_var(k);
         }
     }

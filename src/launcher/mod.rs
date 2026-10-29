@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{self, Event};
 
 use crate::claude::{self, Claude};
 use crate::config::ProjectConfig;
+use crate::pane::OnQuit;
 use crate::project::{self, Note, Where};
 use crate::{db, generated, paths, trust, tui};
 
@@ -72,7 +73,7 @@ pub fn run(new: bool) -> Result<()> {
     let (tx, rx) = mpsc::channel();
 
     let mut terminal = tui::init();
-    let exit = (|| -> Result<Option<String>> {
+    let exit = (|| -> Result<Option<(String, OnQuit)>> {
         loop {
             terminal.draw(|f| ui::draw(f, &app))?;
             if event::poll(POLL)? {
@@ -84,7 +85,7 @@ pub fn run(new: bool) -> Result<()> {
                 for action in actions {
                     match action {
                         Action::Quit => return Ok(None),
-                        Action::Pane(slug) => return Ok(Some(slug)),
+                        Action::Pane(slug) => return Ok(Some((slug, OnQuit::Nothing))),
                         Action::Open(slug) => spawn(tx.clone(), move |send| open(&slug, send)),
                         Action::Create(draft) => {
                             spawn(tx.clone(), move |send| create(&draft, send))
@@ -98,7 +99,15 @@ pub fn run(new: bool) -> Result<()> {
                     finished = Some(slug.clone());
                 }
                 let done = matches!(msg, Msg::Done(_));
+                // In a Rex block the board is beside it: this terminal becomes the conversation.
+                let here = match &msg {
+                    Msg::Done(Ok(Where::Here { board })) => Some(board.clone()),
+                    _ => None,
+                };
                 app.apply(msg);
+                if let (Some(board), app::Screen::Starting(s)) = (here, &app.screen) {
+                    return Ok(Some((s.slug.clone(), OnQuit::Board(board))));
+                }
                 if done && let app::Screen::Starting(s) = &app.screen {
                     finished = Some(s.slug.clone());
                 }
@@ -113,13 +122,14 @@ pub fn run(new: bool) -> Result<()> {
     })();
     tui::restore();
     match exit? {
-        Some(slug) => {
+        Some((slug, OnQuit::Nothing)) => {
             println!(
                 "Showing the conversation with the coordinator. For its threads, run in another \
                  terminal: chief board --project {slug}"
             );
-            crate::pane::run(&slug, false)
+            crate::pane::run(&slug, OnQuit::Nothing)
         }
+        Some((slug, on_quit)) => crate::pane::run(&slug, on_quit),
         None => Ok(()),
     }
 }
