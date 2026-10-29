@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::mux::{BlockRef, BlockSpec, Mux, SessionRef, Split};
+use crate::mux::{BlockRef, BlockSpec, Mux, SessionRef, Split, kill_on_error};
 
 pub const MAIN: &str = "main";
 pub const BOARD: &str = "board";
@@ -132,7 +132,8 @@ pub fn open(
     let (session, main_block, opened) = match live(mux, ours)? {
         None => {
             let (s, m) = mux.create_session(&session_label(slug), &main)?;
-            mux.run_block(&s, &beside(&m, Split::Right, &board, BOARD_RATIO))?;
+            let board = mux.run_block(&s, &beside(&m, Split::Right, &board, BOARD_RATIO));
+            kill_on_error(mux, &s, board)?;
             (s, m, Opened::Created)
         }
         Some(s) => match (block_state(mux, &s, MAIN)?, block_state(mux, &s, BOARD)?) {
@@ -164,7 +165,10 @@ pub fn open(
     // Cosmetic, and a client action Rex refuses when several apps are connected: the layout is
     // there either way, and failing here would lose the session's id.
     let _ = mux.focus(&main_block);
-    let shown = mux.show(&session)?;
+    let shown = match opened {
+        Opened::Created => kill_on_error(mux, &session, mux.show(&session))?,
+        _ => mux.show(&session)?,
+    };
     Ok(Layout {
         session,
         opened,
@@ -202,7 +206,9 @@ pub fn open_beside(
 }
 
 /// Closes the project's layout (`ours`): kills the session when it holds only `main` and
-/// `board`, otherwise closes just those two blocks so the user's blocks stay.
+/// `board`, otherwise closes just those two blocks so the user's blocks stay: `board` first,
+/// `main` last, since `main` runs the pane, which may be the caller (its `q`), and closing its
+/// block hangs it up.
 pub fn close(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Closed> {
     let Some(s) = live(mux, ours)? else {
         return Ok(Closed::Nothing);
@@ -213,8 +219,10 @@ pub fn close(mux: &dyn Mux, ours: Option<&SessionRef>) -> Result<Closed> {
         mux.kill_session(&s)?;
         return Ok(Closed::Killed(s));
     }
-    for b in blocks.iter().filter(|b| chiefs(&b.label)) {
-        mux.close_block(&b.block)?;
+    for label in [BOARD, MAIN] {
+        for b in blocks.iter().filter(|b| b.label == label) {
+            mux.close_block(&b.block)?;
+        }
     }
     Ok(Closed::Blocks(s))
 }
@@ -247,6 +255,9 @@ pub mod testing {
         pub sessions: RefCell<Vec<(String, String, Vec<FakeBlock>)>>,
         pub calls: RefCell<Vec<Call>>,
         pub can_show: bool,
+        /// `run_block` and `show` fail (after recording the call).
+        pub fail_run: bool,
+        pub fail_show: bool,
         pub next: RefCell<usize>,
     }
 
@@ -303,6 +314,9 @@ pub mod testing {
             self.calls
                 .borrow_mut()
                 .push(Call::Run(session.0.clone(), spec.clone()));
+            if self.fail_run {
+                anyhow::bail!("run failed");
+            }
             if let Some(s) = self
                 .sessions
                 .borrow_mut()
@@ -352,6 +366,9 @@ pub mod testing {
 
         fn show(&self, session: &SessionRef) -> Result<bool> {
             self.calls.borrow_mut().push(Call::Show(session.0.clone()));
+            if self.fail_show {
+                anyhow::bail!("show failed");
+            }
             Ok(self.can_show)
         }
 
@@ -555,6 +572,39 @@ mod tests {
         assert!(!mux.calls().iter().any(|c| matches!(c, Call::Kill(_))));
     }
 
+    /// A failure once the session exists kills it before `open` fails: `up` stores the id only
+    /// on success, so the next `up` would make a duplicate, and a `q` in the orphan's pane would
+    /// close the stored session. A session `open` didn't create may hold the user's blocks, and
+    /// is never killed.
+    #[test]
+    fn a_session_open_just_created_is_killed_when_it_fails() {
+        let env = vec![("CHIEF_HOME".to_string(), "/h".to_string())];
+        let open_new = |mux: &FakeMux, ours: Option<&SessionRef>| {
+            open(mux, "demo", Path::new(DIR), Path::new(EXE), &env, ours)
+        };
+        for mux in [
+            FakeMux {
+                fail_run: true,
+                ..FakeMux::default()
+            },
+            FakeMux {
+                fail_show: true,
+                ..FakeMux::default()
+            },
+        ] {
+            assert!(open_new(&mux, None).is_err());
+            assert_eq!(mux.calls().last(), Some(&Call::Kill("s-new1".into())));
+            assert!(mux.sessions.borrow().is_empty());
+        }
+
+        let mux = FakeMux {
+            fail_run: true,
+            ..FakeMux::with_session("chief-demo", &[("main", true), ("logs", true)])
+        };
+        assert!(open_new(&mux, Some(&s0())).is_err());
+        assert!(!mux.calls().iter().any(|c| matches!(c, Call::Kill(_))));
+    }
+
     /// Only the stored id is chief's: a session that merely carries the label, or chief's own
     /// after it was killed, is never reused or killed.
     #[test]
@@ -581,7 +631,8 @@ mod tests {
         assert_eq!(theirs.calls().last(), Some(&Call::Kill("s-new1".into())));
     }
 
-    /// The user added a block to chief's session: `chief down` closes only chief's two.
+    /// The user added a block to chief's session: `chief down` closes only chief's two, `board`
+    /// first: `main` is the pane, which may be the one closing the layout.
     #[test]
     fn close_keeps_a_session_holding_the_users_blocks() {
         let mux = FakeMux::with_session(
@@ -591,7 +642,7 @@ mod tests {
         assert_eq!(close(&mux, Some(&s0())).unwrap(), Closed::Blocks(s0()));
         assert_eq!(
             mux.calls(),
-            [Call::Close("b0".into()), Call::Close("b2".into())]
+            [Call::Close("b2".into()), Call::Close("b0".into())]
         );
         assert_eq!(mux.find_block(&s0(), MAIN).unwrap(), None);
     }

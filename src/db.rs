@@ -935,6 +935,8 @@ pub fn get_pane_showing(conn: &Connection, project_slug: &str) -> Result<Option<
         .flatten())
 }
 
+/// Sets `pane_showing` whoever runs (`chief down`, tests). A pane writes through
+/// `set_pane_showing_as`.
 pub fn set_pane_showing(conn: &Connection, project_slug: &str, name: Option<&str>) -> Result<()> {
     conn.execute(
         "INSERT INTO ui_state (project_slug, pane_showing) VALUES (?1, ?2)
@@ -942,6 +944,31 @@ pub fn set_pane_showing(conn: &Connection, project_slug: &str, name: Option<&str
         params![project_slug, name],
     )?;
     Ok(())
+}
+
+/// Sets `pane_showing` for the pane `pid` (None: a pane that couldn't record itself), only while
+/// `pane_pid` is that pane's (NULL for None), so an older pane can't clear or overwrite what the
+/// newest one shows (§9). Whether it wrote.
+pub fn set_pane_showing_as(
+    conn: &Connection,
+    project_slug: &str,
+    pid: Option<i32>,
+    name: Option<&str>,
+) -> Result<bool> {
+    let written = match pid {
+        // Its record made the row.
+        Some(pid) => conn.execute(
+            "UPDATE ui_state SET pane_showing = ?3 WHERE project_slug = ?1 AND pane_pid = ?2",
+            params![project_slug, pid, name],
+        )?,
+        None => conn.execute(
+            "INSERT INTO ui_state (project_slug, pane_showing) VALUES (?1, ?2)
+             ON CONFLICT(project_slug) DO UPDATE SET pane_showing = excluded.pane_showing
+               WHERE pane_pid IS NULL",
+            params![project_slug, name],
+        )?,
+    };
+    Ok(written > 0)
 }
 
 /// The id of the layout session `chief up` created for the project, if it stored one.
@@ -1014,11 +1041,11 @@ pub fn set_pane_process(
     Ok(())
 }
 
-/// Forgets the recorded pane only while it is still `pid`, so a pane that started since keeps
-/// its record.
+/// Forgets the recorded pane and what it showed, only while it is still `pid`, so a pane that
+/// started since keeps its record. Run by the pane as it exits, and for a pane found gone.
 pub fn clear_pane_process_if(conn: &Connection, project_slug: &str, pid: i32) -> Result<()> {
     conn.execute(
-        "UPDATE ui_state SET pane_pid = NULL, pane_started = NULL
+        "UPDATE ui_state SET pane_pid = NULL, pane_started = NULL, pane_showing = NULL
          WHERE project_slug = ?1 AND pane_pid = ?2",
         params![project_slug, pid],
     )?;
@@ -1544,6 +1571,31 @@ mod tests {
             Some((42, "200.5".to_string()))
         );
         clear_pane_process_if(&conn, "p", 42).unwrap();
+        assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
+    }
+
+    /// Only the recorded pane writes `pane_showing`: an older one can't clear or overwrite what
+    /// the newest shows. A pane that couldn't record itself writes while none is recorded.
+    #[test]
+    fn pane_showing_belongs_to_the_recorded_pane() {
+        let (_dir, conn) = fresh();
+        let showing = |conn: &Connection| get_pane_showing(conn, "p").unwrap();
+        // Nothing recorded: only a pane without a record writes.
+        assert!(!set_pane_showing_as(&conn, "p", Some(41), Some("t")).unwrap());
+        assert!(set_pane_showing_as(&conn, "p", None, Some("t")).unwrap());
+        assert_eq!(showing(&conn).as_deref(), Some("t"));
+
+        set_pane_process(&conn, "p", 42, "200.5").unwrap();
+        assert!(!set_pane_showing_as(&conn, "p", None, None).unwrap());
+        assert!(set_pane_showing_as(&conn, "p", Some(42), Some("x")).unwrap());
+        // The older pane 41 leaves the newest one's alone.
+        assert!(!set_pane_showing_as(&conn, "p", Some(41), None).unwrap());
+        assert!(!set_pane_showing_as(&conn, "p", Some(41), Some("y")).unwrap());
+        clear_pane_process_if(&conn, "p", 41).unwrap();
+        assert_eq!(showing(&conn).as_deref(), Some("x"));
+        // Its own exit forgets both.
+        clear_pane_process_if(&conn, "p", 42).unwrap();
+        assert_eq!(showing(&conn), None);
         assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
     }
 }

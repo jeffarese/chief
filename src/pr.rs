@@ -302,7 +302,7 @@ pub fn refresh_project(ctx: &Ctx, config: &ProjectConfig) -> Result<Refresh> {
     if config.threads.cleanup != Cleanup::Merged {
         return Ok(refresh);
     }
-    let showing = db::get_pane_showing(ctx.conn, &config.slug)?;
+    let showing = crate::pane::showing(ctx.conn, &config.slug)?;
     for row in db::list_sessions(ctx.conn, &config.slug, Some(Role::Thread))? {
         let due = row.resolved
             && row.cleaned_at.is_none()

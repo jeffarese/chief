@@ -15,7 +15,7 @@ use crate::db::{self, SessionRow};
 use crate::layout::{self, Closed, Opened};
 use crate::mux::rex::Rex;
 use crate::mux::tmux::Tmux;
-use crate::mux::{BlockRef, Mux, SessionRef};
+use crate::mux::{BlockRef, Mux, SessionRef, kill_on_error};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
 use crate::{accounts, generated, names, paths, prompts, tools, trust};
@@ -24,6 +24,8 @@ const SLUG_CHARS: usize = 40;
 const STATUS_PREVIEW_CHARS: usize = 160;
 /// How long `up` waits for a respawned coordinator to get a process.
 const RESPAWN_WAIT: Duration = Duration::from_secs(10);
+/// How long `down` waits for the pane it ended: its attach gets 2 s to exit (§9).
+const PANE_END_WAIT: Duration = Duration::from_secs(3);
 
 const INSTRUCTIONS_TEMPLATE: &str = "<!--
 Standing brief for this project. The coordinator and every new thread get this file's text:
@@ -91,8 +93,15 @@ pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: boo
 
     let interactive =
         trust_prompt && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let check = trust::check(&config, &dir, &claude)?;
-    report_trust(&config, &check, interactive)?;
+    // The project exists by now: a trust check that fails is a line, as for an account agp
+    // can't check, not a failed `init` (a second one would find the slug taken).
+    match trust::check(&config, &dir, &claude) {
+        Ok(check) => report_trust(&config, &check, interactive)?,
+        Err(e) => {
+            println!("chief couldn't check which folders Claude Code trusts: {e:#}");
+            println!("To trust them later: chief trust {}", config.slug);
+        }
+    }
     println!(
         "\nNext: chief up {} (or run chief and pick it)",
         config.slug
@@ -400,6 +409,11 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
         Opened::Repaired => "repaired",
         Opened::Reused => "already open",
     };
+    // A layout just created whose id isn't stored would be nobody's (`kill_on_error`).
+    let store = |mux: &dyn Mux, opened: &layout::Layout, stored: Result<()>| match opened.opened {
+        Opened::Created => kill_on_error(mux, &opened.session, stored),
+        _ => stored,
+    };
     // In a Rex block on a terminal: nothing opens elsewhere (and no app needs to switch).
     let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if let Some((session, here)) = Rex::here().filter(|_| terminal) {
@@ -425,7 +439,11 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
     let shown = match rex.check() {
         Ok(()) => match open(&rex, db::get_rex_session(&conn, slug)?) {
             Ok(opened) => {
-                db::set_rex_session(&conn, slug, Some(&opened.session.0))?;
+                store(
+                    &rex,
+                    &opened,
+                    db::set_rex_session(&conn, slug, Some(&opened.session.0)),
+                )?;
                 note(Note::Did(format!("Rex session {label} {}.", done(&opened))));
                 if !opened.shown {
                     note(Note::Info(format!(
@@ -447,7 +465,8 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
         Err(why) => match Tmux::current() {
             Some(tmux) => match open(&tmux, db::get_tmux_window(&conn, slug)?) {
                 Ok(opened) => {
-                    db::set_tmux_window(&conn, slug, Some(&opened.session.0))?;
+                    let stored = db::set_tmux_window(&conn, slug, Some(&opened.session.0));
+                    store(&tmux, &opened, stored)?;
                     note(Note::Did(format!("tmux window {label} {}.", done(&opened))));
                     Where::Tmux
                 }
@@ -671,16 +690,21 @@ pub fn wait_for_pid(
     }
 }
 
-/// Closes the layout `up` opened (Rex or tmux; nothing when the user made it) and stops the
-/// coordinator; with `stop_threads`, every live thread too. Stopping keeps conversations and
-/// worktrees (`claude stop`, never `claude rm`).
+/// Ends the running pane, closes the layout `up` opened (Rex or tmux; nothing when the user made
+/// it) and stops the coordinator; with `stop_threads`, every live thread too. Stopping keeps
+/// conversations and worktrees (`claude stop`, never `claude rm`).
 pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
         bail!("no chief project {slug:?}");
     }
-    let mut failed = close_layout(&conn, slug, &mut |line| println!("{line}"))?;
-    db::set_pane_showing(&conn, slug, None)?;
+    let pane_ended = end_pane(&conn, slug)?;
+    let mut failed = if pane_ended { 0 } else { 1 };
+    failed += close_layout(&conn, slug, &mut |line| println!("{line}"))?;
+    // Left by a pane that couldn't record itself; one still running keeps what it shows.
+    if pane_ended {
+        db::set_pane_showing(&conn, slug, None)?;
+    }
     // The next `chief up` starts on the coordinator: a pane that went back to the thread it last
     // showed would wake it right after `--stop-threads` stopped it.
     db::set_pane_target(&conn, slug, None)?;
@@ -729,6 +753,33 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
         bail!("chief down {slug} didn't finish cleanly");
     }
     Ok(())
+}
+
+/// Ends the recorded `chief pane` (§9), wherever it runs, and says so; false when it still runs
+/// after `PANE_END_WAIT`. A pane `down` didn't open (in the user's own Rex block, or started by
+/// hand) would otherwise attach again and respawn the session `down` is about to stop. SIGTERM
+/// ends it as a hangup does: it reaps its attach, clears its record and closes a board it opened
+/// beside it, but not chief's layout, which `down` closes next.
+fn end_pane(conn: &Connection, slug: &str) -> Result<bool> {
+    let Some(pid) = crate::pane::live_pane(conn, slug)? else {
+        return Ok(true);
+    };
+    // SAFETY: a plain syscall, to the process `live_pane` just proved to be the pane.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + PANE_END_WAIT;
+    while Instant::now() < deadline {
+        // Its record cleared, or it is gone without clearing it.
+        if crate::pane::live_pane(conn, slug)? != Some(pid) {
+            println!("Ended chief pane (pid {pid}).");
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(
+        "chief pane (pid {pid}) is still running after {} s.",
+        PANE_END_WAIT.as_secs()
+    );
+    Ok(false)
 }
 
 /// Closes the layout `chief up` opened (Rex session or tmux window, §9), saying what it did

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{BlockInfo, BlockRef, BlockSpec, Mux, SessionRef, Split};
+use super::{BlockInfo, BlockRef, BlockSpec, Mux, SessionRef, Split, kill_on_error};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -150,21 +150,25 @@ impl Mux for Rex {
         block_args(first, &mut args);
         let created: Created = self.json(&args)?;
         let session = SessionRef(created.session_id);
-        let block = created
+        let named = created
             .initial_windows
             .first()
             .and_then(|w| w.block_ids.first())
             .map(|id| BlockRef(id.clone()))
-            .with_context(|| format!("`rex new {label}` reported no block"))?;
-        // `rex new` has no block label option; the first block starts as "shell".
-        self.run(&[
-            "block".into(),
-            "rename".into(),
-            "-s".into(),
-            (&session.0).into(),
-            (&block.0).into(),
-            (&first.label).into(),
-        ])?;
+            .with_context(|| format!("`rex new {label}` reported no block"))
+            .and_then(|block| {
+                // `rex new` has no block label option; the first block starts as "shell".
+                self.run(&[
+                    "block".into(),
+                    "rename".into(),
+                    "-s".into(),
+                    (&session.0).into(),
+                    (&block.0).into(),
+                    (&first.label).into(),
+                ])?;
+                Ok(block)
+            });
+        let block = kill_on_error(self, &session, named)?;
         Ok((session, block))
     }
 
