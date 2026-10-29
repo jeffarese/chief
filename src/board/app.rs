@@ -16,6 +16,7 @@ use crate::state::{Group, Role};
 use crate::tools;
 
 use super::settings::{self, SettingsForm};
+use super::ui::display_title;
 
 /// Something the board asks its runner to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +25,8 @@ pub enum Action {
     /// Show this thread (None: the coordinator) in the main pane.
     Show(Option<String>),
     Wake(String),
+    /// Stop this thread's process (`tools::stop_thread`).
+    Stop(String),
     SetResolved {
         name: String,
         resolved: bool,
@@ -33,6 +36,8 @@ pub enum Action {
         name: String,
         mode: Mode,
     },
+    /// A safe cleanup of every resolved thread (`cleanup::gc`).
+    CleanAll,
     SaveSettings(Box<ProjectConfig>),
     /// Open a file in `$EDITOR` on this terminal.
     Edit(PathBuf),
@@ -61,7 +66,11 @@ pub enum Msg {
         loss: String,
         confirmed: Option<Inspection>,
     },
-    Saved(Box<ProjectConfig>),
+    /// project.toml now holds `config`; `warning` says why `generated/*` wasn't rewritten.
+    Saved {
+        config: Box<ProjectConfig>,
+        warning: Option<String>,
+    },
     SaveFailed(String),
     /// The pool's trust check, or why it failed.
     Trust(Result<PoolTrust, String>),
@@ -105,6 +114,11 @@ pub enum Screen {
     Board,
     Help,
     Confirm(Confirm),
+    /// Stop this thread? `label` is its title, else its name.
+    Stop {
+        name: String,
+        label: String,
+    },
     Settings(Box<SettingsForm>),
 }
 
@@ -154,6 +168,9 @@ pub struct App {
     /// Short terminals show the detail instead of the list while this is on.
     pub detail_open: bool,
     pub screen: Screen,
+    /// A blocked cleanup's modal that came while settings was open: it shows when settings
+    /// closes, so the draft isn't thrown away.
+    pub pending: Option<Confirm>,
     /// The last action's result; cleared by the next key.
     pub status: Option<String>,
     /// A worker is running (waking, cleaning up).
@@ -168,6 +185,8 @@ pub struct App {
     pub scroll: Cell<usize>,
     /// Screen row → what is drawn there, from the last frame, for the mouse.
     pub hits: RefCell<Vec<(u16, Hit)>>,
+    /// Drawn beside its conversation in the built-in layout (§9), which takes Ctrl+\.
+    pub embedded: bool,
 }
 
 impl App {
@@ -186,6 +205,7 @@ impl App {
             show_resolved: false,
             detail_open: false,
             screen: Screen::Board,
+            pending: None,
             status: None,
             busy: None,
             loaded: false,
@@ -196,6 +216,7 @@ impl App {
             now,
             scroll: Cell::new(0),
             hits: RefCell::new(Vec::new()),
+            embedded: false,
         }
     }
 
@@ -241,16 +262,26 @@ impl App {
                 confirmed,
             } => {
                 self.busy = None;
-                self.screen = Screen::Confirm(Confirm {
+                let confirm = Confirm {
                     name,
                     loss,
                     input: String::new(),
                     confirmed,
-                });
+                };
+                match &mut self.screen {
+                    Screen::Settings(form) => {
+                        form.message = Some(format!(
+                            "Cleanup of {} stopped: the board says why when you leave settings.",
+                            confirm.name
+                        ));
+                        self.pending = Some(confirm);
+                    }
+                    _ => self.screen = Screen::Confirm(confirm),
+                }
             }
-            Msg::Saved(config) => {
+            Msg::Saved { config, warning } => {
                 if let Screen::Settings(form) = &mut self.screen {
-                    form.saved(&config);
+                    form.saved(&config, warning);
                 }
                 self.config = *config;
             }
@@ -370,6 +401,14 @@ impl App {
         }
     }
 
+    /// A result for whichever screen is open: the settings form's message, else the status line.
+    pub fn say(&mut self, text: String) {
+        match &mut self.screen {
+            Screen::Settings(form) => form.message = Some(text),
+            _ => self.status = Some(text),
+        }
+    }
+
     /// Clicks select (a click on the selection shows it, as Enter does; one on the Resolved
     /// header shows or hides it); the wheel moves the selection.
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Vec<Action> {
@@ -382,6 +421,8 @@ impl App {
         };
         match (&mut self.screen, ev.kind) {
             (Screen::Help, MouseEventKind::Down(_)) => self.screen = Screen::Board,
+            // The text being typed belongs to its field: the cursor stays until Enter or Esc.
+            (Screen::Settings(form), _) if form.editing.is_some() => {}
             (Screen::Settings(form), MouseEventKind::ScrollUp) => form.move_cursor(-1),
             (Screen::Settings(form), MouseEventKind::ScrollDown) => form.move_cursor(1),
             (Screen::Settings(_), MouseEventKind::Down(MouseButton::Left)) => {
@@ -432,10 +473,14 @@ impl App {
                 Vec::new()
             }
             Screen::Confirm(_) => self.confirm_key(key),
+            Screen::Stop { .. } => self.stop_key(key),
             Screen::Settings(form) => match form.on_key(key) {
                 settings::Outcome::Stay => Vec::new(),
                 settings::Outcome::Close => {
-                    self.screen = Screen::Board;
+                    self.screen = match self.pending.take() {
+                        Some(confirm) => Screen::Confirm(confirm),
+                        None => Screen::Board,
+                    };
                     Vec::new()
                 }
                 settings::Outcome::Run(action) => vec![action],
@@ -457,20 +502,37 @@ impl App {
                 self.fix_selection();
             }
             KeyCode::Char('?') => self.screen = Screen::Help,
-            KeyCode::Char('s') => {
-                self.screen =
-                    Screen::Settings(Box::new(SettingsForm::new(&self.config, self.dir.clone())))
-            }
+            KeyCode::Char('s') => self.open_settings(),
             KeyCode::Esc | KeyCode::Char('c') => return self.show_coordinator(),
             KeyCode::Enter if self.on_coordinator => return self.show_coordinator(),
             KeyCode::Enter => return self.on_thread(|app, row| app.show(row)),
+            KeyCode::Char('n') => return self.next_waiting(),
             KeyCode::Char('w') => return self.on_thread(|app, row| app.wake(row)),
+            KeyCode::Char('S') => return self.on_thread(|app, row| app.ask_stop(row)),
+            KeyCode::Char('X') => return self.clean_all(),
             KeyCode::Char('r') => return self.on_thread(|app, row| app.resolve(row)),
             KeyCode::Char('o') => return self.on_thread(|app, row| app.open_pr(row)),
             KeyCode::Char('x') => return self.on_thread(|app, row| app.clean(row)),
             _ => {}
         }
         Vec::new()
+    }
+
+    /// The form starts from project.toml as it is now, so a save keeps edits made by hand while
+    /// the board ran; the header's name and goal follow them.
+    fn open_settings(&mut self) {
+        let message = match ProjectConfig::load(&self.dir.join("project.toml")) {
+            Ok(config) => {
+                self.config = config;
+                None
+            }
+            Err(e) => Some(format!(
+                "Couldn't re-read project.toml ({e:#}): this is the board's copy."
+            )),
+        };
+        let mut form = SettingsForm::new(&self.config, self.dir.clone());
+        form.message = message;
+        self.screen = Screen::Settings(Box::new(form));
     }
 
     fn show_coordinator(&mut self) -> Vec<Action> {
@@ -527,12 +589,95 @@ impl App {
         vec![Action::Wake(row.name)]
     }
 
+    /// Shows the next thread waiting on the user after the one the main pane shows (wrapping),
+    /// and selects it, so answering them in turn needs no looking.
+    fn next_waiting(&mut self) -> Vec<Action> {
+        let waiting: Vec<&SessionRow> = self
+            .threads
+            .iter()
+            .filter(|r| group_of(r) == Group::Waiting)
+            .collect();
+        let shown = self
+            .pane_target
+            .as_deref()
+            .and_then(|n| waiting.iter().position(|r| r.name == n));
+        let next = match (waiting.len(), shown) {
+            (0, _) => return self.refuse("Nothing is waiting on you.".to_string()),
+            (1, Some(_)) => {
+                return self.refuse(format!(
+                    "{} is the only thread waiting on you, and the main pane shows it.",
+                    display_title(waiting[0])
+                ));
+            }
+            (n, shown) => waiting[shown.map_or(0, |i| (i + 1) % n)].clone(),
+        };
+        self.select(&Hit::Thread(next.name.clone()));
+        self.show(next)
+    }
+
+    fn ask_stop(&mut self, row: SessionRow) -> Vec<Action> {
+        if row.removed_at.is_some() {
+            return self.refuse(crate::guard::removed_message(&row.name));
+        }
+        if row.cleaned_at.is_some() {
+            return self.refuse(crate::guard::cleaned_message(&row.name));
+        }
+        if row.pid.is_none() {
+            return self.refuse(format!("{} is asleep: there is nothing to stop.", row.name));
+        }
+        if let Some(busy) = &self.busy {
+            return self.refuse(format!("Wait: {busy}"));
+        }
+        self.screen = Screen::Stop {
+            label: display_title(&row),
+            name: row.name,
+        };
+        Vec::new()
+    }
+
+    /// y stops; any other key leaves it running.
+    fn stop_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let Screen::Stop { name, .. } = std::mem::replace(&mut self.screen, Screen::Board) else {
+            return Vec::new();
+        };
+        if key.code != KeyCode::Char('y') {
+            self.status = Some(format!("{name} keeps running."));
+            return Vec::new();
+        }
+        // The main pane leaves it first (the worker does that too): it would respawn it.
+        if self.pane_target.as_deref() == Some(name.as_str()) {
+            self.pane_target = None;
+        }
+        self.busy = Some(format!("stopping {name}…"));
+        vec![Action::Stop(name)]
+    }
+
+    fn clean_all(&mut self) -> Vec<Action> {
+        let any = self
+            .threads
+            .iter()
+            .any(|r| r.resolved && r.cleaned_at.is_none());
+        if !any {
+            return self.refuse("No resolved thread is left to clean up.".to_string());
+        }
+        if let Some(busy) = &self.busy {
+            return self.refuse(format!("Wait: {busy}"));
+        }
+        self.busy = Some("cleaning up resolved threads…".to_string());
+        vec![Action::CleanAll]
+    }
+
     fn resolve(&mut self, row: SessionRow) -> Vec<Action> {
         if row.resolved && row.removed_at.is_some() {
             return self.refuse(crate::guard::removed_message(&row.name));
         }
         if row.resolved && row.cleaned_at.is_some() {
             return self.refuse(crate::guard::cleaned_message(&row.name));
+        }
+        // Flipped here too, so a second r before the refresh undoes the first instead of
+        // sending it again.
+        if let Some(r) = self.threads.iter_mut().find(|r| r.name == row.name) {
+            r.resolved = !row.resolved;
         }
         vec![Action::SetResolved {
             name: row.name,
@@ -656,6 +801,65 @@ pub(crate) mod tests {
             thread("work-2", Group::Working, 4),
             thread("done-1", Group::Resolved, 9),
         ])
+    }
+
+    /// n shows the waiting threads in turn, after whichever the main pane shows.
+    #[test]
+    fn n_shows_the_next_thread_waiting() {
+        let mut app = app_with(vec![
+            thread("wait-1", Group::Waiting, 2),
+            thread("work-1", Group::Working, 3),
+            thread("wait-2", Group::Waiting, 1),
+        ]);
+        let first = app.on_key(ch('n'));
+        let Action::Show(Some(first)) = &first[0] else {
+            panic!("{first:?}")
+        };
+        assert_eq!(app.selected.as_deref(), Some(first.as_str()));
+        let second = app.on_key(ch('n'));
+        let Action::Show(Some(second)) = &second[0] else {
+            panic!("{second:?}")
+        };
+        assert_ne!(first, second);
+        assert_eq!(app.on_key(ch('n')), vec![Action::Show(Some(first.clone()))]);
+
+        let mut one = app_with(vec![thread("wait-1", Group::Waiting, 2)]);
+        one.on_key(ch('n'));
+        assert!(one.on_key(ch('n')).is_empty());
+        assert!(one.status.as_deref().unwrap().contains("the only thread"));
+        let mut none = app_with(vec![thread("work-1", Group::Working, 3)]);
+        assert!(none.on_key(ch('n')).is_empty());
+        assert_eq!(none.status.as_deref(), Some("Nothing is waiting on you."));
+    }
+
+    /// S asks before stopping a running thread and refuses an asleep one; the main pane leaves
+    /// a thread being stopped. X cleans up every resolved thread, one worker at a time.
+    #[test]
+    fn stop_and_clean_all() {
+        let mut asleep = thread("idle-1", Group::Idle, 1);
+        asleep.pid = None;
+        let mut app = app_with(vec![
+            thread("work-1", Group::Working, 3),
+            asleep,
+            thread("done-1", Group::Resolved, 2),
+        ]);
+        app.selected = Some("work-1".into());
+        app.pane_target = Some("work-1".into());
+        assert!(app.on_key(ch('S')).is_empty());
+        assert!(matches!(app.screen, Screen::Stop { .. }));
+        assert_eq!(app.on_key(ch('y')), vec![Action::Stop("work-1".into())]);
+        assert_eq!(app.pane_target, None);
+        assert!(app.on_key(ch('X')).is_empty(), "one worker at a time");
+        app.apply(Msg::Done("Stopped work-1; w wakes it.".into()));
+
+        app.selected = Some("idle-1".into());
+        assert!(app.on_key(ch('S')).is_empty());
+        assert_eq!(app.screen, Screen::Board);
+        assert!(app.status.as_deref().unwrap().contains("asleep"));
+
+        assert_eq!(app.on_key(ch('X')), vec![Action::CleanAll]);
+        let mut none = app_with(vec![thread("work-1", Group::Working, 3)]);
+        assert!(none.on_key(ch('X')).is_empty());
     }
 
     #[test]
@@ -834,6 +1038,14 @@ pub(crate) mod tests {
                 resolved: false
             }]
         );
+        // A second r before the refresh undoes the first rather than sending it again.
+        assert_eq!(
+            app.on_key(ch('r')),
+            [Action::SetResolved {
+                name: "done-1".into(),
+                resolved: true
+            }]
+        );
         assert!(app.on_key(ch('o')).is_empty());
         assert_eq!(
             app.on_key(ch('x')),
@@ -1003,6 +1215,120 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("nothing was removed")
         );
+    }
+
+    /// A blocked cleanup's modal never replaces an open settings form: it waits, and shows once
+    /// settings closes.
+    #[test]
+    fn a_blocked_cleanup_waits_for_settings_to_close() {
+        let mut app = app_with(vec![thread("done-1", Group::Resolved, 3)]);
+        app.on_key(ch('R'));
+        app.on_key(ch('x'));
+        app.on_key(ch('s'));
+        if let Screen::Settings(form) = &mut app.screen {
+            form.draft.ui.notify = !form.draft.ui.notify;
+        }
+        app.apply(Msg::CleanBlocked {
+            name: "done-1".into(),
+            loss: "This loses:\n  1 commit on no remote".into(),
+            confirmed: Some(listed_loss()),
+        });
+        assert_eq!(app.busy, None);
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings stays open")
+        };
+        assert!(form.dirty(), "the draft is kept");
+        assert!(form.message.as_deref().unwrap().contains("done-1 stopped"));
+        // Esc twice: the draft is thrown away on purpose, and the modal shows.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Esc));
+        let Screen::Confirm(c) = &app.screen else {
+            panic!("the modal shows: {:?}", app.screen)
+        };
+        assert_eq!(c.name, "done-1");
+        assert_eq!(app.pending, None);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Board);
+    }
+
+    fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// While a field is being typed into, the wheel and clicks leave the cursor alone, and Enter
+    /// puts the text in the field it was typed into.
+    #[test]
+    fn the_mouse_waits_for_an_edit() {
+        let mut app = sample();
+        app.on_key(ch('s'));
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings")
+        };
+        assert_eq!(form.current(), settings::Field::Goal);
+        let model = form
+            .fields()
+            .iter()
+            .position(|f| *f == settings::Field::ThreadModel)
+            .unwrap();
+        app.hits.borrow_mut().push((9, Hit::Field(model)));
+        app.on_key(key(KeyCode::Enter));
+        for c in " now".chars() {
+            app.on_key(ch(c));
+        }
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 0));
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 9));
+        app.on_key(key(KeyCode::Enter));
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings")
+        };
+        assert_eq!(form.cursor, 0);
+        assert_eq!(form.draft.goal.as_deref(), Some("Ship it now"));
+        assert_eq!(form.draft.threads.model, "sonnet");
+        // With no edit open, a click moves the cursor.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 9));
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings")
+        };
+        assert_eq!(form.cursor, model);
+    }
+
+    /// Settings opens on project.toml as it is now, and what the editor reports shows in the
+    /// form rather than in the hidden status line.
+    #[test]
+    fn settings_reads_project_toml_when_it_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = sample();
+        app.dir = dir.path().into();
+        let mut edited = app.config.clone();
+        edited.goal = Some("Edited by hand".into());
+        edited.save(&dir.path().join("project.toml")).unwrap();
+        app.on_key(ch('s'));
+        assert_eq!(app.config.goal.as_deref(), Some("Edited by hand"));
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings")
+        };
+        assert_eq!(form.draft.goal.as_deref(), Some("Edited by hand"));
+        assert!(!form.dirty());
+        app.say("Edited instructions.md.".into());
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings")
+        };
+        assert_eq!(form.message.as_deref(), Some("Edited instructions.md."));
+        assert_eq!(app.status, None);
+
+        // Unreadable: the board's copy, and the form says so.
+        let mut app = sample();
+        app.on_key(ch('s'));
+        let Screen::Settings(form) = &app.screen else {
+            panic!("settings")
+        };
+        assert_eq!(form.draft.goal.as_deref(), Some("Ship it"));
+        assert!(form.message.as_deref().unwrap().contains("re-read"));
     }
 
     #[test]

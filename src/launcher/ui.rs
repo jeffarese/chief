@@ -3,7 +3,7 @@
 use std::cell::Cell;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -11,7 +11,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::project::{Note, Where};
 use crate::tui::{self, ACCENT, bold, cols, dim, key_bar, panel, tail, truncate};
 
-use super::app::{Hit, Launcher, Screen, Starting};
+use super::app::{Archiving, Hit, Launcher, Screen, Starting};
 use super::wizard::{Setting, Step, Wizard};
 
 const CARD_WIDTH: u16 = 76;
@@ -23,10 +23,14 @@ thread_local! {
     static FRAME: Cell<usize> = const { Cell::new(0) };
 }
 
-/// A screen's content: its lines (each with what a click on it hits) and whether they wrap.
+/// A screen's content: its lines (each with what a click on it hits), whether they wrap, and,
+/// for a wrapping card, the lines pinned at its bottom.
 struct Card {
     title: String,
     lines: Vec<(Line<'static>, Option<Hit>)>,
+    /// What Enter does, the result, the failure: drawn whole at the bottom when the card is cut,
+    /// so a short terminal never hides what the next key does.
+    foot: Vec<Line<'static>>,
     wrap: bool,
 }
 
@@ -35,24 +39,38 @@ impl Card {
         Card {
             title: title.into(),
             lines: lines.into_iter().map(|l| (l, None)).collect(),
+            foot: Vec::new(),
             wrap: true,
         }
     }
 
-    /// Lines it takes at `width`, counting wrapped ones.
-    fn height(&self, width: usize) -> usize {
-        self.lines
-            .iter()
-            .map(|(l, _)| {
-                let w: usize = l.spans.iter().map(|s| cols(&s.content)).sum();
-                if self.wrap && width > 0 {
-                    w.div_ceil(width).max(1)
-                } else {
-                    1
-                }
-            })
-            .sum()
+    fn with_foot(mut self, foot: Vec<Line<'static>>) -> Self {
+        self.foot = foot;
+        self
     }
+
+    fn body(&self) -> Vec<Line<'static>> {
+        self.lines.iter().map(|(l, _)| l.clone()).collect()
+    }
+
+    /// Rows it takes at `width`, wrapped as the Paragraph that draws it wraps them.
+    fn height(&self, width: u16) -> usize {
+        if !self.wrap {
+            return self.lines.len();
+        }
+        rows(&self.body(), width) + rows(&self.foot, width)
+    }
+}
+
+fn wrapped(lines: Vec<Line<'static>>) -> Paragraph<'static> {
+    Paragraph::new(lines).wrap(Wrap { trim: false })
+}
+
+fn rows(lines: &[Line<'static>], width: u16) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    wrapped(lines.to_vec()).line_count(width)
 }
 
 pub fn draw(f: &mut Frame, app: &Launcher) {
@@ -64,25 +82,22 @@ pub fn draw(f: &mut Frame, app: &Launcher) {
     FRAME.with(|n| n.set(n.get().wrapping_add(1)));
     let width = area.width.min(CARD_WIDTH);
     let x = area.x + (area.width - width) / 2;
-    let inner_w = width.saturating_sub(4) as usize;
+    let inner_w = tui::inside(&panel("", true), Rect::new(0, 0, width, 3)).width;
     let (card, keys) = match &app.screen {
-        Screen::List => (
-            list_card(app, inner_w),
-            vec![
-                ("⏎", "open"),
-                ("n", "new project"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-        ),
+        Screen::List => (list_card(app, inner_w as usize), list_keys(app)),
         Screen::Help => (help_card(), vec![("any key", "back")]),
-        Screen::Wizard(w) => (wizard_card(w, inner_w), wizard_keys(w)),
+        Screen::Wizard(w) => (wizard_card(w, inner_w as usize), wizard_keys(w)),
         Screen::Starting(s) => (starting_card(s), starting_keys(s)),
+        Screen::ConfirmArchive(_, name) => (
+            confirm_archive_card(name),
+            vec![("y", "archive"), ("any other key", "cancel")],
+        ),
+        Screen::Archiving(a) => (archiving_card(a), archiving_keys(a)),
     };
     // The card fits its content, a line below the top, with the key bar right under it.
     let top = u16::from(area.height > 12);
     let room = area.height.saturating_sub(top + 1);
-    let height = (card.height(inner_w) as u16 + 2).min(room);
+    let height = (card.height(inner_w) as u16).saturating_add(2).min(room);
     let rect = Rect {
         x,
         y: area.y + top,
@@ -109,8 +124,11 @@ fn render_card(f: &mut Frame, area: Rect, card: &Card, app: &Launcher) {
     let inner = tui::inside(&block, area);
     f.render_widget(block, area);
     if card.wrap {
-        let lines: Vec<Line> = card.lines.iter().map(|(l, _)| l.clone()).collect();
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        let foot_h = (rows(&card.foot, inner.width) as u16).min(inner.height);
+        let [body, foot] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(foot_h)]).areas(inner);
+        draw_end(f, body, card.body());
+        draw_end(f, foot, card.foot.clone());
         return;
     }
     let h = inner.height as usize;
@@ -137,28 +155,65 @@ fn render_card(f: &mut Frame, area: Rect, card: &Card, app: &Launcher) {
     f.render_widget(Paragraph::new(shown), inner);
 }
 
+/// Draws wrapped `lines` in `area`. When they don't fit, their end shows, under a line that says
+/// more is above: the end is what was added last (the Starting card's notes), or what sits next
+/// to the foot (the folders the Review step's box would trust).
+fn draw_end(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let total = rows(&lines, area.width) as u16;
+    if total <= area.height {
+        f.render_widget(wrapped(lines), area);
+        return;
+    }
+    let (more, rest) = if area.height > 1 {
+        let [more, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        (Some(more), rest)
+    } else {
+        (None, area)
+    };
+    if let Some(more) = more {
+        f.render_widget(Paragraph::new(Line::styled("↑ more above", dim())), more);
+    }
+    f.render_widget(wrapped(lines).scroll((total - rest.height, 0)), rest);
+}
+
 fn list_card(app: &Launcher, width: usize) -> Card {
     let mut lines: Vec<(Line<'static>, Option<Hit>)> = vec![
         (Line::styled("Your projects", bold()), None),
         (Line::raw(""), None),
     ];
+    let archived = app.archived_count();
     if app.projects.is_empty() {
         lines.push((Line::styled("No projects yet.", dim()), None));
+    } else if app.projects.len() == archived {
+        lines.push((Line::styled("Every project is archived.", dim()), None));
     }
-    for (i, p) in app.projects.iter().enumerate() {
+    for (i, p) in app.projects[..app.visible()].iter().enumerate() {
         let selected = i == app.cursor;
-        let summary_style = if p.waiting {
+        // Live projects come first: the header goes right before the first archived one.
+        if p.archived && (i == 0 || !app.projects[i - 1].archived) {
+            lines.push((Line::raw(""), None));
+            lines.push((archived_header(archived, false, width), Some(Hit::Archived)));
+        }
+        let summary_style = if p.waiting && !p.archived {
             Style::new().fg(Color::Red)
         } else {
             dim()
         };
-        let summary = truncate(&p.summary, width / 2);
+        let summary = if p.archived {
+            "archived".to_string()
+        } else {
+            truncate(&p.summary, width / 2)
+        };
         let name_room = width.saturating_sub(cols(&summary) + 4);
         let name = truncate(&p.name, name_room);
         let gap = width.saturating_sub(2 + cols(&name) + cols(&summary));
         let mut first = Line::from(vec![
             Span::styled(if selected { "▌ " } else { "  " }, Style::new().fg(ACCENT)),
-            Span::styled(name, bold()),
+            Span::styled(name, if p.archived { dim() } else { bold() }),
             Span::raw(" ".repeat(gap)),
             Span::styled(summary, summary_style),
         ]);
@@ -179,6 +234,10 @@ fn list_card(app: &Launcher, width: usize) -> Card {
             lines.push((second, Some(Hit::Row(i))));
         }
     }
+    if archived > 0 && !app.show_archived {
+        lines.push((Line::raw(""), None));
+        lines.push((archived_header(archived, true, width), Some(Hit::Archived)));
+    }
     lines.push((Line::raw(""), None));
     let new = app.on_new_row();
     let mut add = Line::from(vec![
@@ -189,19 +248,96 @@ fn list_card(app: &Launcher, width: usize) -> Card {
         add = add.style(tui::selected());
         pad(&mut add, width);
     }
-    lines.push((add, Some(Hit::Row(app.projects.len()))));
+    lines.push((add, Some(Hit::Row(app.visible()))));
     if let Some(status) = &app.status {
+        let (text, color) = match status {
+            Ok(text) => (text, Color::Green),
+            Err(text) => (text, Color::Red),
+        };
         lines.push((Line::raw(""), None));
-        lines.push((
-            Line::styled(status.clone(), Style::new().fg(Color::Red)),
-            None,
-        ));
+        lines.push((Line::styled(text.clone(), Style::new().fg(color)), None));
     }
 
     Card {
         title: "chief".into(),
         lines,
+        foot: Vec::new(),
         wrap: false,
+    }
+}
+
+/// `Archived · N · A shows`, as the board's collapsed Resolved header.
+fn archived_header(count: usize, collapsed: bool, width: usize) -> Line<'static> {
+    let mut text = format!("  Archived · {count}");
+    if collapsed {
+        text.push_str(" · A shows");
+    }
+    Line::styled(truncate(&text, width), bold())
+}
+
+fn list_keys(app: &Launcher) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("⏎", "open")];
+    match app.selected() {
+        Some(p) if p.archived => keys.push(("a", "unarchive")),
+        Some(_) => keys.push(("a", "archive")),
+        None => {}
+    }
+    if app.archived_count() > 0 {
+        keys.push((
+            "A",
+            if app.show_archived {
+                "hide archived"
+            } else {
+                "show archived"
+            },
+        ));
+    }
+    keys.extend([("n", "new project"), ("?", "help"), ("q", "quit")]);
+    keys
+}
+
+fn confirm_archive_card(name: &str) -> Card {
+    let lines = vec![
+        Line::styled(
+            format!(
+                "Archive {name}? Its coordinator and threads stop; their conversations, \
+                 worktrees and branches stay."
+            ),
+            bold(),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "It moves under Archived in your projects; a there, or opening it, brings it back.",
+            dim(),
+        ),
+    ];
+    Card::new(format!("Archive {name}"), lines)
+}
+
+fn archiving_card(a: &Archiving) -> Card {
+    let mut lines = note_lines(&a.notes);
+    lines.push(Line::raw(""));
+    let foot = match &a.done {
+        None => {
+            let frame = FRAME.with(Cell::get) / 2 % SPINNER.len();
+            Line::from(vec![
+                Span::styled(format!("{} ", SPINNER[frame]), Style::new().fg(ACCENT)),
+                Span::styled("Stopping its sessions…", dim()),
+            ])
+        }
+        Some(Ok(())) => Line::styled(
+            "It is under Archived in your projects now; a there brings it back.",
+            bold(),
+        ),
+        Some(Err(e)) => Line::styled(e.clone(), Style::new().fg(Color::Red)),
+    };
+    Card::new(format!("Archiving {}", a.name), lines).with_foot(vec![foot])
+}
+
+fn archiving_keys(a: &Archiving) -> Vec<(&'static str, &'static str)> {
+    match &a.done {
+        None => vec![("q", "quit")],
+        Some(_) => vec![("⏎", "projects"), ("q", "quit")],
     }
 }
 
@@ -227,8 +363,17 @@ fn help_card() -> Card {
              comes back to the coordinator, s opens settings and ? lists every key.",
         ),
         Line::raw(""),
+        Line::styled("Archiving a project", bold()),
+        Line::raw(
+            "a stops its coordinator and threads and puts it under Archived; nothing is \
+             deleted. A shows the archived projects; a on one, or opening it, brings it back.",
+        ),
+        Line::raw(""),
         Line::styled("Keys here", bold()),
-        Line::raw("↑↓ or the mouse wheel move · ⏎ or a click opens · n new project · q quit"),
+        Line::raw(
+            "↑↓ or the mouse wheel move · ⏎ or a click opens · a archives or unarchives · A \
+             shows archived · n new project · q quit",
+        ),
     ];
     Card::new("chief · help", lines)
 }
@@ -289,6 +434,7 @@ fn label(text: &str, focused: bool) -> Line<'static> {
 
 fn wizard_card(w: &Wizard, width: usize) -> Card {
     let mut lines = vec![steps_line(w), Line::raw("")];
+    let mut foot = Vec::new();
     match w.step {
         Step::About => {
             lines.push(Line::raw("What is this project about?"));
@@ -406,28 +552,28 @@ fn wizard_card(w: &Wizard, width: usize) -> Card {
                     ));
                 }
                 let check = if w.trust { "[x]" } else { "[ ]" };
-                lines.push(Line::from(vec![
+                foot.push(Line::from(vec![
                     Span::styled(format!("{check} "), Style::new().fg(ACCENT)),
                     Span::raw("Trust them, as accepting Claude's trust prompt would"),
                 ]));
             }
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
+            foot.push(Line::raw(""));
+            foot.push(Line::styled(
                 "⏎ creates the project and opens the conversation with its coordinator.",
                 bold(),
             ));
         }
     }
     if let Some(m) = &w.message {
-        lines.push(Line::raw(""));
+        foot.push(Line::raw(""));
         let style = if m.starts_with("Added") || m.starts_with("Removed") {
             Style::new().fg(Color::Green)
         } else {
             Style::new().fg(Color::Red)
         };
-        lines.push(Line::styled(m.clone(), style));
+        foot.push(Line::styled(m.clone(), style));
     }
-    Card::new(format!("New project · step {} of 4", w.number()), lines)
+    Card::new(format!("New project · step {} of 4", w.number()), lines).with_foot(foot)
 }
 
 fn wizard_keys(w: &Wizard) -> Vec<(&'static str, &'static str)> {
@@ -462,9 +608,9 @@ fn wizard_keys(w: &Wizard) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-fn starting_card(s: &Starting) -> Card {
-    let mut lines: Vec<Line<'static>> = s
-        .notes
+/// What `up` or `archive` reported so far: `✓` done, `·` said, `!` warned.
+fn note_lines(notes: &[Note]) -> Vec<Line<'static>> {
+    notes
         .iter()
         .map(|n| match n {
             Note::Did(t) => Line::from(vec![
@@ -480,34 +626,39 @@ fn starting_card(s: &Starting) -> Card {
                 Span::raw(tui::home_relative(t)),
             ]),
         })
-        .collect();
+        .collect()
+}
+
+fn starting_card(s: &Starting) -> Card {
+    let mut lines = note_lines(&s.notes);
     lines.push(Line::raw(""));
+    let mut foot = Vec::new();
     let label = crate::layout::session_label(&s.slug);
     match &s.done {
         None => {
             let frame = FRAME.with(Cell::get) / 2 % SPINNER.len();
-            lines.push(Line::from(vec![
+            foot.push(Line::from(vec![
                 Span::styled(format!("{} ", SPINNER[frame]), Style::new().fg(ACCENT)),
                 Span::styled("Starting the coordinator…", dim()),
             ]));
         }
         // Only for a moment: the launcher hands this terminal to the conversation.
-        Some(Ok(Where::Here { .. })) => lines.push(Line::styled(
+        Some(Ok(Where::Here { .. } | Where::Builtin)) => foot.push(Line::styled(
             "Opening the conversation here, its threads on the right…",
             bold(),
         )),
-        Some(Ok(Where::Rex { shown: true })) => lines.push(Line::styled(
+        Some(Ok(Where::Rex { shown: true })) => foot.push(Line::styled(
             format!(
                 "Open in Rex session {label}: the conversation with the coordinator on the left, \
                  its threads on the right."
             ),
             bold(),
         )),
-        Some(Ok(Where::Rex { shown: false })) => lines.push(Line::styled(
+        Some(Ok(Where::Rex { shown: false })) => foot.push(Line::styled(
             format!("Ready in Rex session {label}; switch to it in the Rex app."),
             bold(),
         )),
-        Some(Ok(Where::Tmux)) => lines.push(Line::styled(
+        Some(Ok(Where::Tmux)) => foot.push(Line::styled(
             format!(
                 "Open in tmux window {label}: the conversation on the left, its threads on the \
                  right."
@@ -515,27 +666,27 @@ fn starting_card(s: &Starting) -> Card {
             bold(),
         )),
         Some(Ok(Where::Manual)) => {
-            lines.push(Line::styled(
+            foot.push(Line::styled(
                 "⏎ shows the conversation with the coordinator in this terminal.",
                 bold(),
             ));
-            lines.push(Line::styled(
+            foot.push(Line::styled(
                 "For its threads, run this in another terminal or split:",
                 dim(),
             ));
-            lines.push(Line::raw(format!("  chief board --project {}", s.slug)));
+            foot.push(Line::raw(format!("  chief board --project {}", s.slug)));
         }
         Some(Err(e)) => {
-            lines.push(Line::styled(e.clone(), Style::new().fg(Color::Red)));
+            foot.push(Line::styled(e.clone(), Style::new().fg(Color::Red)));
             if s.wizard.is_some() {
-                lines.push(Line::styled(
+                foot.push(Line::styled(
                     "Nothing was created. ⏎ goes back to the wizard.",
                     dim(),
                 ));
             }
         }
     }
-    Card::new(format!("Starting {}", s.name), lines)
+    Card::new(format!("Starting {}", s.name), lines).with_foot(foot)
 }
 
 fn starting_keys(s: &Starting) -> Vec<(&'static str, &'static str)> {
@@ -607,13 +758,84 @@ mod tests {
             "no threads yet",
             "Hold p95",
             "+ New project",
-            "⏎ open  n new project  ? help  q quit",
+            "⏎ open  a archive  n new project  ? help  q quit",
         ] {
             assert!(out.contains(want), "missing {want:?}\n{out}");
         }
+        assert!(!out.contains("Archived"), "{out}");
         for (w, h) in [(20, 5), (3, 2), (120, 50)] {
             render(&app, w, h);
         }
+    }
+
+    #[test]
+    fn archived_projects_fold_under_one_line() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let entry = |name: &str, slug: &str, archived: bool| Entry {
+            archived,
+            ..Entry::new(
+                slug,
+                Ok(ProjectConfig::new(name, slug, None, Vec::new())),
+                &[],
+            )
+        };
+        let mut app = Launcher::new(
+            vec![entry("Old work", "old", true), entry("Pay", "pay", false)],
+            None,
+            false,
+        );
+        let out = render(&app, 80, 20);
+        assert!(out.contains("Archived · 1 · A shows"), "{out}");
+        assert!(!out.contains("Old work"), "{out}");
+        assert!(out.contains("A show archived"), "{out}");
+
+        // A click on the header is A.
+        let y = out
+            .lines()
+            .position(|l| l.contains("Archived · 1"))
+            .unwrap() as u16;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.show_archived);
+        press(&mut app, KeyCode::Down);
+        let out = render(&app, 80, 20);
+        let line = out.lines().find(|l| l.contains("Old work")).unwrap();
+        assert!(line.ends_with("archived │"), "{out}");
+        assert!(!out.contains("A shows"), "{out}");
+        assert!(
+            out.contains("⏎ open  a unarchive  A hide archived"),
+            "{out}"
+        );
+
+        // a on a live project asks first, in its own card.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('a'));
+        let out = render(&app, 80, 20);
+        assert!(
+            out.contains("Archive Pay? Its coordinator and threads stop"),
+            "{out}"
+        );
+        assert!(out.contains("y archive  any other key cancel"), "{out}");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(render(&app, 80, 20).contains("Stopping its sessions…"));
+        app.apply(crate::launcher::app::Msg::Note(Note::Warn(
+            "Could not stop coordinator chief-pay: boom".into(),
+        )));
+        app.apply(crate::launcher::app::Msg::Archived(Err(
+            "Pay isn't archived: chief down pay didn't finish cleanly".into(),
+        )));
+        let out = render(&app, 80, 20);
+        assert!(out.contains("╭ Archiving Pay"), "{out}");
+        assert!(
+            out.contains("! Could not stop coordinator chief-pay"),
+            "{out}"
+        );
+        assert!(out.contains("Pay isn't archived"), "{out}");
+        assert!(out.contains("⏎ projects  q quit"), "{out}");
     }
 
     #[test]
@@ -658,6 +880,79 @@ mod tests {
         for (w, h) in [(20, 5), (3, 2)] {
             render(&app, w, h);
         }
+    }
+
+    /// On a 20-row terminal the Review card keeps the trust box, what Enter does and the last
+    /// folders it would trust; what doesn't fit is cut from the top, and says so.
+    #[test]
+    fn the_review_card_fits_20_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = Launcher::new(Vec::new(), None, false);
+        typed(&mut app, "Payments Latency");
+        press(&mut app, KeyCode::Enter);
+        typed(
+            &mut app,
+            "Hold p95 under 200 ms for every checkout path we own",
+        );
+        press(&mut app, KeyCode::Enter);
+        for i in 1..=6 {
+            let web = tmp.path().join(format!("team-{i}/web"));
+            std::fs::create_dir_all(&web).unwrap();
+            typed(&mut app, &web.to_string_lossy());
+            press(&mut app, KeyCode::Enter);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        for width in [80, 50] {
+            let out = render(&app, width, 20);
+            for want in [
+                "[x] Trust them",
+                "⏎ creates the project",
+                "team-6/web",
+                "↑ more above",
+                "⏎ create",
+            ] {
+                assert!(out.contains(want), "{width}: missing {want:?}\n{out}");
+            }
+        }
+    }
+
+    /// The Starting card keeps its result under the notes, however many came.
+    #[test]
+    fn the_starting_card_fits_20_rows() {
+        let starting = || {
+            let config = ProjectConfig::new("Pay", "pay", None, Vec::new());
+            let mut app = Launcher::new(vec![Entry::new("pay", Ok(config), &[])], None, false);
+            press(&mut app, KeyCode::Enter);
+            for i in 1..=20 {
+                app.apply(crate::launcher::app::Msg::Note(Note::Did(format!(
+                    "Step {i} of starting the coordinator went fine."
+                ))));
+            }
+            app
+        };
+        let mut app = starting();
+        let out = render(&app, 80, 20);
+        assert!(out.contains("Starting the coordinator…"), "{out}");
+        assert!(out.contains("Step 20 of"), "the latest note shows:\n{out}");
+        assert!(out.contains("↑ more above"), "{out}");
+
+        let mut failed = starting();
+        failed.apply(crate::launcher::app::Msg::Done(Err(
+            "chief up failed: the coordinator's session didn't start within 30 s; see \
+             ~/.chief/logs for the reason and try again."
+                .into(),
+        )));
+        let out = render(&failed, 80, 20);
+        assert!(
+            out.contains("try again."),
+            "the whole failure shows:\n{out}"
+        );
+
+        app.apply(crate::launcher::app::Msg::Done(Ok(Where::Manual)));
+        let out = render(&app, 80, 20);
+        assert!(out.contains("⏎ shows the conversation"), "{out}");
+        assert!(out.contains("chief board --project pay"), "{out}");
     }
 
     #[test]

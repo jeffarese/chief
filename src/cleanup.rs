@@ -94,10 +94,11 @@ fn plural(n: usize, what: &str) -> String {
     }
 }
 
-/// `<repo>/.claude/worktrees/<name>` for a cwd at or under it.
+/// `<repo>/.claude/worktrees/<name>` for a cwd at or under it: the innermost one, so a repository
+/// that itself lies under such a path still names its own worktrees.
 pub fn worktree_root(cwd: &Path) -> Option<PathBuf> {
     let parts: Vec<Component> = cwd.components().collect();
-    let i = parts.windows(3).position(|w| {
+    let i = parts.windows(3).rposition(|w| {
         w[0].as_os_str() == ".claude"
             && w[1].as_os_str() == "worktrees"
             && matches!(w[2], Component::Normal(_))
@@ -116,27 +117,41 @@ pub fn active(row: &SessionRow) -> bool {
 /// The thread's own worktree: what its job state names (`Claude::job_worktree`), the folder
 /// `claude rm` deletes, and only when that is a `<repo>/.claude/worktrees/<name>` folder. Never
 /// the hooks' cwd: it follows the thread's shell anywhere, into another thread's worktree too.
-pub fn worktree_of(claude: &Claude, row: &SessionRow) -> Option<PathBuf> {
-    own_job(claude, row).map(|(wt, _)| wt)
+/// An error when the job state can't be read: chief can't tell, so nothing may assume none.
+pub fn worktree_of(claude: &Claude, row: &SessionRow) -> Result<Option<PathBuf>> {
+    Ok(own_job(claude, row)?.map(|(wt, _)| wt))
 }
 
 /// The branch the job state names with the thread's own worktree (`worktree_of`): what its PR is
 /// matched on. Never the hooks' cwd, which may sit in the checkout on `main`.
-pub fn branch_of(claude: &Claude, row: &SessionRow) -> Option<String> {
-    own_job(claude, row)?.1
+pub fn branch_of(claude: &Claude, row: &SessionRow) -> Result<Option<String>> {
+    Ok(own_job(claude, row)?.and_then(|(_, branch)| branch))
 }
 
 /// `claude` is the project's account; the job state is in the thread's own (`Claude::for_row`).
-fn own_job(claude: &Claude, row: &SessionRow) -> Option<(PathBuf, Option<String>)> {
-    let job = claude.for_row(row).job_state(row.short_id.as_deref()?)?;
-    let path = job.worktree?;
-    (worktree_root(&path).as_deref() == Some(path.as_path())).then_some((path, job.branch))
+/// Ok(None) for a thread that never started, has no state file, or never moved into a worktree.
+fn own_job(claude: &Claude, row: &SessionRow) -> Result<Option<(PathBuf, Option<String>)>> {
+    let Some(short) = row.short_id.as_deref() else {
+        return Ok(None);
+    };
+    let job = claude
+        .for_row(row)
+        .job_state(short)
+        .context("reading the thread's job state")?;
+    let Some(claude::JobState {
+        worktree: Some(path),
+        branch,
+    }) = job
+    else {
+        return Ok(None);
+    };
+    Ok((worktree_root(&path).as_deref() == Some(path.as_path())).then_some((path, branch)))
 }
 
 /// Reads the thread's worktree (`worktree_of`). A thread without one has nothing of its own to
-/// lose.
+/// lose; one whose job state can't be read is an error.
 pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
-    let Some((root, branch)) = own_job(claude, row) else {
+    let Some((root, branch)) = own_job(claude, row)? else {
         return Ok(Inspection::default());
     };
     let mut ins = Inspection {
@@ -153,8 +168,10 @@ pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
         if top.and_then(|t| t.canonicalize().ok()) != root.canonicalize().ok() {
             bail!("{} is not a git worktree", root.display());
         }
-        if let Some(branch) = git_line(&root, &["branch", "--show-current"])? {
-            ins.branch = Some(branch);
+        // The job's branch is the one `claude rm` deletes, whatever HEAD is on now (HEAD's own
+        // commits are counted below as well).
+        if ins.branch.is_none() {
+            ins.branch = git_line(&root, &["branch", "--show-current"])?;
         }
         // Explicit, so a `status.showUntrackedFiles = no` config can't hide untracked files.
         ins.dirty = git_lines(
@@ -175,8 +192,8 @@ pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
     }
     if let Some(branch) = &ins.branch {
         let reference = format!("refs/heads/{branch}");
-        if let Ok(sha) = git_line(&dir, &["rev-parse", "--verify", "--quiet", &reference]) {
-            ins.head = ins.head.take().or(sha);
+        if let Some(sha) = branch_sha(&dir, &reference)? {
+            ins.head = ins.head.take().or(Some(sha));
             revs.push(reference);
         }
     }
@@ -200,13 +217,24 @@ pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
     Ok(ins)
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<Output> {
+/// `git -C <dir> <args>`, bounded by `GIT_TIMEOUT`, whatever its exit status. Without the
+/// caller's `GIT_DIR` and the like (`proc::without_repo_env`): run from a git hook, git would
+/// otherwise answer for, and a discard reset, the hook's repository instead of `dir`.
+pub(crate) fn git_output(dir: &Path, args: &[&str]) -> Result<Output> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
+    crate::proc::without_repo_env(&mut cmd)
+        .arg("-C")
+        .arg(dir)
+        .args(args);
     let shown = format!("git -C {} {}", dir.display(), args.join(" "));
-    let out = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)
+    crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)
         .with_context(|| format!("running `{shown}`"))?
-        .with_context(|| format!("`{shown}` took longer than {}s", GIT_TIMEOUT.as_secs()))?;
+        .with_context(|| format!("`{shown}` took longer than {}s", GIT_TIMEOUT.as_secs()))
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<Output> {
+    let out = git_output(dir, args)?;
+    let shown = format!("git -C {} {}", dir.display(), args.join(" "));
     if !out.status.success() {
         bail!(
             "`{shown}` failed ({}): {}",
@@ -215,6 +243,23 @@ fn git(dir: &Path, args: &[&str]) -> Result<Output> {
         );
     }
     Ok(out)
+}
+
+/// The sha `reference` points at; None only when it doesn't exist (`--verify --quiet` exits 1
+/// and prints nothing). Any other failure is an error, so work on it is never left uncounted.
+pub(crate) fn branch_sha(dir: &Path, reference: &str) -> Result<Option<String>> {
+    let out = git_output(dir, &["rev-parse", "--verify", "--quiet", reference])?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    match out.status.code() {
+        Some(0) if !sha.is_empty() => Ok(Some(sha)),
+        Some(1) if sha.is_empty() => Ok(None),
+        _ => bail!(
+            "`git -C {} rev-parse --verify {reference}` failed ({}): {}",
+            dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 fn git_lines(dir: &Path, args: &[&str]) -> Result<Vec<String>> {
@@ -256,6 +301,7 @@ pub fn cleanable(ctx: &Ctx, name: &str) -> Result<Option<SessionRow>> {
 
 /// `claude rm` stops the session even when it refuses: never while the thread works, waits on
 /// the user, or shows in the pane (the user may be typing into it; hooks only fire on submit).
+/// A pane that is gone shows nothing (`pane::showing`).
 fn ensure_idle(conn: &Connection, row: &SessionRow) -> Result<()> {
     let name = &row.name;
     if active(row) {
@@ -264,7 +310,7 @@ fn ensure_idle(conn: &Connection, row: &SessionRow) -> Result<()> {
         let group = state::derive(&facts).group.label().to_lowercase();
         bail!("{name} is {group}; clean it up once it is idle (cleanup stops its session)");
     }
-    if db::get_pane_showing(conn, &row.project_slug)?.as_deref() == Some(name.as_str()) {
+    if crate::pane::showing(conn, &row.project_slug)?.as_deref() == Some(name.as_str()) {
         bail!(
             "{name} is showing in the pane; show another session there first (cleanup stops \
              its session)"
@@ -415,23 +461,38 @@ fn shared(ctx: &Ctx, row: &SessionRow, ins: &Inspection) -> Result<Option<String
     let Some(wt) = &ins.worktree else {
         return Ok(None);
     };
-    Ok(sharing_worktree(ctx, row, wt)?.map(|other| {
-        format!(
-            "{} {SHARED_WORKTREE} {other}; chief won't remove or reset it",
-            wt.display()
-        )
-    }))
+    Ok(
+        sharing_worktree(ctx, row, wt)?.map(|sharing| match sharing {
+            Sharing::Names(other) => format!(
+                "{} is {SHARED_WORKTREE} {other}; chief won't remove or reset it",
+                wt.display()
+            ),
+            Sharing::Unknown(other, e) => format!(
+                "{} is possibly {SHARED_WORKTREE} {other}, whose job state can't be read ({}); \
+             chief won't remove or reset it",
+                wt.display(),
+                one_line(&format!("{e:#}"), 160)
+            ),
+        }),
+    )
 }
 
-/// In a `cleanup_blocked` reason: another session's job state names the same worktree. No
-/// discard can help then.
-pub const SHARED_WORKTREE: &str = "is also the worktree of";
+/// In a `cleanup_blocked` reason: another session's job state names the same worktree, or can't
+/// be read to tell. No discard can help then.
+pub const SHARED_WORKTREE: &str = "also the worktree of";
+
+enum Sharing {
+    /// This session's job state names the worktree too.
+    Names(String),
+    /// This session's job state can't be read, so it may.
+    Unknown(String, anyhow::Error),
+}
 
 /// Another registered session (any project of this chief home) whose job state names the same
-/// worktree, if any. Each session's job state is in its own account's folder: the thread's own
-/// account, else its project's; a project whose project.toml can't say is looked up in this
-/// project's.
-fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<String>> {
+/// worktree, or can't be read, if any. Each session's job state is in its own account's folder:
+/// the thread's own account, else its project's; a project whose project.toml can't say is
+/// looked up in this project's.
+fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<Sharing>> {
     let wt = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
     let mut projects: Vec<(String, Claude)> = vec![(row.project_slug.clone(), ctx.claude.clone())];
     for other in db::all_sessions(ctx.conn)? {
@@ -452,9 +513,12 @@ fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<Str
             }
         };
         let folder = project.for_row(&other).config_dir;
-        let theirs = claude::job_worktree(&folder, short);
-        if theirs.is_some_and(|p| p.canonicalize().unwrap_or(p) == wt) {
-            return Ok(Some(other.name));
+        match claude::job_worktree(&folder, short) {
+            Ok(Some(theirs)) if theirs.canonicalize().unwrap_or_else(|_| theirs.clone()) == wt => {
+                return Ok(Some(Sharing::Names(other.name)));
+            }
+            Ok(_) => {}
+            Err(e) => return Ok(Some(Sharing::Unknown(other.name, e))),
         }
     }
     Ok(None)
@@ -463,17 +527,34 @@ fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<Str
 /// Removed outside chief (§5): `claude rm` has no session left to remove, and the worktree it
 /// left behind is the user's to delete.
 fn removed_outside(ctx: &Ctx, row: &SessionRow) -> Result<Outcome> {
-    let Some(wt) = worktree_of(ctx.claude, row).filter(|p| p.is_dir()) else {
-        record(ctx, &row.name, None)?;
-        return Ok(Outcome::Cleaned);
-    };
-    let why = format!(
-        "{}; worktree remains at {}",
-        registry::REMOVED_OUTSIDE,
-        wt.display()
-    );
-    record(ctx, &row.name, Some(&why))?;
-    Ok(Outcome::Blocked(why))
+    match removed_outside_blocker(ctx, row) {
+        None => {
+            record(ctx, &row.name, None)?;
+            Ok(Outcome::Cleaned)
+        }
+        Some(why) => {
+            record(ctx, &row.name, Some(&why))?;
+            Ok(Outcome::Blocked(why))
+        }
+    }
+}
+
+/// Why a thread removed outside chief stays: its worktree remains, or its job state can't be
+/// read to tell. None: nothing is left, so it counts as cleaned.
+fn removed_outside_blocker(ctx: &Ctx, row: &SessionRow) -> Option<String> {
+    match worktree_of(ctx.claude, row) {
+        Ok(Some(wt)) if wt.is_dir() => Some(format!(
+            "{}; worktree remains at {}",
+            registry::REMOVED_OUTSIDE,
+            wt.display()
+        )),
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "{}; chief can't tell whether its worktree remains: {}",
+            registry::REMOVED_OUTSIDE,
+            one_line(&format!("{e:#}"), 160)
+        )),
+    }
 }
 
 /// Stores a cleanup result: `blocked` None means cleaned. A row that is cleaned already (a sync
@@ -557,16 +638,29 @@ fn sync_agents(ctx: &Ctx, slug: &str) -> Result<()> {
     }
 }
 
+/// What `clean(Safe)` would say, from the same checks in the same order, writing nothing (`gc`
+/// synced the rows just before). Only another process's claim isn't checked.
 fn dry_verdict(ctx: &Ctx, row: &SessionRow) -> Verdict {
-    if active(row) {
-        return Verdict::Skipped("still working or waiting".to_string());
+    if let Err(e) = ensure_idle(ctx.conn, row) {
+        return Verdict::Skipped(format!("{e:#}"));
     }
     if row.short_id.is_none() {
         return Verdict::WouldClean;
     }
+    if row.removed_at.is_some() {
+        return match removed_outside_blocker(ctx, row) {
+            Some(why) => Verdict::Blocked(why),
+            None => Verdict::WouldClean,
+        };
+    }
     let ins = match inspect(ctx.claude, row) {
         Ok(ins) => ins,
-        Err(e) => return Verdict::Blocked(format!("could not inspect the worktree: {e:#}")),
+        Err(e) => {
+            return Verdict::Blocked(format!(
+                "could not inspect the worktree: {}",
+                one_line(&format!("{e:#}"), 200)
+            ));
+        }
     };
     match shared(ctx, row, &ins) {
         Ok(Some(why)) => return Verdict::Blocked(why),
@@ -812,6 +906,11 @@ mod tests {
             (
                 "/r/.claude/worktrees/fix/src/a",
                 Some("/r/.claude/worktrees/fix"),
+            ),
+            // A repository that itself lies in another's worktree folder.
+            (
+                "/h/.claude/worktrees/w/r/.claude/worktrees/fix/src",
+                Some("/h/.claude/worktrees/w/r/.claude/worktrees/fix"),
             ),
             ("/r/.claude/worktrees", None),
             ("/r/.claude/other/fix", None),

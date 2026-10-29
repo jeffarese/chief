@@ -594,6 +594,35 @@ fn init_rejects_bad_input_without_leaving_files() {
     assert!(out.status.success(), "{}", stderr(&out));
 }
 
+/// Once the project is made, a trust check that fails (an unreadable `.claude.json`) is a line,
+/// and `init` still succeeds: failing then would leave a project a second `init` finds taken.
+#[test]
+fn init_finishes_when_trust_cant_be_checked() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    std::fs::write(&home.trust, "{ not json").unwrap();
+    let out = init(&home, &a, &b);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Created project"), "{text}");
+    assert!(
+        text.contains("chief couldn't check which folders Claude Code trusts: parsing"),
+        "{text}"
+    );
+    assert!(
+        text.contains("To trust them later: chief trust payments-latency"),
+        "{text}"
+    );
+    assert!(text.ends_with("(or run chief and pick it)\n"), "{text}");
+    assert!(db::project_dir(&home.db(), SLUG).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_to_string(&home.trust).unwrap(),
+        "{ not json",
+        "never replaced"
+    );
+}
+
 /// Hook commands written by init run from any cwd, without CHIEF_HOME in the environment.
 #[test]
 fn generated_hook_commands_reach_this_home() {
@@ -1034,7 +1063,7 @@ fn status_lines_show_cleanup_then_end_with_the_age() {
     cleaned.cleaned_at = Some(1);
     let mut blocked = thread("payments-latency-b-2222");
     blocked.cleanup_blocked = Some("2 unpushed commits".into());
-    let text = chief::project::render_status(SLUG, &[cleaned, blocked], "", now);
+    let text = chief::project::render_status(SLUG, false, &[cleaned, blocked], "", now);
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("    ")).collect();
     assert_eq!(lines.len(), 2, "{text}");
     for (line, state) in lines
@@ -1277,6 +1306,59 @@ fn up_opens_then_reuses_the_rex_layout() {
     );
     assert_eq!(home.rex.calls_of("new").len(), 1);
     assert_eq!(home.rex.calls_of("run").len(), 1);
+}
+
+/// A session `up` created but couldn't finish (its first block not renamed in Rex, its pane not
+/// marked in tmux) is killed: its id is never stored, so the next `up` would make another, and a
+/// `q` in its pane would close the stored layout instead.
+#[test]
+fn up_kills_a_layout_it_could_not_finish() {
+    let home = Home::new();
+    running_project(&home);
+    home.rex
+        .set("list.stdout", r#"{"sessions": []}"#)
+        .set(
+            "new.stdout",
+            r#"{"session_id": "session:new", "initial_windows": [{"window_id": "window:1", "block_ids": ["block:main"]}]}"#,
+        )
+        .set("block.rename.exit", "1");
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("No Rex layout: `rex block rename"), "{text}");
+    assert_eq!(
+        home.rex.calls_of("kill"),
+        [vec!["kill", "session:new", "--autostart=false"]]
+    );
+    assert!(home.rex.calls_of("run").is_empty());
+    assert_eq!(db::get_rex_session(&home.db(), SLUG).unwrap(), None);
+
+    home.rex
+        .set("list.exit", "1")
+        .set("list.stderr", "Error: no Rex server is running\n");
+    home.tmux
+        .set("new-window.stdout", "%5 @3 4242\n")
+        .set("set-option.exit", "1");
+    let sock = "/tmp/tmux-501/default";
+    let out = home.run_env(
+        &["up", SLUG],
+        &[("TMUX", "/tmp/tmux-501/default,4242,0")],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("No tmux layout: "),
+        "{}",
+        stdout(&out)
+    );
+    let calls = tmux_calls(&home, sock);
+    assert_eq!(
+        calls.last().unwrap(),
+        &strings(&["kill-window", "-t", "@3"]),
+        "{calls:?}"
+    );
+    assert!(!calls.iter().any(|c| c[0] == "split-window"), "{calls:?}");
+    assert_eq!(db::get_tmux_window(&home.db(), SLUG).unwrap(), None);
 }
 
 /// The fake tmux's calls, without the leading `-S <socket>` chief always passes.
@@ -1630,14 +1712,221 @@ fn down_closes_the_layout_and_stops_sessions() {
     assert_eq!(
         closed,
         [
-            vec!["block", "close", "block:main", "--autostart=false"],
-            vec!["block", "close", "block:board", "--autostart=false"]
-        ]
+            vec!["block", "close", "block:board", "--autostart=false"],
+            vec!["block", "close", "block:main", "--autostart=false"]
+        ],
+        "main, the pane, last"
     );
     assert_eq!(
         db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
         Some("session:7")
     );
+}
+
+/// `chief down` ends the running pane first, one it didn't open too (in the user's own Rex
+/// block, or run by hand): left running, it would attach again and respawn the coordinator
+/// seconds after `down` stopped it.
+#[test]
+fn down_ends_the_running_pane_first() {
+    use std::os::unix::process::ExitStatusExt;
+    let home = Home::new();
+    running_project(&home);
+    // A stand-in for the pane, reaped as soon as it ends, as its shell would. It never clears
+    // its record: `down` sees it gone.
+    let pane = |ignore_term: bool| {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        if ignore_term {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: signal() is async-signal-safe; the ignore survives exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let started = chief::proc::start_time(pid).unwrap();
+        let conn = home.db();
+        db::set_pane_process(&conn, SLUG, pid, &started).unwrap();
+        db::set_pane_showing(&conn, SLUG, Some("chief-payments-latency")).unwrap();
+        (pid, std::thread::spawn(move || child.wait().unwrap()))
+    };
+    let (pid, waiter) = pane(false);
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with(&format!(
+            "Ended chief pane (pid {pid}).\nNo layout of chief's is open.\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Stopped coordinator chief-payments-latency."),
+        "{text}"
+    );
+    assert_eq!(waiter.join().unwrap().signal(), Some(libc::SIGTERM));
+    assert_eq!(db::get_pane_process(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
+
+    // A pane that doesn't end: `down` goes on, keeps what it shows, and fails (on stderr).
+    let (pid, waiter) = pane(true);
+    let out = home.run(&["down", SLUG], "");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).starts_with(&format!(
+            "chief pane (pid {pid}) is still running after 3 s.\n"
+        )),
+        "{}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("Stopped coordinator chief-payments-latency."),
+        "{text}"
+    );
+    assert_eq!(
+        db::get_pane_showing(&home.db(), SLUG).unwrap().as_deref(),
+        Some("chief-payments-latency")
+    );
+    // SAFETY: our own child, not reaped until the waiter returns.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    waiter.join().unwrap();
+
+    // Gone without clearing its record: nothing to end, and the record is forgotten.
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("No layout of chief's is open.\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(db::get_pane_process(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
+}
+
+/// `chief archive` is `down --stop-threads`, and archives only when that finished cleanly.
+/// `status` then leaves the project out, `gc` still cleans it, and `unarchive` or `up` brings it
+/// back.
+#[test]
+fn archive_stops_everything_then_puts_the_project_away() {
+    let home = Home::new();
+    running_project(&home);
+    {
+        let mut t = db::SessionRow::new(
+            "payments-latency-a-1111",
+            SLUG,
+            chief::state::Role::Thread,
+            db::now_ms(),
+        );
+        t.short_id = Some("t1".into());
+        t.session_id = Some("t1-sid".into());
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    home.fake.set(
+        "agents.stdout",
+        &json!([
+            agent(
+                "c0ffee",
+                "coord-sid",
+                "chief-payments-latency",
+                "done",
+                Some(74112)
+            ),
+            agent(
+                "t1",
+                "t1-sid",
+                "payments-latency-a-1111",
+                "working",
+                Some(5)
+            ),
+        ])
+        .to_string(),
+    );
+
+    // A stop that fails: still running, so not archived (nothing keeps running hidden).
+    home.fake.set("stop.exit", "1");
+    let out = home.run(&["archive", SLUG], "");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("Could not stop coordinator chief-payments-latency"),
+        "{err}"
+    );
+    assert!(
+        err.contains("Payments Latency isn't archived: chief down payments-latency didn't finish"),
+        "{err}"
+    );
+    assert_eq!(db::archived_at(&home.db(), SLUG).unwrap(), None);
+
+    home.fake.unset("stop.exit");
+    let out = home.run(&["archive", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "No layout of chief's is open.\n\
+         Stopped coordinator chief-payments-latency.\n\
+         Stopped thread payments-latency-a-1111.\n\
+         Archived Payments Latency. Nothing was deleted: chief unarchive payments-latency or \
+         chief up payments-latency brings it back.\n"
+    );
+    assert_eq!(home.fake.calls_of("stop").len(), 4);
+    assert!(home.fake.calls_of("rm").is_empty());
+    assert!(db::archived_at(&home.db(), SLUG).unwrap().is_some());
+
+    // Archived already: said, nothing stopped again.
+    let out = home.run(&["archive", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "Payments Latency is archived already.\n");
+    assert_eq!(home.fake.calls_of("stop").len(), 4);
+
+    let out = home.run(&["status"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "1 archived project not shown; chief status <slug> shows one.\n"
+    );
+    let out = home.run(&["status", SLUG], "");
+    assert!(
+        stdout(&out).starts_with(
+            "payments-latency (archived; chief unarchive payments-latency brings it back)\n"
+        ),
+        "{}",
+        stdout(&out)
+    );
+    // Its resolved threads still hold worktrees: gc goes through archived projects too.
+    let out = home.run(&["gc", "--dry-run"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("payments-latency\n"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = home.run(&["unarchive", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "Unarchived Payments Latency. chief up payments-latency opens it.\n"
+    );
+    assert_eq!(db::archived_at(&home.db(), SLUG).unwrap(), None);
+    assert!(home.fake.calls_of("respawn").is_empty(), "starts nothing");
+    let out = home.run(&["unarchive", SLUG], "");
+    assert_eq!(stdout(&out), "Payments Latency isn't archived.\n");
+
+    // `up` on an archived project brings it back first.
+    assert!(home.run(&["archive", SLUG], "").status.success());
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("Unarchived Payments Latency.\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(db::archived_at(&home.db(), SLUG).unwrap(), None);
 }
 
 /// `chief` alone is the launcher (§10a); without a terminal it says so instead of drawing.

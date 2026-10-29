@@ -67,3 +67,13 @@ pub trait Mux {
             .map(|b| b.block))
     }
 }
+
+/// `result`, after killing `session` (best effort) when it is an error. For a session just
+/// created: `chief up` stores its id only once the layout opened, so one left running would be
+/// nobody's. The next `up` would make another, and a `q` in its pane would close the stored one.
+pub fn kill_on_error<T>(mux: &dyn Mux, session: &SessionRef, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        let _ = mux.kill_session(session);
+    }
+    result
+}

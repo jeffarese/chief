@@ -3,11 +3,15 @@
 pub mod accounts;
 pub mod agp;
 pub mod board;
+#[cfg(feature = "builtin-layout")]
+pub mod builtin;
 pub mod claude;
 pub mod cleanup;
 pub mod config;
 pub mod context;
 pub mod db;
+#[cfg(feature = "builtin-layout")]
+pub mod embed;
 pub mod generated;
 pub mod guard;
 pub mod hook;

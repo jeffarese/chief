@@ -334,10 +334,8 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(value)? + "\n";
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    crate::config::replace_file(path, &text)
 }
 
 #[cfg(test)]

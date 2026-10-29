@@ -13,12 +13,17 @@ use chief::state::Role;
 use common::{Home, OutputWithStdin, agent, stderr};
 use serde_json::Value;
 
+/// `chief hook` with a temp home and no `claude` at all: a hook that tried to list sessions
+/// would fail (and log it) rather than reach the real one.
 fn hook(home: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_chief"))
         .arg("hook")
         .args(args)
         .env("CHIEF_HOME", home)
         .env("CHIEF_NO_NOTIFY", "1")
+        .env("CHIEF_CLAUDE_BIN", home.join("no-claude"))
+        .env("CHIEF_CLAUDE_DIR", home.join("no-claude-dir"))
+        .env_remove("CLAUDE_CONFIG_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -94,6 +99,145 @@ fn stop_hook_updates_the_database() {
     );
     assert_eq!(row.group_name, "idle");
     assert_eq!(db::recent_events(&conn, "demo", 10).unwrap().len(), 1);
+}
+
+/// Another process holds the write lock past the 5 s busy timeout: a hook that can't record its
+/// event still exits 0 with nothing on stdout and logs why, whatever the event.
+#[test]
+fn hooks_against_a_locked_database_log_and_exit_zero() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("chief.db");
+    {
+        let conn = db::open(&db_path).unwrap();
+        db::register_project(&conn, "demo", &home.path().join("projects/demo"), 0).unwrap();
+        let mut t = SessionRow::new("demo-a-1a2b", "demo", Role::Thread, 0);
+        t.short_id = Some("a1".into());
+        t.session_id = Some("a-sid".into());
+        db::insert_session(&conn, &t).unwrap();
+    }
+    let lock = db::open(&db_path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let payload = |event: &str| {
+        serde_json::json!({
+            "session_id": "a-sid",
+            "hook_event_name": event,
+            "cwd": "/x",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "last_assistant_message": "done",
+            "background_tasks": [],
+        })
+        .to_string()
+    };
+    let outs: Vec<Output> = std::thread::scope(|scope| {
+        let runs: Vec<_> = ["Stop", "PreToolUse", "PostToolUse"]
+            .map(|event| {
+                let stdin = payload(event);
+                let home = home.path();
+                scope.spawn(move || {
+                    hook(
+                        home,
+                        &[event, "--project", "demo", "--role", "thread"],
+                        &stdin,
+                    )
+                })
+            })
+            .into_iter()
+            .collect();
+        runs.into_iter().map(|r| r.join().unwrap()).collect()
+    });
+    lock.execute_batch("ROLLBACK").unwrap();
+    for out in &outs {
+        assert_silent_success(out);
+    }
+    let log = error_log(home.path());
+    assert_eq!(log.lines().count(), 3, "{log}");
+    for event in ["Stop", "PreToolUse", "PostToolUse"] {
+        assert!(
+            log.lines()
+                .any(|l| l.contains(&format!("hook {event} --project demo"))
+                    && l.contains("database is locked")),
+            "{event}: {log}"
+        );
+    }
+    let conn = db::open(&db_path).unwrap();
+    assert!(db::recent_events(&conn, "demo", 10).unwrap().is_empty());
+}
+
+/// §4: after `/clear` the session runs under a new id, which a sync learns by short id. A Stop
+/// in between syncs first, so its report isn't lost; a Stop chief can match asks nothing.
+#[test]
+fn a_stop_after_clear_keeps_its_report() {
+    let home = Home::new();
+    {
+        let conn = home.db();
+        db::register_project(&conn, "demo", &home.path().join("projects/demo"), 0).unwrap();
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.short_id = Some("c1".into());
+        coord.session_id = Some("coord-sid".into());
+        db::insert_session(&conn, &coord).unwrap();
+        let mut t = SessionRow::new("demo-t-1111", "demo", Role::Thread, db::now_ms());
+        t.short_id = Some("t1".into());
+        t.session_id = Some("old-sid".into());
+        db::insert_session(&conn, &t).unwrap();
+    }
+    home.fake.set(
+        "agents.stdout",
+        &serde_json::json!([
+            agent("c1", "coord-sid", "chief-demo", "done", Some(100)),
+            agent("t1", "new-sid", "demo-t-1111", "working", Some(201)),
+        ])
+        .to_string(),
+    );
+    let stop = |sid: &str, message: &str| {
+        let payload = serde_json::json!({
+            "session_id": sid,
+            "hook_event_name": "Stop",
+            "cwd": "/x",
+            "last_assistant_message": message,
+            "background_tasks": [],
+        });
+        home.run(
+            &["hook", "Stop", "--project", "demo", "--role", "thread"],
+            &payload.to_string(),
+        )
+    };
+    assert_silent_success(&stop("new-sid", "Done after /clear."));
+    assert_eq!(error_log(home.path()), "");
+    let conn = home.db();
+    let row = db::get_session(&conn, "demo-t-1111").unwrap().unwrap();
+    assert_eq!(
+        (row.session_id.as_deref(), row.last_report.as_deref()),
+        (Some("new-sid"), Some("Done after /clear."))
+    );
+    assert_eq!(
+        db::recent_reports(&conn, "demo-t-1111", 10).unwrap().len(),
+        1
+    );
+    assert_eq!(home.fake.calls_of("agents").len(), 1);
+
+    // Now it matches: no listing.
+    assert_silent_success(&stop("new-sid", "Again."));
+    assert_eq!(home.fake.calls_of("agents").len(), 1);
+
+    // A session nobody lists stays unmatched, and a failing listing is logged.
+    home.fake
+        .set("agents.exit", "1")
+        .set("agents.stderr", "down");
+    assert_silent_success(&stop("stranger-sid", "Who?"));
+    let log = error_log(home.path());
+    assert!(
+        log.contains("hook Stop --project demo: couldn't look up session stranger-sid"),
+        "{log}"
+    );
+    let events = db::recent_events(&conn, "demo", 1).unwrap();
+    assert_eq!(
+        (
+            events[0].session_name.as_deref(),
+            events[0].session_id.as_deref()
+        ),
+        (None, Some("stranger-sid"))
+    );
 }
 
 #[test]
@@ -395,8 +539,9 @@ fn guard_fails_closed() {
     );
 }
 
-/// A guard that can't finish (here the database stays locked) still denies before Claude Code's
-/// hook timeout would let the call through.
+/// A guard that can't finish (here the database stays locked, so it can't record its denial;
+/// opening a current database takes no lock) still denies before Claude Code's hook timeout
+/// would let the call through.
 #[test]
 fn guard_denies_at_its_deadline() {
     let home = guarded_home();
@@ -417,7 +562,7 @@ fn guard_denies_at_its_deadline() {
         .stdin
         .take()
         .unwrap()
-        .write_all(send("demo-a-1111").as_bytes())
+        .write_all(send("other-project-thread").as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
     let took = start.elapsed();
@@ -426,6 +571,138 @@ fn guard_denies_at_its_deadline() {
     let reason = deny_reason(&out).unwrap();
     assert!(reason.contains("didn't decide within 1s"), "{reason}");
     assert!(error_log(home.path()).contains("didn't decide within 1s"));
+}
+
+/// The watchdog also covers a `claude agents` that hangs, whose own bound (10 s) is longer than
+/// a shortened deadline.
+#[test]
+fn guard_denies_at_its_deadline_while_the_listing_hangs() {
+    let home = guarded_home();
+    home.fake.set("agents.sleep", "30");
+    let start = std::time::Instant::now();
+    let out = home
+        .command(&[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ])
+        .env("CHIEF_GUARD_DEADLINE_MS", "1000")
+        .output_with_stdin(&send("demo-a-1111"));
+    let took = start.elapsed();
+    // The guard exited at its deadline and left the hanging listing behind: stop it.
+    let listing = home
+        .fake
+        .calls()
+        .iter()
+        .position(|c| c.first().map(String::as_str) == Some("agents"))
+        .expect("the guard listed the sessions");
+    let pid = home.fake.pid(listing);
+    assert!(
+        Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(took < std::time::Duration::from_secs(4), "took {took:?}");
+    let reason = deny_reason(&out).unwrap();
+    assert!(reason.contains("didn't decide within 1s"), "{reason}");
+    assert!(error_log(home.path()).contains("didn't decide within 1s"));
+}
+
+/// A guard that fails after reading the payload records the call it blocked: the tool, the
+/// target and the caller.
+#[test]
+fn a_failed_guard_records_what_it_knows() {
+    let home = guarded_home();
+    home.fake
+        .set("agents.exit", "1")
+        .set("agents.stderr", "supervisor down");
+    let out = home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        &send("demo-a-1111"),
+    );
+    assert!(deny_reason(&out).unwrap().contains("supervisor down"));
+    let out = home.run(
+        &[
+            "hook",
+            "guard",
+            "--project",
+            "demo",
+            "--role",
+            "coordinator",
+        ],
+        "{not json",
+    );
+    assert!(deny_reason(&out).is_some());
+    let rows: Vec<(Option<String>, String, Option<String>)> = home
+        .db()
+        .prepare("SELECT session_name, tool, target FROM guard_denials ORDER BY ts, rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                Some("chief-demo".to_string()),
+                "SendMessage".to_string(),
+                Some("demo-a-1111".to_string())
+            ),
+            (None, "unknown".to_string(), None),
+        ]
+    );
+}
+
+/// A thread caller chief doesn't know (its session id after `/clear`) while a thread runs in
+/// another account: placed by its transcript's folder, and kept from its coordinator's name
+/// when that doesn't place it (§6).
+#[test]
+fn the_guard_places_an_unknown_thread_by_its_transcript() {
+    let home = guarded_home();
+    let cpb = common::account(home.path(), "claude-cpb");
+    {
+        let mut t = SessionRow::new("demo-far-3333", "demo", Role::Thread, db::now_ms());
+        t.session_id = Some("far-sid".into());
+        common::in_account(&mut t, "cpb", "PB2", Some(&cpb));
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    common::account_agents(&cpb, &[]);
+    let from_new = |transcript: Option<&Path>| {
+        let mut payload = serde_json::json!({
+            "session_id": "new-sid",
+            "tool_name": "SendMessage",
+            "tool_input": {"to": "chief-demo", "message": "done"},
+        });
+        if let Some(t) = transcript {
+            payload["transcript_path"] = t.to_string_lossy().into();
+        }
+        deny_reason(&home.run(
+            &["hook", "guard", "--project", "demo", "--role", "thread"],
+            &payload.to_string(),
+        ))
+    };
+    // The project's account is the default one, whose folder is the fake's.
+    let here = home.fake.config_dir().join("projects/-repo/new-sid.jsonl");
+    assert_eq!(from_new(Some(&here)), None);
+    let there = cpb.join("projects/-repo/new-sid.jsonl");
+    let reason = from_new(Some(&there)).unwrap();
+    assert!(reason.contains("another Claude account (PB2)"), "{reason}");
+    let reason = from_new(None).unwrap();
+    assert!(reason.contains("can't tell whether you run in"), "{reason}");
+    assert!(reason.contains("from=\"uds:"), "{reason}");
 }
 
 fn send(to: &str) -> String {

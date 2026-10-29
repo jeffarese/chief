@@ -288,3 +288,50 @@ Not verified live yet: that a background session accepts a folder chief marked (
 value match what M2b read from Claude's own dialog, but no live session has started in a
 chief-marked folder). Check with `chief new` on a fresh repo: the coordinator must start, and so
 must the first thread.
+
+## Built-in layout (built, 2026-10-29)
+
+Problem (user request): without Rex or tmux, `chief up` printed two commands to run side by side.
+chief now draws the layout itself in the terminal it runs in (ARCHITECTURE §9 "Built-in layout"):
+`claude attach` on a pseudo-terminal of its own, emulated by libghostty and drawn into ratatui's
+buffer on the left, the board on the right, Ctrl+\ or a click to switch sides.
+
+1. **Emulator** (`src/embed/`): libghostty-vt from libghostty-rs at a pinned commit, not
+   crates.io's 0.2.2. That release pins a Ghostty that needs exactly Zig 0.15.2, which can't link
+   native binaries against the macOS 26 SDK (its `libSystem.tbd` lists only arm64e). The pinned
+   commit builds with Zig 0.17. A spike checked the queries Claude Code's terminal layer sends
+   (DA1, DSR, OSC 10/11, XTVERSION, DECRQM 2026, kitty keyboard, size), colours, wide characters
+   and vim on the alternate screen through the real pty path. libghostty's
+   `key::Encoder::encode_to_vec` fails on any key whose first try runs out of room (it reserves
+   from the length, not the capacity), so chief encodes into a stack buffer.
+2. **Layout** (`src/builtin.rs`): the pane loop's steps on the embedded terminal, the wake on a
+   worker, the same pane record and signals as `chief pane`, so the board's switch and
+   `chief down` work unchanged. `chief up --layout builtin` forces it.
+3. **Optional**: the `builtin-layout` cargo feature, on by default; `--no-default-features`
+   builds without Zig and keeps the printed commands.
+
+Tested on a pseudo-terminal with the fake `claude` (`tests/builtin_cli.rs`). Not verified live
+yet: a real `claude attach` in the embedded terminal (its prompt, Shift+Enter, the agent view's
+mouse and paste). Check with `chief up <slug> --layout builtin` on a live project.
+
+## Day-to-day management (built, 2026-10-29)
+
+Problem (review of the UX): getting to what needs you took looking, nothing could stop a thread
+that was off track, cleaning up meant `x` one thread at a time, and the launcher's list only
+grew.
+
+1. **Board** (ARCHITECTURE §10): `n` shows the next thread waiting on you; `S` stops a running
+   thread after a confirm (`claude stop`, the main pane moved off it first, since a pane showing
+   it would respawn it); `X` runs `chief gc` for the project. The key bar offers `S` on a running
+   thread and `w` only on an asleep one.
+2. **Coordinator**: `stop_thread` (§7), which the prompt keeps for when the user asks or a thread
+   is off track and a message didn't help.
+3. **Archive** (§2, §10a): `chief archive <slug>` is `down --stop-threads`, then the project
+   leaves the launcher's list and `chief status`; it isn't archived when down didn't finish
+   cleanly. `chief unarchive`, or `chief up`, brings it back. In the launcher, `a` archives (after
+   a confirm) or unarchives, and `A` shows the archived projects.
+4. **Built-in layout** (§9): the terminal's title says how many threads wait on you, and the
+   conversation is marked while it shows history.
+
+Tested with the fake `claude` only. Not verified live yet: `claude stop` on a thread mid-turn
+(what its board row and the coordinator see afterwards), and the title in Ghostty and iTerm2.

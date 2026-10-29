@@ -73,6 +73,8 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const AGENTS_TIMEOUT: Duration = Duration::from_secs(15);
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// `claude rm` deletes the worktree before it answers, which takes a while for a large one.
+const RM_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a freshly spawned session may take to show up in `claude agents` (§7).
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -139,6 +141,9 @@ impl Claude {
     /// `claude` in this account; every call chief makes goes through here.
     pub fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
+        // `claude rm` asks git about the worktree, and `--bg` starts a session in `cwd`: a
+        // `GIT_DIR` inherited from a git hook would point both at another repository.
+        crate::proc::without_repo_env(&mut cmd);
         match &self.account {
             Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
             None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
@@ -152,14 +157,15 @@ impl Claude {
     }
 
     /// The worktree a background session works in, as its job state records it: the folder
-    /// `claude rm` deletes (ARCHITECTURE §12). None without a state file or a `worktreePath`.
-    pub fn job_worktree(&self, short_id: &str) -> Option<PathBuf> {
+    /// `claude rm` deletes (ARCHITECTURE §12). Ok(None) without a state file or a
+    /// `worktreePath`; an error when the state can't be read (`read_job_state`).
+    pub fn job_worktree(&self, short_id: &str) -> Result<Option<PathBuf>> {
         job_worktree(&self.config_dir, short_id)
     }
 
-    /// A background session's job state (`job_state`).
-    pub fn job_state(&self, short_id: &str) -> Option<JobState> {
-        job_state(&self.config_dir, short_id)
+    /// A background session's job state (`read_job_state`).
+    pub fn job_state(&self, short_id: &str) -> Result<Option<JobState>> {
+        read_job_state(&self.config_dir, short_id)
     }
 
     /// Fails when `claude --version` is older than MIN_VERSION.
@@ -230,7 +236,7 @@ impl Claude {
             args.push("--discard-unpushed".into());
             args.push(token.into());
         }
-        let out = self.run(&args, None, CONTROL_TIMEOUT)?;
+        let out = self.run(&args, None, RM_TIMEOUT)?;
         Ok(parse_rm(
             short_id,
             out.status.success(),
@@ -475,12 +481,18 @@ fn discard_token(line: &str) -> Option<String> {
     (hex(sha) && hex(worktree)).then(|| token.to_string())
 }
 
+/// Drops CSI sequences (colours: ESC [ … letter) and OSC sequences (ESC ] … BEL or ESC \, as
+/// an OSC 8 link around an id), so the text around them parses.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
                 chars.next();
                 for c in chars.by_ref() {
                     if c.is_ascii_alphabetic() {
@@ -488,9 +500,20 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
             }
-            continue;
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
-        out.push(c);
     }
     out
 }
@@ -580,34 +603,47 @@ pub struct JobState {
     pub branch: Option<String>,
 }
 
-/// `<config_dir>/jobs/<short_id>/state.json`. A missing or unreadable file, or a short id that
-/// isn't a plain name, is None.
-pub fn job_state(config_dir: &Path, short_id: &str) -> Option<JobState> {
+/// `<config_dir>/jobs/<short_id>/state.json`. Ok(None) only when the file doesn't exist: the
+/// session has no worktree of its own. A file that can't be read or doesn't parse (the
+/// supervisor may be rewriting it) is an error, never "no worktree", and so is a short id that
+/// isn't a plain name.
+pub fn read_job_state(config_dir: &Path, short_id: &str) -> Result<Option<JobState>> {
     let plain = !short_id.is_empty()
         && short_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if !plain {
-        return None;
+        bail!("{short_id:?} isn't a background session's short id");
     }
     let state = config_dir.join("jobs").join(short_id).join("state.json");
+    let text = match std::fs::read_to_string(&state) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", state.display())),
+    };
     let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", state.display()))?;
     let text = |key: &str| {
         json[key]
             .as_str()
             .filter(|p| !p.is_empty())
             .map(str::to_string)
     };
-    Some(JobState {
+    Ok(Some(JobState {
         worktree: text("worktreePath").map(PathBuf::from),
         branch: text("worktreeBranch"),
-    })
+    }))
 }
 
-/// `job_state` → `worktreePath`: None is no worktree chief may touch.
-pub fn job_worktree(config_dir: &Path, short_id: &str) -> Option<PathBuf> {
-    job_state(config_dir, short_id)?.worktree
+/// `read_job_state` with every failure as None, for the sync's display of a thread's branch and
+/// its record of a removal (§5). Nothing that resets, removes or attributes work uses it.
+pub fn job_state(config_dir: &Path, short_id: &str) -> Option<JobState> {
+    read_job_state(config_dir, short_id).ok().flatten()
+}
+
+/// `read_job_state` → `worktreePath`: Ok(None) is no worktree chief may touch.
+pub fn job_worktree(config_dir: &Path, short_id: &str) -> Result<Option<PathBuf>> {
+    Ok(read_job_state(config_dir, short_id)?.and_then(|job| job.worktree))
 }
 
 /// An account's Claude Code config file, where folder trust lives: `<dir>/.claude.json` (one
@@ -628,8 +664,9 @@ pub fn claude_config_path(account: Option<&Path>) -> PathBuf {
 /// Claude Code 2.1.310 did live: a trusted folder covers the folders under it (with `/` trusted, a
 /// background session started in a folder whose own entry said false), but not past a git
 /// repository's root (the same `/` didn't cover a fresh repo; Claude asked to trust it). So the
-/// walk up stops at the first folder holding `.git`. Both the path as given and its canonical
-/// form (macOS `/tmp` is `/private/tmp`) are checked.
+/// walk up stops at the first folder holding `.git`, found on the real path (`trust_keys`); the
+/// path as given (macOS `/tmp` is `/private/tmp`) is checked too, but only as far as it names the
+/// same folders.
 pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
@@ -638,11 +675,7 @@ pub fn is_trusted_in(config: &Path, path: &Path) -> Result<bool> {
     };
     let json: serde_json::Value =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", config.display()))?;
-    let mut keys = vec![path.to_path_buf()];
-    if let Ok(canon) = path.canonicalize() {
-        keys.push(canon);
-    }
-    Ok(keys.iter().flat_map(|key| trust_scope(key)).any(|dir| {
+    Ok(trust_keys(path).iter().any(|dir| {
         let key = dir.to_string_lossy();
         let key = if key.len() > 1 {
             key.trim_end_matches('/')
@@ -676,10 +709,37 @@ pub fn mark_trusted(config: &Path, path: &Path) -> Result<()> {
     )
 }
 
+/// The file a write to `config` must replace: `config` itself, or through any symlinks the file
+/// they end at, even when it doesn't exist yet (a dangling link). Replacing the link itself would
+/// turn it into a regular file.
+fn link_target(config: &Path) -> Result<PathBuf> {
+    if let Ok(real) = config.canonicalize() {
+        return Ok(real);
+    }
+    let mut target = config.to_path_buf();
+    // As many hops as the kernel follows (MAXSYMLINKS on macOS).
+    for _ in 0..32 {
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&target)
+                    .with_context(|| format!("reading the link {}", target.display()))?;
+                target = target.parent().unwrap_or(Path::new("/")).join(link);
+            }
+            _ => return Ok(target),
+        }
+    }
+    bail!("{} is a loop of symlinks", config.display())
+}
+
+/// Temp file names unique within this process: several marks can run at once (board workers, the
+/// wizard).
+static TRUST_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_trust(config: &Path, path: &Path) -> Result<()> {
-    let target = config
-        .canonicalize()
-        .unwrap_or_else(|_| config.to_path_buf());
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let target = link_target(config)?;
     let (mut json, perms) = match std::fs::read_to_string(&target) {
         Ok(text) => (
             serde_json::from_str::<serde_json::Value>(&text)
@@ -712,13 +772,27 @@ fn write_trust(config: &Path, path: &Path) -> Result<()> {
 
     let dir = target.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = dir.join(format!(".claude.json.chief-{}", std::process::id()));
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".claude.json".into());
+    let n = TRUST_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.chief-{}-{n}", std::process::id()));
     let text = serde_json::to_string_pretty(&json)? + "\n";
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    let perms = perms.unwrap_or_else(|| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::Permissions::from_mode(0o600)
-    });
+    // Private from the start: the file holds the whole config, and `create_new` never reuses a
+    // file someone else left (or made) under that name.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    if let Err(e) = file.write_all(text.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    drop(file);
+    let perms = perms.unwrap_or_else(|| std::fs::Permissions::from_mode(0o600));
     let renamed = std::fs::set_permissions(&tmp, perms)
         .and_then(|()| std::fs::rename(&tmp, &target))
         .with_context(|| format!("replacing {}", target.display()));
@@ -726,6 +800,35 @@ fn write_trust(config: &Path, path: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     renamed
+}
+
+/// The folders whose trust covers `path`: the canonical path and its ancestors up to the git
+/// root (`trust_scope`), plus each ancestor of the path as given that is the same folder as the
+/// canonical ancestor at its depth. Claude Code walks the real path, so the as-given walk must
+/// neither go deeper than that walk nor leave it: with `/Users/me/work` a link to
+/// `/mono/projects` and `.git` in `/mono`, a trusted `/Users/me` doesn't count (it isn't `/mono`).
+/// A path that doesn't exist is walked as given.
+fn trust_keys(path: &Path) -> Vec<PathBuf> {
+    let Ok(canon) = path.canonicalize() else {
+        return trust_scope(path)
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect();
+    };
+    let real: Vec<PathBuf> = trust_scope(&canon)
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect();
+    let mut keys = real.clone();
+    for (given, real) in path.ancestors().zip(&real) {
+        if given.canonicalize().ok().as_ref() != Some(real) {
+            break;
+        }
+        if given != real {
+            keys.push(given.to_path_buf());
+        }
+    }
+    keys
 }
 
 /// `path` and its ancestors up to and including the git repository root, or up to `/` outside a
@@ -1005,18 +1108,61 @@ mod tests {
         write("bad", "{");
         let claude = Claude::with_bin("claude".into(), Some(dir.path().to_path_buf()));
         assert_eq!(
-            claude.job_worktree("a1b2c3d4"),
+            claude.job_worktree("a1b2c3d4").unwrap(),
             Some(PathBuf::from("/r/.claude/worktrees/fix"))
         );
-        for short in ["e5f6", "bad", "missing", "", "../a1b2c3d4", "a1b2c3d4/x"] {
-            assert_eq!(claude.job_worktree(short), None, "{short:?}");
+        for short in ["e5f6", "missing"] {
+            assert_eq!(claude.job_worktree(short).unwrap(), None, "{short:?}");
         }
         assert_eq!(
-            claude.job_state("a1b2c3d4").unwrap().branch.as_deref(),
+            claude
+                .job_state("a1b2c3d4")
+                .unwrap()
+                .unwrap()
+                .branch
+                .as_deref(),
             Some("worktree-fix")
         );
-        assert_eq!(claude.job_state("e5f6"), Some(JobState::default()));
-        assert_eq!(claude.job_state("bad"), None);
+        assert_eq!(claude.job_state("e5f6").unwrap(), Some(JobState::default()));
+        assert_eq!(claude.job_state("missing").unwrap(), None);
+        // Mid-rewrite or corrupt, or a short id that could name another folder: unknown, never
+        // "no worktree".
+        for short in ["bad", "", "../a1b2c3d4", "a1b2c3d4/x"] {
+            assert!(claude.job_worktree(short).is_err(), "{short:?}");
+        }
+        let err = claude.job_state("bad").unwrap_err();
+        assert!(format!("{err:#}").contains("parsing"), "{err:#}");
+        // A state folder chief can't read is an error too.
+        let unreadable = dir.path().join("jobs/dir0/state.json");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        assert!(claude.job_state("dir0").is_err());
+        // The sync's lenient reading.
+        assert_eq!(job_state(dir.path(), "bad"), None);
+        assert_eq!(
+            job_state(dir.path(), "e5f6"),
+            Some(JobState::default()),
+            "lenient only about failures"
+        );
+    }
+
+    #[test]
+    fn osc_links_are_stripped() {
+        let link = |text: &str, end: &str| {
+            format!("\u{1b}]8;;https://x.test/{text}{end}{text}\u{1b}]8;;{end}")
+        };
+        for end in ["\u{7}", "\u{1b}\\"] {
+            let out = format!("backgrounded · {} · name\n", link("abc123", end));
+            assert_eq!(
+                parse_bg_short_id(&out).as_deref(),
+                Some("abc123"),
+                "{out:?}"
+            );
+            let rm = format!("removed {}\n", link("abc123", end));
+            assert_eq!(parse_rm("abc123", true, &rm, ""), RmOutcome::Removed);
+        }
+        assert_eq!(strip_ansi("a\u{1b}[1mb\u{1b}[0mc"), "abc");
+        // An unterminated OSC swallows the rest rather than leaking its payload.
+        assert_eq!(strip_ansi("ok \u{1b}]8;;http://x"), "ok ");
     }
 
     #[test]
@@ -1078,6 +1224,91 @@ mod tests {
         std::fs::write(&broken, "{ not json").unwrap();
         assert!(mark_trusted(&broken, &repo).is_err());
         assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ not json");
+    }
+
+    /// A dotfile link whose target doesn't exist yet (a fresh dotfiles checkout): the target is
+    /// created, private, and the link stays a link.
+    #[test]
+    fn marking_trust_through_a_dangling_link_writes_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(dir.path().join("home/dotfiles")).unwrap();
+        // Relative to the link's own folder, and through a second link.
+        let config = dir.path().join("home/.claude.json");
+        std::os::unix::fs::symlink("dotfiles/claude.json", &config).unwrap();
+        std::os::unix::fs::symlink(
+            "real-claude.json",
+            dir.path().join("home/dotfiles/claude.json"),
+        )
+        .unwrap();
+        assert!(!config.exists(), "dangling");
+
+        mark_trusted(&config, &repo).unwrap();
+        assert!(config.symlink_metadata().unwrap().file_type().is_symlink());
+        let real = dir.path().join("home/dotfiles/real-claude.json");
+        let meta = std::fs::symlink_metadata(&real).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert!(is_trusted_in(&config, &repo).unwrap());
+        // A second mark in the same process gets a temp file of its own and leaves none behind.
+        mark_trusted(&config, dir.path()).unwrap();
+        assert!(is_trusted_in(&config, dir.path()).unwrap());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("home/dotfiles"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("chief-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let looped = dir.path().join("loop.json");
+        std::os::unix::fs::symlink("loop.json", &looped).unwrap();
+        assert!(mark_trusted(&looped, &repo).is_err());
+    }
+
+    /// Claude Code walks the real path: a trusted folder the given path passes through by a
+    /// symlink, outside the real repository, doesn't count.
+    #[test]
+    fn the_trust_walk_stops_where_the_real_path_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        // /mono holds .git; /me/work is a link to /mono/projects.
+        let mono = base.join("mono");
+        std::fs::create_dir_all(mono.join(".git")).unwrap();
+        std::fs::create_dir_all(mono.join("projects/app")).unwrap();
+        std::fs::create_dir_all(base.join("me")).unwrap();
+        let work = base.join("me/work");
+        std::os::unix::fs::symlink(mono.join("projects"), &work).unwrap();
+        let config = base.join("claude.json");
+        let trust = |folders: &[&Path]| {
+            let projects: serde_json::Map<_, _> = folders
+                .iter()
+                .map(|f| {
+                    (
+                        f.to_string_lossy().into_owned(),
+                        serde_json::json!({"hasTrustDialogAccepted": true}),
+                    )
+                })
+                .collect();
+            std::fs::write(
+                &config,
+                serde_json::json!({ "projects": projects }).to_string(),
+            )
+            .unwrap();
+        };
+
+        trust(&[&base.join("me")]);
+        assert!(!is_trusted_in(&config, &work).unwrap());
+        assert!(!is_trusted_in(&config, &work.join("app")).unwrap());
+        // The folders the given path names on the real walk still count by their given names.
+        trust(&[&work]);
+        assert!(is_trusted_in(&config, &work.join("app")).unwrap());
+        trust(&[&mono]);
+        assert!(is_trusted_in(&config, &work.join("app")).unwrap());
+        // Past the real repository's root, nothing counts.
+        trust(&[&base]);
+        assert!(!is_trusted_in(&config, &work).unwrap());
     }
 
     #[test]

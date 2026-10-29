@@ -121,6 +121,7 @@ fn serves_the_tools_over_stdio() {
             "read_report",
             "resolve_thread",
             "start_thread",
+            "stop_thread",
             "wake_thread"
         ]
     );
@@ -157,6 +158,65 @@ fn serves_the_tools_over_stdio() {
         status.success(),
         "chief mcp exits cleanly when stdin closes: {status}"
     );
+}
+
+/// A `start_thread` the client cancels while it runs starts no session: the tool checks rmcp's
+/// cancellation right before the spawn (§7).
+#[test]
+fn a_cancelled_start_thread_spawns_nothing() {
+    let home = Home::new();
+    home.fake
+        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("agents.stdout", "[]")
+        .set("bg.stdout", "backgrounded · abc123 · x\n");
+    assert!(home.run(&["init", "Demo"], "").status.success());
+    let repo = home.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let repo = repo.canonicalize().unwrap();
+    let toml = home.path().join("projects/demo/project.toml");
+    let mut config = chief::config::ProjectConfig::load(&toml).unwrap();
+    config.repos = vec![chief::config::Repo {
+        name: "repo".into(),
+        path: repo.clone(),
+    }];
+    config.save(&toml).unwrap();
+    common::trust_file(&home.trust, &[&repo]);
+    // Each listing now takes a second: time to cancel before the spawn.
+    home.fake.set("agents.sleep", "1");
+
+    let mut child = home.command(&["mcp", "--project", "demo"]).spawn().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, errors) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut client = connect(&mut child);
+    client.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "start_thread",
+            "arguments": {"title": "Fix", "task": "Fix it", "repo": "repo"}}}));
+    client.send(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 2, "reason": "test"}}),
+    );
+    let mut seen = Vec::new();
+    loop {
+        let line = errors
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("chief mcp never said the start was cancelled: {seen:?}"));
+        if line.contains("was cancelled") {
+            break;
+        }
+        seen.push(line);
+    }
+    assert!(home.fake.calls_of("--bg").is_empty());
+    let threads = chief::db::list_sessions(&home.db(), "demo", Some(chief::state::Role::Thread));
+    assert!(threads.unwrap().is_empty());
+    drop(client);
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]

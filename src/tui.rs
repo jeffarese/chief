@@ -1,9 +1,16 @@
 //! What chief's TUIs (the board, §10; the launcher, §10a) share: one look (framed panels, a key
 //! bar that always fits), width-aware text cutting, and a terminal with the mouse turned on.
 
+use std::cell::RefCell;
 use std::io::stdout;
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::ThreadId;
 
-use ratatui::DefaultTerminal;
+use anyhow::{Context, Result};
+use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::CellWidth;
 use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -13,7 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType};
-use unicode_width::UnicodeWidthChar;
+use ratatui::{DefaultTerminal, Terminal};
 
 /// The one colour for focus, keys and the selection mark. It reads on dark and light terminals.
 pub const ACCENT: Color = Color::Cyan;
@@ -86,9 +93,22 @@ pub fn key_bar(hints: &[(&str, &str)], width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The graphemes of `s` with the columns each takes, as ratatui splits and measures them when it
+/// draws: emoji with a variation selector or a zero-width joiner are one grapheme, not several
+/// characters.
+fn graphemes(s: &str) -> Vec<(String, usize)> {
+    Span::raw(s)
+        .styled_graphemes(Style::new())
+        .map(|g| (g.symbol.to_string(), usize::from(g.symbol.cell_width())))
+        .collect()
+}
+
 /// Terminal columns `s` takes.
 pub fn cols(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+    Span::raw(s)
+        .styled_graphemes(Style::new())
+        .map(|g| usize::from(g.symbol.cell_width()))
+        .sum()
 }
 
 /// Cuts `s` to `width` terminal columns, ending in "…" when cut.
@@ -101,12 +121,11 @@ pub fn truncate(s: &str, width: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    for (g, w) in graphemes(s) {
         if used + w > width - 1 {
             break;
         }
-        out.push(c);
+        out.push_str(&g);
         used += w;
     }
     out.push('…');
@@ -123,15 +142,15 @@ pub fn tail(s: &str, width: usize) -> String {
     }
     let mut kept = Vec::new();
     let mut used = 1;
-    for c in s.chars().rev() {
-        let w = c.width().unwrap_or(0);
+    for (g, w) in graphemes(s).into_iter().rev() {
         if used + w > width {
             break;
         }
-        kept.push(c);
+        kept.push(g);
         used += w;
     }
-    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+    kept.reverse();
+    format!("…{}", kept.concat())
 }
 
 /// `path` with the home folder as `~`, cut from the left to `width` columns: the end of a
@@ -149,8 +168,39 @@ pub fn path(path: &std::path::Path, width: usize) -> String {
 /// `text` with the home folder written `~`, for messages that hold paths.
 pub fn home_relative(text: &str) -> String {
     match dirs::home_dir().map(|h| h.display().to_string()) {
-        Some(home) if home.len() > 1 => text.replace(&format!("{home}/"), "~/"),
+        Some(home) if home.len() > 1 => relative_to(text, &home),
         _ => text.to_string(),
+    }
+}
+
+/// `text` with `home/` written `~/` where a path starts: at the start, or after whitespace, a
+/// quote or `(`. Elsewhere it is part of a longer path (`/private/tmp/…` with a home under
+/// `/tmp`), and `~` there would name another folder.
+fn relative_to(text: &str, home: &str) -> String {
+    let needle = format!("{home}/");
+    let mut out = String::new();
+    let mut rest = text;
+    let mut before: Option<char> = None;
+    while let Some(i) = rest.find(&needle) {
+        let prev = rest[..i].chars().next_back().or(before);
+        out.push_str(&rest[..i]);
+        let starts_path =
+            prev.is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '('));
+        out.push_str(if starts_path { "~/" } else { &needle });
+        before = Some('/');
+        rest = &rest[i + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `~` and `~/…` as the home folder; any other text as a path.
+pub fn expand_home(text: &str) -> PathBuf {
+    let home = || dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    match text.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None if text == "~" => home(),
+        None => PathBuf::from(text),
     }
 }
 
@@ -166,23 +216,89 @@ pub fn centred(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-/// `ratatui::init` (alternate screen, raw mode, a panic hook that restores both) plus mouse
-/// reporting, which the panic hook turns off too: left on, every mouse move would print escape
-/// codes into the shell.
-pub fn init() -> DefaultTerminal {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture);
-        previous(info);
-    }));
-    let terminal = ratatui::init();
-    let _ = execute!(stdout(), EnableMouseCapture);
-    terminal
+/// Whether chief's terminal is set up (between `init` and `restore`).
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Where this thread last panicked, for `catch`'s message.
+    static PANICKED_AT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+/// What the panic hook does with a panic on `current` while the terminal belongs to `owner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnPanic {
+    /// The UI thread: the program is going down, so give the shell its terminal back first.
+    Restore,
+    /// A worker while the UI runs: the UI goes on and `catch` reports it. Printed, the message
+    /// would land in the middle of the screen, which raw mode doesn't scroll.
+    Quiet,
+    /// No UI: the usual report.
+    Report,
+}
+
+fn on_panic(owner: ThreadId, current: ThreadId, active: bool) -> OnPanic {
+    match (active, owner == current) {
+        (true, true) => OnPanic::Restore,
+        (true, false) => OnPanic::Quiet,
+        (false, _) => OnPanic::Report,
+    }
+}
+
+/// The alternate screen, raw mode and mouse reporting, with a panic hook that undoes them for a
+/// panic on this thread only. Set up here rather than with `ratatui::init`, whose hook restores
+/// the terminal for a panic on any thread: a worker's panic would leave the board drawing over
+/// the shell with raw mode off.
+pub fn init() -> Result<DefaultTerminal> {
+    let owner = std::thread::current().id();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()));
+        PANICKED_AT.with(|p| *p.borrow_mut() = at);
+        let current = std::thread::current().id();
+        match on_panic(owner, current, ACTIVE.load(Ordering::SeqCst)) {
+            OnPanic::Restore => {
+                restore();
+                previous(info);
+            }
+            OnPanic::Quiet => {}
+            OnPanic::Report => previous(info),
+        }
+    }));
+    ACTIVE.store(true, Ordering::SeqCst);
+    let setup = || -> Result<DefaultTerminal> {
+        enable_raw_mode().context("turning on raw mode")?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
+            .context("entering the alternate screen")?;
+        Terminal::new(CrosstermBackend::new(stdout())).context("opening the terminal")
+    };
+    setup().inspect_err(|_| restore())
+}
+
+/// Mouse reporting, the alternate screen and raw mode off. Mouse reporting left on would print
+/// escape codes into the shell at every mouse move.
 pub fn restore() {
+    ACTIVE.store(false, Ordering::SeqCst);
     let _ = execute!(stdout(), DisableMouseCapture);
-    ratatui::restore();
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout(), LeaveAlternateScreen);
+}
+
+/// Runs `job`, turning a panic into its message (`boom at src/x.rs:12`), so a worker that panics
+/// still sends its result and the UI doesn't wait on it for good.
+pub fn catch<T>(job: impl FnOnce() -> T) -> std::result::Result<T, String> {
+    std::panic::catch_unwind(AssertUnwindSafe(job)).map_err(|payload| {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic".to_string());
+        match PANICKED_AT.with(|p| p.borrow_mut().take()) {
+            Some(at) => format!("{what} at {at}"),
+            None => what,
+        }
+    })
 }
 
 /// Hands the terminal to a program for a while (an editor, the coordinator's pane): mouse
@@ -219,5 +335,68 @@ mod tests {
         assert_eq!(truncate("abc", 4), "abc");
         assert_eq!(tail("abcdef", 4), "…def");
         assert_eq!(truncate("日本語", 4), "日…");
+    }
+
+    /// Emoji with a variation selector or a joiner take the columns ratatui draws them in.
+    #[test]
+    fn widths_are_counted_per_grapheme() {
+        assert_eq!(cols("✔\u{fe0f} done"), 2 + 5);
+        assert_eq!(cols("👩\u{200d}💻"), 2);
+        assert_eq!(truncate("👩\u{200d}💻 coder", 4), "👩\u{200d}💻 …");
+        assert_eq!(tail("coder 👩\u{200d}💻", 4), "… 👩\u{200d}💻");
+    }
+
+    #[test]
+    fn home_becomes_tilde_only_where_a_path_starts() {
+        let home = "/tmp/x/home";
+        assert_eq!(
+            relative_to("Created /private/tmp/x/home/work/payments-api.", home),
+            "Created /private/tmp/x/home/work/payments-api."
+        );
+        assert_eq!(
+            relative_to(
+                "/tmp/x/home/a and /tmp/x/home/b (/tmp/x/home/c) '/tmp/x/home/d'",
+                home
+            ),
+            "~/a and ~/b (~/c) '~/d'"
+        );
+        assert_eq!(
+            relative_to("/tmp/x/home/tmp/x/home/a", home),
+            "~/tmp/x/home/a"
+        );
+    }
+
+    #[test]
+    fn tilde_alone_is_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/code"), home.join("code"));
+        assert_eq!(expand_home("~code"), PathBuf::from("~code"));
+        assert_eq!(expand_home("/r/api"), PathBuf::from("/r/api"));
+    }
+
+    /// Only a panic on the thread that set the terminal up restores it; a worker's panic leaves
+    /// the UI running, and with no UI a panic is reported as usual.
+    #[test]
+    fn only_the_ui_thread_restores_the_terminal() {
+        let ui = std::thread::current().id();
+        let worker = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert_eq!(on_panic(ui, ui, true), OnPanic::Restore);
+        assert_eq!(on_panic(ui, worker, true), OnPanic::Quiet);
+        assert_eq!(on_panic(ui, ui, false), OnPanic::Report);
+        assert_eq!(on_panic(ui, worker, false), OnPanic::Report);
+    }
+
+    #[test]
+    fn catch_turns_a_panic_into_its_message() {
+        assert_eq!(catch(|| 7), Ok(7));
+        assert_eq!(catch(|| -> u8 { panic!("boom") }), Err("boom".to_string()));
+        let n = 3;
+        assert_eq!(
+            catch(|| -> u8 { panic!("{n} booms") }),
+            Err("3 booms".to_string())
+        );
     }
 }

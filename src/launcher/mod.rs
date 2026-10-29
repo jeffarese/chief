@@ -16,7 +16,7 @@ use ratatui::crossterm::event::{self, Event};
 use crate::claude::{self, Claude};
 use crate::config::ProjectConfig;
 use crate::pane::OnQuit;
-use crate::project::{self, Note, Where};
+use crate::project::{self, LayoutChoice, Note, Where};
 use crate::{db, generated, paths, trust, tui};
 
 use app::{Action, Entry, Launcher, Msg};
@@ -32,9 +32,20 @@ pub fn entries() -> Result<Vec<Entry>> {
         let config = ProjectConfig::load(&Path::new(&dir).join("project.toml"))
             .map_err(|e| format!("{e:#}"));
         let rows = db::list_sessions(&conn, &slug, None).unwrap_or_default();
-        out.push(Entry::new(&slug, config, &rows));
+        let mut entry = Entry::new(&slug, config, &rows);
+        entry.archived = db::archived_at(&conn, &slug)?.is_some();
+        out.push(entry);
     }
     Ok(out)
+}
+
+/// `a` on an archived project: back in the list, nothing started.
+fn unarchive(slug: &str, name: &str) -> Result<String, String> {
+    let conn = db::open(&paths::db()).map_err(|e| format!("{e:#}"))?;
+    match db::unarchive_project(&conn, slug) {
+        Ok(_) => Ok(format!("Unarchived {name}. ⏎ opens it.")),
+        Err(e) => Err(format!("{name} isn't unarchived: {e:#}")),
+    }
 }
 
 /// What the wizard checks as it goes: free slugs, and folder trust in the account a new project
@@ -72,8 +83,8 @@ pub fn run(new: bool) -> Result<()> {
     let mut app = Launcher::new(entries()?, cwd, new);
     let (tx, rx) = mpsc::channel();
 
-    let mut terminal = tui::init();
-    let exit = (|| -> Result<Option<(String, OnQuit)>> {
+    let mut terminal = tui::init()?;
+    let exit = (|| -> Result<Option<Next>> {
         loop {
             terminal.draw(|f| ui::draw(f, &app))?;
             if event::poll(POLL)? {
@@ -85,10 +96,21 @@ pub fn run(new: bool) -> Result<()> {
                 for action in actions {
                     match action {
                         Action::Quit => return Ok(None),
-                        Action::Pane(slug) => return Ok(Some((slug, OnQuit::Nothing))),
+                        Action::Pane(slug) => return Ok(Some(Next::Pane(slug, OnQuit::Nothing))),
                         Action::Open(slug) => spawn(tx.clone(), move |send| open(&slug, send)),
                         Action::Create(draft) => {
                             spawn(tx.clone(), move |send| create(&draft, send))
+                        }
+                        Action::Archive(slug) => spawn_archive(tx.clone(), slug),
+                        Action::Unarchive(slug) => {
+                            let name = app
+                                .selected()
+                                .map_or_else(|| slug.clone(), |p| p.name.clone());
+                            let status = unarchive(&slug, &name);
+                            if let Ok(projects) = entries() {
+                                app.set_projects(projects, Some(&slug));
+                            }
+                            app.status = Some(status);
                         }
                     }
                 }
@@ -98,15 +120,25 @@ pub fn run(new: bool) -> Result<()> {
                 if let Msg::Created(slug) = &msg {
                     finished = Some(slug.clone());
                 }
+                // Archived or not, its sessions may have stopped: the list shows what is now.
+                if let (Msg::Archived(_), app::Screen::Archiving(a)) = (&msg, &app.screen) {
+                    finished = Some(a.slug.clone());
+                }
                 let done = matches!(msg, Msg::Done(_));
                 // In a Rex block the board is beside it: this terminal becomes the conversation.
+                // Without Rex or tmux it becomes the built-in layout, both sides.
                 let here = match &msg {
-                    Msg::Done(Ok(Where::Here { board })) => Some(board.clone()),
+                    Msg::Done(Ok(Where::Here { board })) => Some(Some(board.clone())),
+                    Msg::Done(Ok(Where::Builtin)) => Some(None),
                     _ => None,
                 };
                 app.apply(msg);
                 if let (Some(board), app::Screen::Starting(s)) = (here, &app.screen) {
-                    return Ok(Some((s.slug.clone(), OnQuit::Board(board))));
+                    let slug = s.slug.clone();
+                    return Ok(Some(match board {
+                        Some(board) => Next::Pane(slug, OnQuit::Board(board)),
+                        None => Next::Builtin(slug),
+                    }));
                 }
                 if done && let app::Screen::Starting(s) = &app.screen {
                     finished = Some(s.slug.clone());
@@ -122,16 +154,25 @@ pub fn run(new: bool) -> Result<()> {
     })();
     tui::restore();
     match exit? {
-        Some((slug, OnQuit::Nothing)) => {
+        Some(Next::Builtin(slug)) => project::run_builtin(&slug),
+        Some(Next::Pane(slug, OnQuit::Nothing)) => {
             println!(
                 "Showing the conversation with the coordinator. For its threads, run in another \
                  terminal: chief board --project {slug}"
             );
             crate::pane::run(&slug, OnQuit::Nothing)
         }
-        Some((slug, on_quit)) => crate::pane::run(&slug, on_quit),
+        Some(Next::Pane(slug, on_quit)) => crate::pane::run(&slug, on_quit),
         None => Ok(()),
     }
+}
+
+/// What this terminal shows once the launcher closes.
+enum Next {
+    /// `chief pane`, closing `OnQuit` when it ends.
+    Pane(String, OnQuit),
+    /// The built-in layout (§9): the conversation and the board.
+    Builtin(String),
 }
 
 /// Runs `job` on a worker; its notes and its result come back as messages.
@@ -139,17 +180,39 @@ fn spawn(
     tx: mpsc::Sender<Msg>,
     job: impl FnOnce(&mut dyn FnMut(Msg)) -> Result<Where> + Send + 'static,
 ) {
+    on_worker(tx, job, "Starting", Msg::Done);
+}
+
+/// `chief archive` on a worker, reporting into the Archiving card.
+fn spawn_archive(tx: mpsc::Sender<Msg>, slug: String) {
+    let job = move |send: &mut dyn FnMut(Msg)| {
+        project::archive_with(&slug, &mut |note| send(Msg::Note(note)))
+    };
+    on_worker(tx, job, "Archiving", Msg::Archived);
+}
+
+/// Runs `job` on a worker: its notes come back as messages, then `done` with its result.
+fn on_worker<T: 'static>(
+    tx: mpsc::Sender<Msg>,
+    job: impl FnOnce(&mut dyn FnMut(Msg)) -> Result<T> + Send + 'static,
+    what: &'static str,
+    done: fn(std::result::Result<T, String>) -> Msg,
+) {
     std::thread::spawn(move || {
         let mut send = |msg: Msg| {
             let _ = tx.send(msg);
         };
-        let result = job(&mut send).map_err(|e| format!("{e:#}"));
-        send(Msg::Done(result));
+        // A panic must still end the card's spinner.
+        let result = match tui::catch(|| job(&mut send)) {
+            Ok(result) => result.map_err(|e| format!("{e:#}")),
+            Err(panic) => Err(format!("{what} crashed: {panic}")),
+        };
+        send(done(result));
     });
 }
 
 fn open(slug: &str, send: &mut dyn FnMut(Msg)) -> Result<Where> {
-    project::up_with(slug, &mut |note| send(Msg::Note(note)))
+    project::up_with(slug, LayoutChoice::Auto, &mut |note| send(Msg::Note(note)))
 }
 
 /// The wizard's draft: `chief init` with the quick settings, trust as agreed, then `chief up`.
@@ -201,4 +264,27 @@ pub fn create(draft: &Draft, send: &mut dyn FnMut(Msg)) -> Result<Where> {
         }));
     }
     open(&config.slug, send)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worker that panics still sends Done, so the Starting card stops spinning and says why.
+    #[test]
+    fn a_panicking_worker_still_finishes() {
+        let (tx, rx) = mpsc::channel();
+        spawn(tx, |send| {
+            send(Msg::Note(Note::Did("Created project.".into())));
+            panic!("boom")
+        });
+        let msgs: Vec<Msg> = rx.iter().collect();
+        assert_eq!(
+            msgs,
+            [
+                Msg::Note(Note::Did("Created project.".into())),
+                Msg::Done(Err("Starting crashed: boom".into())),
+            ]
+        );
+    }
 }

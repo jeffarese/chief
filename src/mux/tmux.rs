@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{BlockInfo, BlockRef, BlockSpec, Mux, SessionRef, Split};
+use super::{BlockInfo, BlockRef, BlockSpec, Mux, SessionRef, Split, kill_on_error};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// The pane option holding a block's label. Programs can retitle a pane; they can't set this.
@@ -197,8 +197,8 @@ impl Mux for Tmux {
         let (Some(pane), Some(window), Some(server)) = (ids.next(), ids.next(), ids.next()) else {
             bail!("`tmux new-window` reported no pane: {out:?}");
         };
-        self.mark(pane, &first.label)?;
         let session = SessionRef(format!("{window} {server} {}", self.socket.display()));
+        kill_on_error(self, &session, self.mark(pane, &first.label))?;
         Ok((session, BlockRef(pane.to_string())))
     }
 

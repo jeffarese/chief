@@ -29,7 +29,12 @@ pub fn coordinator_context(threads: &[SessionRow], memory: &str, as_of: &str) ->
     if bare.len() < MAX_CONTEXT_BYTES {
         let marker = "\n[memory cut; read memory/MEMORY.md]";
         let room = (MAX_CONTEXT_BYTES - bare.len()).saturating_sub(marker.len());
-        return assemble(&board, &format!("{}{marker}", truncate_bytes(memory, room)));
+        // The marker takes the place of `(empty)`, which is shorter: with almost no room left
+        // even an empty cut doesn't fit, and the board must be cut instead.
+        let text = assemble(&board, &format!("{}{marker}", truncate_bytes(memory, room)));
+        if text.len() <= MAX_CONTEXT_BYTES {
+            return text;
+        }
     }
     let marker = "\n[board cut; call list_threads]\n</chief-board>";
     let tail = "\n<chief-memory>\n[left out; read memory/MEMORY.md]\n</chief-memory>";
@@ -223,6 +228,32 @@ mod tests {
         assert!(text.len() <= MAX_CONTEXT_BYTES, "{}", text.len());
         assert!(text.contains("[board cut; call list_threads]\n</chief-board>"));
         assert!(text.ends_with("</chief-memory>"));
+    }
+
+    /// Every gap the bare board can leave below the budget, around the memory marker's size:
+    /// the marker takes the place of `(empty)`, so a small gap can't hold even an empty cut.
+    #[test]
+    fn memory_cut_stays_within_the_budget() {
+        let memory = "m".repeat(10_000);
+        let sized = |len: usize| {
+            let mut r = row(&"n".repeat(len), "working");
+            r.title = None;
+            vec![r]
+        };
+        let bare = |threads: &[SessionRow]| assemble(&board(threads, 0, "10:00"), "").len();
+        let base = bare(&sized(0));
+        for gap in 1..=60 {
+            let threads = sized(MAX_CONTEXT_BYTES - gap - base);
+            assert_eq!(bare(&threads), MAX_CONTEXT_BYTES - gap);
+            let text = coordinator_context(&threads, &memory, "10:00");
+            assert!(text.len() <= MAX_CONTEXT_BYTES, "gap {gap}: {}", text.len());
+            let cut = if gap >= 29 {
+                "[memory cut;"
+            } else {
+                "[board cut;"
+            };
+            assert!(text.contains(cut), "gap {gap}: {text}");
+        }
     }
 
     #[test]

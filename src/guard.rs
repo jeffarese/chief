@@ -52,8 +52,8 @@ pub struct GuardInput<'a> {
     /// A fresh `claude agents --json --all` snapshot (every state) of the coordinator's account,
     /// the project's (§3). Empty for the Agent tool, which reads `listed`.
     pub snapshot: &'a [AgentRow],
-    /// For a thread's call: the label of its own account when that isn't its coordinator's.
-    pub caller_elsewhere: Option<&'a str>,
+    /// For a thread's call: whether it runs in its coordinator's account.
+    pub caller_account: CallerAccount<'a>,
     /// One of the caller's subagents made the call: the payload has an `agent_id`, which Claude
     /// Code sets, not the model (§1).
     pub from_subagent: bool,
@@ -61,6 +61,18 @@ pub struct GuardInput<'a> {
     pub teammates: &'a [Teammate],
     /// Who else a name could reach.
     pub listed: &'a Listed,
+}
+
+/// The account a thread's call comes from, compared with its coordinator's (§3, §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerAccount<'a> {
+    /// The coordinator's, the project's.
+    Same,
+    /// Another one, by its label.
+    Other(&'a str),
+    /// chief can't tell: the caller matches no thread (its new session id after `/clear`, say)
+    /// while threads of the project run in other accounts.
+    Unknown,
 }
 
 /// The sessions in the guard's fresh listings of the project's account and the caller's own
@@ -114,6 +126,10 @@ pub fn removed_message(name: &str) -> String {
          messaged; start a new thread (its reports are still readable with read_report)"
     )
 }
+
+/// Said after a name that more than one session carries, lookalikes included.
+const LOOKALIKE: &str = " (or a name that differs from it only in case, surrounding spaces or \
+                         invisible characters)";
 
 /// What a subagent calls its lead (§1); from the lead itself they name nobody chief knows.
 const LEAD_NAMES: [&str; 2] = ["team-lead", "main"];
@@ -173,8 +189,15 @@ fn subagent_send(input: &GuardInput, to: &str) -> Option<Decision> {
              `.`) and not team-lead or main: {to} could be read as another address. {by_its_id}"
         )));
     }
-    // Claude Code makes agent ids; no session answers to one.
+    // Claude Code makes agent ids, and no session should answer to one; one that does (a
+    // session named like the id) could get the message.
     if by_id.is_some() {
+        if name_taken(input, to) {
+            return Some(Decision::Deny(format!(
+                "{to} is your subagent's agent id, but another Claude session has that name too, \
+                 so a message to {to} could reach it instead of your subagent; message not sent."
+            )));
+        }
         return Some(Decision::Allow);
     }
     // In-process names win only while the subagent lives in this process (§1).
@@ -210,12 +233,60 @@ fn agent_spawn(input: &GuardInput) -> Decision {
     Decision::Allow
 }
 
-/// Whether a session other than the caller's subagents answers to `name`: the coordinator, a
-/// thread of the project (any state), or a session in the listings.
+/// Whether a session other than the caller's subagents answers to `name`, or to a lookalike of
+/// it (`lookalike`): the coordinator, a thread of the project (any state), or a session in the
+/// listings. Only ever a reason to deny.
 fn name_taken(input: &GuardInput, name: &str) -> bool {
-    name == input.coordinator_name
-        || input.threads.iter().any(|t| t.name == name)
-        || input.listed.names.iter().any(|n| n == name)
+    let name = lookalike(name);
+    lookalike(input.coordinator_name) == name
+        || input.threads.iter().any(|t| lookalike(&t.name) == name)
+        || input.listed.names.iter().any(|n| lookalike(n) == name)
+}
+
+/// `name` without what a reader can't see or tell apart: format characters (zero-width spaces
+/// and joiners, bidi controls, U+FEFF, the soft hyphen) and variation selectors removed, then
+/// trimmed and lowercased. Two names with the same lookalike may reach the same session if
+/// Claude Code ever matches names loosely, so the guard counts them as one wherever that can
+/// only add a denial; what it allows is still matched byte for byte.
+fn lookalike(name: &str) -> String {
+    let visible: String = name.chars().filter(|c| !invisible(*c)).collect();
+    visible.trim().to_lowercase()
+}
+
+/// Unicode's format characters (category Cf) and the other characters that render as nothing.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{08E2}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
+    )
 }
 
 /// Letters, digits, `-`, `_` and `.` only: no `uds:` or other scheme, no ref, no whitespace.
@@ -285,11 +356,11 @@ fn coordinator_send(input: &GuardInput, to: &str) -> Decision {
 fn thread_send(input: &GuardInput, to: &str) -> Decision {
     let coordinator = input.coordinator_name;
     let only = || {
-        let how = match input.caller_elsewhere {
-            Some(_) => {
+        let how = match input.caller_account {
+            CallerAccount::Other(_) | CallerAccount::Unknown => {
                 "by replying to the exact `from=\"uds:…\"` address of its message".to_string()
             }
-            None => format!("by its exact name {coordinator}"),
+            CallerAccount::Same => format!("by its exact name {coordinator}"),
         };
         Decision::Deny(format!(
             "Threads may message only their coordinator, {how}, and their own subagents, by the \
@@ -302,11 +373,21 @@ fn thread_send(input: &GuardInput, to: &str) -> Decision {
     };
     if to == coordinator {
         // From another account the name reaches nothing, or a session of that account's.
-        if let Some(label) = input.caller_elsewhere {
-            return Decision::Deny(format!(
-                "You run in another Claude account ({label}) than your coordinator, and \
-                 {coordinator}'s name doesn't reach across accounts. {REPLY_INSTEAD}"
-            ));
+        match input.caller_account {
+            CallerAccount::Same => {}
+            CallerAccount::Other(label) => {
+                return Decision::Deny(format!(
+                    "You run in another Claude account ({label}) than your coordinator, and \
+                     {coordinator}'s name doesn't reach across accounts. {REPLY_INSTEAD}"
+                ));
+            }
+            CallerAccount::Unknown => {
+                return Decision::Deny(format!(
+                    "chief doesn't know your session yet, so it can't tell whether you run in \
+                     your coordinator's Claude account, and {coordinator}'s name doesn't reach \
+                     across accounts. {REPLY_INSTEAD}"
+                ));
+            }
         }
         return match reached {
             Reach::Live(_) => Decision::Allow,
@@ -320,8 +401,8 @@ fn thread_send(input: &GuardInput, to: &str) -> Decision {
                 shown(now.as_deref())
             )),
             Reach::Ambiguous => Decision::Deny(format!(
-                "More than one Claude session is named {coordinator}; chief won't send to an \
-                 ambiguous name. {REPORT_INSTEAD}"
+                "More than one Claude session is named {coordinator}{LOOKALIKE}; chief won't \
+                 send to an ambiguous name. {REPORT_INSTEAD}"
             )),
         };
     }
@@ -364,8 +445,8 @@ fn reach_thread(input: &GuardInput, thread: &Member) -> Result<u32, String> {
             shown(now.as_deref())
         )),
         Reach::Ambiguous => Err(format!(
-            "More than one Claude session is named {name}; chief won't send to an ambiguous \
-             name."
+            "More than one Claude session is named {name}{LOOKALIKE}; chief won't send to an \
+             ambiguous name."
         )),
     }
 }
@@ -399,9 +480,11 @@ fn reach(member: &Member, name: &str, snapshot: &[AgentRow]) -> Reach {
     if own.name.as_deref() != Some(name) {
         return Reach::Renamed(own.name.clone());
     }
+    // A lookalike (`lookalike`) counts as another session with the name: it only denies.
+    let wanted = lookalike(name);
     let named = snapshot
         .iter()
-        .filter(|a| a.name.as_deref() == Some(name))
+        .filter(|a| a.name.as_deref().is_some_and(|n| lookalike(n) == wanted))
         .count();
     if named > 1 {
         return Reach::Ambiguous;
@@ -568,7 +651,7 @@ mod tests {
             coordinator: Some(&coordinator),
             threads: &threads,
             snapshot: &snapshot,
-            caller_elsewhere: None,
+            caller_account: CallerAccount::Same,
             from_subagent: false,
             teammates: &[],
             listed: &listed,
@@ -886,7 +969,7 @@ mod tests {
             },
         ];
         let listed = Listed::default();
-        let decide = |role: Role, to: &str, caller: Option<&str>| {
+        let decide_from = |role: Role, to: &str, caller_account: CallerAccount| {
             evaluate(&GuardInput {
                 role,
                 tool: "SendMessage",
@@ -896,11 +979,18 @@ mod tests {
                 coordinator: Some(&coordinator),
                 threads: &threads,
                 snapshot: &here,
-                caller_elsewhere: caller,
+                caller_account,
                 from_subagent: false,
                 teammates: &[],
                 listed: &listed,
             })
+        };
+        let decide = |role: Role, to: &str, caller: Option<&str>| {
+            decide_from(
+                role,
+                to,
+                caller.map_or(CallerAccount::Same, CallerAccount::Other),
+            )
         };
         let denied = |d: Decision, part: &str| match d {
             Decision::Deny(r) => assert!(r.contains(part), "{r:?} lacks {part:?}"),
@@ -962,6 +1052,14 @@ mod tests {
             "only their coordinator",
         );
         assert_eq!(decide(T, "chief-p", None), Decision::Allow);
+
+        // A thread chief can't place (it matches no row while threads run elsewhere): not by
+        // name, which might reach nothing or someone else; by address as any thread.
+        let unknown = |to: &str| decide_from(T, to, CallerAccount::Unknown);
+        denied(unknown("chief-p"), "can't tell whether you run in");
+        denied(unknown("chief-p"), "from=\"uds:");
+        assert_eq!(unknown(&uds_address(COORD_PID)), Decision::Allow);
+        denied(unknown("p-far-1a2b"), "by replying to the exact");
     }
 
     fn mate(agent_id: &str, name: Option<&str>) -> Teammate {
@@ -1022,7 +1120,7 @@ mod tests {
                 coordinator: Some(&coordinator),
                 threads: &threads,
                 snapshot: &snapshot,
-                caller_elsewhere: None,
+                caller_account: CallerAccount::Same,
                 from_subagent,
                 teammates: &mates,
                 listed,
@@ -1148,7 +1246,7 @@ mod tests {
             coordinator: Some(&coordinator),
             threads: &threads,
             snapshot: &snapshot,
-            caller_elsewhere: None,
+            caller_account: CallerAccount::Same,
             from_subagent: false,
             teammates: &[],
             listed: &all,
@@ -1158,7 +1256,7 @@ mod tests {
                 && r.contains("their own subagents")));
         // From another account the coordinator's name doesn't reach: point at the reply address.
         let elsewhere = evaluate(&GuardInput {
-            caller_elsewhere: Some("PB3"),
+            caller_account: CallerAccount::Other("PB3"),
             ..none.clone()
         });
         assert!(
@@ -1173,6 +1271,40 @@ mod tests {
             });
             assert!(matches!(d, Decision::Deny(_)), "{to}: {d:?}");
         }
+
+        // An agent id that another session also answers to (here a listed session, as is or as
+        // a lookalike) could reach that session: denied, as a name would be.
+        let odd = [
+            mate("other-project-thread", Some("odd")),
+            mate("Spike-Other", None),
+            mate("afine-8888", Some("Spike-Other")),
+        ];
+        let from = |to: &'static str| {
+            evaluate(&GuardInput {
+                to: Some(to),
+                teammates: &odd,
+                ..none.clone()
+            })
+        };
+        for to in ["other-project-thread", "Spike-Other"] {
+            let d = from(to);
+            assert!(
+                matches!(&d, Decision::Deny(r) if r.contains("is your subagent's agent id")),
+                "{to}: {d:?}"
+            );
+        }
+        assert_eq!(from("afine-8888"), Decision::Allow);
+        assert_eq!(from("odd"), Decision::Allow);
+        // A name whose lookalike another session has.
+        let d = evaluate(&GuardInput {
+            to: Some("Spike-Other"),
+            teammates: &odd[2..],
+            ..none.clone()
+        });
+        assert!(
+            matches!(&d, Decision::Deny(r) if r.contains("also the name of another Claude session")),
+            "{d:?}"
+        );
     }
 
     /// §6 "Subagents" at spawn: a subagent may not take a name another session answers to, or
@@ -1199,7 +1331,7 @@ mod tests {
                 coordinator: Some(&coordinator),
                 threads: &threads,
                 snapshot: &snapshot,
-                caller_elsewhere: None,
+                caller_account: CallerAccount::Same,
                 from_subagent,
                 teammates: &[],
                 listed,
@@ -1211,16 +1343,32 @@ mod tests {
             assert_eq!(decide(T, false, None, listed), Decision::Allow);
             assert_eq!(decide(C, false, Some(""), listed), Decision::Allow);
             assert_eq!(decide(T, false, Some("helper"), listed), Decision::Allow);
-            assert_eq!(decide(C, false, Some("Chief-P"), listed), Decision::Allow);
+            assert_eq!(decide(C, false, Some("chief-p2"), listed), Decision::Allow);
             // The coordinator and every thread of the project, from the database.
             assert!(taken(decide(T, false, Some("chief-p"), listed)));
             assert!(taken(decide(T, true, Some("chief-p"), listed)));
             assert!(taken(decide(C, false, Some("p-live-1a2b"), listed)));
             assert!(taken(decide(C, false, Some("p-cleaned-9c0d"), listed)));
+            // And their lookalikes: case, surrounding spaces, invisible characters.
+            for lookalike in [
+                "Chief-P",
+                " chief-p",
+                "chief-p\t",
+                "\u{200b}chief-p",
+                "chief\u{2060}-p\u{feff}",
+                "P-LIVE-1A2B",
+                "p-live-1a2b\u{00ad}",
+            ] {
+                assert!(
+                    taken(decide(C, false, Some(lookalike), listed)),
+                    "{lookalike:?}"
+                );
+            }
         }
-        // Every listed session.
+        // Every listed session, and its lookalikes.
         assert!(taken(decide(T, false, Some("other-project-thread"), &all)));
         assert!(taken(decide(C, false, Some("spike-other"), &all)));
+        assert!(taken(decide(C, false, Some("Spike-Other\u{200d}"), &all)));
         // Without a listing those are allowed: a broken listing doesn't stop subagents.
         assert_eq!(
             decide(T, false, Some("other-project-thread"), &unlisted),
@@ -1254,6 +1402,18 @@ mod tests {
         );
         let unnamed = member("x", "z");
         assert_eq!(reach(&unnamed, "x", &snap), Reach::Renamed(None));
+
+        // Another session under a lookalike of the name makes it ambiguous, in any state.
+        for other in ["P-Live-1a2b", "p-live-1a2b ", "p-live\u{200b}-1a2b"] {
+            let mut with = snap.clone();
+            with.push(row("look", Some(other), None));
+            assert_eq!(
+                reach(&m, "p-live-1a2b", &with),
+                Reach::Ambiguous,
+                "{other:?}"
+            );
+        }
+        assert_eq!(lookalike("\u{feff} A\u{200d}b\u{fe0f} "), "ab");
     }
 
     #[test]

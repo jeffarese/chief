@@ -7,6 +7,7 @@ pub mod refresh;
 pub mod settings;
 pub mod ui;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -26,53 +27,96 @@ use refresh::Sources;
 /// How long a frame waits for a key before redrawing and reading worker results.
 const POLL: Duration = Duration::from_millis(100);
 
-pub fn run(project: &str) -> Result<()> {
-    let dir = crate::project::project_dir(project);
-    let config = ProjectConfig::load(&dir.join("project.toml"))
-        .with_context(|| format!("no usable chief project {project:?}"))?;
-    let conn = db::open(&paths::db())?;
-    if db::project_dir(&conn, project)?.is_none() {
-        bail!("no chief project {project:?}");
+/// The board with its workers: what `chief board` runs, and the right side of the built-in
+/// layout (§9).
+pub struct Board {
+    pub app: App,
+    src: Sources,
+    tx: mpsc::Sender<Msg>,
+    rx: mpsc::Receiver<Msg>,
+    shows: mpsc::Sender<Option<String>>,
+    refresher: refresh::Refresher,
+}
+
+impl Board {
+    /// Reads the project and starts the refresher and the Show worker.
+    pub fn open(project: &str) -> Result<Board> {
+        let dir = crate::project::project_dir(project);
+        let config = ProjectConfig::load(&dir.join("project.toml"))
+            .with_context(|| format!("no usable chief project {project:?}"))?;
+        let conn = db::open(&paths::db())?;
+        if db::project_dir(&conn, project)?.is_none() {
+            bail!("no chief project {project:?}");
+        }
+        drop(conn);
+
+        let src = Sources {
+            slug: project.to_string(),
+            dir: dir.clone(),
+            db: paths::db(),
+            claude_bin: crate::claude::Claude::from_env().bin,
+            // The project's account, whatever the block's shell names (§3).
+            claude_account: config.claude_config_dir.clone(),
+            claude_dir: crate::claude::claude_dir(config.claude_config_dir.as_deref()),
+            gh_bin: crate::pr::Gh::from_env().bin,
+            agp_bin: crate::agp::Agp::from_env().bin,
+        };
+        let (tx, rx) = mpsc::channel();
+        let refresher = refresh::spawn(src.clone(), tx.clone());
+        let shows = jobs::spawn_shows(src.clone(), tx.clone(), refresher.kicker());
+        Ok(Board {
+            app: App::new(project, dir, config, db::now_ms()),
+            src,
+            tx,
+            rx,
+            shows,
+            refresher,
+        })
     }
-    drop(conn);
 
-    let src = Sources {
-        slug: project.to_string(),
-        dir: dir.clone(),
-        db: paths::db(),
-        claude_bin: crate::claude::Claude::from_env().bin,
-        // The project's account, whatever the block's shell names (§3).
-        claude_account: config.claude_config_dir.clone(),
-        claude_dir: crate::claude::claude_dir(config.claude_config_dir.as_deref()),
-        gh_bin: crate::pr::Gh::from_env().bin,
-        agp_bin: crate::agp::Agp::from_env().bin,
-    };
-    let (tx, rx) = mpsc::channel();
-    let refresher = refresh::spawn(src.clone(), tx.clone());
-    let mut app = App::new(project, dir, config, db::now_ms());
+    /// Runs an action off the UI thread. `Quit` and `Edit` need the terminal: the caller's.
+    pub fn dispatch(&self, action: Action) {
+        match action {
+            Action::Show(target) => {
+                let _ = self.shows.send(target);
+            }
+            other => jobs::spawn(
+                self.src.clone(),
+                other,
+                self.tx.clone(),
+                self.refresher.kicker(),
+            ),
+        }
+    }
 
-    let mut terminal = tui::init();
-    let result = event_loop(&mut terminal, &mut app, &rx, |action| {
-        jobs::spawn(src.clone(), action, tx.clone(), refresher.kicker())
-    });
+    /// Applies what the workers sent since the last call.
+    pub fn take_messages(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.app.apply(msg);
+        }
+    }
+}
+
+pub fn run(project: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("chief board needs a terminal");
+    }
+    let mut board = Board::open(project)?;
+    let mut terminal = tui::init()?;
+    let result = event_loop(&mut terminal, &mut board);
     tui::restore();
     result
 }
 
-fn event_loop(
-    terminal: &mut DefaultTerminal,
-    app: &mut App,
-    rx: &mpsc::Receiver<Msg>,
-    spawn: impl Fn(Action),
-) -> Result<()> {
+fn event_loop(terminal: &mut DefaultTerminal, board: &mut Board) -> Result<()> {
     loop {
-        app.now = db::now_ms();
-        terminal.draw(|f| ui::draw(f, app))?;
+        board.app.now = db::now_ms();
+        terminal.draw(|f| ui::draw(f, &board.app))?;
         if event::poll(POLL)? {
             // Resize needs nothing: the next draw uses the new size.
             let actions = match event::read()? {
-                Event::Key(key) => app.on_key(key),
-                Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Key(key) => board.app.on_key(key),
+                Event::Mouse(mouse) => board.app.on_mouse(mouse),
                 _ => Vec::new(),
             };
             for action in actions {
@@ -80,20 +124,18 @@ fn event_loop(
                     Action::Quit => return Ok(()),
                     Action::Edit(path) => {
                         let msg = edit(terminal, &path);
-                        app.status = Some(msg);
+                        board.app.say(msg);
                     }
-                    other => spawn(other),
+                    other => board.dispatch(other),
                 }
             }
         }
-        while let Ok(msg) = rx.try_recv() {
-            app.apply(msg);
-        }
+        board.take_messages();
     }
 }
 
 /// Hands the terminal to `$EDITOR` (else `vi`) and takes it back. Returns a status line.
-fn edit(terminal: &mut DefaultTerminal, path: &Path) -> String {
+pub fn edit(terminal: &mut DefaultTerminal, path: &Path) -> String {
     let editor = std::env::var("EDITOR")
         .ok()
         .filter(|e| !e.trim().is_empty())

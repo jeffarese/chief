@@ -1,0 +1,4 @@
+# libghostty-vt is a git dependency; the git CLI honours the user's own git config (an ssh
+# insteadOf, credential helpers) where cargo's built-in client does not.
+[net]
+git-fetch-with-cli = true

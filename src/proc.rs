@@ -6,6 +6,35 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// The variables that tie git to one repository (`git rev-parse --local-env-vars`). A git hook
+/// exports `GIT_DIR` and `GIT_INDEX_FILE`, so chief run from one would ask, or reset, another
+/// repository than the `-C` folder it names.
+const REPO_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Clears `REPO_ENV` for `cmd`: for git itself and for every tool that runs git (`gh`, `claude`).
+pub fn without_repo_env(cmd: &mut Command) -> &mut Command {
+    for var in REPO_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Runs `cmd` with stdin closed and stdout/stderr captured. Returns None when the child hasn't
 /// exited *and* closed both pipes within `timeout`; its whole process group is then killed.
 ///
@@ -67,6 +96,9 @@ fn run_bounded(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // The child, or something left in its group, still holds a pipe.
                 kill_group(group);
+                // The child itself too: it may have moved to another group, and `wait` must
+                // not wait it out.
+                let _ = child.kill();
                 let _ = child.wait();
                 return Ok(None);
             }
@@ -80,6 +112,7 @@ fn run_bounded(
         }
         if Instant::now() >= deadline {
             kill_group(group);
+            let _ = child.kill();
             let _ = child.wait();
             return Ok(None);
         }
@@ -275,6 +308,47 @@ mod tests {
         .unwrap();
         assert!(out.is_none());
         assert_eq!(*leader_there.lock().unwrap(), [true, true]);
+    }
+
+    /// A leader that leaves its process group (here for its parent's, the test process's) isn't
+    /// reached by the group kill, so the child is killed itself; otherwise `wait` would wait out
+    /// its `sleep 30`.
+    #[test]
+    fn a_leader_that_leaves_its_group_is_killed_too() {
+        if Command::new("perl").arg("-v").output().is_err() {
+            return;
+        }
+        let script = "use POSIX; POSIX::setpgid(0, getpgrp(getppid())) or die $!; \
+                      print \"moved\\n\"; sleep 30";
+        let start = Instant::now();
+        let out = output_with_timeout(
+            Command::new("perl").args(["-e", script]),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn repo_env_is_cleared() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo \"${GIT_DIR-unset} ${GIT_INDEX_FILE-unset} $KEPT\"",
+        ])
+        .env("GIT_DIR", "/elsewhere/.git")
+        .env("GIT_INDEX_FILE", "/elsewhere/.git/index")
+        .env("KEPT", "kept");
+        without_repo_env(&mut cmd);
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset unset kept\n");
     }
 
     /// Output that a grandchild finishes writing before the deadline is kept.

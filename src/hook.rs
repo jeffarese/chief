@@ -44,14 +44,22 @@ pub fn run(event: &str, project: &str, role: Role) {
     if event == "guard" {
         start_guard_watchdog(project, guard_deadline());
     }
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| dispatch(event, project, role)));
+    // Read here, not in `dispatch`: a guard that fails still records what the payload says.
+    let mut input = String::new();
+    let read = std::io::stdin()
+        .read_to_string(&mut input)
+        .context("reading the hook payload");
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        read?;
+        dispatch(event, project, role, &input)
+    }));
     let (out, error) = match result {
         Ok(Ok(out)) => (out, None),
         Ok(Err(e)) => (None, Some(format!("{e:#}"))),
         Err(panic) => (None, Some(format!("panic: {}", panic_message(&*panic)))),
     };
     let out = match (&error, event) {
-        (Some(error), "guard") => Some(guard_failed(project, error)),
+        (Some(error), "guard") => Some(guard_failed(project, &input, error)),
         _ => out,
     };
     answer(out.as_deref());
@@ -104,16 +112,15 @@ fn start_guard_watchdog(project: &str, deadline: Duration) {
 }
 
 /// Routes an event; the returned text goes to stdout.
-fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .context("reading the hook payload")?;
+fn dispatch(event: &str, project: &str, role: Role, input: &str) -> Result<Option<String>> {
     if event == "guard" {
-        return guard(project, role, &input);
+        return guard(project, role, input);
     }
-    let payload: Value = serde_json::from_str(&input).context("parsing the hook payload")?;
+    let payload: Value = serde_json::from_str(input).context("parsing the hook payload")?;
     let conn = db::open(&paths::db())?;
+    if event == "Stop" {
+        learn_session_id(&conn, project, &payload);
+    }
     let ctx = Ctx {
         project,
         role,
@@ -153,6 +160,44 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
         return coordinator_context(&conn, project).map(Some);
     }
     Ok(None)
+}
+
+/// §4 "Matching a hook to a session": after `/clear` a session runs under a new session id,
+/// which no row has until a sync finds it under the row's short id (§5), and a Stop carries no
+/// title to match by. A Stop in that window would lose its report, so a Stop whose session id no
+/// row has syncs the project first, as a board poll would (bounded like the coordinator's
+/// context). Only then, and only while the project has a session the sync could match: other
+/// Stops never wait on `claude agents`. A failure is logged, and the Stop is recorded unmatched.
+fn learn_session_id(conn: &Connection, project: &str, payload: &Value) {
+    let Some(sid) = payload.get("session_id").and_then(Value::as_str) else {
+        return;
+    };
+    let unknown = || -> Result<bool> {
+        if db::get_session_by_session_id(conn, sid)?.is_some() {
+            return Ok(false);
+        }
+        Ok(db::list_sessions(conn, project, None)?
+            .iter()
+            .any(|r| r.short_id.is_some() && r.cleaned_at.is_none() && r.removed_at.is_none()))
+    };
+    let failed = match unknown() {
+        Ok(false) => None,
+        Ok(true) => {
+            let claude = project_claude(project);
+            accounts::refresh(conn, project, &claude, CONTEXT_AGENTS_TIMEOUT, db::now_ms)
+                .map(|listings| listings.error())
+                .unwrap_or_else(|e| Some(format!("{e:#}")))
+        }
+        Err(e) => Some(format!("{e:#}")),
+    };
+    if let Some(e) = failed {
+        log_error(
+            &paths::hook_error_log(),
+            "Stop",
+            project,
+            &format!("couldn't look up session {sid} in claude agents: {e}"),
+        );
+    }
 }
 
 /// A Bash call with `run_in_background` from one of `session`'s recorded subagents (§5
@@ -258,6 +303,10 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
     let conn = db::open(&paths::db())?;
     let rows = db::list_sessions(&conn, project, None)?;
     let caller_sid = payload.get("session_id").and_then(Value::as_str);
+    let transcript = payload
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(Path::new);
     let teammates = match call.tool {
         "SendMessage" => caller_teammates(&conn, &rows, caller_sid)?,
         _ => Vec::new(),
@@ -281,11 +330,8 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
         };
         let mate_named = |to: &str| teammates.iter().any(|t| t.name.as_deref() == Some(to));
         if spawn_name.is_some() || send_to.is_some_and(mate_named) {
-            want(caller_account(
-                &rows,
-                caller_sid,
-                project_account.as_deref(),
-            ));
+            let place = caller_place(&rows, caller_sid, transcript, project_account.as_deref());
+            want(place.account(project_account.as_deref()));
         }
         if role == Role::Coordinator
             && let Some(to) = send_to
@@ -331,6 +377,7 @@ fn guard(project: &str, role: Role, input: &str) -> Result<Option<String>> {
             snapshot: &snapshot,
             others: &others,
             caller: caller_sid,
+            transcript,
         },
         &teammates,
     );
@@ -406,18 +453,89 @@ pub fn caller_teammates(
     }
 }
 
-/// The account where a name the caller sends reaches sessions (§1): a thread's own, else the
-/// project's.
-fn caller_account(
-    rows: &[SessionRow],
+/// The account the calling session runs in (§3, §6), where the names it sends reach sessions
+/// (§1).
+#[derive(Debug, Clone, Copy)]
+enum Place<'r> {
+    /// The project's: the coordinator, or a caller chief doesn't know while every thread that
+    /// may still run is there.
+    Project,
+    /// The account of this thread: the caller itself, or a thread in the account whose folder
+    /// holds the caller's transcript.
+    Of(&'r SessionRow),
+    /// A caller chief doesn't know, while threads of the project run in other accounts.
+    Unknown,
+}
+
+impl Place<'_> {
+    /// Where its names reach sessions, as far as chief can tell: the project's when unknown.
+    fn account(&self, project: Option<&Path>) -> Option<std::path::PathBuf> {
+        match self {
+            Place::Of(row) => row.account(project),
+            Place::Project | Place::Unknown => project.map(Path::to_path_buf),
+        }
+    }
+}
+
+/// Where the session calling the guard runs: a registered thread's own account, the project's
+/// for the coordinator. A caller that matches no row (a thread whose session id changed with
+/// `/clear`, before a hook or a sync stores the new one) is placed by its `transcript_path`,
+/// which Claude Code keeps in its account's folder (`<folder>/projects/…`); when that doesn't
+/// place it and a thread of the project that isn't cleaned up runs in another account, it is
+/// Unknown, so the guard won't let it message its coordinator by name (§6).
+fn caller_place<'r>(
+    rows: &'r [SessionRow],
     caller: Option<&str>,
+    transcript: Option<&Path>,
     project: Option<&Path>,
-) -> Option<std::path::PathBuf> {
-    caller
-        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
-        .filter(|r| r.role == Role::Thread.as_str())
-        .map(|r| r.account(project))
-        .unwrap_or_else(|| project.map(Path::to_path_buf))
+) -> Place<'r> {
+    let matched = caller.and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)));
+    if let Some(row) = matched {
+        if row.role == Role::Thread.as_str() {
+            return Place::Of(row);
+        }
+        return Place::Project;
+    }
+    // A removed session can come back (§5), so only cleaned-up threads are out of the question.
+    let elsewhere: Vec<&SessionRow> = rows
+        .iter()
+        .filter(|r| r.role == Role::Thread.as_str() && r.cleaned_at.is_none())
+        .filter(|r| !claude::same_account(r.account(project).as_deref(), project))
+        .collect();
+    if elsewhere.is_empty() {
+        return Place::Project;
+    }
+    let Some(transcript) = transcript else {
+        return Place::Unknown;
+    };
+    if transcript_in(transcript, project) {
+        return Place::Project;
+    }
+    elsewhere
+        .into_iter()
+        .find(|r| transcript_in(transcript, r.account(project).as_deref()))
+        .map_or(Place::Unknown, Place::Of)
+}
+
+/// Whether `transcript` is in `account`'s transcript folder, `<account folder>/projects/`.
+fn transcript_in(transcript: &Path, account: Option<&Path>) -> bool {
+    use std::path::Component;
+    // `starts_with` compares components, and `..` would climb out of the folder.
+    if !transcript.is_absolute() || transcript.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let projects = claude::claude_dir(account).join("projects");
+    if transcript.starts_with(&projects) {
+        return true;
+    }
+    // An account folder given through a symlink, or `/tmp` for `/private/tmp` on macOS.
+    match (
+        transcript.parent().map(Path::canonicalize),
+        projects.canonicalize(),
+    ) {
+        (Some(Ok(folder)), Ok(projects)) => folder.starts_with(projects),
+        _ => false,
+    }
 }
 
 /// `claude` in the project's account (project.toml → `claude_config_dir`), whatever account the
@@ -454,6 +572,7 @@ pub fn guard_decision(
         snapshot,
         others: &[],
         caller: None,
+        transcript: None,
     };
     let call = Call {
         tool,
@@ -473,6 +592,8 @@ pub struct Accounts<'a> {
     pub others: &'a [accounts::Listing],
     /// The calling session's id, from the hook payload.
     pub caller: Option<&'a str>,
+    /// The payload's `transcript_path`, which places a caller chief doesn't know yet.
+    pub transcript: Option<&'a Path>,
 }
 
 /// `guard_decision` with threads in other accounts and the caller's subagents: each thread is
@@ -492,10 +613,7 @@ pub fn guard_decision_in(
         if claude::same_account(account.as_deref(), accounts.project) {
             return None;
         }
-        let label = r
-            .account_shown()
-            .map(str::to_string)
-            .unwrap_or_else(|| claude::account_label(account.as_deref()));
+        let label = shown_account(r, account.as_deref());
         let snapshot = match accounts
             .others
             .iter()
@@ -526,20 +644,20 @@ pub fn guard_decision_in(
         .iter()
         .find(|r| r.role == Role::Coordinator.as_str())
         .map(member);
-    let caller_elsewhere = accounts
-        .caller
-        .and_then(|sid| rows.iter().find(|r| r.session_id.as_deref() == Some(sid)))
-        .filter(|r| r.role == Role::Thread.as_str())
-        .and_then(|r| {
-            let account = r.account(accounts.project);
-            (!claude::same_account(account.as_deref(), accounts.project)).then(|| {
-                r.account_shown()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| claude::account_label(account.as_deref()))
-            })
-        });
+    let place = caller_place(rows, accounts.caller, accounts.transcript, accounts.project);
     // Where a name from the caller can reach someone (§1): its own account, and the project's.
-    let own = caller_account(rows, accounts.caller, accounts.project);
+    let own = place.account(accounts.project);
+    let caller_label = match place {
+        Place::Of(r) if !claude::same_account(own.as_deref(), accounts.project) => {
+            Some(shown_account(r, own.as_deref()))
+        }
+        _ => None,
+    };
+    let caller_account = match (place, caller_label.as_deref()) {
+        (Place::Unknown, _) => guard::CallerAccount::Unknown,
+        (_, Some(label)) => guard::CallerAccount::Other(label),
+        _ => guard::CallerAccount::Same,
+    };
     let names = |agents: &[AgentRow]| -> Vec<String> {
         agents.iter().filter_map(|a| a.name.clone()).collect()
     };
@@ -568,24 +686,50 @@ pub fn guard_decision_in(
         coordinator: coordinator.as_ref(),
         threads: &threads,
         snapshot: accounts.snapshot,
-        caller_elsewhere: caller_elsewhere.as_deref(),
+        caller_account,
         from_subagent: call.from_subagent,
         teammates,
         listed: &listed,
     })
 }
 
-/// The deny JSON for a guard that couldn't decide, recorded if the database still opens.
-fn guard_failed(project: &str, error: &str) -> String {
+/// A thread's account for messages: its agp label, else the folder.
+fn shown_account(row: &SessionRow, account: Option<&Path>) -> String {
+    row.account_shown()
+        .map(str::to_string)
+        .unwrap_or_else(|| claude::account_label(account))
+}
+
+/// The deny JSON for a guard that couldn't decide, recorded if the database still opens, with
+/// as much of the call as the payload `input` gives: the tool, its target, and the caller when
+/// its row can be read.
+fn guard_failed(project: &str, input: &str, error: &str) -> String {
     let reason = format!("chief's message guard failed, so the message is blocked: {error}");
+    let payload: Option<Value> = serde_json::from_str(input).ok();
+    let call = payload.as_ref().and_then(|p| Call::from_payload(p).ok());
+    let target = call.and_then(|c| match c.tool {
+        "Agent" => c.name,
+        _ => c.to,
+    });
+    let caller_sid = payload
+        .as_ref()
+        .and_then(|p| p.get("session_id"))
+        .and_then(Value::as_str);
     if let Ok(conn) = db::open(&paths::db()) {
+        let caller = caller_sid.and_then(|sid| {
+            let rows = db::list_sessions(&conn, project, None).ok()?;
+            let row = rows
+                .into_iter()
+                .find(|r| r.session_id.as_deref() == Some(sid))?;
+            Some(row.name)
+        });
         let _ = db::insert_guard_denial(
             &conn,
             &db::GuardDenial {
                 project_slug: project.to_string(),
-                session_name: None,
-                tool: "unknown".to_string(),
-                target: None,
+                session_name: caller,
+                tool: call.map_or("unknown", |c| c.tool).to_string(),
+                target: target.map(str::to_string),
                 reason: reason.clone(),
                 ts: db::now_ms(),
             },
@@ -739,6 +883,21 @@ fn listed_tasks(payload: &Value, kind: impl Fn(&str) -> bool) -> u32 {
         })
 }
 
+/// The ids of the `background_tasks` entries of type `kind` a Stop lists as running.
+fn listed_ids(payload: &Value, kind: &str) -> Vec<String> {
+    fn field<'a>(t: &'a Value, k: &str) -> Option<&'a str> {
+        t.get(k).and_then(Value::as_str)
+    }
+    payload
+        .get("background_tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| field(t, "type") == Some(kind) && field(t, "status") == Some("running"))
+        .filter_map(|t| field(t, "id").map(str::to_string))
+        .collect()
+}
+
 /// §5 "Background work". A thread's Stop while an in-process teammate works told its
 /// coordinator it was idle (§1), so it is marked; async agents and background commands keep it
 /// busy, so they don't. The next Stop that finds nothing running clears the mark and is due to
@@ -825,15 +984,20 @@ fn record_teammates(
                 db::set_teammate_busy(conn, session, agent, false)?;
             }
         }
-        // The session's own Stop lists the subagents it still has (a teammate even while idle,
-        // an async agent until its hand-back): every task that isn't a `shell`. With none
-        // listed, none can be mid-turn, whatever SubagentStop chief missed.
+        // The session's own Stop lists the subagents it still has: a teammate even while idle,
+        // an async agent (a `subagent`, by its agent id) until its hand-back. So an agent it
+        // doesn't list can't be mid-turn, whatever SubagentStop chief missed (one that hit the
+        // busy timeout, say). A teammate is listed under a task id, not its agent id, and busy
+        // or not, so while one is listed (or a task of a type chief doesn't know) nothing is
+        // cleared.
         "Stop"
             if text(Some(payload), "agent_id").is_none()
                 && payload.get("background_tasks").is_some_and(Value::is_array)
-                && listed_tasks(payload, |k| k != "shell") == 0 =>
+                && listed_tasks(payload, |k| k != "shell" && k != "subagent") == 0 =>
         {
-            db::idle_teammates(conn, session)?;
+            let running = listed_ids(payload, "subagent");
+            let running: Vec<&str> = running.iter().map(String::as_str).collect();
+            db::idle_teammates(conn, session, &running)?;
         }
         "PostToolUse" if text(Some(payload), "tool_name") == Some("Agent") => {
             let response = payload.get("tool_response");
@@ -856,37 +1020,38 @@ fn record_teammates(
 /// stops counting until the next poll. Returns the new report, if the hook carried one. The cwd
 /// is kept for display only: the thread's worktree and branch come from its job state (sync).
 fn apply(row: &mut SessionRow, kind: HookKind, payload: &Value, now: i64) -> Option<String> {
+    use HookKind::*;
     let str_field = |k: &str| payload.get(k).and_then(Value::as_str);
     row.last_hook = Some(kind.as_str().to_string());
     row.last_hook_at = Some(now);
     row.cc_fresh = false;
     row.updated_at = now;
-    if kind != HookKind::IdleNotification {
+    if kind != IdleNotification {
         row.last_activity_at = now;
     }
+    // A subagent's tool calls carry its lead's session id (§1) and so match the lead's row:
+    // they show the process works, but they don't answer the lead's permission prompt (rule 3
+    // keeps it waiting), and their cwd isn't the lead's.
+    let own = str_field("agent_id").is_none_or(str::is_empty);
+    if own && matches!(kind, UserPromptSubmit | PreToolUse | PostToolUse | Stop) {
+        row.pending_permission = false;
+    }
+    if own
+        && matches!(kind, PostToolUse | Stop)
+        && let Some(cwd) = str_field("cwd")
+    {
+        row.cwd = Some(cwd.to_string());
+    }
+    if kind == PermissionNotification {
+        row.pending_permission = true;
+    }
     let mut report = None;
-    match kind {
-        HookKind::SessionStart | HookKind::IdleNotification => {}
-        HookKind::UserPromptSubmit | HookKind::PreToolUse => row.pending_permission = false,
-        HookKind::PostToolUse => {
-            row.pending_permission = false;
-            if let Some(cwd) = str_field("cwd") {
-                row.cwd = Some(cwd.to_string());
-            }
-        }
-        HookKind::PermissionNotification => row.pending_permission = true,
-        HookKind::Stop => {
-            row.pending_permission = false;
-            if let Some(cwd) = str_field("cwd") {
-                row.cwd = Some(cwd.to_string());
-            }
-            if let Some(text) = str_field("last_assistant_message").filter(|r| !r.trim().is_empty())
-            {
-                row.last_report = Some(text.to_string());
-                row.last_report_at = Some(now);
-                report = Some(text.to_string());
-            }
-        }
+    if kind == Stop
+        && let Some(text) = str_field("last_assistant_message").filter(|r| !r.trim().is_empty())
+    {
+        row.last_report = Some(text.to_string());
+        row.last_report_at = Some(now);
+        report = Some(text.to_string());
     }
     registry::rederive(row);
     report
@@ -984,11 +1149,13 @@ pub fn log_error(log: &Path, event: &str, project: &str, error: &str) {
         .open(log)
     {
         let error = error.replace('\n', " | ");
-        let _ = writeln!(
-            f,
-            "{} hook {event} --project {project}: {error}",
+        // One write per line: hooks run at once, and `writeln!` writes each piece on its own, so
+        // their pieces would interleave even in append mode.
+        let line = format!(
+            "{} hook {event} --project {project}: {error}\n",
             db::now_ms()
         );
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -1608,6 +1775,133 @@ mod tests {
         assert_eq!(row(&conn, "spike-sub2"), (0, 0, "idle".into()));
     }
 
+    /// A subagent's tool calls carry its lead's session id (§1), so they match the lead's row.
+    /// They don't answer the lead's permission prompt (rule 3 comes before rule 5), and their
+    /// cwd isn't the lead's; the lead's own next hook clears the prompt.
+    #[test]
+    fn teammate_tool_calls_keep_the_leads_permission_prompt() {
+        let (_dir, conn) = wait_setup();
+        let lines = subagent_wait_fixture();
+        replay_range(&conn, &lines, 0..=5);
+        let lead_cwd = get(&conn, "spike-lead2").cwd;
+        assert!(lead_cwd.is_some());
+        let mut prompt = lines[1].clone();
+        prompt["hook_event_name"] = "Notification".into();
+        prompt["notification_type"] = "permission_prompt".into();
+        prompt["message"] = "Claude needs your permission".into();
+        replay(&conn, &prompt, 6);
+        let waiting = |conn: &Connection| {
+            let r = get(conn, "spike-lead2");
+            (r.pending_permission, r.group_name, r.waiting_reason)
+        };
+        let permission = (true, "waiting".to_string(), Some("permission".to_string()));
+        assert_eq!(waiting(&conn), permission);
+
+        // The teammate works on: its PostToolUse, PreToolUse and PostToolUse (7, 8, 9).
+        for (i, line) in lines.iter().enumerate().take(10).skip(7) {
+            let mut call = line.clone();
+            assert!(call["agent_id"].as_str().is_some_and(|a| !a.is_empty()));
+            call["cwd"] = "/elsewhere/teammate-worktree".into();
+            replay(&conn, &call, 10 + i as i64);
+            assert_eq!(waiting(&conn), permission, "line {i}");
+        }
+        let r = get(&conn, "spike-lead2");
+        assert_eq!(r.cwd, lead_cwd, "a teammate's cwd isn't the lead's");
+        assert_eq!(
+            (r.last_hook.as_deref(), r.last_hook_at),
+            (Some("PostToolUse"), Some(19))
+        );
+        // A fresh `claude agents` row saying busy changes nothing either.
+        let mut polled = r.clone();
+        polled.cc_status = Some("busy".into());
+        polled.cc_state = Some("working".into());
+        polled.cc_fresh = true;
+        registry::rederive(&mut polled);
+        assert_eq!(polled.waiting_reason.as_deref(), Some("permission"));
+
+        // The lead's own next call (10, no agent_id) ends the prompt.
+        replay(&conn, &lines[10], 20);
+        assert_eq!(waiting(&conn), (false, "working".to_string(), None));
+    }
+
+    /// §5 "Background work": a lost SubagentStop doesn't keep an async agent mid-turn for good.
+    /// The lead's own Stop lists each async agent by its agent id until its hand-back, so an
+    /// agent it doesn't list is done; a listed one stays busy.
+    #[test]
+    fn a_lost_subagent_stop_ends_at_the_leads_next_stop() {
+        let lines: Vec<Value> = include_str!("../tests/fixtures/hooks/async-wait-events.jsonl")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let (_dir, conn) = wait_setup();
+        for name in ["spike-sub2", "spike-sh2"] {
+            db::insert_session(&conn, &SessionRow::new(name, "demo", Role::Thread, 0)).unwrap();
+        }
+        replay_range(&conn, &lines, 0..=11);
+        let first = lines[7]["agent_id"].as_str().unwrap();
+        assert_eq!(lines[11]["background_tasks"][0]["id"], first);
+        // A second async agent starts; the first one's SubagentStop (19) never lands.
+        let mut start = lines[7].clone();
+        start["agent_id"] = "asecond-1".into();
+        replay(&conn, &start, 12);
+        assert_eq!(get(&conn, "spike-sub2").subagents_busy, 2);
+
+        let mut stop = lines[20].clone();
+        stop["background_tasks"] = serde_json::json!([
+            {"id": "asecond-1", "type": "subagent", "status": "running", "description": "x"},
+            {"id": "b1", "type": "shell", "status": "running", "description": "y"},
+        ]);
+        let out = replay(&conn, &stop, 13);
+        let row = get(&conn, "spike-sub2");
+        assert_eq!((row.subagents_busy, row.background_running), (1, 1));
+        assert_eq!((out.notices.len(), row.group_name.as_str()), (0, "working"));
+        // A teammate listed (under a task id, idle or not) leaves every turn as it is.
+        let mut start = lines[7].clone();
+        start["agent_id"] = "athird-2".into();
+        replay(&conn, &start, 14);
+        stop["background_tasks"] = serde_json::json!([
+            {"id": "t5yzdiksp", "type": "teammate", "status": "running", "description": "z"},
+        ]);
+        replay(&conn, &stop, 15);
+        assert_eq!(get(&conn, "spike-sub2").subagents_busy, 2);
+        stop["background_tasks"] = serde_json::json!([]);
+        replay(&conn, &stop, 16);
+        let row = get(&conn, "spike-sub2");
+        assert_eq!((row.subagents_busy, row.group_name.as_str()), (0, "idle"));
+    }
+
+    /// A Stop without `background_tasks` says nothing about subagents (they keep their turn)
+    /// and lists no running command; its report is kept as any Stop's.
+    #[test]
+    fn a_stop_without_background_tasks() {
+        let (_dir, conn) = wait_setup();
+        let lines = subagent_wait_fixture();
+        replay_range(&conn, &lines, 36..=40);
+        replay(&conn, &lines[46], 46);
+        let row = get(&conn, "spike-lead4");
+        assert_eq!((row.subagents_busy, row.background_running), (1, 2));
+
+        let mut stop = lines[49].clone();
+        stop.as_object_mut().unwrap().remove("background_tasks");
+        stop["last_assistant_message"] = "still waiting on runner".into();
+        let out = replay(&conn, &stop, 50);
+        let row = get(&conn, "spike-lead4");
+        assert_eq!(
+            (
+                row.subagents_busy,
+                row.background_running,
+                row.group_name.as_str()
+            ),
+            (1, 0, "working")
+        );
+        assert_eq!(row.last_report.as_deref(), Some("still waiting on runner"));
+        // Still waiting: no notice, no report asked for, the early Stop (46) still marked.
+        assert_eq!(
+            (out.notices.len(), out.final_report, row.stopped_early_at),
+            (0, false, Some(46))
+        );
+    }
+
     /// Only a recorded subagent's Bash call in the background (§5).
     #[test]
     fn subagent_background_commands_are_denied() {
@@ -1682,6 +1976,7 @@ mod tests {
                 snapshot: &snapshot,
                 others: &[],
                 caller: sid,
+                transcript: None,
             };
             let call = Call::from_payload(payload).unwrap();
             guard_decision_in("demo", role, &call, &rows, &accounts, &teammates)
@@ -2082,6 +2377,85 @@ mod tests {
             &snap,
         );
         assert!(denied(&d, "recorded"), "{d:?}");
+    }
+
+    /// §6: a thread caller whose session id matches no row (after `/clear`, before a hook or a
+    /// sync stores the new id) is placed by its transcript; while a thread runs in another
+    /// account and the transcript doesn't place it, it can't use its coordinator's name.
+    #[test]
+    fn guard_places_a_caller_it_does_not_know() {
+        let accounts_dir = tempfile::tempdir().unwrap();
+        let project = accounts_dir.path().join("project");
+        let pb2 = accounts_dir.path().join("pb2");
+        let mut rows = guard_rows();
+        let mut far = SessionRow::new("demo-far-3333", "demo", Role::Thread, 0);
+        far.session_id = Some("far-sid".into());
+        far.account_id = Some("pb2".into());
+        far.account_label = Some("PB2".into());
+        far.account_dir = Some(pb2.to_string_lossy().into_owned());
+        rows.push(far);
+        let snap = [agent_row("c1", "c-sid", "chief-demo", Some(100))];
+        let decide = |rows: &[SessionRow], caller: &str, transcript: Option<&Path>, to: &str| {
+            let accounts = Accounts {
+                project: Some(&project),
+                snapshot: &snap,
+                others: &[],
+                caller: Some(caller),
+                transcript,
+            };
+            let call = Call {
+                tool: "SendMessage",
+                to: Some(to),
+                ..Call::default()
+            };
+            guard_decision_in("demo", Role::Thread, &call, rows, &accounts, &[])
+        };
+        let in_project = project.join("projects/-repo/new-sid.jsonl");
+        let in_pb2 = pb2.join("projects/-repo/new-sid.jsonl");
+        let allowed = guard::Decision::Allow;
+
+        // Known callers keep their account, whatever the transcript says.
+        assert_eq!(decide(&rows, "t-sid", Some(&in_pb2), "chief-demo"), allowed);
+        let d = decide(&rows, "far-sid", Some(&in_project), "chief-demo");
+        assert!(denied(&d, "another Claude account (PB2)"), "{d:?}");
+
+        // Unknown: by its transcript's folder.
+        assert_eq!(
+            decide(&rows, "new-sid", Some(&in_project), "chief-demo"),
+            allowed
+        );
+        let d = decide(&rows, "new-sid", Some(&in_pb2), "chief-demo");
+        assert!(denied(&d, "another Claude account (PB2)"), "{d:?}");
+        // Not placed: no transcript, one elsewhere, or one that climbs out of the folder.
+        let nowhere = accounts_dir.path().join("other/projects/x.jsonl");
+        let climbs = project.join("projects/../../pb2/projects/x.jsonl");
+        for transcript in [None, Some(nowhere.as_path()), Some(climbs.as_path())] {
+            let d = decide(&rows, "new-sid", transcript, "chief-demo");
+            assert!(
+                denied(&d, "can't tell whether you run in"),
+                "{transcript:?}: {d:?}"
+            );
+            assert!(denied(&d, "from=\"uds:"), "{d:?}");
+            // Its coordinator's exact address still works.
+            assert_eq!(
+                decide(&rows, "new-sid", transcript, "uds:/tmp/cc-socks/100.sock"),
+                allowed
+            );
+        }
+        // A thread elsewhere that is resolved, or was removed outside chief, may still run.
+        for change in [
+            (|r: &mut SessionRow| r.resolved = true) as fn(&mut SessionRow),
+            |r| r.removed_at = Some(1),
+        ] {
+            let mut rows = rows.clone();
+            change(&mut rows[2]);
+            let d = decide(&rows, "new-sid", None, "chief-demo");
+            assert!(denied(&d, "can't tell"), "{d:?}");
+        }
+        // Once it is cleaned up, every thread that may run is in the project's account.
+        let mut rows = rows.clone();
+        rows[2].cleaned_at = Some(1);
+        assert_eq!(decide(&rows, "new-sid", None, "chief-demo"), allowed);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! waits as input for it instead of being lost. It also ignores SIGTSTP and gives `claude attach`
 //! the default disposition back, in case one gets through.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::cursor::MoveTo;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
 use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
@@ -37,26 +36,33 @@ use crate::state::Role;
 use crate::{accounts, names, paths, proc, project};
 
 /// How often a failed attach is retried.
-const RETRY: Duration = Duration::from_millis(500);
+pub(crate) const RETRY: Duration = Duration::from_millis(500);
 /// How long a respawned session gets to show a process.
 const WAKE_WAIT: Duration = Duration::from_secs(20);
 /// An attach that ends sooner than this counts as a failed start: wait before the next try so a
 /// session that keeps refusing doesn't spin.
-const SHORT_ATTACH: Duration = Duration::from_secs(1);
+pub(crate) const SHORT_ATTACH: Duration = Duration::from_secs(1);
 /// How long attach gets to exit after a hangup or a switch before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(2);
 /// How often the wait for attach looks at the child and the signal flags.
 const WAIT_TICK: Duration = Duration::from_millis(50);
-/// What a `claude attach` ended by a signal leaves on: the alternate screen, a hidden cursor,
-/// mouse reporting, bracketed paste and focus events. Leave and turn off each, reset attributes,
-/// clear.
-const TERMINAL_RESET: &str = "\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
-                              \x1b[?2004l\x1b[?1004l\x1b[0m\x1b[2J\x1b[H";
+/// What a `claude attach` ended by a signal leaves on: synchronized output, the alternate
+/// screen, a hidden cursor, mouse reporting, bracketed paste, focus events, kitty keyboard flags
+/// and modifyOtherKeys. End synchronized output first (the terminal holds back everything else
+/// until then), then leave or turn off each, reset attributes, clear.
+const TERMINAL_RESET: &str = "\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\
+                              \x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[>4m\x1b[0m\x1b[2J\x1b[H";
 /// How often an unusable project.toml is read again.
-const CONFIG_RETRY: Duration = Duration::from_secs(5);
+pub(crate) const CONFIG_RETRY: Duration = Duration::from_secs(5);
 /// After the user leaves a session, keys this soon are still the ones that closed Claude (a
 /// third Ctrl+C), not an answer to the pane.
-const SETTLE: Duration = Duration::from_millis(300);
+pub(crate) const SETTLE: Duration = Duration::from_millis(300);
+/// The longest one look for keys lasts. A signal interrupts a look, but one that lands just
+/// before it starts is only seen once it ends.
+const KEY_SLICE: Duration = Duration::from_millis(200);
+/// Ctrl+C, a plain byte in raw mode.
+const CTRL_C: u8 = 0x03;
+const ESC: u8 = 0x1b;
 
 /// Set by SIGHUP or SIGTERM.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
@@ -86,6 +92,22 @@ fn catch_hangup() {
 /// its pid: SIGUSR1's default action would end it.
 fn catch_switch() {
     catch(&[libc::SIGUSR1], on_switch);
+}
+
+/// Both, for a pane that isn't `chief pane`: the built-in layout's conversation (§9).
+pub fn catch_signals() {
+    catch_hangup();
+    catch_switch();
+}
+
+/// SIGHUP or SIGTERM arrived.
+pub fn hung_up() -> bool {
+    HUNG_UP.load(Ordering::SeqCst)
+}
+
+/// Whether a switch request arrived since the last call.
+pub fn take_switch() -> bool {
+    SWITCH.swap(false, Ordering::SeqCst)
 }
 
 fn catch(signals: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
@@ -123,19 +145,32 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
     let tty = Tty::take()?;
     // Where the board's switch requests go, with the start time that proves the pid is still
     // this pane. Without a start time the board can't switch this pane, but it still works.
-    let me = std::process::id() as i32;
-    if let Some(started) = proc::start_time(me) {
-        db::set_pane_process(&conn, project, me, &started)?;
+    let pid = std::process::id() as i32;
+    let me = match proc::start_time(pid) {
+        Some(started) => {
+            db::set_pane_process(&conn, project, pid, &started)?;
+            Some(pid)
+        }
+        None => None,
+    };
+    let result = pane_loop(&conn, project, me, &tty, &on_quit);
+    // Only while the record is still this pane's: a newer pane's stays.
+    let _ = db::set_pane_showing_as(&conn, project, me, None);
+    if let Some(me) = me {
+        let _ = db::clear_pane_process_if(&conn, project, me);
     }
-    let result = pane_loop(&conn, project, &tty, &on_quit);
-    let _ = db::set_pane_showing(&conn, project, None);
-    let _ = db::clear_pane_process_if(&conn, project, me);
     drop(tty);
     match &on_quit {
         // The user quit (a hangup means the layout is closing already). Closing it hangs up
         // this terminal too, so it comes last.
         OnQuit::Layout if result.is_ok() && !HUNG_UP.load(Ordering::SeqCst) => {
-            project::close_layout(&conn, project, &mut |line| println!("{line}"))?;
+            // Not `println!`: it panics once the terminal has hung up.
+            project::close_layout(&conn, project, &mut |note| {
+                let (project::Note::Did(line)
+                | project::Note::Info(line)
+                | project::Note::Warn(line)) = note;
+                let _ = writeln!(std::io::stdout(), "{line}");
+            })?;
         }
         // Even after a hangup (the user closed this block): a board beside nothing is no use.
         OnQuit::Board(board) => {
@@ -149,7 +184,7 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
 }
 
 /// What the pane shows once the user left `name` by hand.
-fn left_lines(name: &str, coordinator: bool, on_quit: &OnQuit) -> Vec<String> {
+pub(crate) fn left_lines(name: &str, coordinator: bool, on_quit: &OnQuit) -> Vec<String> {
     let what = if coordinator {
         format!("the coordinator ({name})")
     } else {
@@ -193,7 +228,7 @@ pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<Session
 
 /// project.toml as it is now, or the lines the pane shows while it can't be read or doesn't
 /// validate: the pane then neither attaches nor rewrites or respawns from stale files.
-fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
+pub(crate) fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
     ProjectConfig::load(&dir.join("project.toml")).map_err(|e| {
         let mut lines = vec!["chief · project.toml can't be used:".to_string()];
         lines.extend(format!("{e:#}").lines().map(|l| format!("  {l}")));
@@ -205,8 +240,17 @@ fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
     })
 }
 
-fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> Result<()> {
+/// `me`: this pane's pid when it recorded itself in `pane_pid`; it writes `pane_showing` only
+/// while that record is still its own.
+fn pane_loop(
+    conn: &Connection,
+    project: &str,
+    me: Option<i32>,
+    tty: &Tty,
+    on_quit: &OnQuit,
+) -> Result<()> {
     let dir = project::project_dir(project);
+    let showing = |name: Option<&str>| db::set_pane_showing_as(conn, project, me, name);
     loop {
         if HUNG_UP.load(Ordering::SeqCst) {
             return Ok(());
@@ -218,7 +262,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
                 for line in &lines[1..] {
                     tty.note(line)?;
                 }
-                if tty.quit_pressed(CONFIG_RETRY)? {
+                if tty.quit_pressed(CONFIG_RETRY) {
                     return Ok(());
                 }
                 continue;
@@ -230,7 +274,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
             tty.say(&format!(
                 "chief · no coordinator yet: run chief up {project} · q quits"
             ))?;
-            if tty.quit_pressed(RETRY)? {
+            if tty.quit_pressed(RETRY) {
                 return Ok(());
             }
             continue;
@@ -238,9 +282,12 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
         let name = row.name.clone();
         let short_id = row.short_id.clone().context("target has no short id")?;
         tty.say(&format!("chief · {name} …"))?;
-        if let Err(e) = wake(conn, claude, (&dir, &config), &row, tty) {
+        let mut say = |line: &str| {
+            let _ = tty.say(line);
+        };
+        if let Err(e) = wake(conn, claude, (&dir, &config), &row, &mut say) {
             tty.say(&format!("chief · {name}: {e:#} · retrying · q quits"))?;
-            if tty.quit_pressed(RETRY)? {
+            if tty.quit_pressed(RETRY) {
                 return Ok(());
             }
             continue;
@@ -248,14 +295,14 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
 
         // Claim the pane, then look again: a board that wrote a new target before this claim
         // saw no attach to interrupt and sent nothing.
-        db::set_pane_showing(conn, project, Some(&name))?;
+        showing(Some(&name))?;
         if resolve_target(conn, project)?.map(|r| r.name).as_deref() != Some(name.as_str()) {
-            db::set_pane_showing(conn, project, None)?;
+            showing(None)?;
             continue;
         }
         // Drops keys that arrived meanwhile, a switch's Ctrl+Z among them, so attach doesn't
         // read one and detach at once.
-        if tty.quit_pressed(Duration::ZERO)? {
+        if tty.quit_pressed(Duration::ZERO) {
             return Ok(());
         }
         tty.release();
@@ -279,7 +326,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
             tty.reset();
         }
         tty.retake()?;
-        db::set_pane_showing(conn, project, None)?;
+        showing(None)?;
         if switched {
             continue;
         }
@@ -293,7 +340,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
             let why = failed.unwrap_or_else(|| format!("claude attach {short_id} ended at once"));
             // Below whatever attach printed, which says why.
             tty.note(&format!("chief · {name}: {why} · retrying · q quits"))?;
-            if tty.quit_pressed(RETRY)? {
+            if tty.quit_pressed(RETRY) {
                 return Ok(());
             }
             continue;
@@ -306,7 +353,7 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
         for line in &lines[1..] {
             tty.note(line)?;
         }
-        if tty.pick()? == Pick::Quit {
+        if tty.pick() == Pick::Quit {
             return Ok(());
         }
     }
@@ -315,12 +362,12 @@ fn pane_loop(conn: &Connection, project: &str, tty: &Tty, on_quit: &OnQuit) -> R
 /// Respawns `row` when `claude agents` shows no process for it and waits for one, from the
 /// project.toml just read (`claude` is the project's account). A failing `claude agents` is no
 /// reason not to try attaching.
-fn wake(
+pub(crate) fn wake(
     conn: &Connection,
     claude: &Claude,
     (dir, config): (&Path, &ProjectConfig),
     row: &SessionRow,
-    tty: &Tty,
+    say: &mut dyn FnMut(&str),
 ) -> Result<()> {
     // Its own account's `claude agents` is the one that can see it.
     if accounts::refresh_row(conn, claude, row, AGENTS_TIMEOUT, db::now_ms).is_err() {
@@ -331,7 +378,7 @@ fn wake(
     if row.pid.is_some() {
         return Ok(());
     }
-    tty.say(&format!("chief · waking {} …", row.name))?;
+    say(&format!("chief · waking {} …", row.name));
     project::respawn(conn, claude, dir, config, &row, WAKE_WAIT)?;
     Ok(())
 }
@@ -537,56 +584,99 @@ impl Tty {
     }
 
     /// Waits for the user's answer after they left a session: ⏎ or a board selection (a switch
-    /// request) attaches again, `q` or Ctrl+C quits. Keys in the first `SETTLE` are dropped.
-    fn pick(&self) -> Result<Pick> {
+    /// request) attaches again, `q`, Ctrl+C or a hangup quits. Keys in the first `SETTLE` are
+    /// dropped.
+    fn pick(&self) -> Pick {
         let settle = Instant::now() + SETTLE;
         loop {
             if HUNG_UP.load(Ordering::SeqCst) {
-                return Ok(Pick::Quit);
+                return Pick::Quit;
             }
             if SWITCH.swap(false, Ordering::SeqCst) {
-                return Ok(Pick::Back);
+                return Pick::Back;
             }
-            // Short polls: a switch request only sets a flag.
-            if !event::poll(WAIT_TICK * 4)? {
+            // Short looks: a switch request only sets a flag.
+            let keys = read_keys(KEY_SLICE);
+            if Instant::now() < settle {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press || Instant::now() < settle {
-                continue;
-            }
-            match (key.code, key.modifiers) {
-                (KeyCode::Enter, _) => return Ok(Pick::Back),
-                (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(Pick::Quit),
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(Pick::Quit),
-                _ => {}
+            for key in keys {
+                match key {
+                    b'\r' | b'\n' => return Pick::Back,
+                    b'q' | CTRL_C => return Pick::Quit,
+                    _ => {}
+                }
             }
         }
     }
 
-    /// Reads keys for `wait`, then whatever is still queued; true when `q` was pressed. Other
-    /// keys are dropped.
-    fn quit_pressed(&self, wait: Duration) -> Result<bool> {
+    /// Reads keys for `wait`, then whatever is still queued; true when `q` was pressed or the
+    /// terminal hung up. Other keys are dropped. A switch request doesn't end the wait: it stays
+    /// for the next attach, which drops it when it is for the target being attached.
+    fn quit_pressed(&self, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         loop {
             if HUNG_UP.load(Ordering::SeqCst) {
-                return Ok(true);
+                return true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            if !event::poll(left)? {
-                return Ok(false);
+            let keys = read_keys(left.min(KEY_SLICE));
+            if keys.contains(&b'q') {
+                return true;
             }
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && key.code == KeyCode::Char('q')
-                && key.modifiers == KeyModifiers::NONE
-            {
-                return Ok(true);
+            if keys.is_empty() && left.is_zero() {
+                return HUNG_UP.load(Ordering::SeqCst);
             }
         }
     }
+}
+
+/// Waits up to `wait` for keys on the pane's terminal and returns them; nothing on a timeout or
+/// a signal. A terminal that hung up (POLLHUP, POLLERR or POLLNVAL, end of file, EIO) sets
+/// `HUNG_UP`. Not crossterm's reader: on a hung-up terminal it retries a read that returns 0 or
+/// EIO forever, so its poll never returns, the flag is never looked at, and the pane spins at
+/// full CPU until it is killed. The pane needs only `q`, Enter and Ctrl+C, so it reads bytes:
+/// from an ESC on they are an escape sequence (an arrow key, a mouse report, a paste), not keys.
+fn read_keys(wait: Duration) -> Vec<u8> {
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: polls one descriptor, passed by a pointer to a live pollfd.
+    let ready = unsafe { libc::poll(&mut fd, 1, ms) };
+    if ready == 0 {
+        return Vec::new();
+    }
+    if ready < 0 {
+        // A signal: the caller looks at the flags. Any other failure would repeat at once.
+        if std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+            HUNG_UP.store(true, Ordering::SeqCst);
+        }
+        return Vec::new();
+    }
+    if fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        HUNG_UP.store(true, Ordering::SeqCst);
+        return Vec::new();
+    }
+    let mut buf = [0u8; 64];
+    // SAFETY: reads at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+    if n > 0 {
+        let read = &buf[..n as usize];
+        return read
+            .split(|&b| b == ESC)
+            .next()
+            .unwrap_or_default()
+            .to_vec();
+    }
+    // A killed `claude attach` may leave the terminal non-blocking: EAGAIN is no hangup.
+    let kind = std::io::Error::last_os_error().kind();
+    if n == 0 || !matches!(kind, ErrorKind::Interrupted | ErrorKind::WouldBlock) {
+        HUNG_UP.store(true, Ordering::SeqCst);
+    }
+    Vec::new()
 }
 
 impl Drop for Tty {
@@ -614,16 +704,34 @@ pub fn request_switch(conn: &Connection, project: &str) -> Result<()> {
     if showing.as_deref() == Some(target.as_str()) {
         return Ok(());
     }
-    let Some((pid, started)) = db::get_pane_process(conn, project)? else {
+    let Some(pid) = live_pane(conn, project)? else {
         return Ok(());
     };
-    if proc::start_time(pid).as_deref() != Some(started.as_str()) {
-        db::clear_pane_process_if(conn, project, pid)?;
-        return Ok(());
-    }
     // SAFETY: a plain syscall, to the process just proven to be the pane.
     unsafe { libc::kill(pid, libc::SIGUSR1) };
     Ok(())
+}
+
+/// The recorded pane's pid while that process still runs: its start time matches
+/// `pane_started`. A record whose process is gone (a pane killed with SIGKILL never clears it)
+/// is cleared, with what it showed, and None returned: the pid may be another process's by now.
+pub fn live_pane(conn: &Connection, project: &str) -> Result<Option<i32>> {
+    let Some((pid, started)) = db::get_pane_process(conn, project)? else {
+        return Ok(None);
+    };
+    if proc::start_time(pid).as_deref() != Some(started.as_str()) {
+        db::clear_pane_process_if(conn, project, pid)?;
+        return Ok(None);
+    }
+    Ok(Some(pid))
+}
+
+/// The session the pane shows, for §12 cleanup: `pane_showing`, unless the pane that recorded it
+/// is gone (`live_pane`), which would otherwise keep cleanup away from that thread for good. A
+/// pane that couldn't record itself is trusted, since nothing proves it gone.
+pub fn showing(conn: &Connection, project: &str) -> Result<Option<String>> {
+    live_pane(conn, project)?;
+    db::get_pane_showing(conn, project)
 }
 
 #[cfg(test)]
@@ -764,6 +872,34 @@ mod tests {
         db::set_pane_showing(&conn, "demo", None).unwrap();
         request_switch(&conn, "demo").unwrap();
         assert_eq!(ended_by(&mut pane), Some(libc::SIGUSR1));
+    }
+
+    /// A pane killed with SIGKILL never clears its record: once its process is gone, what it
+    /// showed no longer keeps §12 cleanup away from that thread.
+    #[test]
+    fn a_gone_panes_showing_is_not_trusted() {
+        let (_dir, conn) = fresh();
+        let mut pane = fake_pane(&conn);
+        db::set_pane_showing(&conn, "demo", Some("demo-a-1111")).unwrap();
+        assert_eq!(
+            showing(&conn, "demo").unwrap().as_deref(),
+            Some("demo-a-1111")
+        );
+        pane.kill().unwrap();
+        pane.wait().unwrap();
+        assert_eq!(showing(&conn, "demo").unwrap(), None);
+        assert_eq!(
+            db::get_pane_process(&conn, "demo").unwrap(),
+            None,
+            "forgotten"
+        );
+
+        // A pane that couldn't record itself: nothing proves it gone.
+        db::set_pane_showing(&conn, "demo", Some("demo-a-1111")).unwrap();
+        assert_eq!(
+            showing(&conn, "demo").unwrap().as_deref(),
+            Some("demo-a-1111")
+        );
     }
 
     #[test]

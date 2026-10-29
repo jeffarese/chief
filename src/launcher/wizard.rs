@@ -265,8 +265,8 @@ impl Wizard {
                 self.repo_cursor = Some(self.repos.len() - 1);
             }
             KeyCode::Tab => match complete(&self.path) {
-                Some(longer) => self.path = longer,
-                None => self.message = Some("No folder matches.".to_string()),
+                Ok(longer) => self.path = longer,
+                Err(why) => self.message = Some(why),
             },
             KeyCode::Enter if self.path.trim().is_empty() => return self.next_from_code(probe),
             KeyCode::Enter => self.add_path(),
@@ -279,7 +279,7 @@ impl Wizard {
     }
 
     fn add_path(&mut self) {
-        let path = expand_home(self.path.trim());
+        let path = crate::tui::expand_home(self.path.trim());
         if !path.is_dir() {
             self.message = Some(format!("{} isn't a folder.", path.display()));
             return;
@@ -368,7 +368,10 @@ fn edit(field: &mut String, key: KeyEvent, ctrl: bool) {
         }
         KeyCode::Char('u') if ctrl => field.clear(),
         KeyCode::Char('w') if ctrl => {
-            let kept = field.trim_end().rfind([' ', '/']).map_or(0, |i| i + 1);
+            // A completed folder ends in `/`: the word is the folder name before it.
+            let text = field.trim_end();
+            let text = text.strip_suffix('/').unwrap_or(text);
+            let kept = text.rfind([' ', '/']).map_or(0, |i| i + 1);
             field.truncate(kept);
         }
         KeyCode::Char(c) if !ctrl => field.push(c),
@@ -384,19 +387,13 @@ fn repo_root(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub fn expand_home(text: &str) -> PathBuf {
-    match text.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(text)),
-        None if text == "~" => dirs::home_dir().unwrap_or_else(|| PathBuf::from(text)),
-        None => PathBuf::from(text),
-    }
-}
-
 /// Tab completion of the last folder name in `text`: the one folder that matches, with a `/`,
-/// or the longest prefix the matches share. None when nothing matches or nothing is added.
-pub fn complete(text: &str) -> Option<String> {
+/// or the longest prefix the matches share. Otherwise, what to say: nothing matches, or how
+/// many do when they share nothing longer.
+pub fn complete(text: &str) -> Result<String, String> {
+    if text == "~" {
+        return Ok("~/".to_string());
+    }
     let (head, prefix) = match text.rfind('/') {
         Some(i) => (&text[..=i], &text[i + 1..]),
         None => ("", text),
@@ -404,19 +401,20 @@ pub fn complete(text: &str) -> Option<String> {
     let dir = if head.is_empty() {
         PathBuf::from(".")
     } else {
-        expand_home(head)
+        crate::tui::expand_home(head)
     };
+    let none = || "No folder matches.".to_string();
     let mut names: Vec<String> = std::fs::read_dir(&dir)
-        .ok()?
+        .map_err(|_| none())?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
         .collect();
     names.sort();
-    let first = names.first()?;
+    let first = names.first().ok_or_else(none)?;
     if names.len() == 1 {
-        return Some(format!("{head}{first}/"));
+        return Ok(format!("{head}{first}/"));
     }
     let shared = names.iter().fold(first.clone(), |acc, n| {
         acc.chars()
@@ -425,7 +423,14 @@ pub fn complete(text: &str) -> Option<String> {
             .map(|(a, _)| a)
             .collect()
     });
-    (shared.len() > prefix.len()).then(|| format!("{head}{shared}"))
+    if shared.len() > prefix.len() {
+        Ok(format!("{head}{shared}"))
+    } else {
+        Err(format!(
+            "{} folders match: type more of the name.",
+            names.len()
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -572,17 +577,25 @@ mod tests {
         }
         std::fs::write(dir.path().join("alpine.txt"), "").unwrap();
         let base = format!("{}/", dir.path().display());
-        assert_eq!(complete(&format!("{base}al")), Some(format!("{base}alp")));
+        assert_eq!(complete(&format!("{base}al")), Ok(format!("{base}alp")));
         assert_eq!(
             complete(&format!("{base}alph")),
-            Some(format!("{base}alpha/"))
+            Ok(format!("{base}alpha/"))
         );
-        assert_eq!(complete(&format!("{base}alp")), None, "nothing to add");
-        assert_eq!(complete(&format!("{base}z")), None);
+        assert_eq!(
+            complete(&format!("{base}alp")),
+            Err("2 folders match: type more of the name.".into()),
+            "nothing to add"
+        );
+        assert_eq!(
+            complete(&format!("{base}z")),
+            Err("No folder matches.".into())
+        );
         assert_eq!(
             complete(&format!("{base}.h")),
-            Some(format!("{base}.hidden/"))
+            Ok(format!("{base}.hidden/"))
         );
+        assert_eq!(complete("~"), Ok("~/".into()));
 
         let mut text = "cd /some/path".to_string();
         edit(
@@ -597,5 +610,13 @@ mod tests {
             false,
         );
         assert_eq!(text, "cd /some");
+
+        // After a completion the text ends in `/`: ^W drops the folder name before it.
+        let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let mut text = "~/code/".to_string();
+        edit(&mut text, ctrl_w, true);
+        assert_eq!(text, "~/");
+        edit(&mut text, ctrl_w, true);
+        assert_eq!(text, "");
     }
 }

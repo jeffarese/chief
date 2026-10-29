@@ -24,10 +24,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("↑↓ j k", "move (or the mouse wheel)"),
     ("⏎ click", "show it in the main pane"),
     ("Esc c", "back to the coordinator"),
-    ("w", "wake (respawn) a thread"),
+    ("n", "show the next thread waiting on you"),
+    ("w", "wake (respawn) an asleep thread"),
+    ("S", "stop a running thread (asks first)"),
     ("r", "resolve / reopen"),
     ("o", "open the pull request"),
     ("x", "clean up a resolved thread"),
+    ("X", "clean up every resolved thread that loses nothing"),
     ("R", "show / hide resolved"),
     ("Tab", "detail (short terminals)"),
     ("s", "settings"),
@@ -266,9 +269,14 @@ fn status_line(app: &App, width: usize) -> Option<Line<'static>> {
     ))
 }
 
-/// The keys that do something for the selection, most useful first; help always ends it.
+/// The keys that do something for the selection, most useful first; help always ends it, after
+/// the side switch in the built-in layout. Those are kept when the rest doesn't fit
+/// (`board_keys_kept`).
 fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = vec![("⏎", "show")];
+    if app.threads.iter().any(|r| group_of(r) == Group::Waiting) {
+        keys.push(("n", "next waiting"));
+    }
     match app.selected_row() {
         None => keys.push(("s", "settings")),
         Some(row) => {
@@ -277,38 +285,54 @@ fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 keys.push(("r", "reopen"));
                 if row.cleaned_at.is_none() {
                     keys.push(("x", "clean up"));
+                    keys.push(("X", "clean up all"));
                 }
             } else {
                 keys.push(("r", "resolve"));
-                keys.push(("w", "wake"));
+                // A running thread needs no wake; an asleep one has nothing to stop.
+                keys.push(if row.pid.is_some() {
+                    ("S", "stop")
+                } else {
+                    ("w", "wake")
+                });
             }
             if row.pr_url.is_some() {
                 keys.push(("o", "PR"));
             }
         }
     }
+    if app.embedded {
+        keys.push(("^\\", "conversation"));
+    }
     keys.push(("?", "help"));
     keys
 }
 
-/// The key bar with `?` kept at the end when the rest doesn't fit.
-fn keys_line(keys: &[(&str, &str)], width: usize) -> Line<'static> {
+/// How many of `board_keys`' last keys the bar keeps: the side switch is the one key the built-in
+/// layout adds, and nothing else on screen names it.
+fn board_keys_kept(app: &App) -> usize {
+    if app.embedded { 2 } else { 1 }
+}
+
+/// The key bar with the last `kept` keys kept at the end when the rest doesn't fit.
+fn keys_line(keys: &[(&str, &str)], kept: usize, width: usize) -> Line<'static> {
     let full = key_bar(keys, width);
     let shown: usize = full.spans.iter().map(|s| cols(&s.content)).sum();
-    let all: usize = keys
-        .iter()
-        .map(|(k, w)| cols(k) + 1 + cols(w))
-        .sum::<usize>()
-        + 2 * keys.len().saturating_sub(1);
-    if shown == all || keys.len() < 2 {
+    let bar_cols = |keys: &[(&str, &str)]| {
+        keys.iter()
+            .map(|(k, w)| cols(k) + 1 + cols(w))
+            .sum::<usize>()
+            + 2 * keys.len().saturating_sub(1)
+    };
+    if shown == bar_cols(keys) || keys.len() <= kept {
         return full;
     }
-    let (last, rest) = keys.split_last().unwrap_or((&("", ""), &[]));
-    let room = width.saturating_sub(cols(last.0) + 1 + cols(last.1) + 2);
+    let (rest, tail) = keys.split_at(keys.len() - kept);
+    let room = width.saturating_sub(bar_cols(tail) + 2);
     let mut line = key_bar(rest, room);
     let sep = if line.spans.is_empty() { "" } else { "  " };
     line.spans.push(Span::raw(sep));
-    line.spans.extend(key_bar(&[*last], width).spans);
+    line.spans.extend(key_bar(tail, width).spans);
     line
 }
 
@@ -397,7 +421,12 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
+    draw_in(f, f.area(), app);
+}
+
+/// The board in `area` of the frame: all of it for `chief board`, the right side in the built-in
+/// layout. Mouse hits are recorded by row, so `area` spans the frame's height.
+pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
     app.hits.borrow_mut().clear();
     if area.width == 0 || area.height == 0 {
         return;
@@ -417,7 +446,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(line) = status {
         f.render_widget(Paragraph::new(line), status_area);
     }
-    f.render_widget(Paragraph::new(keys_line(&board_keys(app), width)), foot);
+    let keys = keys_line(&board_keys(app), board_keys_kept(app), width);
+    f.render_widget(Paragraph::new(keys), foot);
 
     if body.height >= SPLIT_MIN_BODY {
         // The list takes what it needs up to 3/5 of the body; the detail gets the rest.
@@ -436,6 +466,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match &app.screen {
         Screen::Help => draw_help(f, area),
         Screen::Confirm(c) => draw_confirm(f, area, c),
+        Screen::Stop { label, .. } => draw_stop(f, area, label),
         Screen::Board | Screen::Settings(_) => {}
     }
 }
@@ -527,8 +558,9 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             // The first page holds it: show the coordinator and the first header too.
             top = 0;
         } else if s < top {
-            // Show the group header above the first row of a group when scrolling up.
-            top = s.saturating_sub(1);
+            // Show the group header above the first row of a group when scrolling up, when
+            // there is room for both.
+            top = s.saturating_sub(usize::from(h > 1));
         } else if s >= top + h {
             top = s + 1 - h;
         }
@@ -684,6 +716,28 @@ fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     f.render_widget(Paragraph::new(input), input_area);
 }
 
+fn draw_stop(f: &mut Frame, area: Rect, label: &str) {
+    let width = area.width.min(56);
+    let text = "Its process ends, and the turn it is in with it: it sends no report for that \
+                turn. Its conversation, worktree and branch stay, and w wakes it.";
+    let block = panel(&format!("Stop {label}?"), true).border_style(Style::new().fg(Color::Yellow));
+    let body = Paragraph::new(text).wrap(Wrap { trim: true });
+    // The panel's borders and the foot line, around the text as it wraps.
+    let inner_width = block.inner(Rect::new(0, 0, width, 3)).width;
+    let lines = body.line_count(inner_width) as u16;
+    let rect = tui::centred(area, width, lines + 3);
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let [text_area, foot] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    f.render_widget(body, text_area);
+    f.render_widget(
+        Paragraph::new(Line::styled("y stops · any other key cancels", bold())),
+        foot,
+    );
+}
+
 fn settings_keys(form: &SettingsForm) -> Vec<(&'static str, &'static str)> {
     if form.editing.is_some() {
         return vec![("⏎", "apply"), ("Esc", "cancel"), ("^U", "clear")];
@@ -773,9 +827,14 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
         if current {
             cursor_line = lines.len();
         }
-        let value = match (&form.editing, current) {
-            (Some(text), true) => format!("{text}▏"),
-            _ => form.value(*field),
+        let edited = form
+            .editing
+            .as_ref()
+            .filter(|(f, _)| f == field)
+            .map(|(_, text)| text);
+        let value = match edited {
+            Some(text) => format!("{text}▏"),
+            None => form.value(*field),
         };
         let label = match field {
             Field::Repo(_) => "repo",
@@ -787,7 +846,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
         } else {
             format!(" {:<label_w$} {value}", truncate(label, label_w))
         };
-        let text = if current && form.editing.is_some() {
+        let text = if edited.is_some() {
             tail(&text, width)
         } else {
             truncate(&text, width)
@@ -826,7 +885,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
     f.render_widget(Paragraph::new(shown), body);
 
     let (text, style) = match &form.message {
-        Some(m) if m.starts_with("Not saved") || m.contains("doesn't exist") => {
+        Some(m)
+            if m.starts_with("Not saved")
+                || m.starts_with("Saved, but")
+                || m.contains("doesn't exist") =>
+        {
             (m.clone(), Style::new().fg(Color::Red))
         }
         Some(m) => (m.clone(), Style::new()),
@@ -837,7 +900,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
         note,
     );
     f.render_widget(
-        Paragraph::new(keys_line(&settings_keys(form), area.width as usize)),
+        Paragraph::new(keys_line(&settings_keys(form), 1, area.width as usize)),
         foot,
     );
 }
@@ -943,6 +1006,57 @@ mod tests {
         }
     }
 
+    /// At every list height from 4 to 8 the selection stays in view while it moves down and back
+    /// up, and the last line says what is below, the collapsed Resolved header included.
+    #[test]
+    fn the_list_scrolls_and_says_what_is_below() {
+        let rows = [
+            "Coordinator",
+            "Approve the migration",
+            "A very long",
+            "Speed up",
+        ];
+        for list_h in 4..=8u16 {
+            let mut app = busy_board();
+            app.on_key(ch('g'));
+            // The list gets all but the key bar.
+            let mut walk: Vec<usize> = (0..rows.len()).collect();
+            walk.extend((0..rows.len() - 1).rev());
+            for (step, &at) in walk.iter().enumerate() {
+                if step > 0 {
+                    let down = at > walk[step - 1];
+                    app.on_key(ch(if down { 'j' } else { 'k' }));
+                }
+                let out = render(&app, 40, list_h + 1);
+                assert!(
+                    out.contains(rows[at]),
+                    "height {list_h}, step {step}: {:?} not shown\n{out}",
+                    rows[at]
+                );
+                let last = out.lines().nth(list_h as usize - 2).unwrap();
+                assert!(
+                    last.contains("↓") || last.contains("↑ more above"),
+                    "height {list_h}, step {step}: no fold line\n{out}"
+                );
+                if !out.contains("Speed up") {
+                    assert!(
+                        last.contains("Resolved 1 · R shows"),
+                        "height {list_h}: {last:?}\n{out}"
+                    );
+                }
+                for line in out.lines() {
+                    assert!(cols(line) <= 40, "{line:?}");
+                }
+            }
+        }
+        // At 8 the first page shows the goal, the coordinator and the first group.
+        let app = busy_board();
+        let out = render(&app, 40, 9);
+        assert!(out.contains("Ship it"), "{out}");
+        assert!(out.contains("Coordinator"), "{out}");
+        assert!(out.contains("↓ 2 more · Resolved 1 · R shows"), "{out}");
+    }
+
     #[test]
     fn wide_board_shows_resolved_tags_when_expanded() {
         let mut app = busy_board();
@@ -1045,6 +1159,9 @@ mod tests {
     #[test]
     fn settings_screen_renders_fields() {
         let mut app = busy_board();
+        let dir = tempfile::tempdir().unwrap();
+        app.config.save(&dir.path().join("project.toml")).unwrap();
+        app.dir = dir.path().into();
         app.on_key(ch('s'));
         let out = render(&app, 48, 40);
         for want in [
@@ -1087,13 +1204,14 @@ mod tests {
         assert!(!tags(&row).iter().any(|t| t.contains("subagent")));
     }
 
-    /// The key bar names what works on the selection, and always keeps `? help`.
+    /// The key bar names what works on the selection, and always keeps `? help`: `n` while a
+    /// thread waits, `S` on a running thread, `w` on an asleep one.
     #[test]
     fn the_key_bar_follows_the_selection() {
         let mut app = busy_board();
         let out = render(&app, 70, 24);
         assert!(
-            out.contains("⏎ show  Esc coordinator  r resolve  w wake  ? help"),
+            out.contains("⏎ show  n next waiting  Esc coordinator  r resolve  S stop  ? help"),
             "{out}"
         );
         let out = render(&app, 30, 24);
@@ -1101,11 +1219,52 @@ mod tests {
         assert!(foot.ends_with("? help"), "{foot:?}");
         app.on_key(ch('g'));
         assert!(app.on_coordinator);
-        assert!(render(&app, 70, 24).contains("⏎ show  s settings  ? help"));
+        assert!(render(&app, 70, 24).contains("⏎ show  n next waiting  s settings  ? help"));
+        app.selected = Some("demo-pr-5e6f".into());
+        app.on_coordinator = false;
+        assert!(render(&app, 90, 24).contains("r resolve  w wake  o PR"));
         app.on_key(ch('R'));
         app.on_key(ch('G'));
-        let out = render(&app, 70, 30);
-        assert!(out.contains("r reopen  x clean up"), "{out}");
+        let out = render(&app, 110, 30);
+        assert!(
+            out.contains("r reopen  x clean up  X clean up all"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn stopping_asks_first() {
+        let mut app = busy_board();
+        app.on_key(ch('S'));
+        let out = render(&app, 70, 24);
+        assert!(out.contains("Stop Approve the migration?"), "{out}");
+        assert!(out.contains("y stops · any other key cancels"), "{out}");
+        assert!(app.on_key(ch('n')).is_empty(), "n cancels here");
+        assert_eq!(app.screen, Screen::Board);
+        app.on_key(ch('S'));
+        assert_eq!(
+            app.on_key(ch('y')),
+            vec![super::super::app::Action::Stop("demo-perm-1a2b".into())]
+        );
+    }
+
+    /// Beside its conversation, the board's narrow key bar still names the side switch.
+    #[test]
+    fn the_embedded_key_bar_keeps_the_side_switch() {
+        let mut app = busy_board();
+        app.embedded = true;
+        let out = render(&app, 110, 24);
+        assert!(
+            out.contains(
+                "⏎ show  n next waiting  Esc coordinator  r resolve  S stop  ^\\ conversation  \
+                 ? help"
+            ),
+            "{out}"
+        );
+        let out = render(&app, 41, 24);
+        let foot = out.lines().last().unwrap();
+        assert!(foot.ends_with("^\\ conversation  ? help"), "{foot:?}");
+        assert!(foot.starts_with("⏎ show"), "{foot:?}");
     }
 
     #[test]

@@ -143,6 +143,19 @@ CREATE TABLE ui_state (
      ALTER TABLE sessions ADD COLUMN subagents_busy INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE sessions ADD COLUMN background_running INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE sessions ADD COLUMN stopped_early_at INTEGER;",
+    // Undoing a removed verdict (§5): the reason a reopened thread kept, which the verdict
+    // replaces with `removed`, so a session listed again gets it back and stays reopened. And
+    // which cleaned rows may carry a wrong verdict from before migration 6: it set only
+    // `cleaned_at` on a resolved row, and migration 6's backfill gave such rows no `removed_at`
+    // to undo. Every row cleaned before now is one of them or was removed by `claude rm`, whose
+    // session is never listed again.
+    "ALTER TABLE sessions ADD COLUMN reason_before_removed TEXT;
+     ALTER TABLE sessions ADD COLUMN legacy_cleaned INTEGER NOT NULL DEFAULT 0;
+     UPDATE sessions SET legacy_cleaned = 1
+       WHERE cleaned_at IS NOT NULL AND removed_at IS NULL;",
+    // When the project was archived (§2 `chief archive`): nothing of it runs, and the launcher
+    // and `chief status` leave it out. NULL is a live project.
+    "ALTER TABLE projects ADD COLUMN archived_at INTEGER;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -162,7 +175,14 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Every hook opens the database, so a current schema is checked with a read alone: a write
+/// lock per check would double the write transactions of each tool call. Only a database behind
+/// takes `BEGIN IMMEDIATE`, and reads the version again inside it, so processes opening it at
+/// once migrate it once.
 fn migrate(conn: &mut Connection) -> Result<()> {
+    if user_version(conn)? >= MIGRATIONS.len() {
+        return Ok(());
+    }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version = user_version(&tx)?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
@@ -184,19 +204,18 @@ pub fn schema_version(conn: &Connection) -> Result<usize> {
 }
 
 /// Runs `f` inside `BEGIN IMMEDIATE`, so a read-modify-write of a row can't interleave with a
-/// hook or board poll in another process. Rolls back on error.
+/// hook or board poll in another process. Rolls back on error, a failed COMMIT included: that
+/// leaves the transaction open, and a long-lived connection (the board's) would stay in it.
 pub fn immediate<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    match f(conn) {
-        Ok(v) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(v)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
-        }
+    let result = f(conn).and_then(|v| {
+        conn.execute_batch("COMMIT")?;
+        Ok(v)
+    });
+    if result.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
     }
+    result
 }
 
 /// A `sessions` row.
@@ -267,6 +286,13 @@ pub struct SessionRow {
     /// When a thread last ended a turn while background work still ran: its coordinator was told
     /// it was idle, so the Stop that finds nothing running asks it to report (§5).
     pub stopped_early_at: Option<i64>,
+    /// The `resolved_reason` a reopened thread kept when a sync marked it removed (§5), put
+    /// back if the session is listed again.
+    pub reason_before_removed: Option<String>,
+    /// Cleaned before migration 13, so possibly by a wrong removed verdict from before
+    /// migration 6 that left no `removed_at` (§5): a snapshot taken after `cleaned_at` that lists
+    /// the session again clears `cleaned_at`.
+    pub legacy_cleaned: bool,
 }
 
 impl SessionRow {
@@ -309,7 +335,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
     last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked, synced_at, ids_at, \
     removed_at, account_id, account_label, account_dir, subagents_busy, background_running, \
-    stopped_early_at";
+    stopped_early_at, reason_before_removed, legacy_cleaned";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -358,6 +384,8 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         subagents_busy: r.get(42)?,
         background_running: r.get(43)?,
         stopped_early_at: r.get(44)?,
+        reason_before_removed: r.get(45)?,
+        legacy_cleaned: r.get(46)?,
     })
 }
 
@@ -388,11 +416,41 @@ pub fn project_dir(conn: &Connection, slug: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// When the project was archived, if it is.
+pub fn archived_at(conn: &Connection, slug: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT archived_at FROM projects WHERE slug = ?1",
+            [slug],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+pub fn archive_project(conn: &Connection, slug: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE projects SET archived_at = ?2 WHERE slug = ?1",
+        params![slug, now],
+    )?;
+    Ok(())
+}
+
+/// Whether the project was archived (it isn't any more).
+pub fn unarchive_project(conn: &Connection, slug: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE projects SET archived_at = NULL WHERE slug = ?1 AND archived_at IS NOT NULL",
+        [slug],
+    )?;
+    Ok(changed > 0)
+}
+
 pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
     let sql = format!(
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)"
+         ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
+         ?47)"
     );
     let has_ids = s.short_id.is_some() || s.session_id.is_some();
     let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
@@ -444,6 +502,8 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.subagents_busy,
             s.background_running,
             s.stopped_early_at,
+            s.reason_before_removed,
+            s.legacy_cleaned,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -468,7 +528,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            ids_at = CASE WHEN short_id IS ?4 AND session_id IS ?5 THEN coalesce(?38, ids_at)
                          ELSE ?31 END,
            removed_at = ?39, account_id = ?40, account_label = ?41, account_dir = ?42,
-           subagents_busy = ?43, background_running = ?44, stopped_early_at = ?45
+           subagents_busy = ?43, background_running = ?44, stopped_early_at = ?45,
+           reason_before_removed = ?46, legacy_cleaned = ?47
          WHERE name = ?1",
             params![
                 s.name,
@@ -516,6 +577,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.subagents_busy,
                 s.background_running,
                 s.stopped_early_at,
+                s.reason_before_removed,
+                s.legacy_cleaned,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -577,8 +640,35 @@ pub fn release_cleanup(conn: &Connection, name: &str, claimed_at: i64) -> Result
     Ok(())
 }
 
-/// Removes a session that never started (a failed spawn), with its events and reports.
+/// Removes a session that never started (a failed spawn), with its events, reports and
+/// teammates, all or nothing: a hook between the statements could otherwise leave an event or
+/// teammate of a session that no longer exists.
 pub fn delete_session(conn: &Connection, name: &str) -> Result<()> {
+    immediate(conn, |conn| delete_session_rows(conn, name))
+}
+
+/// `delete_session` after a failed spawn, unless the session's hooks attached the row: only a
+/// running session's hooks store a session id (§4), so it started. The check and the delete are
+/// one transaction, so hooks that attach it in between keep it. Whether no attached row is left
+/// (it was deleted, or there was none).
+pub fn delete_unattached_session(conn: &Connection, name: &str) -> Result<bool> {
+    immediate(conn, |conn| {
+        let session_id: Option<Option<String>> = conn
+            .query_row(
+                "SELECT session_id FROM sessions WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if matches!(session_id, Some(Some(_))) {
+            return Ok(false);
+        }
+        delete_session_rows(conn, name)?;
+        Ok(true)
+    })
+}
+
+fn delete_session_rows(conn: &Connection, name: &str) -> Result<()> {
     conn.execute("DELETE FROM events WHERE session_name = ?1", [name])?;
     conn.execute("DELETE FROM reports WHERE session_name = ?1", [name])?;
     forget_teammates(conn, name)?;
@@ -776,12 +866,16 @@ pub fn set_teammate_busy(
     Ok(())
 }
 
-/// Marks every subagent of `session_name` done with its turn: its Stop listed none running.
-pub fn idle_teammates(conn: &Connection, session_name: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE teammates SET busy = 0 WHERE session_name = ?1",
-        [session_name],
-    )?;
+/// Marks every subagent of `session_name` done with its turn but the agents in `running`: its
+/// Stop listed only those as running.
+pub fn idle_teammates(conn: &Connection, session_name: &str, running: &[&str]) -> Result<()> {
+    let busy: Vec<String> = conn
+        .prepare("SELECT agent_id FROM teammates WHERE session_name = ?1 AND busy = 1")?
+        .query_map([session_name], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for agent in busy.iter().filter(|a| !running.contains(&a.as_str())) {
+        set_teammate_busy(conn, session_name, agent, false)?;
+    }
     Ok(())
 }
 
@@ -896,6 +990,8 @@ pub fn get_pane_showing(conn: &Connection, project_slug: &str) -> Result<Option<
         .flatten())
 }
 
+/// Sets `pane_showing` whoever runs (`chief down`, tests). A pane writes through
+/// `set_pane_showing_as`.
 pub fn set_pane_showing(conn: &Connection, project_slug: &str, name: Option<&str>) -> Result<()> {
     conn.execute(
         "INSERT INTO ui_state (project_slug, pane_showing) VALUES (?1, ?2)
@@ -903,6 +999,31 @@ pub fn set_pane_showing(conn: &Connection, project_slug: &str, name: Option<&str
         params![project_slug, name],
     )?;
     Ok(())
+}
+
+/// Sets `pane_showing` for the pane `pid` (None: a pane that couldn't record itself), only while
+/// `pane_pid` is that pane's (NULL for None), so an older pane can't clear or overwrite what the
+/// newest one shows (§9). Whether it wrote.
+pub fn set_pane_showing_as(
+    conn: &Connection,
+    project_slug: &str,
+    pid: Option<i32>,
+    name: Option<&str>,
+) -> Result<bool> {
+    let written = match pid {
+        // Its record made the row.
+        Some(pid) => conn.execute(
+            "UPDATE ui_state SET pane_showing = ?3 WHERE project_slug = ?1 AND pane_pid = ?2",
+            params![project_slug, pid, name],
+        )?,
+        None => conn.execute(
+            "INSERT INTO ui_state (project_slug, pane_showing) VALUES (?1, ?2)
+             ON CONFLICT(project_slug) DO UPDATE SET pane_showing = excluded.pane_showing
+               WHERE pane_pid IS NULL",
+            params![project_slug, name],
+        )?,
+    };
+    Ok(written > 0)
 }
 
 /// The id of the layout session `chief up` created for the project, if it stored one.
@@ -975,11 +1096,11 @@ pub fn set_pane_process(
     Ok(())
 }
 
-/// Forgets the recorded pane only while it is still `pid`, so a pane that started since keeps
-/// its record.
+/// Forgets the recorded pane and what it showed, only while it is still `pid`, so a pane that
+/// started since keeps its record. Run by the pane as it exits, and for a pane found gone.
 pub fn clear_pane_process_if(conn: &Connection, project_slug: &str, pid: i32) -> Result<()> {
     conn.execute(
-        "UPDATE ui_state SET pane_pid = NULL, pane_started = NULL
+        "UPDATE ui_state SET pane_pid = NULL, pane_started = NULL, pane_showing = NULL
          WHERE project_slug = ?1 AND pane_pid = ?2",
         params![project_slug, pid],
     )?;
@@ -1039,11 +1160,159 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 12);
+        assert_eq!(MIGRATIONS.len(), 14);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+    }
+
+    /// A database as an older chief left it: the first `version` migrations, nothing else.
+    fn at_version(path: &Path, version: usize) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        for sql in &MIGRATIONS[..version] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", version as i64)
+            .unwrap();
+        conn
+    }
+
+    /// Migration 6's backfill (ids, sync-made removals) and migration 13's (which cleaned rows
+    /// may carry a wrong removed verdict from before migration 6, §5).
+    #[test]
+    fn upgrades_a_v5_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chief.db");
+        let old = at_version(&path, 5);
+        old.execute_batch(
+            "INSERT INTO projects VALUES ('p', '/p', 1);
+             INSERT INTO sessions (name, project_slug, role, short_id, session_id, resolved,
+                 resolved_reason, cleaned_at, created_at, updated_at, last_activity_at) VALUES
+               ('removed', 'p', 'thread', 'r1', 'r-sid', 1, 'removed', 100, 1, 90, 1),
+               ('kept-reason', 'p', 'thread', 'k1', 'k-sid', 1, 'user', 200, 1, 210, 1),
+               ('open', 'p', 'thread', 'o1', NULL, 0, NULL, NULL, 1, 70, 1),
+               ('unspawned', 'p', 'thread', NULL, NULL, 0, NULL, NULL, 1, 50, 1);",
+        )
+        .unwrap();
+        drop(old);
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+        let row = |name: &str| get_session(&conn, name).unwrap().unwrap();
+        let backfilled = |name: &str| {
+            let r = row(name);
+            (r.ids_at, r.removed_at, r.legacy_cleaned)
+        };
+        assert_eq!(backfilled("removed"), (Some(90), Some(100), false));
+        // The old verdict on a resolved row looks like chief's own cleanup: flagged.
+        assert_eq!(backfilled("kept-reason"), (Some(210), None, true));
+        assert_eq!(backfilled("open"), (Some(70), None, false));
+        assert_eq!(backfilled("unspawned"), (None, None, false));
+        assert_eq!(row("kept-reason").resolved_reason.as_deref(), Some("user"));
+        assert_eq!(row("removed").reason_before_removed, None);
+    }
+
+    /// Migration 12 gives existing teammates and sessions no background work, and migration 13
+    /// flags rows cleaned until then.
+    #[test]
+    fn upgrades_a_v11_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chief.db");
+        let old = at_version(&path, 11);
+        old.execute_batch(
+            "INSERT INTO projects VALUES ('p', '/p', 1);
+             INSERT INTO sessions (name, project_slug, role, short_id, session_id, resolved,
+                 resolved_reason, cleaned_at, created_at, updated_at, last_activity_at) VALUES
+               ('lead', 'p', 'thread', 'l1', 'l-sid', 0, NULL, NULL, 1, 10, 1),
+               ('cleaned', 'p', 'thread', 'c1', 'c-sid', 1, 'merged', 300, 1, 310, 1);
+             INSERT INTO teammates VALUES ('lead', 'l-sid', 'ahelper-1', 'helper', 5);",
+        )
+        .unwrap();
+        drop(old);
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+        assert_eq!(busy_teammates(&conn, "lead", "l-sid").unwrap(), 0);
+        let busy: i64 = conn
+            .query_row("SELECT busy FROM teammates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 0);
+        let lead = get_session(&conn, "lead").unwrap().unwrap();
+        assert_eq!(
+            (
+                lead.subagents_busy,
+                lead.background_running,
+                lead.stopped_early_at,
+                lead.legacy_cleaned
+            ),
+            (0, 0, None, false)
+        );
+        assert!(
+            get_session(&conn, "cleaned")
+                .unwrap()
+                .unwrap()
+                .legacy_cleaned
+        );
+        assert_eq!(
+            teammates(&conn, "lead", "l-sid").unwrap(),
+            [Teammate {
+                agent_id: "ahelper-1".into(),
+                name: Some("helper".into())
+            }]
+        );
+    }
+
+    /// Every hook opens the database: at the current version that takes no write lock, so it
+    /// doesn't wait behind a writer.
+    #[test]
+    fn opening_a_current_database_takes_no_write_lock() {
+        let (dir, writer) = fresh();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let start = std::time::Instant::now();
+        let conn = open(&dir.path().join("nested/chief.db")).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// Processes opening a database behind at once migrate it once: each re-reads the version
+    /// inside its write transaction.
+    #[test]
+    fn concurrent_opens_migrate_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chief.db");
+        drop(at_version(&path, 5));
+        let versions: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| schema_version(&open(&path).unwrap()).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(versions, [MIGRATIONS.len(); 4]);
+    }
+
+    /// A COMMIT that fails leaves its transaction open; `immediate` rolls it back, so the
+    /// connection takes the next transaction.
+    #[test]
+    fn immediate_rolls_back_a_failed_commit() {
+        let (_dir, conn) = fresh();
+        let err = immediate(&conn, |conn| {
+            // Checked at COMMIT: the project isn't registered.
+            conn.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+            insert_session(conn, &SessionRow::new("x", "unregistered", Role::Thread, 1))
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("FOREIGN KEY"), "{err:#}");
+        assert!(conn.is_autocommit(), "still inside the failed transaction");
+        assert_eq!(get_session(&conn, "x").unwrap(), None);
+        immediate(&conn, |conn| {
+            register_project(conn, "p", Path::new("/p"), 1)
+        })
+        .unwrap();
+        assert!(project_dir(&conn, "p").unwrap().is_some());
     }
 
     #[test]
@@ -1082,6 +1351,8 @@ mod tests {
         t.subagents_busy = 2;
         t.background_running = 1;
         t.stopped_early_at = Some(25);
+        t.reason_before_removed = Some("user".into());
+        t.legacy_cleaned = true;
         t.updated_at = 30;
         update_session(&conn, &t).unwrap();
         t.ids_at = Some(30);
@@ -1212,15 +1483,56 @@ mod tests {
         set_teammate_busy(&conn, "t", "aother-2", false).unwrap();
         set_teammate_busy(&conn, "t", "unknown-agent", false).unwrap();
         assert_eq!(busy("t", "sid-t"), 1);
-        idle_teammates(&conn, "t").unwrap();
+        // A Stop listing an agent as running keeps it mid-turn, and only it.
+        set_teammate_busy(&conn, "t", "ahelper-3", true).unwrap();
+        idle_teammates(&conn, "t", &["ahelper-3", "not-recorded"]).unwrap();
+        assert_eq!(busy("t", "sid-t"), 1);
+        idle_teammates(&conn, "t", &[]).unwrap();
         assert_eq!(busy("t", "sid-t"), 0);
         assert_eq!(busy("u", "sid-u"), 1, "only that session's");
 
         assert_eq!(forget_teammates(&conn, "t").unwrap(), 3);
         assert!(of("t", "sid-t").is_empty());
         assert_eq!(of("u", "sid-u").len(), 1, "only that session's");
+        insert_event(
+            &conn,
+            &Event {
+                session_name: Some("u".into()),
+                session_id: None,
+                project_slug: "p".into(),
+                hook: "Stop".into(),
+                ts: 1,
+                summary: None,
+            },
+        )
+        .unwrap();
+        insert_report(&conn, "u", 1, "done").unwrap();
         delete_session(&conn, "u").unwrap();
         assert!(of("u", "sid-u").is_empty());
+        assert_eq!(get_session(&conn, "u").unwrap(), None);
+        assert!(recent_events(&conn, "p", 10).unwrap().is_empty());
+        assert!(recent_reports(&conn, "u", 10).unwrap().is_empty());
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn a_failed_spawns_row_is_deleted_only_while_no_hook_attached_it() {
+        let (_dir, conn) = fresh();
+        register_project(&conn, "p", Path::new("/p"), 1).unwrap();
+        insert_session(&conn, &SessionRow::new("bare", "p", Role::Thread, 1)).unwrap();
+        let mut hooked = SessionRow::new("hooked", "p", Role::Thread, 1);
+        hooked.session_id = Some("sid-hooked".into());
+        insert_session(&conn, &hooked).unwrap();
+        insert_report(&conn, "bare", 1, "done").unwrap();
+
+        assert!(delete_unattached_session(&conn, "bare").unwrap());
+        assert_eq!(get_session(&conn, "bare").unwrap(), None);
+        assert!(recent_reports(&conn, "bare", 10).unwrap().is_empty());
+        assert!(!delete_unattached_session(&conn, "hooked").unwrap());
+        assert!(get_session(&conn, "hooked").unwrap().is_some());
+        // No row: nothing attached is left.
+        assert!(delete_unattached_session(&conn, "never").unwrap());
+        assert!(conn.is_autocommit());
     }
 
     #[test]
@@ -1228,6 +1540,22 @@ mod tests {
         let (_dir, conn) = fresh();
         let s = SessionRow::new("x", "unregistered", Role::Thread, 1);
         assert!(insert_session(&conn, &s).is_err());
+    }
+
+    #[test]
+    fn archiving_a_project_and_back() {
+        let (_dir, conn) = fresh();
+        register_project(&conn, "p", Path::new("/root/projects/p"), 1).unwrap();
+        assert_eq!(archived_at(&conn, "p").unwrap(), None);
+        assert!(!unarchive_project(&conn, "p").unwrap(), "wasn't archived");
+        archive_project(&conn, "p", 42).unwrap();
+        assert_eq!(archived_at(&conn, "p").unwrap(), Some(42));
+        // Registering again (chief up does when the row is missing) keeps it archived.
+        register_project(&conn, "p", Path::new("/root/projects/p"), 2).unwrap();
+        assert_eq!(archived_at(&conn, "p").unwrap(), Some(42));
+        assert!(unarchive_project(&conn, "p").unwrap());
+        assert_eq!(archived_at(&conn, "p").unwrap(), None);
+        assert_eq!(archived_at(&conn, "unknown").unwrap(), None);
     }
 
     #[test]
@@ -1334,6 +1662,31 @@ mod tests {
             Some((42, "200.5".to_string()))
         );
         clear_pane_process_if(&conn, "p", 42).unwrap();
+        assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
+    }
+
+    /// Only the recorded pane writes `pane_showing`: an older one can't clear or overwrite what
+    /// the newest shows. A pane that couldn't record itself writes while none is recorded.
+    #[test]
+    fn pane_showing_belongs_to_the_recorded_pane() {
+        let (_dir, conn) = fresh();
+        let showing = |conn: &Connection| get_pane_showing(conn, "p").unwrap();
+        // Nothing recorded: only a pane without a record writes.
+        assert!(!set_pane_showing_as(&conn, "p", Some(41), Some("t")).unwrap());
+        assert!(set_pane_showing_as(&conn, "p", None, Some("t")).unwrap());
+        assert_eq!(showing(&conn).as_deref(), Some("t"));
+
+        set_pane_process(&conn, "p", 42, "200.5").unwrap();
+        assert!(!set_pane_showing_as(&conn, "p", None, None).unwrap());
+        assert!(set_pane_showing_as(&conn, "p", Some(42), Some("x")).unwrap());
+        // The older pane 41 leaves the newest one's alone.
+        assert!(!set_pane_showing_as(&conn, "p", Some(41), None).unwrap());
+        assert!(!set_pane_showing_as(&conn, "p", Some(41), Some("y")).unwrap());
+        clear_pane_process_if(&conn, "p", 41).unwrap();
+        assert_eq!(showing(&conn).as_deref(), Some("x"));
+        // Its own exit forgets both.
+        clear_pane_process_if(&conn, "p", 42).unwrap();
+        assert_eq!(showing(&conn), None);
         assert_eq!(get_pane_process(&conn, "p").unwrap(), None);
     }
 }

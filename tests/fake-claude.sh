@@ -5,6 +5,7 @@
 #   calls/<n>.cwd      the working directory of call n
 #   calls/<n>.pid      the process id of call n
 #   calls/<n>.env      the CLAUDE_CONFIG_DIR of call n (the account), or `unset`
+#   calls/<n>.git-dir  the GIT_DIR of call n, or `unset` (chief clears it for every tool)
 #   <key>.stdout       canned stdout for a subcommand (<key> = first argument without dashes)
 #   <key>.stdout.<k>   canned stdout for the k-th call of that subcommand (1-based), if present
 #   <key>.stderr       canned stderr
@@ -30,6 +31,7 @@ printf '%s\0' "$@" > "$dir/calls/$n"
 pwd > "$dir/calls/$n.cwd"
 echo $$ > "$dir/calls/$n.pid"
 printf '%s' "${CLAUDE_CONFIG_DIR-unset}" > "$dir/calls/$n.env"
+printf '%s' "${GIT_DIR-unset}" > "$dir/calls/$n.git-dir"
 
 first=$1
 [ "$1" = "-S" ] && first=$3

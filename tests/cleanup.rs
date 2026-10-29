@@ -523,7 +523,7 @@ fn cleanup_checks_again_right_before_claude_rm() {
     let err = env.clean(Mode::Safe).unwrap_err().to_string();
     assert!(err.contains("is showing in the pane"), "{err}");
     // Its PR merged: the board's refresh waits too, without an error line every 30 s.
-    env.gh.set("pr.stdout", &merged_pr());
+    env.gh.set("pr.stdout", &env.merged_pr());
     let refresh = env
         .with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Merged)))
         .unwrap();
@@ -534,6 +534,27 @@ fn cleanup_checks_again_right_before_claude_rm() {
         env.clean(Mode::Discard(confirmed)).unwrap(),
         Outcome::Cleaned
     );
+}
+
+/// A pane killed with SIGKILL leaves `pane_showing` behind. Once its recorded process is gone,
+/// that no longer keeps the thread from being cleaned up.
+#[test]
+fn a_gone_pane_doesnt_block_cleanup() {
+    let env = Env::new();
+    let mut pane = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = pane.id() as i32;
+    let started = chief::proc::start_time(pid).unwrap();
+    db::set_pane_process(&env.conn, "demo", pid, &started).unwrap();
+    db::set_pane_showing(&env.conn, "demo", Some(NAME)).unwrap();
+    let err = env.clean(Mode::Safe).unwrap_err().to_string();
+    assert!(err.contains("is showing in the pane"), "{err}");
+    pane.kill().unwrap();
+    pane.wait().unwrap();
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::Cleaned);
+    assert_eq!(db::get_pane_showing(&env.conn, "demo").unwrap(), None);
 }
 
 #[test]
@@ -735,12 +756,20 @@ fn a_thread_removed_outside_chief_is_marked_cleaned() {
     assert!(env.rm_calls().is_empty());
 }
 
-/// Opened 30 s after the thread row (NOW - 60 s, 2027-01-15T07:59:00Z).
-fn merged_pr() -> String {
+/// Opened 30 s after the thread row (NOW - 60 s, 2027-01-15T07:59:00Z), with `head` as its head
+/// commit.
+fn merged_pr_at(head: &str) -> String {
     json!([{"url": "https://github.com/o/r/pull/3", "state": "MERGED", "isDraft": false,
             "reviewDecision": "APPROVED", "createdAt": "2027-01-15T07:59:30Z",
-            "isCrossRepository": false}])
+            "isCrossRepository": false, "headRefOid": head}])
     .to_string()
+}
+
+impl Env {
+    /// The thread's merged PR, at its worktree's head.
+    fn merged_pr(&self) -> String {
+        merged_pr_at(&self.head())
+    }
 }
 
 /// A new thread whose worktree reuses an old branch name sees the old thread's merged PR, and a
@@ -828,7 +857,7 @@ fn a_merged_pr_resolves_and_cleans_the_thread() {
         r.resolved_reason = None;
         r.group_name = "idle".into();
     });
-    env.gh.set("pr.stdout", &merged_pr());
+    env.gh.set("pr.stdout", &env.merged_pr());
 
     let refresh = env
         .with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Merged)))
@@ -849,7 +878,7 @@ fn a_merged_pr_resolves_and_cleans_the_thread() {
             "--state",
             "all",
             "--json",
-            "url,state,isDraft,reviewDecision,createdAt,isCrossRepository",
+            "url,state,isDraft,reviewDecision,createdAt,isCrossRepository,headRefOid",
             "--limit",
             "10"
         ]
@@ -879,7 +908,7 @@ fn merged_cleanup_waits_for_idle_and_respects_manual() {
         r.resolved = false;
         r.resolved_reason = None;
     });
-    env.gh.set("pr.stdout", &merged_pr());
+    env.gh.set("pr.stdout", &env.merged_pr());
     let manual = env
         .with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Manual)))
         .unwrap();
@@ -1104,4 +1133,336 @@ fn cli_gc_and_clean() {
         "{}",
         stderr(&out)
     );
+}
+
+/// The reviewer's scenario: thread A opened a PR on `worktree-fix-ci` and was cleaned (its remote
+/// branch stays); thread B, created earlier, later names its worktree the same. A's PR is newer
+/// than B, but its head isn't on B's branch: it must not resolve or clean B.
+#[test]
+fn a_pr_counts_only_when_its_head_is_on_the_threads_branch() {
+    let env = Env::new();
+    env.insert(|r| {
+        r.resolved = false;
+        r.resolved_reason = None;
+        r.group_name = "idle".into();
+    });
+    // A's work: pushed from its own worktree, whose local branch is gone now.
+    let a = env.git.worktree("a");
+    env.git.commit(&a, "a.txt", "A's fix");
+    env.git.push(&a);
+    let a_head = git(&a, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        &env.git.repo,
+        &["worktree", "remove", "--force", a.to_str().unwrap()],
+    );
+    git(&env.git.repo, &["branch", "-D", "worktree-a"]);
+    let refresh = || {
+        env.with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Merged)))
+            .unwrap()
+    };
+
+    env.gh.set("pr.stdout", &merged_pr_at(&a_head));
+    let done = refresh();
+    assert!(done.errors.is_empty(), "{:?}", done.errors);
+    assert_eq!((done.polled, done.cleaned.len()), (1, 0));
+    // A commit this repository doesn't have, or no usable head: not the thread's either.
+    for head in ["0123456789abcdef0123456789abcdef01234567", "", "--all"] {
+        env.gh.set("pr.stdout", &merged_pr_at(head));
+        let done = refresh();
+        assert!(done.errors.is_empty(), "{head}: {:?}", done.errors);
+    }
+    let row = env.row();
+    assert_eq!(
+        (row.pr_url, row.resolved, row.cleaned_at),
+        (None, false, None)
+    );
+    assert!(env.rm_calls().is_empty());
+
+    // The thread's own PR, at a commit its branch has moved past since: its own.
+    let reviewed = env.head();
+    env.git.commit(&env.worktree, "more.txt", "More");
+    env.git.push(&env.worktree);
+    env.gh.set("pr.stdout", &merged_pr_at(&reviewed));
+    let done = refresh();
+    assert_eq!(done.cleaned, [NAME.to_string()], "{:?}", done.errors);
+    assert_eq!(env.row().pr_state.as_deref(), Some("MERGED"));
+}
+
+/// Without the thread's local branch the head can't be checked: an error, and the stored PR stays.
+#[test]
+fn a_pr_whose_branch_is_gone_is_not_attributed() {
+    let env = Env::new();
+    env.insert(|r| {
+        r.resolved = false;
+        r.resolved_reason = None;
+        r.pr_url = Some("https://github.com/o/r/pull/2".into());
+        r.pr_state = Some("OPEN".into());
+    });
+    env.gh.set("pr.stdout", &env.merged_pr());
+    env.claude
+        .job_on(SHORT, Some(&env.worktree), Some("worktree-renamed"));
+    let refresh = env
+        .with(|ctx| pr::refresh_project(ctx, &env.config(Cleanup::Merged)))
+        .unwrap();
+    assert!(
+        refresh.errors[0].contains("no local branch worktree-renamed"),
+        "{:?}",
+        refresh.errors
+    );
+    let row = env.row();
+    assert_eq!(
+        (row.pr_state.as_deref(), row.resolved, row.cleaned_at),
+        (Some("OPEN"), false, None)
+    );
+    assert!(env.rm_calls().is_empty());
+}
+
+/// A `repo_path` that's gone isn't "gh isn't installed": an error, no hint, and the stored PR
+/// stays.
+#[test]
+fn gh_in_a_missing_repo_path_is_an_error() {
+    let env = Env::new();
+    env.insert(|r| {
+        r.resolved = false;
+        r.resolved_reason = None;
+        r.repo_path = Some("/nonexistent/chief-test-repo".into());
+        r.pr_url = Some("https://github.com/o/r/pull/2".into());
+        r.pr_state = Some("OPEN".into());
+    });
+    env.gh.set("pr.stdout", &env.merged_pr());
+    let refresh = env.with(|ctx| pr::poll_project(ctx, "demo")).unwrap();
+    assert_eq!(refresh.hint, None);
+    assert!(
+        refresh.errors[0].contains("/nonexistent/chief-test-repo isn't a folder"),
+        "{:?}",
+        refresh.errors
+    );
+    assert!(env.gh.calls().is_empty());
+    let row = env.row();
+    assert_eq!(
+        (row.pr_url.as_deref(), row.pr_state.as_deref()),
+        (Some("https://github.com/o/r/pull/2"), Some("OPEN"))
+    );
+}
+
+/// A job state that doesn't parse (mid-rewrite, or corrupt) isn't "no worktree": a safe cleanup
+/// stops with the reason, a discard fails, and PR polling skips the thread.
+#[test]
+fn a_job_state_that_does_not_parse_blocks_cleanup() {
+    let env = Env::new();
+    let state = env
+        .claude
+        .config_dir()
+        .join("jobs")
+        .join(SHORT)
+        .join("state.json");
+    std::fs::write(&state, "{\"worktreePath\": \"/r/.claude/wor").unwrap();
+    std::fs::write(env.worktree.join("draft.txt"), "wip").unwrap();
+
+    let err = cleanup::inspect(&env.claude.claude(), &env.row()).unwrap_err();
+    assert!(format!("{err:#}").contains("parsing"), "{err:#}");
+    let Outcome::Blocked(why) = env.clean(Mode::Safe).unwrap() else {
+        panic!("want blocked");
+    };
+    assert!(why.starts_with("could not inspect the worktree:"), "{why}");
+    assert_eq!(env.row().cleanup_blocked.as_deref(), Some(why.as_str()));
+    assert!(env.clean(Mode::Discard(Default::default())).is_err());
+    assert!(env.rm_calls().is_empty());
+    assert!(env.worktree.join("draft.txt").exists(), "nothing reset");
+    let dry = env.with(|ctx| cleanup::gc(ctx, "demo", true)).unwrap();
+    assert!(
+        matches!(&dry.verdicts[0].1, Verdict::Blocked(w) if w.starts_with("could not inspect")),
+        "{:?}",
+        dry.verdicts
+    );
+
+    env.insert(|r| {
+        r.resolved = false;
+        r.resolved_reason = None;
+    });
+    let refresh = env.with(|ctx| pr::poll_project(ctx, "demo")).unwrap();
+    assert_eq!(refresh.polled, 0);
+    assert!(refresh.errors[0].contains(NAME), "{:?}", refresh.errors);
+    assert!(env.gh.calls().is_empty());
+}
+
+/// Another session's job state that can't be read may name this worktree: block, as if it did.
+#[test]
+fn another_sessions_unreadable_job_state_blocks_cleanup() {
+    let env = Env::new();
+    let mut other = SessionRow::new("demo-b-2222", "demo", Role::Thread, NOW);
+    other.short_id = Some("bb22".into());
+    other.session_id = Some("sid-bb22".into());
+    db::insert_session(&env.conn, &other).unwrap();
+    let dir = env.claude.config_dir().join("jobs/bb22");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), "not json").unwrap();
+
+    let Outcome::Blocked(why) = env.clean(Mode::Safe).unwrap() else {
+        panic!("want blocked");
+    };
+    assert!(
+        why.contains("is possibly also the worktree of demo-b-2222"),
+        "{why}"
+    );
+    assert!(why.contains(cleanup::SHARED_WORKTREE), "no discard offered");
+    assert!(env.rm_calls().is_empty());
+    assert!(env.worktree.is_dir());
+}
+
+/// `claude rm` deletes the job's `worktreeBranch`, wherever HEAD is now: its unpushed commits are
+/// counted and listed, and the branch is named.
+#[test]
+fn discard_counts_the_job_branch_when_head_is_elsewhere() {
+    let env = Env::new();
+    env.git.commit(&env.worktree, "job.txt", "Job work");
+    git(
+        &env.worktree,
+        &["switch", "-q", "-c", "side", "origin/main"],
+    );
+    let ins = env.inspect();
+    assert_eq!(ins.branch.as_deref(), Some("worktree-add-notes"));
+    assert_eq!(ins.unpushed_count, 1);
+    assert!(ins.unpushed[0].ends_with(" Job work"), "{:?}", ins.unpushed);
+    let shown = cleanup::render_loss(NAME, &ins);
+    assert!(
+        shown.contains("its local branch worktree-add-notes"),
+        "{shown}"
+    );
+    assert!(shown.contains("1 commit on no remote:"), "{shown}");
+
+    assert_eq!(
+        env.clean(Mode::Safe).unwrap(),
+        Outcome::Blocked("1 unpushed commit".into())
+    );
+    assert!(env.rm_calls().is_empty());
+
+    // Confirmed: `claude rm`'s token names the head chief saw, so the retry discards it.
+    env.rm_refuses_unpushed(1, &env.head());
+    env.claude.set("rm.stdout.2", &format!("removed {SHORT}\n"));
+    assert_eq!(env.clean(Mode::Discard(ins)).unwrap(), Outcome::Cleaned);
+    assert_eq!(env.rm_calls().len(), 2);
+}
+
+/// `chief gc --dry-run` says what the real run does: a thread in the pane is skipped, one removed
+/// outside chief with its worktree left is blocked.
+#[test]
+fn gc_dry_run_matches_the_real_run() {
+    let env = Env::new();
+    db::set_pane_showing(&env.conn, "demo", Some(NAME)).unwrap();
+    env.gh.set("pr.stdout", "[]");
+    let verdicts = |dry| {
+        env.with(|ctx| cleanup::gc(ctx, "demo", dry))
+            .unwrap()
+            .verdicts
+    };
+    let dry = verdicts(true);
+    assert!(
+        matches!(&dry[0].1, Verdict::Skipped(w) if w.contains("is showing in the pane")),
+        "{dry:?}"
+    );
+    assert_eq!(dry, verdicts(false));
+    db::set_pane_showing(&env.conn, "demo", None).unwrap();
+
+    let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+    coord.short_id = Some("c0ffee".into());
+    coord.session_id = Some("coord".into());
+    db::insert_session(&env.conn, &coord).unwrap();
+    env.agents(&[agent("c0ffee", "coord", "chief-demo", "done", Some(1))]);
+    let dry = verdicts(true);
+    let remains = format!(
+        "session removed outside chief; worktree remains at {}",
+        env.worktree.display()
+    );
+    assert_eq!(dry, [(NAME.to_string(), Verdict::Blocked(remains))]);
+    assert_eq!(dry, verdicts(false));
+    assert!(env.rm_calls().is_empty());
+}
+
+/// Run from a git hook, chief inherits `GIT_DIR` (and the like) for another repository. Every git
+/// call it makes, and every tool that runs git, must still act on the thread's own worktree: a
+/// discard resets that worktree and nothing of the other repository.
+#[test]
+fn cli_discard_ignores_an_inherited_git_dir() {
+    let home = Home::new();
+    let git_repo = GitRepo::new();
+    let wt = git_repo.worktree("hooked");
+    std::fs::write(wt.join("scratch.txt"), "x").unwrap();
+    // The repository a hook would run in: a commit of its own and a staged edit.
+    let other = GitRepo::new();
+    other.commit(&other.repo, "other.txt", "Other's file");
+    std::fs::write(other.repo.join("README.md"), "other's edit\n").unwrap();
+    git(&other.repo, &["add", "README.md"]);
+    let other_head = git(&other.repo, &["rev-parse", "HEAD"]);
+    let other_status = git(&other.repo, &["status", "--porcelain"]);
+    {
+        let conn = home.db();
+        home.register("demo");
+        let mut row = SessionRow::new("demo-hook-1111", "demo", Role::Thread, NOW);
+        row.short_id = Some("hk1".into());
+        row.session_id = Some("sid-hk1".into());
+        row.repo_path = Some(git_repo.repo.to_string_lossy().into_owned());
+        row.resolved = true;
+        db::insert_session(&conn, &row).unwrap();
+    }
+    home.fake
+        .job("hk1", Some(&wt))
+        .set(
+            "agents.stdout",
+            &json!([agent("hk1", "sid-hk1", "demo-hook-1111", "done", None)]).to_string(),
+        )
+        .set("rm.stdout", "removed hk1\n");
+
+    let git_dir = other.repo.join(".git");
+    let index = git_dir.join("index");
+    let env = [
+        ("GIT_DIR", git_dir.to_str().unwrap()),
+        ("GIT_INDEX_FILE", index.to_str().unwrap()),
+    ];
+    let out = home.run_env(
+        &["clean", "demo", "demo-hook-1111", "--discard", "--yes"],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let shown = stdout(&out);
+    assert!(shown.contains("?? scratch.txt"), "{shown}");
+    assert!(!shown.contains("other.txt"), "{shown}");
+    assert!(!wt.join("scratch.txt").exists(), "the worktree was reset");
+    assert!(!wt.join("other.txt").exists(), "not with the other's files");
+    assert_eq!(other_status, "M  README.md\n");
+    assert_eq!(git(&other.repo, &["rev-parse", "HEAD"]), other_head);
+    assert_eq!(git(&other.repo, &["status", "--porcelain"]), other_status);
+    assert_eq!(
+        std::fs::read_to_string(other.repo.join("README.md")).unwrap(),
+        "other's edit\n"
+    );
+    // `claude` runs git too: it never sees the hook's repository either.
+    let rm = home
+        .fake
+        .calls()
+        .iter()
+        .position(|c| c.first().map(String::as_str) == Some("rm"))
+        .unwrap();
+    let seen = home.fake.dir.path().join(format!("calls/{rm}.git-dir"));
+    assert_eq!(std::fs::read_to_string(seen).unwrap(), "unset");
+}
+
+/// An empty `CHIEF_HOME` counts as unset: chief's files go to `$XDG_DATA_HOME/chief`, not the
+/// current folder.
+#[test]
+fn an_empty_chief_home_is_ignored() {
+    let home = Home::new();
+    let xdg = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let out = home
+        .command(&["gc"])
+        .env("CHIEF_HOME", "")
+        .env("XDG_DATA_HOME", xdg.path())
+        .current_dir(cwd.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(xdg.path().join("chief/chief.db").exists());
+    assert!(!cwd.path().join("chief.db").exists());
 }
