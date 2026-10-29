@@ -142,6 +142,7 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
                 row.short_id = a.id.clone();
             }
             restore_removed(row);
+            restore_legacy_cleaned(row, taken_at);
             row.pid = a.pid;
             if !stale {
                 row.cc_state = a.state.clone();
@@ -222,12 +223,15 @@ fn session_id_taken(row: &SessionRow, sid: &str, registered: &[SessionRow]) -> b
         .any(|r| r.name != row.name && r.session_id.as_deref() == Some(sid))
 }
 
-/// Removed outside chief: resolved (`removed`, unless it already was). Cleaned only when its
-/// worktree is gone too; otherwise `cleanup_blocked` says where the worktree remains.
+/// Removed outside chief: resolved (`removed`, unless it already was). A reopened thread's kept
+/// reason is set aside, so undoing the verdict leaves it reopened for good (auto-resolve skips
+/// a thread with a reason). Cleaned only when its worktree is gone too; otherwise
+/// `cleanup_blocked` says where the worktree remains.
 fn mark_removed(row: &mut SessionRow, poll: &Poll) {
     row.removed_at = Some(poll.taken_at);
     if !row.resolved {
         row.resolved = true;
+        row.reason_before_removed = row.resolved_reason.take();
         row.resolved_reason = Some("removed".to_string());
     }
     match worktree_on_disk(row, poll) {
@@ -267,17 +271,20 @@ fn refresh_branch(row: &mut SessionRow, poll: &Poll) {
     }
 }
 
-/// The session is listed again: undo what `mark_removed` did, and only that.
+/// The session is listed again: undo what the removed verdict did, and only that. Every
+/// `cleaned_at` from `removed_at` on came from it: set with the verdict, or once its worktree
+/// was found gone (here or by cleanup, which runs no `claude rm` on a removed row, §12).
 fn restore_removed(row: &mut SessionRow) {
     let Some(removed_at) = row.removed_at.take() else {
         return;
     };
-    if row.cleaned_at == Some(removed_at) {
+    if row.cleaned_at.is_some_and(|at| at >= removed_at) {
         row.cleaned_at = None;
     }
+    let before = row.reason_before_removed.take();
     if row.resolved_reason.as_deref() == Some("removed") {
         row.resolved = false;
-        row.resolved_reason = None;
+        row.resolved_reason = before;
     }
     if row
         .cleanup_blocked
@@ -285,6 +292,21 @@ fn restore_removed(row: &mut SessionRow) {
         .is_some_and(|b| b.starts_with(REMOVED_OUTSIDE))
     {
         row.cleanup_blocked = None;
+    }
+}
+
+/// Before migration 6 a removed verdict on a resolved row set only `cleaned_at`, and gave it no
+/// `removed_at` to undo; migration 13 flagged every row cleaned until then. chief's own cleanup
+/// sets `cleaned_at` only once `claude rm` has removed the session, which then is never listed
+/// again (§1). So a flagged row that a snapshot taken after it was cleaned lists again was
+/// cleaned by a wrong verdict, and still has its session.
+fn restore_legacy_cleaned(row: &mut SessionRow, taken_at: i64) {
+    if row.legacy_cleaned
+        && row.removed_at.is_none()
+        && row.cleaned_at.is_some_and(|at| taken_at > at)
+    {
+        row.cleaned_at = None;
+        row.legacy_cleaned = false;
     }
 }
 
@@ -802,10 +824,30 @@ mod tests {
             )
         );
 
+        // Its worktree is deleted later: cleaned then, by the same verdict.
+        let mut later = t.clone();
+        std::fs::remove_dir(&fix).unwrap();
+        let poll_150 = Poll {
+            taken_at: 150,
+            ..poll
+        };
+        sync_row(&mut later, &poll_150, 160);
+        assert_eq!(
+            (later.cleaned_at, later.cleanup_blocked.as_deref()),
+            (Some(150), None)
+        );
+        std::fs::create_dir(&fix).unwrap();
+
         let mut back = coordinator_agent();
         back.id = Some("t1".into());
         back.session_id = "t-sid".into();
         back.pid = Some(4);
+        sync_one(&mut later, &[coordinator_agent(), back.clone()], 200, 210);
+        assert_eq!(
+            (later.cleaned_at, later.removed_at, later.resolved),
+            (None, None, false),
+            "every cleaned_at the verdict led to is undone"
+        );
         sync_one(&mut t, &[coordinator_agent(), back.clone()], 200, 210);
         assert_eq!(
             (
@@ -844,6 +886,102 @@ mod tests {
         listed.session_id = "t-sid".into();
         sync_one(&mut c, &[coordinator_agent(), listed], 200, 210);
         assert_eq!(c.cleaned_at, Some(50));
+    }
+
+    /// Before migration 6 a removed verdict on a resolved row set only `cleaned_at`; migration
+    /// 13 flags every row cleaned until then. Listed by a snapshot taken after it was cleaned,
+    /// such a row still has its session; an earlier snapshot, taken while `claude rm` ran, proves
+    /// nothing.
+    #[test]
+    fn a_legacy_cleaned_session_listed_again_is_not_cleaned() {
+        let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
+        t.resolved = true;
+        t.resolved_reason = Some("user".into());
+        t.cleaned_at = Some(150);
+        t.legacy_cleaned = true;
+        let mut listed = coordinator_agent();
+        listed.id = Some("t1".into());
+        listed.session_id = "t-sid".into();
+        listed.pid = Some(4);
+        let agents = [coordinator_agent(), listed];
+
+        sync_one(&mut t, &agents, 100, 110);
+        assert_eq!(t.cleaned_at, Some(150), "taken before it was cleaned");
+        let mut gone = t.clone();
+        sync_one(&mut gone, &[coordinator_agent()], 200, 210);
+        assert_eq!((gone.cleaned_at, gone.legacy_cleaned), (Some(150), true));
+
+        assert!(sync_one(&mut t, &agents, 200, 210));
+        assert_eq!(
+            (
+                t.cleaned_at,
+                t.legacy_cleaned,
+                t.resolved,
+                t.resolved_reason.as_deref(),
+                t.pid
+            ),
+            (None, false, true, Some("user"), Some(4))
+        );
+    }
+
+    /// A reopened thread keeps its reason so it isn't resolved again automatically (§5); a
+    /// removed verdict that is undone gives the reason back.
+    #[test]
+    fn undoing_a_removed_verdict_keeps_a_reopened_thread_open() {
+        let (_dir, conn) = setup();
+        let now = 100 * DAY;
+        let mut coord = SessionRow::new("chief-demo", "demo", Role::Coordinator, 0);
+        coord.short_id = Some("c1".into());
+        coord.session_id = Some("c-sid".into());
+        db::insert_session(&conn, &coord).unwrap();
+        let mut t = thread("t", Some("t1"), Some("t-sid"), now - 30 * DAY);
+        t.pr_state = Some("MERGED".into());
+        db::insert_session(&conn, &t).unwrap();
+        let mut listed = coordinator_agent();
+        listed.id = Some("t1".into());
+        listed.session_id = "t-sid".into();
+        let both = [coordinator_agent(), listed];
+        let get = || db::get_session(&conn, "t").unwrap().unwrap();
+
+        sync(&conn, "demo", &both, now, now).unwrap();
+        assert_eq!(get().resolved_reason.as_deref(), Some("merged"));
+        set_resolved(&conn, "t", false, "user", now).unwrap();
+
+        // Missing from a snapshot that can know: removed, the kept reason set aside.
+        sync(&conn, "demo", &[coordinator_agent()], now + 1, now + 1).unwrap();
+        let r = get();
+        assert_eq!(
+            (
+                r.resolved,
+                r.resolved_reason.as_deref(),
+                r.reason_before_removed.as_deref()
+            ),
+            (true, Some("removed"), Some("merged"))
+        );
+        // Listed again: reopened as it was, and it stays open.
+        sync(&conn, "demo", &both, now + 2, now + 2).unwrap();
+        let r = get();
+        assert_eq!(
+            (
+                r.resolved,
+                r.resolved_reason.as_deref(),
+                r.reason_before_removed,
+                r.removed_at
+            ),
+            (false, Some("merged"), None, None)
+        );
+        sync(&conn, "demo", &both, now + 30 * DAY, now + 30 * DAY).unwrap();
+        assert!(!get().resolved, "not resolved again");
+
+        // A thread never resolved has no reason to give back.
+        let mut fresh = thread("demo-u-2222", Some("u2"), Some("u-sid"), 0);
+        sync_one(&mut fresh, &[coordinator_agent()], 100, 110);
+        assert_eq!(fresh.reason_before_removed, None);
+        let mut back = coordinator_agent();
+        back.id = Some("u2".into());
+        back.session_id = "u-sid".into();
+        sync_one(&mut fresh, &[coordinator_agent(), back], 200, 210);
+        assert_eq!((fresh.resolved, fresh.resolved_reason), (false, None));
     }
 
     /// The reviewer's probe: a thread whose shell wandered into the checkout (`main`) or another
