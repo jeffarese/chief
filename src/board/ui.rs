@@ -266,7 +266,9 @@ fn status_line(app: &App, width: usize) -> Option<Line<'static>> {
     ))
 }
 
-/// The keys that do something for the selection, most useful first; help always ends it.
+/// The keys that do something for the selection, most useful first; help always ends it, after
+/// the side switch in the built-in layout. Those are kept when the rest doesn't fit
+/// (`board_keys_kept`).
 fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = vec![("⏎", "show")];
     match app.selected_row() {
@@ -294,24 +296,31 @@ fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     keys
 }
 
-/// The key bar with `?` kept at the end when the rest doesn't fit.
-fn keys_line(keys: &[(&str, &str)], width: usize) -> Line<'static> {
+/// How many of `board_keys`' last keys the bar keeps: the side switch is the one key the built-in
+/// layout adds, and nothing else on screen names it.
+fn board_keys_kept(app: &App) -> usize {
+    if app.embedded { 2 } else { 1 }
+}
+
+/// The key bar with the last `kept` keys kept at the end when the rest doesn't fit.
+fn keys_line(keys: &[(&str, &str)], kept: usize, width: usize) -> Line<'static> {
     let full = key_bar(keys, width);
     let shown: usize = full.spans.iter().map(|s| cols(&s.content)).sum();
-    let all: usize = keys
-        .iter()
-        .map(|(k, w)| cols(k) + 1 + cols(w))
-        .sum::<usize>()
-        + 2 * keys.len().saturating_sub(1);
-    if shown == all || keys.len() < 2 {
+    let bar_cols = |keys: &[(&str, &str)]| {
+        keys.iter()
+            .map(|(k, w)| cols(k) + 1 + cols(w))
+            .sum::<usize>()
+            + 2 * keys.len().saturating_sub(1)
+    };
+    if shown == bar_cols(keys) || keys.len() <= kept {
         return full;
     }
-    let (last, rest) = keys.split_last().unwrap_or((&("", ""), &[]));
-    let room = width.saturating_sub(cols(last.0) + 1 + cols(last.1) + 2);
+    let (rest, tail) = keys.split_at(keys.len() - kept);
+    let room = width.saturating_sub(bar_cols(tail) + 2);
     let mut line = key_bar(rest, room);
     let sep = if line.spans.is_empty() { "" } else { "  " };
     line.spans.push(Span::raw(sep));
-    line.spans.extend(key_bar(&[*last], width).spans);
+    line.spans.extend(key_bar(tail, width).spans);
     line
 }
 
@@ -425,7 +434,8 @@ pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
     if let Some(line) = status {
         f.render_widget(Paragraph::new(line), status_area);
     }
-    f.render_widget(Paragraph::new(keys_line(&board_keys(app), width)), foot);
+    let keys = keys_line(&board_keys(app), board_keys_kept(app), width);
+    f.render_widget(Paragraph::new(keys), foot);
 
     if body.height >= SPLIT_MIN_BODY {
         // The list takes what it needs up to 3/5 of the body; the detail gets the rest.
@@ -855,7 +865,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
         note,
     );
     f.render_widget(
-        Paragraph::new(keys_line(&settings_keys(form), area.width as usize)),
+        Paragraph::new(keys_line(&settings_keys(form), 1, area.width as usize)),
         foot,
     );
 }
@@ -1178,6 +1188,22 @@ mod tests {
         app.on_key(ch('G'));
         let out = render(&app, 70, 30);
         assert!(out.contains("r reopen  x clean up"), "{out}");
+    }
+
+    /// Beside its conversation, the board's narrow key bar still names the side switch.
+    #[test]
+    fn the_embedded_key_bar_keeps_the_side_switch() {
+        let mut app = busy_board();
+        app.embedded = true;
+        let out = render(&app, 100, 24);
+        assert!(
+            out.contains("⏎ show  Esc coordinator  r resolve  w wake  ^\\ conversation  ? help"),
+            "{out}"
+        );
+        let out = render(&app, 41, 24);
+        let foot = out.lines().last().unwrap();
+        assert!(foot.ends_with("^\\ conversation  ? help"), "{foot:?}");
+        assert!(foot.starts_with("⏎ show"), "{foot:?}");
     }
 
     #[test]

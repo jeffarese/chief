@@ -1374,7 +1374,7 @@ board, sharing a screen instead of a multiplexer.
   reach `chief pane`: the board beside it writes `pane_target` and signals its own process.
 - Board. `board::Board` (the app, the refresher and the Show worker, as in `chief board`) drawn
   with `ui::draw_in` in the right part of the frame; `App::embedded` adds `^\ conversation` to
-  its key bar. Its Edit action pauses the input thread and the layout's terminal modes around the
+  its key bar, which keeps it however narrow the board is. Its Edit action pauses the input thread and the layout's terminal modes around the
   editor, so neither takes the editor's keys.
 - Screen. 100 columns or more: the board gets 32 % (at least 36 columns), a dim `│` divider, the
   conversation the rest. Narrower: the focused side fills the screen; the conversation keeps its
@@ -1426,7 +1426,8 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   margin inside when the panel has 34 columns to spare, one accent colour (cyan) for focus, keys
   and marks, the selection in reverse video across the width. The last line is always the key
   bar: the keys that act on the selection, most useful first, each `key what` with the key in
-  the accent colour, whole hints only, `? help` kept at the end when the rest doesn't fit. Above
+  the accent colour, whole hints only, `? help` kept at the end when the rest doesn't fit (in the
+  built-in layout `^\ conversation` before it, §9). Above
   it, when there is one, the status line: a running worker, else the last action's result
   (cleared by the next key), else refresh errors, else the PR hint. Widths are counted per
   grapheme, as ratatui draws them (an emoji with a variation selector or a joiner is one). In
