@@ -661,10 +661,15 @@ pub fn ensure_coordinator(
                 (agent.id.clone(), Some(agent))
             }
             Ok(None) => {
-                if inserted {
-                    let _ = db::delete_session(conn, &name);
-                }
-                return Err(e);
+                let kept = match inserted.then(|| db::delete_unattached_session(conn, &name)) {
+                    None | Some(Ok(true)) => return Err(e),
+                    Some(Ok(false)) => "its hooks already ran, so it started".to_string(),
+                    Some(Err(del)) => format!("chief couldn't remove it ({del:#})"),
+                };
+                return Err(e.context(format!(
+                    "{name}'s row is kept: {kept}; run chief up again, and it adopts the \
+                     session once claude agents lists it"
+                )));
             }
             Err(lookup) => {
                 return Err(e.context(format!(

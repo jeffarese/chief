@@ -948,8 +948,8 @@ succeed without it, chief reads the row first: a `session_id` there means a hook
 already attached it (only a running session's hooks store one, §4), so it started, and the row is
 kept and the call succeeds with `short_id` null and a `warning` that quotes the failure (sync
 then matches it by session id). Otherwise the row is deleted and the error returned; a row that
-can't be read is kept, and the error says so. (The read and the delete are two statements: a
-hook that attaches the row between them loses it, as before this check.) When every listing
+can't be read is kept, and the error says so. The read and the delete are one transaction
+(`db::delete_unattached_session`), so a hook that attaches the row meanwhile keeps it. When every listing
 fails, chief can't tell: the row is kept without a short id (hooks attach it by title if the
 session did start) and the error says so. Failing to resolve the session id is not an error
 (hooks match by title, sync by short id). Once the spawn returned an id (or a session was
@@ -1075,7 +1075,8 @@ No prompt: it waits for you. Started when it has no row or no `short_id` (the pr
 trusted, and chief marks it first when it isn't; no other live session may already use the name).
 A failed spawn is handled as a thread's is (above): a session that started anyway is adopted, with a
 warning (stderr from the command line); a row it
-inserted is removed only when listings show no such session, and kept when chief can't tell. A
+inserted is removed only when listings show no such session and no hook stored a session id in
+it (in one transaction, as for a thread), and kept when chief can't tell or a hook did. A
 kept row (no `short_id`) is adopted by the next `up` when `claude agents` lists its session (by
 `session_id` if a hook stored one, else a background session with exactly the name whose `cwd`
 is the project folder, compared canonically), instead of refusing the name as taken. A live

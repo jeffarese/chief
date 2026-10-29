@@ -449,34 +449,23 @@ fn after_failed_spawn(
             eprintln!("chief mcp: {warning}");
             Ok((Kept::Listed(agent), warning))
         }
-        Ok(None) => {
-            // Only a running session's hooks store a session id in the row (§4).
-            let attached = db::get_session(ctx.conn, name)
-                .map(|row| row.is_some_and(|r| r.session_id.is_some()));
-            match attached {
-                Ok(true) => {
-                    let warning = format!(
-                        "`claude --bg` reported a failure, and `claude agents` doesn't list \
-                         {name} yet, but its hooks already ran, so it started and chief kept \
-                         it. The failure: {err:#}"
-                    );
-                    eprintln!("chief mcp: {warning}");
-                    return Ok((Kept::Attached, warning));
-                }
-                Ok(false) => {}
-                Err(read) => {
-                    return Err(err.context(format!(
-                        "chief couldn't read {name}'s row to check whether it started anyway \
-                         ({read:#}), so the row is kept: if it started, its hooks attach it; \
-                         if it never shows up in list_threads, resolve it"
-                    )));
-                }
+        Ok(None) => match db::delete_unattached_session(ctx.conn, name) {
+            Ok(true) => Err(err),
+            Ok(false) => {
+                let warning = format!(
+                    "`claude --bg` reported a failure, and `claude agents` doesn't list {name} \
+                     yet, but its hooks already ran, so it started and chief kept it. The \
+                     failure: {err:#}"
+                );
+                eprintln!("chief mcp: {warning}");
+                Ok((Kept::Attached, warning))
             }
-            if let Err(del) = db::delete_session(ctx.conn, name) {
-                eprintln!("chief mcp: could not remove {name} after a failed spawn: {del:#}");
-            }
-            Err(err)
-        }
+            Err(read) => Err(err.context(format!(
+                "chief couldn't check {name}'s row to see whether it started anyway ({read:#}), \
+                 so the row is kept: if it started, its hooks attach it; if it never shows up \
+                 in list_threads, resolve it"
+            ))),
+        },
         Err(lookup) => Err(err.context(format!(
             "chief couldn't check whether {name} started anyway ({lookup:#}), so its row is \
              kept: if it started, its hooks attach it; if it never shows up in list_threads, \

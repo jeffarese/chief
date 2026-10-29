@@ -612,13 +612,36 @@ pub fn release_cleanup(conn: &Connection, name: &str, claimed_at: i64) -> Result
 /// teammates, all or nothing: a hook between the statements could otherwise leave an event or
 /// teammate of a session that no longer exists.
 pub fn delete_session(conn: &Connection, name: &str) -> Result<()> {
+    immediate(conn, |conn| delete_session_rows(conn, name))
+}
+
+/// `delete_session` after a failed spawn, unless the session's hooks attached the row: only a
+/// running session's hooks store a session id (§4), so it started. The check and the delete are
+/// one transaction, so hooks that attach it in between keep it. Whether no attached row is left
+/// (it was deleted, or there was none).
+pub fn delete_unattached_session(conn: &Connection, name: &str) -> Result<bool> {
     immediate(conn, |conn| {
-        conn.execute("DELETE FROM events WHERE session_name = ?1", [name])?;
-        conn.execute("DELETE FROM reports WHERE session_name = ?1", [name])?;
-        forget_teammates(conn, name)?;
-        conn.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
-        Ok(())
+        let session_id: Option<Option<String>> = conn
+            .query_row(
+                "SELECT session_id FROM sessions WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if matches!(session_id, Some(Some(_))) {
+            return Ok(false);
+        }
+        delete_session_rows(conn, name)?;
+        Ok(true)
     })
+}
+
+fn delete_session_rows(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("DELETE FROM events WHERE session_name = ?1", [name])?;
+    conn.execute("DELETE FROM reports WHERE session_name = ?1", [name])?;
+    forget_teammates(conn, name)?;
+    conn.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
+    Ok(())
 }
 
 pub fn get_session(conn: &Connection, name: &str) -> Result<Option<SessionRow>> {
@@ -1457,6 +1480,26 @@ mod tests {
         assert_eq!(get_session(&conn, "u").unwrap(), None);
         assert!(recent_events(&conn, "p", 10).unwrap().is_empty());
         assert!(recent_reports(&conn, "u", 10).unwrap().is_empty());
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn a_failed_spawns_row_is_deleted_only_while_no_hook_attached_it() {
+        let (_dir, conn) = fresh();
+        register_project(&conn, "p", Path::new("/p"), 1).unwrap();
+        insert_session(&conn, &SessionRow::new("bare", "p", Role::Thread, 1)).unwrap();
+        let mut hooked = SessionRow::new("hooked", "p", Role::Thread, 1);
+        hooked.session_id = Some("sid-hooked".into());
+        insert_session(&conn, &hooked).unwrap();
+        insert_report(&conn, "bare", 1, "done").unwrap();
+
+        assert!(delete_unattached_session(&conn, "bare").unwrap());
+        assert_eq!(get_session(&conn, "bare").unwrap(), None);
+        assert!(recent_reports(&conn, "bare", 10).unwrap().is_empty());
+        assert!(!delete_unattached_session(&conn, "hooked").unwrap());
+        assert!(get_session(&conn, "hooked").unwrap().is_some());
+        // No row: nothing attached is left.
+        assert!(delete_unattached_session(&conn, "never").unwrap());
         assert!(conn.is_autocommit());
     }
 
