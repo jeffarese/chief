@@ -1,7 +1,6 @@
 //! The built-in layout (`chief up --layout builtin`) on a real pseudo-terminal with the fake
 //! `claude`: the conversation's attach in an embedded terminal, the board beside it. No real
 //! Claude session and no multiplexer.
-#![cfg(feature = "builtin-layout")]
 
 mod common;
 
@@ -117,6 +116,32 @@ fn the_layout_shows_both_sides_and_switches_like_a_pane() {
     assert!(gone(second), "its attach was reaped");
     assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
     assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+    assert!(
+        home.fake.calls_of("stop").is_empty(),
+        "sessions keep running"
+    );
+}
+
+/// Ctrl+Q closes the layout while Claude has the keys, in one key, and leaves every session
+/// running.
+#[test]
+fn ctrl_q_closes_the_layout_while_attached() {
+    let home = project();
+    let conn = home.db();
+    let mut ui = Pane::spawn_sized(
+        &home,
+        &["up", "demo", "--layout", "builtin"],
+        &[],
+        (140, 40),
+    );
+    wait_until_shown(&ui, "coordinator-here");
+    wait_until_shown(&ui, "^Q");
+    let attach = home.fake.pid(attach_call(&home, "c0").unwrap());
+    ui.send("\x11");
+    let status = ui.exited().expect("Ctrl+Q closes the layout");
+    assert!(status.success(), "{status:?}");
+    assert!(gone(attach), "its attach was reaped");
+    assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
     assert!(
         home.fake.calls_of("stop").is_empty(),
         "sessions keep running"

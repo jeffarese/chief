@@ -25,17 +25,6 @@ the Claude sessions behind them a replay. <code>scripts/demo/demo.sh</code> reco
 cargo install --path .
 ```
 
-The built-in layout (below) embeds libghostty, Ghostty's terminal emulator, which is written in
-Zig: the first build downloads Ghostty's source at a pinned commit and compiles it, so it needs
-network access and **Zig 0.17** on `PATH` (`brew install zig`, or `mise use -g zig@0.17.0`).
-Without Zig, build without that layout:
-
-```sh
-cargo install --path . --no-default-features
-```
-
-`chief up` then prints the two commands to run side by side instead.
-
 Install it rather than running it from `target/`: the hooks Claude Code calls use chief's absolute
 path, and `cargo clean` would switch them off (chief warns about this).
 
@@ -86,10 +75,12 @@ first that applies:
   session, the pane on the left and the board on the right.
 - **Anything else**: chief draws both itself, in the terminal you ran it in: the conversation on
   the left, the board on the right. **Ctrl+\\** switches sides (or click one); the side without
-  the keyboard is dimmed, and below 100 columns the focused side fills the screen. `q` on the
-  board closes it; sessions keep running. `chief up <slug> --layout builtin` opens it even where
-  Rex or tmux would. A chief built with `--no-default-features` prints the two commands instead,
-  to run side by side in two windows or splits of your terminal (iTerm, Ghostty, …).
+  the keyboard is dimmed, and below 100 columns the focused side fills the screen. The
+  conversation's last row is chief's: what it shows, and `^Q quit` and `^\ board`, which you can
+  click. Ctrl+Q, or `q` on the board, closes it; sessions keep running. `chief up <slug> --layout
+  builtin` opens it even where Rex or tmux would. Without a terminal, chief prints the two
+  commands instead, to run side by side in two windows or splits of your terminal (iTerm,
+  Ghostty, …).
 
 Switching works the same in all of them: Enter on the board tells the pane process to show that
 thread, whatever terminal it runs in. `chief down` closes only a layout `chief up` opened, and
@@ -121,10 +112,11 @@ too: click to select, click again to show, scroll to move.
 | ? | Help |
 | q | Quit the board (the layout stays) |
 
-Leaving Claude in the left pane (Ctrl+Z, or Ctrl+C out of its agent view) brings you to chief's
-own screen: ⏎ goes back, a pick on the board shows that instead, and `q` closes the layout. The
-coordinator and threads keep running in the background; `chief` or `chief up <slug>` opens the
-layout again.
+**Ctrl+Q** in the conversation quits chief at once, whatever Claude is doing, and closes the
+layout (in a Rex block, the board beside it). Leaving Claude in the left pane by hand (Ctrl+Z, or
+Ctrl+C out of its agent view) brings you to chief's own screen instead: ⏎ goes back, a pick on the
+board shows that instead, and `q` or Ctrl+Q closes the layout. The coordinator and threads keep
+running in the background either way; `chief` or `chief up <slug>` opens the layout again.
 
 ## Settings
 
@@ -233,11 +225,8 @@ how; `docs/PLAN.md` has the build plan and the live test results.
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --no-default-features -- -D warnings
 cargo fmt --check
 ```
-
-With Zig 0.17 from mise but not on `PATH`, prefix each with `mise exec zig@0.17.0 --`.
 
 Tests never start real Claude sessions: they use fake `claude`, `gh`, `rex` and `tmux` binaries
 (`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`) and a temporary

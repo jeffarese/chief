@@ -4,19 +4,17 @@
 //! its `claude attach` with SIGTERM, undoes the screen modes the killed client left behind, and
 //! attaches to the new target. That needs no terminal multiplexer.
 //!
-//! The user can still leave by hand: Ctrl+Z inside attach, or quitting Claude's agent view. The
-//! pane then says so and waits for ⏎, a board selection or `q`, rather than attaching again,
-//! which would put the user straight back in with no way out. If a Ctrl+Z lands while chief
-//! itself has the terminal, the line discipline would turn it into SIGTSTP and freeze the pane.
-//! So chief keeps the terminal in raw mode (no signal keys) whenever it is in the foreground and
-//! hands it to attach with signal keys still off, so a Ctrl+Z that lands before Claude's UI is up
-//! waits as input for it instead of being lost. It also ignores SIGTSTP and gives `claude attach`
-//! the default disposition back, in case one gets through.
+//! `claude attach` runs on a pseudo-terminal of its own whose bytes chief relays to this terminal
+//! untouched (`relay`): Claude draws on the user's terminal as if it had it, and chief sees every
+//! key on the way, so Ctrl+Q quits chief whatever Claude is doing. chief keeps this terminal in
+//! raw mode throughout (no signal keys: a Ctrl+Z or Ctrl+C is a byte for Claude or for chief).
+//!
+//! The user can still leave Claude by hand: Ctrl+Z inside attach, or quitting Claude's agent
+//! view. The pane then says so and waits for ⏎, a board selection or `q`, rather than attaching
+//! again, which would put the user straight back in with no way out.
 
 use std::io::{ErrorKind, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -32,6 +30,7 @@ use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::mux::rex::Rex;
 use crate::mux::{BlockRef, Mux};
+use crate::relay::{self, Ended};
 use crate::state::Role;
 use crate::{accounts, names, paths, proc, project};
 
@@ -42,10 +41,6 @@ const WAKE_WAIT: Duration = Duration::from_secs(20);
 /// An attach that ends sooner than this counts as a failed start: wait before the next try so a
 /// session that keeps refusing doesn't spin.
 pub(crate) const SHORT_ATTACH: Duration = Duration::from_secs(1);
-/// How long attach gets to exit after a hangup or a switch before it is killed.
-const HANGUP_GRACE: Duration = Duration::from_secs(2);
-/// How often the wait for attach looks at the child and the signal flags.
-const WAIT_TICK: Duration = Duration::from_millis(50);
 /// What a `claude attach` ended by a signal leaves on: synchronized output, the alternate
 /// screen, a hidden cursor, mouse reporting, bracketed paste, focus events, kitty keyboard flags
 /// and modifyOtherKeys. End synchronized output first (the terminal holds back everything else
@@ -60,14 +55,17 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(300);
 /// The longest one look for keys lasts. A signal interrupts a look, but one that lands just
 /// before it starts is only seen once it ends.
 const KEY_SLICE: Duration = Duration::from_millis(200);
-/// Ctrl+C, a plain byte in raw mode.
+/// Ctrl+C and Ctrl+Q, plain bytes in raw mode.
 const CTRL_C: u8 = 0x03;
+const CTRL_Q: u8 = 0x11;
 const ESC: u8 = 0x1b;
 
 /// Set by SIGHUP or SIGTERM.
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
 /// Set by SIGUSR1: the board asks for another target.
 static SWITCH: AtomicBool = AtomicBool::new(false);
+/// Set by SIGWINCH: the relay gives attach's terminal the new size.
+static RESIZED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_hangup(_: libc::c_int) {
     HUNG_UP.store(true, Ordering::SeqCst);
@@ -75,6 +73,10 @@ extern "C" fn on_hangup(_: libc::c_int) {
 
 extern "C" fn on_switch(_: libc::c_int) {
     SWITCH.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_resize(_: libc::c_int) {
+    RESIZED.store(true, Ordering::SeqCst);
 }
 
 /// The multiplexer closing the pane or killing the session hangs up the pty, and the kernel sends
@@ -142,6 +144,8 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
     }
     catch_hangup();
     catch_switch();
+    // The relay passes a new size on to attach's terminal.
+    catch(&[libc::SIGWINCH], on_resize);
     let tty = Tty::take()?;
     // Where the board's switch requests go, with the start time that proves the pid is still
     // this pane. Without a start time the board can't switch this pane, but it still works.
@@ -300,12 +304,11 @@ fn pane_loop(
             showing(None)?;
             continue;
         }
-        // Drops keys that arrived meanwhile, a switch's Ctrl+Z among them, so attach doesn't
-        // read one and detach at once.
+        // Drops keys that arrived meanwhile, so attach doesn't read one meant for chief (a
+        // Ctrl+Z would detach it at once).
         if tty.quit_pressed(Duration::ZERO) {
             return Ok(());
         }
-        tty.release();
         let started = Instant::now();
         // A request for the target this attach already shows (the board saw the pane just
         // before it moved on) is dropped.
@@ -317,25 +320,33 @@ fn pane_loop(
         };
         // In the session's own account: no other account's supervisor knows it.
         let attached = attach(&claude.for_row(&row), &short_id, &switch);
-        if HUNG_UP.load(Ordering::SeqCst) {
-            // Nothing left to draw on; `run` clears `pane_showing`.
-            return Ok(());
-        }
-        let switched = matches!(attached, Ok(Waited { switched: true, .. }));
-        if switched {
-            tty.reset();
-        }
-        tty.retake()?;
-        showing(None)?;
-        if switched {
-            continue;
-        }
-
         let failed = match attached {
-            Ok(w) if w.status.success() => None,
-            Ok(w) => Some(format!("claude attach {short_id} exited with {}", w.status)),
+            Ok(Ended::HungUp) => {
+                // The relay may have seen the hangup on the terminal itself, before any signal.
+                HUNG_UP.store(true, Ordering::SeqCst);
+                // Nothing left to draw on; `run` clears `pane_showing`.
+                return Ok(());
+            }
+            // attach was killed and restored nothing: undo the screen modes it left on.
+            Ok(Ended::Quit) => {
+                tty.reset();
+                return Ok(());
+            }
+            Ok(Ended::Switched) => {
+                tty.reset();
+                showing(None)?;
+                continue;
+            }
+            Ok(Ended::Exited(Some(status))) if status.success() => None,
+            Ok(Ended::Exited(Some(status))) => {
+                Some(format!("claude attach {short_id} exited with {status}"))
+            }
+            Ok(Ended::Exited(None)) => {
+                Some(format!("claude attach {short_id} closed its terminal"))
+            }
             Err(e) => Some(format!("{e:#}")),
         };
+        showing(None)?;
         if failed.is_some() || started.elapsed() < SHORT_ATTACH {
             let why = failed.unwrap_or_else(|| format!("claude attach {short_id} ended at once"));
             // Below whatever attach printed, which says why.
@@ -383,138 +394,20 @@ pub(crate) fn wake(
     Ok(())
 }
 
-/// Runs `claude attach <short_id>` on this terminal and waits for it, or until `switch` says the
-/// board wants another target.
-fn attach(claude: &Claude, short_id: &str, switch: &dyn Fn() -> bool) -> Result<Waited> {
+/// Relays `claude attach <short_id>` between a pseudo-terminal of its own and this one until it
+/// exits, the board wants another target (`switch`), the user presses Ctrl+Q or the terminal
+/// hangs up; chief ends it in all but the first (SIGTERM, a grace period, then SIGKILL), which
+/// leaves its session running.
+fn attach(claude: &Claude, short_id: &str, switch: &dyn Fn() -> bool) -> Result<Ended> {
     let mut cmd = claude.command();
     cmd.args(["attach", short_id]);
-    with_default_tstp(&mut cmd);
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("running {} attach {short_id}", claude.bin.display()))?;
-    Ok(wait_continuing(child, &HUNG_UP, switch)?)
-}
-
-/// This process ignores SIGTSTP, and an ignored signal stays ignored across exec; the child
-/// gets the default back so Claude Code's own job control works as usual.
-fn with_default_tstp(cmd: &mut Command) {
-    // SAFETY: signal() is async-signal-safe, the only kind of call allowed between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-            Ok(())
-        });
-    }
-}
-
-/// How a wait for attach ended.
-#[derive(Debug)]
-struct Waited {
-    status: ExitStatus,
-    /// How many times the child was stopped (and continued). Only tests look.
-    #[cfg_attr(not(test), allow(dead_code))]
-    stops: usize,
-    /// Ended for a switch.
-    switched: bool,
-}
-
-/// Waits for `pid` to exit. A child stopped before it took the terminal (a Ctrl+Z during attach
-/// start-up) is continued: nothing else would, and the pane would hang. Once `hung_up` is set the
-/// child gets SIGHUP; once `switch()` says so, SIGTERM (which ends `claude attach` and leaves its
-/// session running). Either way it gets `HANGUP_GRACE` to exit, then SIGKILL, and is reaped. The
-/// wait polls every `WAIT_TICK` instead of blocking in `waitpid`: a signal landing between the
-/// flag check and a blocking `waitpid` would go unseen until attach exits, which for a switch is
-/// never.
-fn wait_continuing(
-    child: Child,
-    hung_up: &AtomicBool,
-    switch: &dyn Fn() -> bool,
-) -> std::io::Result<Waited> {
-    // Reaped here rather than by `Child::wait`, which can't see a stop.
-    let pid = child.id() as libc::pid_t;
-    let mut stops = 0;
-    loop {
-        if hung_up.load(Ordering::SeqCst) {
-            let status = end_child(pid, libc::SIGHUP);
-            return Ok(Waited {
-                status,
-                stops,
-                switched: false,
-            });
-        }
-        if switch() {
-            let status = end_child(pid, libc::SIGTERM);
-            return Ok(Waited {
-                status,
-                stops,
-                switched: true,
-            });
-        }
-        let mut status = 0;
-        // SAFETY: plain syscalls on our own child.
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
-        if r == 0 {
-            std::thread::sleep(WAIT_TICK);
-            continue;
-        }
-        if r == -1 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        if libc::WIFSTOPPED(status) {
-            stops += 1;
-            unsafe { libc::kill(pid, libc::SIGCONT) };
-            continue;
-        }
-        return Ok(Waited {
-            status: ExitStatus::from_raw(status),
-            stops,
-            switched: false,
-        });
-    }
-}
-
-/// Sends `signal` to `pid`, waits up to `HANGUP_GRACE` for it to exit, then kills it, and reaps
-/// it.
-fn end_child(pid: libc::pid_t, signal: libc::c_int) -> ExitStatus {
-    // SAFETY: signals and waits on our own, not yet reaped, child.
-    unsafe {
-        libc::kill(pid, signal);
-        libc::kill(pid, libc::SIGCONT);
-    }
-    let deadline = Instant::now() + HANGUP_GRACE;
-    loop {
-        let mut status = 0;
-        // SAFETY: as above.
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r == pid && !libc::WIFSTOPPED(status) {
-            return ExitStatus::from_raw(status);
-        }
-        if r == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            // Already reaped elsewhere: nothing left to wait for.
-            return ExitStatus::from_raw(0);
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // SAFETY: as above.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    loop {
-        let mut status = 0;
-        // SAFETY: as above.
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if r == pid {
-            return ExitStatus::from_raw(status);
-        }
-        if r == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return ExitStatus::from_raw(0);
-        }
-    }
+    let signals = relay::Signals {
+        hung_up: &|| HUNG_UP.load(Ordering::SeqCst),
+        switch,
+        resized: &|| RESIZED.swap(false, Ordering::SeqCst),
+    };
+    relay::relay(cmd, &signals)
+        .with_context(|| format!("running {} attach {short_id}", claude.bin.display()))
 }
 
 #[derive(Debug, PartialEq)]
@@ -523,8 +416,9 @@ enum Pick {
     Quit,
 }
 
-/// The pane's terminal while chief has it: raw mode (Ctrl+Z and Ctrl+C are plain bytes) and
-/// SIGTSTP ignored. Keeps the mode the pane started in, to hand over and restore.
+/// The pane's terminal, in raw mode for as long as the pane runs (Ctrl+Z and Ctrl+C are plain
+/// bytes), with SIGTSTP ignored in case one gets through. Keeps the mode the pane started in, to
+/// restore.
 struct Tty {
     cooked: libc::termios,
 }
@@ -545,24 +439,9 @@ impl Tty {
         Ok(Tty { cooked })
     }
 
-    /// Hands the terminal to a child in the mode the pane started in, minus signal keys.
-    fn release(&self) {
-        let _ = disable_raw_mode();
-        let mut t = self.cooked;
-        t.c_lflag &= !libc::ISIG;
-        // SAFETY: writing a termios read from the same terminal.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) };
-    }
-
-    fn retake(&self) -> Result<()> {
-        enable_raw_mode().context("restoring raw mode")
-    }
-
-    /// After a `claude attach` ended by a signal, which restored nothing: puts back the mode the
-    /// pane started in and undoes the client's screen modes.
+    /// After a `claude attach` chief ended, which restored nothing: undoes the screen modes it
+    /// turned on in this terminal through the relay.
     fn reset(&self) {
-        // SAFETY: as in `release`.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.cooked) };
         let mut out = std::io::stdout();
         let _ = out.write_all(TERMINAL_RESET.as_bytes());
         let _ = out.flush();
@@ -584,7 +463,7 @@ impl Tty {
     }
 
     /// Waits for the user's answer after they left a session: ⏎ or a board selection (a switch
-    /// request) attaches again, `q`, Ctrl+C or a hangup quits. Keys in the first `SETTLE` are
+    /// request) attaches again, `q`, Ctrl+C, Ctrl+Q or a hangup quits. Keys in the first `SETTLE` are
     /// dropped.
     fn pick(&self) -> Pick {
         let settle = Instant::now() + SETTLE;
@@ -603,15 +482,15 @@ impl Tty {
             for key in keys {
                 match key {
                     b'\r' | b'\n' => return Pick::Back,
-                    b'q' | CTRL_C => return Pick::Quit,
+                    b'q' | CTRL_C | CTRL_Q => return Pick::Quit,
                     _ => {}
                 }
             }
         }
     }
 
-    /// Reads keys for `wait`, then whatever is still queued; true when `q` was pressed or the
-    /// terminal hung up. Other keys are dropped. A switch request doesn't end the wait: it stays
+    /// Reads keys for `wait`, then whatever is still queued; true when `q` or Ctrl+Q was pressed or
+    /// the terminal hung up. Other keys are dropped. A switch request doesn't end the wait: it stays
     /// for the next attach, which drops it when it is for the target being attached.
     fn quit_pressed(&self, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
@@ -621,7 +500,7 @@ impl Tty {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             let keys = read_keys(left.min(KEY_SLICE));
-            if keys.contains(&b'q') {
+            if keys.contains(&b'q') || keys.contains(&CTRL_Q) {
                 return true;
             }
             if keys.is_empty() && left.is_zero() {
@@ -682,7 +561,7 @@ fn read_keys(wait: Duration) -> Vec<u8> {
 impl Drop for Tty {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        // SAFETY: as in `release`.
+        // SAFETY: writing a termios read from the same terminal.
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.cooked) };
         // Not `println!`: it panics when the terminal has hung up.
         let _ = writeln!(std::io::stdout());
@@ -736,6 +615,9 @@ pub fn showing(conn: &Connection, project: &str) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, Command};
+
     use super::*;
     use crate::state::Role;
 
@@ -948,92 +830,5 @@ mod tests {
         request_switch(&conn, "demo").unwrap();
         pane.kill().unwrap();
         pane.wait().unwrap();
-    }
-
-    /// A switch that still applies ends attach with SIGTERM and reaps it; one that no longer
-    /// applies leaves it running.
-    #[test]
-    fn a_switch_ends_and_reaps_attach() {
-        let calm = AtomicBool::new(false);
-        let asked = AtomicBool::new(false);
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id() as libc::pid_t;
-        let waited = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(200));
-                asked.store(true, Ordering::SeqCst);
-            });
-            wait_continuing(child, &calm, &|| asked.swap(false, Ordering::SeqCst)).unwrap()
-        });
-        assert!(waited.switched);
-        assert_eq!(waited.status.signal(), Some(libc::SIGTERM));
-        // SAFETY: probing a pid; it is reaped, so nothing has it.
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "reaped");
-
-        let looked = std::sync::atomic::AtomicUsize::new(0);
-        let child = Command::new("sh")
-            .args(["-c", "sleep 0.3; exit 5"])
-            .spawn()
-            .unwrap();
-        let waited = wait_continuing(child, &calm, &|| {
-            looked.fetch_add(1, Ordering::SeqCst);
-            false
-        })
-        .unwrap();
-        assert!(!waited.switched);
-        assert_eq!(waited.status.code(), Some(5));
-        assert!(looked.load(Ordering::SeqCst) > 1, "asked while it waited");
-    }
-
-    /// The child of a pane that ignores SIGTSTP gets the default back (it stops when it sends
-    /// itself SIGTSTP), and the wait continues it instead of hanging.
-    #[test]
-    fn attach_child_can_stop_and_is_continued() {
-        // SAFETY: as in the pane; harmless for the test process.
-        unsafe { libc::signal(libc::SIGTSTP, libc::SIG_IGN) };
-        // Its own process group: stop signals are discarded in an orphaned one, which the test
-        // runner's group may be.
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "kill -TSTP $$; exit 3"]).process_group(0);
-        with_default_tstp(&mut cmd);
-        let child = cmd.spawn().unwrap();
-        let calm = AtomicBool::new(false);
-        let waited = wait_continuing(child, &calm, &|| false).unwrap();
-        assert_eq!((waited.status.code(), waited.stops), (Some(3), 1));
-
-        // Without the reset the child inherits the ignore and never stops.
-        let child = Command::new("sh")
-            .args(["-c", "kill -TSTP $$; exit 4"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let waited = wait_continuing(child, &calm, &|| false).unwrap();
-        assert_eq!((waited.status.code(), waited.stops), (Some(4), 0));
-    }
-
-    /// Rex closing the block hangs up the pty, and only the session leader (chief) gets SIGHUP.
-    /// chief must live on to reap attach (here one that ignores SIGHUP, so it gets SIGKILL after
-    /// the grace period) and then clear `pane_showing`.
-    #[test]
-    fn a_hangup_reaps_the_attach_child() {
-        use std::os::unix::thread::JoinHandleExt;
-        catch_hangup();
-        let child = Command::new("sh")
-            .args(["-c", "trap '' HUP; exec sleep 30"])
-            .spawn()
-            .unwrap();
-        let pid = child.id() as libc::pid_t;
-        let waiter = std::thread::spawn(move || wait_continuing(child, &HUNG_UP, &|| false));
-        // Let it block in waitpid, then hang up on that thread.
-        std::thread::sleep(Duration::from_millis(300));
-        let started = Instant::now();
-        // SAFETY: signalling a live thread of this process; the handler only stores a flag.
-        unsafe { libc::pthread_kill(waiter.as_pthread_t(), libc::SIGHUP) };
-        let waited = waiter.join().unwrap().unwrap();
-        assert_eq!(waited.status.signal(), Some(libc::SIGKILL));
-        assert!(started.elapsed() < HANGUP_GRACE + Duration::from_secs(2));
-        // SAFETY: probing a pid; it is reaped, so nothing has it.
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "reaped");
-        assert!(HUNG_UP.load(Ordering::SeqCst));
     }
 }

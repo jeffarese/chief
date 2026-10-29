@@ -1,5 +1,6 @@
 //! `chief pane` on a real pseudo-terminal with the fake `claude`, whose `attach` sleeps the way
-//! a real attach stays attached. No real Claude session and no multiplexer.
+//! a real attach stays attached, on the pty chief relays (whose echo shows the keys that reached
+//! it). No real Claude session and no multiplexer.
 
 mod common;
 
@@ -276,6 +277,149 @@ fn up_in_a_rex_block_shows_the_conversation_there() {
     assert!(home.rex.calls_of("kill").is_empty());
 }
 
+/// Ctrl+Q while Claude has the keys quits at once, in the user's own Rex block: attach is ended
+/// (its session keeps running), the screen modes it left are undone, and only the board beside
+/// the block closes. Before, the way out was Claude's own: Ctrl+C twice, twice more in its agent
+/// view, then `q`. Other keys reach attach untouched.
+#[test]
+fn ctrl_q_quits_while_claude_has_the_keys() {
+    let home = coordinator_home(&[
+        ("attach.sleep", "30"),
+        ("version.stdout", "2.1.310 (Claude Code)\n"),
+    ]);
+    let conn = home.db();
+    home.rex
+        .set("list.exit", "0")
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:mine", "label": "work"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:shell", "label": "shell"}]}"#,
+        )
+        .set("run.stdout", r#"{"block_ids": ["block:board"]}"#);
+    let mut pane = Pane::spawn(
+        &home,
+        &["up", "demo"],
+        &[
+            ("REX_SESSION", "session:mine"),
+            ("REX_BLOCK", "block:shell"),
+        ],
+    );
+    wait_for("the attach", || {
+        attach_call(&home, "c0").is_some()
+            && db::get_pane_showing(&conn, "demo").unwrap().as_deref() == Some(COORD)
+    });
+    let attach = home.fake.pid(attach_call(&home, "c0").unwrap());
+    // attach's terminal echoes what reaches it.
+    pane.send("hello");
+    wait_for("the echo", || pane.says("hello"));
+    let before = pane.output().len();
+
+    pane.send("\x11");
+    let status = pane.exited().expect("Ctrl+Q quits");
+    assert!(status.success(), "{status:?}");
+    assert!(gone(attach), "its attach was reaped");
+    let after = pane.output()[before..].to_vec();
+    let reset = b"\x1b[?1049l\x1b[?25h";
+    assert!(
+        after.windows(reset.len()).any(|w| w == reset),
+        "terminal reset written: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+    let closes: Vec<_> = home
+        .rex
+        .calls_of("block")
+        .into_iter()
+        .filter(|c| c.get(1).map(String::as_str) == Some("close"))
+        .collect();
+    assert_eq!(
+        closes,
+        [vec!["block", "close", "block:board", "--autostart=false"]],
+        "only the board closed"
+    );
+    assert!(
+        home.fake.calls_of("stop").is_empty(),
+        "sessions keep running"
+    );
+    assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
+    assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+}
+
+/// A Rex session whose blocks are chief's `main` and `board`, stored as the project's layout.
+fn rex_layout(home: &Home) {
+    db::set_rex_session(&home.db(), "demo", Some("session:7")).unwrap();
+    home.rex
+        .set("list.exit", "0")
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:7", "label": "chief-demo"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        );
+}
+
+/// Once Claude turns on the kitty keyboard protocol, the terminal sends Ctrl+Q as `CSI 113;5u`:
+/// that quits too, and closes chief's layout as `q` does, while other keys in the same encoding
+/// (Ctrl+C here) pass to attach.
+#[test]
+fn ctrl_q_in_the_kitty_protocol_closes_the_layout() {
+    let home = coordinator_home(&[("attach.sleep", "30")]);
+    rex_layout(&home);
+    let mut pane = Pane::start_with(&home, &["--layout"]);
+    wait_for("the attach", || attach_call(&home, "c0").is_some());
+    pane.send("\x1b[99;5u");
+    wait_for("Ctrl+C passed on", || pane.says("[99;5u"));
+    assert!(home.rex.calls().is_empty(), "nothing closed yet");
+
+    pane.send("\x1b[113;5u");
+    let status = pane.exited().expect("Ctrl+Q quits");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        home.rex.calls_of("kill"),
+        [vec!["kill", "session:7", "--autostart=false"]],
+        "the layout closed"
+    );
+    assert!(
+        home.fake.calls_of("stop").is_empty(),
+        "sessions keep running"
+    );
+}
+
+/// Ctrl+Q also quits from chief's own screens: here the wait after the user left Claude.
+#[test]
+fn ctrl_q_quits_after_leaving_claude() {
+    let home = coordinator_home(&[("attach.sleep", "1.2")]);
+    rex_layout(&home);
+    let mut pane = Pane::start_with(&home, &["--layout"]);
+    wait_for("left", || pane.says("you left the coordinator"));
+    std::thread::sleep(Duration::from_millis(400));
+    pane.send("\x11");
+    let status = pane.exited().expect("Ctrl+Q quits");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(home.rex.calls_of("kill").len(), 1, "the layout closed");
+}
+
+/// attach's terminal starts at the pane's size and follows it when the window is resized.
+#[test]
+fn attachs_terminal_follows_the_panes_size() {
+    let home = coordinator_home(&[(
+        "attach.sh",
+        "stty size; trap 'stty size' WINCH; while :; do sleep 0.05; done\n",
+    )]);
+    let mut pane = Pane::spawn_sized(&home, &["pane", "--project", "demo"], &[], (100, 30));
+    wait_for("the starting size", || pane.says("30 100"));
+    pane.resize(120, 40);
+    wait_for("the new size", || pane.says("40 120"));
+    // SAFETY: our own child.
+    unsafe { libc::kill(pane.pid(), libc::SIGTERM) };
+    assert!(pane.exited().expect("ended").success());
+}
+
 /// A home whose coordinator runs (a pid in `claude agents`), with the fake's files `fake` set.
 fn coordinator_home(fake: &[(&str, &str)]) -> Home {
     let home = Home::new();
@@ -320,6 +464,26 @@ fn a_hangup_ends_a_waiting_pane() {
         assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
         assert!(home.rex.calls().is_empty(), "{waiting}: the layout stays");
     }
+}
+
+/// A hangup while attached (Rex closing the block) ends attach and the pane, but no layout.
+#[test]
+fn a_hangup_while_attached_reaps_attach() {
+    let home = coordinator_home(&[("attach.sleep", "30")]);
+    let conn = home.db();
+    db::set_rex_session(&conn, "demo", Some("session:7")).unwrap();
+    let mut pane = Pane::start_with(&home, &["--layout"]);
+    wait_for("the attach", || {
+        attach_call(&home, "c0").is_some()
+            && db::get_pane_showing(&conn, "demo").unwrap().as_deref() == Some(COORD)
+    });
+    let attach = home.fake.pid(attach_call(&home, "c0").unwrap());
+    pane.hang_up();
+    assert!(pane.exited().is_some(), "the pane ends");
+    wait_for("its attach reaped", || gone(attach));
+    assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
+    assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+    assert!(home.rex.calls().is_empty(), "the layout stays");
 }
 
 /// SIGTERM (`kill <pid>`, `chief down`) ends a pane waiting for a key, as it ends one attached.

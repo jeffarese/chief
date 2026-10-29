@@ -1,9 +1,10 @@
-//! A child program on its own pseudo-terminal. The reader thread only moves bytes: the emulator
-//! lives on the UI thread, since libghostty's types never cross threads.
+//! A child program on its own pseudo-terminal: emulated (`spawn`, the built-in layout, whose
+//! reader thread only moves bytes to the UI thread's emulator), or relayed to the user's terminal
+//! (`open`, the pane: the caller polls and reads it).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -34,9 +35,9 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
 }
 
 impl Pty {
-    /// Starts `cmd` with the pty as its controlling terminal. `wrap` turns each read into the
-    /// caller's event type, so one channel carries the pty, the outer terminal's input and the
-    /// workers, and output from an earlier child can be told apart.
+    /// Starts `cmd` for an emulator, with the pty as its controlling terminal. `wrap` turns each
+    /// read into the caller's event type, so one channel carries the pty, the outer terminal's
+    /// input and the workers, and output from an earlier child can be told apart.
     pub fn spawn<E: Send + 'static>(
         mut cmd: Command,
         cols: u16,
@@ -44,6 +45,48 @@ impl Pty {
         tx: Sender<E>,
         wrap: impl Fn(Output) -> E + Send + 'static,
     ) -> io::Result<Pty> {
+        // The child talks to this emulator, not to the outer terminal.
+        cmd.env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("TERM_PROGRAM_VERSION");
+        let pty = Pty::start(cmd, cols, rows)?;
+        let mut reader = File::from(pty.master.try_clone()?);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(wrap(Output::Bytes(buf[..n].to_vec()))).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    // EIO once the child side is closed.
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(wrap(Output::Exited));
+        });
+        Ok(pty)
+    }
+
+    /// Starts `cmd` for a relay: it keeps this process's `TERM`, since its bytes go to the
+    /// user's terminal as they are, and the master is non-blocking for the caller's `poll`,
+    /// `read` and `write_some`.
+    pub fn open(cmd: Command, cols: u16, rows: u16) -> io::Result<Pty> {
+        let pty = Pty::start(cmd, cols, rows)?;
+        let fd = pty.master.as_raw_fd();
+        // SAFETY: plain fcntl on our own fd; the flag is shared by its duplicate, the writer.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        Ok(pty)
+    }
+
+    fn start(mut cmd: Command, cols: u16, rows: u16) -> io::Result<Pty> {
         let (mut m, mut s) = (0, 0);
         let mut ws = winsize(cols, rows);
         // SAFETY: out-pointers to locals; a null name and termios are allowed.
@@ -66,12 +109,7 @@ impl Pty {
 
         cmd.stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave))
-            // The child talks to this emulator, not to the outer terminal.
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor")
-            .env_remove("TERM_PROGRAM")
-            .env_remove("TERM_PROGRAM_VERSION");
+            .stderr(Stdio::from(slave));
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
@@ -85,25 +123,6 @@ impl Pty {
             });
         }
         let child = cmd.spawn()?;
-
-        let mut reader = File::from(master.try_clone()?);
-        std::thread::spawn(move || {
-            let mut buf = vec![0u8; 1 << 16];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(wrap(Output::Bytes(buf[..n].to_vec()))).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    // EIO once the child side is closed.
-                    Err(_) => break,
-                }
-            }
-            let _ = tx.send(wrap(Output::Exited));
-        });
         Ok(Pty {
             writer: File::from(master.try_clone()?),
             master,
@@ -118,6 +137,21 @@ impl Pty {
 
     pub fn write(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
+    }
+
+    /// The master, for `poll`.
+    pub fn fd(&self) -> RawFd {
+        self.master.as_raw_fd()
+    }
+
+    /// The child's output; on an `open` pty, WouldBlock when there is none yet.
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        (&self.writer).read(buf)
+    }
+
+    /// As much of `bytes` as the pty takes now (an `open` pty never blocks).
+    pub fn write_some(&self, bytes: &[u8]) -> io::Result<usize> {
+        (&self.writer).write(bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -177,6 +211,30 @@ mod tests {
         let out = output(&rx);
         assert!(out.contains("7 33"), "{out:?}");
         assert!(out.contains("xterm-256color none"), "{out:?}");
+        pty.end();
+    }
+
+    /// A relayed child keeps the user's terminal type: its bytes go to that terminal.
+    #[test]
+    fn an_open_pty_keeps_term_and_is_read_by_the_caller() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "stty size; echo \"$TERM $TERM_PROGRAM\""])
+            .env("TERM", "xterm-ghostty")
+            .env("TERM_PROGRAM", "rex");
+        let pty = Pty::open(cmd, 41, 9).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match pty.read(&mut buf) {
+                Ok(0) | Err(_) if out.ends_with(b"rex\r\n") => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.contains("9 41"), "{out:?}");
+        assert!(out.contains("xterm-ghostty rex"), "{out:?}");
         pty.end();
     }
 

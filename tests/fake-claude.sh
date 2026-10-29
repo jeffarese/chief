@@ -13,6 +13,7 @@
 #   <key>.exit.<k>     exit code for the k-th call of that subcommand, if present
 #   <key>.<arg>.stdout canned stdout when the second argument is <arg>, and <key>.<arg>.exit its
 #                      exit code: `agp exec <id> …` per account (`exec.cpb.stdout`)
+#   <key>.sh           sourced before the output: a test's own behaviour (`stty size` on SIGWINCH)
 #   <key>.sleep        after the output, sleep this many seconds in place (exec, same pid) instead
 #                      of exiting: a `claude attach` that stays attached
 # With CLAUDE_CONFIG_DIR set, `$CLAUDE_CONFIG_DIR/fake-<key>.stdout.<k>`, else
@@ -42,6 +43,7 @@ k=$(( $(ls "$dir/$key.seq" | wc -l) + 1 ))
 while ! (set -C; : > "$dir/$key.seq/$k") 2>/dev/null; do k=$((k + 1)); done
 echo "$k" > "$count_file"
 
+[ -f "$dir/$key.sh" ] && . "$dir/$key.sh"
 account_stdout="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/fake-$key.stdout}"
 second=$(printf '%s' "${2-}" | tr -c 'A-Za-z0-9_-' '_')
 if [ -n "$account_stdout" ] && [ -f "$account_stdout.$k" ]; then

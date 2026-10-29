@@ -224,7 +224,7 @@ archived project is wanting it back), runs the coordinator step (§7), then open
 installed and its server runs (`rex list` succeeds), storing the session id in
 `ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux window, storing it
 in `ui_state.tmux_window`; else, on a terminal, it draws both sides itself, the built-in layout
-(§9); else (no terminal, or a chief built without the `builtin-layout` feature) it prints why and
+(§9); else (no terminal) it prints why and
 the two commands to run side by side in terminals or splits of the user's own, `chief pane
 --project <slug>` and `chief board --project <slug>`. When opening the chosen layout fails it
 falls back the same way. `--layout builtin` skips Rex and tmux and opens the built-in layout; it
@@ -1181,8 +1181,7 @@ any two terminals or splits work. `chief up` opens it for the user with the firs
 3. Neither, on a terminal: the built-in layout (below), in this terminal: `up_with` returns
    `Where::Builtin` and `chief up` (or the launcher, §10a) runs it. `chief down` has nothing to
    close then, but ends it as it ends any pane.
-4. Without a terminal, or in a chief built without the `builtin-layout` cargo feature (it needs
-   Zig to build libghostty): it prints why and the two commands, `chief pane --project <slug>` and
+4. Without a terminal: it prints why and the two commands, `chief pane --project <slug>` and
    `chief board --project <slug>`, to run side by side (two windows, iTerm or Ghostty splits,
    anything). `chief down` has nothing to close then. From the launcher (§10a), Enter runs the
    pane in the launcher's own terminal instead, after printing the board's command.
@@ -1289,11 +1288,9 @@ thread for one nobody shows.
    `claude agents` skips this step; a failing respawn is shown and retried after 500 ms.
 3. Write `pane_showing = <name>`, then read the target again; if it changed, clear
    `pane_showing` and start over (see board switching below).
-4. Drain queued keys (`q` quits), restore the terminal mode the pane started in but with ISIG off,
-   run `claude attach <short_id>` as a child on the same TTY, in the target's own account (§3:
-   a thread in another account is attached, polled and respawned there), wait (polling `waitpid(WNOHANG)`
-   every 50 ms, so a signal flag set at any moment is seen), take raw mode back, clear
-   `pane_showing`.
+4. Drain queued keys (`q` or Ctrl+Q quits), then relay `claude attach <short_id>` (below) in the
+   target's own account (§3: a thread in another account is attached, polled and respawned
+   there) until it ends, then clear `pane_showing`.
 5. An attach that failed, exited non-zero, or ended within 1 s prints why below its own output
    (`… · retrying · q quits`) and waits 500 ms, reading keys. Then back to 0. An attach ended for a
    switch goes straight back to 0.
@@ -1305,21 +1302,44 @@ thread for one nobody shows.
    waits: ⏎ or a switch request (SIGUSR1, below) goes back to 0; `q`, Ctrl+C or a hangup ends the
    loop. Keys in the first 300 ms are dropped: a third Ctrl+C meant for Claude isn't an answer.
 
-`q` while chief has the terminal ends the loop; so does the block being closed or the session
-killed. With `--layout` a `q` (not a hangup) then closes the layout as `chief down` does
+Relay (`src/relay.rs`). attach runs on a pseudo-terminal of its own (`embed::Pty::open`: the
+child leads its own session with the slave as its controlling terminal, keeps the pane's `TERM`
+and `TERM_PROGRAM`, and has SIGTSTP/SIGHUP/SIGINT/SIGTERM at their defaults), of the pane
+terminal's size, resized on SIGWINCH. One thread `poll`s stdin and the pty's master
+(non-blocking) in slices of at most 50 ms, looking at the signal flags between them, and copies
+bytes both ways untouched: Claude draws on the user's terminal as if it had it (its scrollback,
+selection and rendering are the terminal's), its queries reach that terminal and the answers come
+back as input. Keys attach hasn't taken yet are queued and written as the pty takes them, so a
+long paste into a busy Claude never deadlocks the relay. There is no emulator: chief reads the keys
+only as far as Ctrl+Q, in each encoding a terminal sends it in: 0x11; the kitty keyboard
+protocol's `CSI 113;<mods>[:<event>]…u` with Ctrl and no other modifier but Caps Lock or Num
+Lock (a press quits, a repeat or release is dropped), once Claude turns the protocol on; and
+modifyOtherKeys' `CSI 27;5;113~`. Inside a bracketed paste (`CSI 200~` … `CSI 201~`) nothing is
+a key. The start of an escape sequence cut off at the end of a read waits up to 10 ms for its
+rest, then goes on as it is (a lone Esc is a key). Claude Code doesn't bind Ctrl+Q; its own way
+out of an attach is Ctrl+C twice, then twice more in its agent view, and lands in step 6.
+The relay ends when attach closes its terminal (then it gets 500 ms to be reaped, or is ended and
+counts as failed), when attach exits with its terminal still held open, or when chief ends it:
+for a switch, for Ctrl+Q (the loop then stops as for `q`) or for a hangup (SIGHUP or SIGTERM,
+POLLHUP on stdin, a read of 0 or a failed write). chief ends it with SIGTERM to its process
+group, 2 s, then SIGKILL, and reaps it (`Pty::end`); SIGTERM leaves its session running. chief
+keeps the pane's terminal in raw mode the whole time.
+
+`q` or Ctrl+Q while chief has the terminal ends the loop, as Ctrl+Q does during a relay; so does
+the block being closed or the session killed. With `--layout` a `q` or Ctrl+Q (not a hangup) then closes the layout as `chief down` does
 (`project::close_layout`: the Rex session, or the tmux window, or just chief's two blocks when
 the user added others), after the pane cleared its rows and restored the terminal, since closing
 hangs up the pane's own terminal; no session stops. It writes the lines `close_layout` reports
 ignoring errors: that terminal may have hung up already. Then the pty hangs up and the kernel
-sends SIGHUP to the session leader, chief, not to `claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
-`SA_RESTART`, so the default action can't end it before cleanup: the wait sees the flag, passes
-SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either way; the loop
-then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
+sends SIGHUP to the session leader, chief; `claude attach` leads a session of its own. chief
+catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without `SA_RESTART`, so the
+default action can't end it before cleanup: the relay sees the flag and ends attach as above; the
+loop then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
 thread).
 
 Keys: while chief has the terminal it reads them itself, with `poll` on stdin in slices of at most
 200 ms and `read`, looking at the signal flags between slices (a signal also interrupts a
-slice). Only `q`, Enter (CR or LF) and Ctrl+C (0x03) count; the bytes of a read from an ESC on
+slice). Only `q`, Enter (CR or LF), Ctrl+C (0x03) and Ctrl+Q (0x11) count; the bytes of a read from an ESC on
 are an escape sequence (an arrow key, a mouse report, a paste), never a key. POLLHUP, POLLERR or
 POLLNVAL, a read of 0 bytes, or a read error other than EINTR or EAGAIN is a hangup, as SIGHUP
 is. Not crossterm's event reader: on a hung-up terminal it retries a read that returns 0 or EIO
@@ -1327,15 +1347,12 @@ forever, so its poll never returns, the flags go unread, and a pane waiting for 
 CPU until SIGKILL (seen live after its tmux server was killed; SIGTERM didn't end it).
 
 Ctrl+Z: the user can detach by hand with Claude's own Ctrl+Z inside `claude attach`; the loop then
-waits as in step 6. While chief itself has the terminal, the terminal is in raw mode
-(ISIG off), so Ctrl+Z, Ctrl+C and other keys are plain bytes chief reads and drops (only `q`
-counts). Attach starts with ISIG still off, so a Ctrl+Z that arrives before Claude's UI is up
-stays queued as input; Claude reads it once it takes the terminal and detaches. In case a SIGTSTP
-gets through anyway, chief ignores it and spawns attach with SIGTSTP reset to default (an ignored
-signal would survive exec); it waits with `WUNTRACED` and sends SIGCONT to a stopped attach, so the
-loop can't hang. On exit chief restores the terminal mode it started with. Also, Rex runs the
-command as the leader of its own session, an orphaned process group, so the kernel discards
-terminal stop signals there anyway (verified in M4: with ISIG on, `^Z` echoes and nothing stops).
+waits as in step 6. The pane's terminal is in raw mode (ISIG off) for as long as the pane runs,
+so Ctrl+Z, Ctrl+C and other keys are plain bytes: relayed to attach, whose own terminal decides
+what they do, or read and dropped by chief between attaches (only `q`, Ctrl+Q and the step 6
+answers count). In case a SIGTSTP gets through anyway, chief ignores it; attach starts with it at
+its default (an ignored signal would survive exec). On exit chief restores the terminal mode it
+started with.
 
 Board switching works in any terminal, with or without a multiplexer: write `pane_target`, then
 `pane::request_switch(conn, slug)`. When `pane_showing` equals the target (NULL target = the
@@ -1347,20 +1364,20 @@ Otherwise check that the recorded pid's start time still matches `pane_started`
 (`pane::live_pane`); if not, the pane is gone and the pid may be another process's by now, so
 clear the record and its `pane_showing` (only while it holds that pid) and send nothing. Else
 send it SIGUSR1. The pane catches SIGUSR1 like SIGHUP (a handler that only sets a flag, no
-`SA_RESTART`), before it records its pid, since the default action would end it. When the wait sees the flag it clears it and reads the target again: a target it already shows
-(the board saw the pane just before it moved on) is ignored. Otherwise it sends SIGTERM to `claude
-attach`, gives it 2 s to exit, then SIGKILLs it, and reaps it. SIGTERM ends the attach client and
-leaves the background session running (verified on Claude Code 2.1.310: still listed, idle, with
-its pid). A killed attach leaves its screen behind, so the pane then restores the terminal mode it
-started with and writes a reset: end synchronized output first (`ESC[?2026l`: until then the
+`SA_RESTART`), before it records its pid, since the default action would end it. When the relay
+sees the flag it clears it and reads the target again: a target it already shows (the board saw
+the pane just before it moved on) is ignored. Otherwise it ends `claude attach` as above. SIGTERM
+ends the attach client and leaves the background session running (verified on Claude Code
+2.1.310: still listed, idle, with its pid). A killed attach leaves the screen modes it turned on
+in the pane's terminal behind (and so does one ended for Ctrl+Q), so the pane then writes a reset: end synchronized output first (`ESC[?2026l`: until then the
 terminal holds back the rest), leave the alternate screen (`ESC[?1049l`), show the cursor
 (`ESC[?25h`), turn off mouse reporting (`ESC[?1000l ESC[?1002l ESC[?1003l ESC[?1006l`), bracketed
 paste (`ESC[?2004l`) and focus events (`ESC[?1004l`), pop the kitty keyboard flags (`ESC[<u`),
 reset modifyOtherKeys (`ESC[>4m`), reset attributes (`ESC[0m`), clear (`ESC[2J ESC[H`); then it
-takes raw mode back, clears `pane_showing` and attaches to the new target. The pane writes `pane_showing` before its last read of the target and the board writes the
+clears `pane_showing` and attaches to the new target. The pane writes `pane_showing` before its last read of the target and the board writes the
 target before reading `pane_showing`, so a switch that sends nothing is always seen by the pane's
-next read; a SIGUSR1 that lands before attach starts leaves the flag set, and the first look of the
-wait ends that attach at once. One pane per project receives switches and owns `pane_showing`: the
+next read; a SIGUSR1 that lands before attach starts leaves the flag set, and the relay's first
+look ends that attach at once. One pane per project receives switches and owns `pane_showing`: the
 latest one started.
 
 ### Built-in layout (`src/builtin.rs`, `src/embed/`)
@@ -1371,18 +1388,22 @@ board, sharing a screen instead of a multiplexer.
 
 - Conversation. The pane loop's steps 0 to 6, with the same constants, messages and
   `left_lines` (as for `OnQuit::Layout`), but `claude attach <short_id>` runs on a pseudo-terminal
-  of its own (`embed::Pty`: `openpty`, the child leads its own session with the slave as its
-  controlling terminal, `TERM=xterm-256color`, `COLORTERM=truecolor`, no `TERM_PROGRAM`,
-  SIGTSTP/SIGHUP/SIGINT/SIGTERM at their defaults) instead of on this terminal. libghostty
-  (`libghostty-vt`, Ghostty's terminal emulator, a git dependency at a pinned commit) emulates it
-  (`embed::Screen`): it parses attach's output, answers its queries (DA1/DA2/DA3, DSR, OSC 10/11
-  from a dark default, XTVERSION `chief`, the size report, DECRQM), and encodes the keys, mouse,
-  paste and focus reports chief sends it in whatever modes attach asked for (application cursor
-  keys, the kitty keyboard protocol, SGR mouse, bracketed paste with control bytes neutralised).
-  libghostty's types are single-threaded, so the UI thread owns the emulator and a reader thread
-  only moves the pty's bytes. The screen is copied into ratatui's buffer each frame, palette
-  colours as indices so the outer terminal's theme applies; during a synchronized update (mode
-  2026) the last complete frame stays, for at most 500 ms. chief's own lines (`chief · <name> …`,
+  of its own (`embed::Pty::spawn`: as for the relay above, but with `TERM=xterm-256color`,
+  `COLORTERM=truecolor` and no `TERM_PROGRAM`, since chief's emulator reads its output, and a
+  reader thread) instead of being relayed. `alacritty_terminal` (Alacritty's terminal emulator,
+  pure Rust, from crates.io) emulates it (`embed::Screen`): it parses attach's output and answers
+  most of its queries (DA1 as a VT102, DA2, DSR, the size reports, DECRQM, the kitty keyboard
+  query; OSC 10/11 and the palette chief answers from a dark default and xterm's colours). A
+  second parser over the same bytes answers what alacritty_terminal never sees (XTVERSION
+  `chief`, DA3) in order with the rest, follows X10 mouse mode (9), and drops a kitty keyboard
+  push past 1024 deep (alacritty_terminal panics at 4096). Alacritty keeps its input encoders in
+  the app, so chief encodes the keys, mouse, paste and focus reports itself, in whatever modes
+  attach asked for: xterm's keys (application cursor keys, Shift+Enter as modifyOtherKeys'
+  `CSI 27;2;13~`), the kitty keyboard protocol's flags, SGR, legacy and UTF-8 mouse, bracketed
+  paste with ESC neutralised. The UI thread owns the emulator, and a reader thread only moves the
+  pty's bytes. The screen is copied into ratatui's buffer each frame, palette colours as indices
+  so the outer terminal's theme applies; during a synchronized update (mode 2026) vte's processor
+  holds the update's bytes, so the last complete frame stays, for at most 500 ms. chief's own lines (`chief · <name> …`,
   the retry and "you left" lines) are written on a fresh emulated screen, or below attach's own
   output when it failed. Each pass of the loop has a generation number, so output of an attach
   that was ended, or the result of a wake for an earlier target, is dropped. The wake step
@@ -1403,7 +1424,13 @@ board, sharing a screen instead of a multiplexer.
   size while the board is over it, so switching sides doesn't make Claude redraw. The side without
   the keyboard is drawn dim, and the cursor shows only while the conversation has the keys and
   attach runs.
-- Keys. Ctrl+\ (which Claude Code doesn't bind; legacy terminals report it as Ctrl+4) switches
+- Bar. The conversation's last row (when it has two or more) is chief's, and Claude gets the rows
+  above: dim `chief · coordinator` or `chief · thread <name>` on the left while that target is
+  being woken or attached (else `chief`), and on the right, in the key bar's style, `^Q quit`
+  and `^\ board`, as many as fit, quit first. A click on a hint does what its key
+  does; other clicks on the bar go nowhere.
+- Keys. Ctrl+Q (which Claude Code doesn't bind) quits from either side, attached or not. Ctrl+\
+  (which Claude Code doesn't bind either; legacy terminals report it as Ctrl+4) switches
   sides, and a click focuses the side clicked. On the conversation side every other key goes to
   attach while it runs; otherwise `q` quits (also Ctrl+C in the "you left" wait, whose ⏎ goes
   back and whose first 300 ms of keys are dropped, as in step 6). On the board side keys are the
@@ -1666,9 +1693,10 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
   files first); the test home's link is missing until a test installs it, so agp counts as not
   installed and no test reaches the real one. Layout logic is also tested against an in-memory `Mux`, and the tmux backend
   against a real tmux server on a private socket (`-L chief-test-…`, no config) that the test kills.
-  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps,
-  and so is the built-in layout (`tests/builtin_cli.rs`: both sides drawn, a switch, the board's
-  `q`, a hangup); its emulator and pty are unit-tested (`embed::`) with no Claude at all;
+  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps on
+  the pty chief relays (`tests/pane_cli.rs`: its echo shows which keys reached it; Ctrl+Q in each
+  encoding, a resize through the fake's `attach.sh`, hangups), and so is the built-in layout
+  (`tests/builtin_cli.rs`: both sides drawn, a switch, the board's `q`, Ctrl+Q, a hangup); its emulator and pty are unit-tested (`embed::`) with no Claude at all;
   a hangup by closing the pty's master side, which the test opens close-on-exec so neither the
   pane nor its attach holds it. `claude rm` outputs from the live M2b probe are in
   `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{SetTitle, supports_keyboard_enhancement};
@@ -233,28 +233,45 @@ impl Gate {
 }
 
 /// Where each side goes. Narrow terminals show only the focused side, over the whole screen; the
-/// conversation keeps its size, so switching sides doesn't make Claude redraw.
+/// conversation keeps its size, so switching sides doesn't make Claude redraw. Its last row is
+/// chief's bar.
 struct Areas {
     conv: Rect,
+    bar: Option<Rect>,
     divider: Option<Rect>,
     board: Option<Rect>,
 }
 
 impl Areas {
     fn of(area: Rect, focus: Side) -> Areas {
-        if area.width < SPLIT_MIN_WIDTH {
-            return Areas {
-                conv: area,
-                divider: None,
-                board: (focus == Side::Board).then_some(area),
-            };
-        }
-        let board_w = (area.width * BOARD_PERCENT / 100).max(BOARD_MIN_WIDTH);
-        let conv_w = area.width - board_w - 1;
+        let (column, divider, board) = if area.width < SPLIT_MIN_WIDTH {
+            (area, None, (focus == Side::Board).then_some(area))
+        } else {
+            let board_w = (area.width * BOARD_PERCENT / 100).max(BOARD_MIN_WIDTH);
+            let conv_w = area.width - board_w - 1;
+            (
+                Rect::new(area.x, area.y, conv_w, area.height),
+                Some(Rect::new(area.x + conv_w, area.y, 1, area.height)),
+                Some(Rect::new(area.x + conv_w + 1, area.y, board_w, area.height)),
+            )
+        };
+        // A terminal too short to spare a row keeps it for Claude; Ctrl+Q works all the same.
+        let (conv, bar) = if column.height < 2 {
+            (column, None)
+        } else {
+            (
+                Rect {
+                    height: column.height - 1,
+                    ..column
+                },
+                Some(Rect::new(column.x, column.bottom() - 1, column.width, 1)),
+            )
+        };
         Areas {
-            conv: Rect::new(area.x, area.y, conv_w, area.height),
-            divider: Some(Rect::new(area.x + conv_w, area.y, 1, area.height)),
-            board: Some(Rect::new(area.x + conv_w + 1, area.y, board_w, area.height)),
+            conv,
+            bar,
+            divider,
+            board,
         }
     }
 
@@ -360,6 +377,9 @@ impl Split<'_> {
             {
                 f.set_cursor_position(at);
             }
+            if let Some(bar) = areas.bar {
+                draw_bar(f, bar, &self.conv.label());
+            }
         }
         if let Some(div) = areas.divider {
             for y in div.top()..div.bottom() {
@@ -394,6 +414,7 @@ impl Split<'_> {
     ) -> Result<bool> {
         match ev {
             Event::Key(key) if key.kind == KeyEventKind::Release => {}
+            Event::Key(key) if quits(&key) => return Ok(true),
             Event::Key(key) if switches_side(&key) => self.set_focus(match self.focus {
                 Side::Conversation => Side::Board,
                 Side::Board => Side::Conversation,
@@ -415,7 +436,7 @@ impl Split<'_> {
                     }
                 }
             },
-            Event::Mouse(m) => self.on_mouse(m, areas, board),
+            Event::Mouse(m) => return Ok(self.on_mouse(m, areas, board)),
             Event::Paste(text) if self.focus == Side::Conversation => self.conv.paste(&text),
             Event::FocusGained | Event::FocusLost if self.focus == Side::Conversation => {
                 self.conv.focus(ev == Event::FocusGained);
@@ -426,10 +447,25 @@ impl Split<'_> {
         Ok(false)
     }
 
-    fn on_mouse(&mut self, m: MouseEvent, areas: &Areas, board: &mut Board) {
+    /// Whether the layout should close: a click on the bar's `^Q quit`.
+    fn on_mouse(&mut self, m: MouseEvent, areas: &Areas, board: &mut Board) -> bool {
         let at = Position::new(m.column, m.row);
         let on_board = areas.board.is_some_and(|b| b.contains(at));
-        let on_conv = areas.conv_shown() && !on_board && areas.conv.contains(at);
+        let shown = areas.conv_shown() && !on_board;
+        let on_conv = shown && areas.conv.contains(at);
+        if let Some(bar) = areas.bar.filter(|b| shown && b.contains(at)) {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                match placed(&BAR_KEYS, bar)
+                    .into_iter()
+                    .find(|(_, r)| r.contains(at))
+                {
+                    Some((BarKey::Quit, _)) => return true,
+                    Some((BarKey::Board, _)) => self.set_focus(Side::Board),
+                    None => {}
+                }
+            }
+            return false;
+        }
         if matches!(m.kind, MouseEventKind::Down(_)) {
             if on_board {
                 self.set_focus(Side::Board);
@@ -447,6 +483,7 @@ impl Split<'_> {
                 }
             }
         }
+        false
     }
 
     fn set_focus(&mut self, side: Side) {
@@ -695,6 +732,80 @@ fn switches_side(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
+/// Ctrl+Q quits chief from either side, attached or not: Claude Code doesn't bind it, and its
+/// own ways out (Ctrl+C twice, then twice more in its agent view) take four keys and a `q`.
+fn quits(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+}
+
+/// chief's keys on the bar below the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarKey {
+    Quit,
+    Board,
+}
+
+impl BarKey {
+    fn hint(self) -> (&'static str, &'static str) {
+        match self {
+            BarKey::Quit => ("^Q", "quit"),
+            BarKey::Board => ("^\\", "board"),
+        }
+    }
+}
+
+/// Columns between the bar's hints, and between the label and the first.
+const BAR_GAP: u16 = 2;
+
+/// The bar's keys, most important first.
+const BAR_KEYS: [BarKey; 2] = [BarKey::Quit, BarKey::Board];
+
+/// Where each of `keys` that fits goes on `bar`: right-aligned, in order, whole hints only (the
+/// first ones win), each a column inside the bar so a click can find it.
+fn placed(keys: &[BarKey], bar: Rect) -> Vec<(BarKey, Rect)> {
+    let width = |k: BarKey| {
+        let (key, what) = k.hint();
+        (tui::cols(key) + 1 + tui::cols(what)) as u16
+    };
+    let mut fit = Vec::new();
+    let mut used = 0;
+    for &k in keys {
+        let need = width(k) + if fit.is_empty() { 0 } else { BAR_GAP };
+        if used + need > bar.width {
+            break;
+        }
+        fit.push(k);
+        used += need;
+    }
+    let mut x = bar.right() - used;
+    fit.into_iter()
+        .map(|k| {
+            let at = Rect::new(x, bar.y, width(k), 1);
+            x += width(k) + BAR_GAP;
+            (k, at)
+        })
+        .collect()
+}
+
+/// The bar: what the conversation shows on the left, chief's keys on the right, which work
+/// whatever Claude is doing.
+fn draw_bar(f: &mut Frame, bar: Rect, label: &str) {
+    let keys = placed(&BAR_KEYS, bar);
+    let room = keys
+        .first()
+        .map_or(bar.width, |(_, at)| (at.x - bar.x).saturating_sub(BAR_GAP));
+    let label = tui::truncate(label, usize::from(room));
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(label).style(tui::dim()),
+        Rect { width: room, ..bar },
+    );
+    for (k, at) in keys {
+        let (key, what) = k.hint();
+        f.render_widget(tui::key_bar(&[(key, what)], usize::from(at.width)), at);
+    }
+}
+
 /// The board's editor, with the input thread and this layout's terminal modes paused: they
 /// would take the editor's keys or confuse it.
 fn edit(terminal: &mut DefaultTerminal, path: &Path, input: &Gate, enhanced: bool) -> String {
@@ -761,6 +872,20 @@ impl Conversation {
 
     fn attached(&self) -> bool {
         matches!(self.state, State::Attached(_))
+    }
+
+    /// The bar's label: whom the conversation is about to show or shows.
+    fn label(&self) -> String {
+        let row = match &self.state {
+            State::Waking { row, .. } => row,
+            State::Attached(a) => &a.row,
+            State::Waiting { .. } | State::Left { .. } => return "chief".into(),
+        };
+        if row.role == Role::Coordinator.as_str() {
+            "chief · coordinator".into()
+        } else {
+            format!("chief · thread {}", row.name)
+        }
     }
 
     fn resize(&mut self, size: (u16, u16)) {
@@ -862,7 +987,7 @@ impl Conversation {
 
 /// An empty screen for chief's own lines, without a cursor.
 fn blank(cols: u16, rows: u16) -> Screen {
-    let mut screen = Screen::new(cols, rows, |_| {}).expect("libghostty terminal");
+    let mut screen = Screen::new(cols, rows, |_| {}).expect("a terminal emulator");
     screen.feed(b"\x1b[?25l");
     screen
 }
@@ -874,7 +999,9 @@ mod tests {
     #[test]
     fn wide_terminals_split_and_narrow_ones_show_the_focused_side() {
         let a = Areas::of(Rect::new(0, 0, 140, 40), Side::Conversation);
-        assert_eq!(a.conv, Rect::new(0, 0, 95, 40));
+        // The conversation's last row is chief's bar.
+        assert_eq!(a.conv, Rect::new(0, 0, 95, 39));
+        assert_eq!(a.bar, Some(Rect::new(0, 39, 95, 1)));
         assert_eq!(a.divider, Some(Rect::new(95, 0, 1, 40)));
         assert_eq!(a.board, Some(Rect::new(96, 0, 44, 40)));
         assert!(a.conv_shown());
@@ -885,12 +1012,64 @@ mod tests {
 
         let full = Rect::new(0, 0, 80, 24);
         let a = Areas::of(full, Side::Conversation);
-        assert_eq!((a.conv, a.divider, a.board), (full, None, None));
+        assert_eq!(a.conv, Rect::new(0, 0, 80, 23));
+        assert_eq!((a.divider, a.board), (None, None));
         let a = Areas::of(full, Side::Board);
         assert_eq!(a.board, Some(full));
         assert!(!a.conv_shown());
         // Claude keeps its size while the board is over it.
-        assert_eq!(a.conv_size(), (80, 24));
+        assert_eq!(a.conv_size(), (80, 23));
+    }
+
+    #[test]
+    fn a_terminal_one_row_high_keeps_it_for_claude() {
+        let a = Areas::of(Rect::new(0, 0, 80, 1), Side::Conversation);
+        assert_eq!((a.conv, a.bar), (Rect::new(0, 0, 80, 1), None));
+    }
+
+    #[test]
+    fn the_bar_puts_its_keys_on_the_right_and_drops_what_does_not_fit() {
+        let bar = Rect::new(0, 23, 80, 1);
+        let keys = placed(&BAR_KEYS, bar);
+        // `^Q quit` (7) and `^\ board` (8), two apart, flush right.
+        assert_eq!(
+            keys,
+            [
+                (BarKey::Quit, Rect::new(63, 23, 7, 1)),
+                (BarKey::Board, Rect::new(72, 23, 8, 1)),
+            ]
+        );
+        // Short of room, the board's hint goes first.
+        let narrow = Rect::new(0, 0, 10, 1);
+        assert_eq!(
+            placed(&BAR_KEYS, narrow),
+            [(BarKey::Quit, Rect::new(3, 0, 7, 1))]
+        );
+    }
+
+    #[test]
+    fn the_bar_says_whom_it_shows_and_its_keys() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        t.draw(|f| draw_bar(f, f.area(), "chief · coordinator"))
+            .unwrap();
+        let row: String = (0..60)
+            .map(|x| t.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert_eq!(
+            row.trim_end(),
+            format!("chief · coordinator{}^Q quit  ^\\ board", " ".repeat(24))
+        );
+    }
+
+    #[test]
+    fn ctrl_q_quits_in_either_case() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(quits(&ctrl('q')));
+        assert!(quits(&ctrl('Q')));
+        assert!(!quits(&KeyEvent::from(KeyCode::Char('q'))));
+        assert!(!quits(&ctrl('c')));
     }
 
     #[test]

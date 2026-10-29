@@ -335,3 +335,31 @@ grew.
 
 Tested with the fake `claude` only. Not verified live yet: `claude stop` on a thread mid-turn
 (what its board row and the coordinator see afterwards), and the title in Ghostty and iTerm2.
+
+## Quitting in one key (built, 2026-10-29)
+
+Problem (from use, in a Rex block): `chief pane` gave the terminal to `claude attach`, so the only
+way out was Claude's: Ctrl+C twice, twice more in its agent view, then `q` on chief's "you left"
+screen.
+
+1. **Relay** (ARCHITECTURE §9): `chief pane` runs attach on a pseudo-terminal of its own and
+   copies the bytes both ways untouched, so Claude still draws on the user's terminal (its
+   scrollback, selection, rendering) while chief sees every key. Ctrl+Q, which Claude Code 2.1.312
+   doesn't bind, quits from anywhere: as a plain byte, in the kitty keyboard protocol or under
+   modifyOtherKeys, never inside a paste. Sessions keep running. No emulator, so no Zig on this
+   path. A first version ran the pane on the built-in layout's emulator to put a bar under
+   Claude; it cost the terminal's own scrollback and selection, and tied the Rex path to
+   libghostty.
+2. **Built-in layout**: the conversation's last row is chief's bar (`chief · coordinator`,
+   `^Q quit`, `^\ board`, clickable), and Ctrl+Q quits from either side.
+3. **No Zig**: the built-in layout's emulator is `alacritty_terminal` 0.26 (pure Rust, crates.io)
+   instead of libghostty, so the `builtin-layout` feature, the pinned git dependency and Zig are
+   gone. chief encodes keys, mouse and paste itself (Alacritty keeps those encoders in the app),
+   and a second parser answers XTVERSION and DA3, which the crate never sees. DA1 now reports a
+   VT102. alacritty_terminal panics on a kitty keyboard push 4096 deep; chief drops pushes past
+   1024.
+
+Tested with the fake `claude` (`tests/pane_cli.rs`, `tests/builtin_cli.rs`) and the emulator's
+unit tests (`embed::`). Not verified live yet: Ctrl+Q reaching chief through Rex, Claude's kitty
+keyboard query answered by the user's terminal through the relay, and a real `claude attach` in
+the alacritty_terminal emulator (Shift+Enter, the agent view's mouse and paste).

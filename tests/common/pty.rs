@@ -137,6 +137,21 @@ impl Pane {
         input.write_all(keys.as_bytes()).unwrap();
     }
 
+    /// Gives the pty a new size, as a terminal window resized does: the kernel sends SIGWINCH to
+    /// the pane.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        use std::os::fd::AsRawFd;
+        let input = self.input.as_ref().expect("not hung up");
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ on our own master fd.
+        unsafe { libc::ioctl(input.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    }
+
     /// Closes the pty's master side, as a terminal window closing or a killed tmux server
     /// does: the pane's terminal hangs up.
     pub fn hang_up(&mut self) {

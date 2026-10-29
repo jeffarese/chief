@@ -346,18 +346,9 @@ pub enum LayoutChoice {
     Builtin,
 }
 
-/// Whether this chief can draw the layout itself: built with the default `builtin-layout`
-/// feature, which needs Zig to build libghostty.
-pub const BUILTIN_LAYOUT: bool = cfg!(feature = "builtin-layout");
-
 /// The built-in layout in this terminal (§9), until the user quits it.
 pub fn run_builtin(slug: &str) -> Result<()> {
-    #[cfg(feature = "builtin-layout")]
-    return crate::builtin::run(slug);
-    #[cfg(not(feature = "builtin-layout"))]
-    bail!(
-        "chief {slug} · this chief was built without its built-in layout (cargo feature builtin-layout)"
-    );
+    crate::builtin::run(slug)
 }
 
 /// A line `up`, `down` or `archive` reports: what it did, what it didn't and why (no layout,
@@ -398,15 +389,8 @@ pub enum Where {
 /// `up`, reporting through `note` instead of printing, for the launcher (§10a).
 pub fn up_with(slug: &str, choice: LayoutChoice, note: &mut dyn FnMut(Note)) -> Result<Where> {
     let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if choice == LayoutChoice::Builtin {
-        if !BUILTIN_LAYOUT {
-            bail!(
-                "this chief was built without its built-in layout (cargo feature builtin-layout)"
-            );
-        }
-        if !terminal {
-            bail!("the built-in layout needs a terminal");
-        }
+    if choice == LayoutChoice::Builtin && !terminal {
+        bail!("the built-in layout needs a terminal");
     }
     let dir = project_dir(slug);
     let config = ProjectConfig::load(&dir.join("project.toml"))
@@ -451,10 +435,10 @@ pub fn up_with(slug: &str, choice: LayoutChoice, note: &mut dyn FnMut(Note)) -> 
     let found = open_layout(slug, (&dir, &exe, &env), &conn, terminal, note)?;
     Ok(match found {
         // Neither Rex nor tmux: chief draws both sides itself.
-        Where::Manual if BUILTIN_LAYOUT && terminal => {
+        Where::Manual if terminal => {
             note(Note::Info(
                 "Drawing the layout in this terminal: the conversation on the left, its \
-                 threads on the right (Ctrl+\\ switches sides)."
+                 threads on the right (Ctrl+\\ switches sides, Ctrl+Q quits)."
                     .into(),
             ));
             Where::Builtin
