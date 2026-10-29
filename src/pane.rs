@@ -2,7 +2,8 @@
 //!
 //! The board switches the pane by signalling it (SIGUSR1, see `request_switch`): the pane ends
 //! its `claude attach` with SIGTERM, undoes the screen modes the killed client left behind, and
-//! attaches to the new target. That needs no terminal multiplexer.
+//! attaches to the new target. That needs no terminal multiplexer. The board's Ctrl+Q asks the
+//! pane to quit the same way (SIGUSR2, `request_quit`).
 //!
 //! `claude attach` runs on a pseudo-terminal of its own whose bytes chief relays to this terminal
 //! untouched (`relay`): Claude draws on the user's terminal as if it had it, and chief sees every
@@ -64,6 +65,8 @@ const ESC: u8 = 0x1b;
 static HUNG_UP: AtomicBool = AtomicBool::new(false);
 /// Set by SIGUSR1: the board asks for another target.
 static SWITCH: AtomicBool = AtomicBool::new(false);
+/// Set by SIGUSR2: the board's Ctrl+Q, which quits the pane as its own Ctrl+Q does.
+static QUIT: AtomicBool = AtomicBool::new(false);
 /// Set by SIGWINCH: the relay gives attach's terminal the new size.
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
@@ -73,6 +76,10 @@ extern "C" fn on_hangup(_: libc::c_int) {
 
 extern "C" fn on_switch(_: libc::c_int) {
     SWITCH.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_quit(_: libc::c_int) {
+    QUIT.store(true, Ordering::SeqCst);
 }
 
 extern "C" fn on_resize(_: libc::c_int) {
@@ -90,10 +97,11 @@ fn catch_hangup() {
     catch(&[libc::SIGHUP, libc::SIGTERM], on_hangup);
 }
 
-/// The board's switch request, caught the same way. It must be caught before the pane records
-/// its pid: SIGUSR1's default action would end it.
+/// The board's switch and quit requests, caught the same way. They must be caught before the
+/// pane records its pid: the default action of SIGUSR1 and SIGUSR2 would end it.
 fn catch_switch() {
     catch(&[libc::SIGUSR1], on_switch);
+    catch(&[libc::SIGUSR2], on_quit);
 }
 
 /// Both, for a pane that isn't `chief pane`: the built-in layout's conversation (§9).
@@ -110,6 +118,16 @@ pub fn hung_up() -> bool {
 /// Whether a switch request arrived since the last call.
 pub fn take_switch() -> bool {
     SWITCH.swap(false, Ordering::SeqCst)
+}
+
+/// Whether the board asked chief to quit.
+pub fn quit_requested() -> bool {
+    QUIT.load(Ordering::SeqCst)
+}
+
+/// The user quit through the board, or the terminal hung up.
+fn ending() -> bool {
+    HUNG_UP.load(Ordering::SeqCst) || quit_requested()
 }
 
 fn catch(signals: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
@@ -206,6 +224,8 @@ pub(crate) fn left_lines(name: &str, coordinator: bool, on_quit: &OnQuit) -> Vec
             OnQuit::Layout => "  q  close chief's layout (sessions keep running)".into(),
             OnQuit::Board(_) => "  q  close chief and its board (sessions keep running)".into(),
         },
+        String::new(),
+        "Next time, Ctrl+Q quits at once, even inside Claude.".into(),
     ]
 }
 
@@ -256,7 +276,7 @@ fn pane_loop(
     let dir = project::project_dir(project);
     let showing = |name: Option<&str>| db::set_pane_showing_as(conn, project, me, name);
     loop {
-        if HUNG_UP.load(Ordering::SeqCst) {
+        if ending() {
             return Ok(());
         }
         let config = match project_config(&dir) {
@@ -403,6 +423,7 @@ fn attach(claude: &Claude, short_id: &str, switch: &dyn Fn() -> bool) -> Result<
     cmd.args(["attach", short_id]);
     let signals = relay::Signals {
         hung_up: &|| HUNG_UP.load(Ordering::SeqCst),
+        quit: &quit_requested,
         switch,
         resized: &|| RESIZED.swap(false, Ordering::SeqCst),
     };
@@ -468,7 +489,7 @@ impl Tty {
     fn pick(&self) -> Pick {
         let settle = Instant::now() + SETTLE;
         loop {
-            if HUNG_UP.load(Ordering::SeqCst) {
+            if ending() {
                 return Pick::Quit;
             }
             if SWITCH.swap(false, Ordering::SeqCst) {
@@ -489,13 +510,13 @@ impl Tty {
         }
     }
 
-    /// Reads keys for `wait`, then whatever is still queued; true when `q` or Ctrl+Q was pressed or
-    /// the terminal hung up. Other keys are dropped. A switch request doesn't end the wait: it stays
+    /// Reads keys for `wait`, then whatever is still queued; true when `q` or Ctrl+Q was pressed,
+    /// the board asked chief to quit or the terminal hung up. Other keys are dropped. A switch request doesn't end the wait: it stays
     /// for the next attach, which drops it when it is for the target being attached.
     fn quit_pressed(&self, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         loop {
-            if HUNG_UP.load(Ordering::SeqCst) {
+            if ending() {
                 return true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -504,7 +525,7 @@ impl Tty {
                 return true;
             }
             if keys.is_empty() && left.is_zero() {
-                return HUNG_UP.load(Ordering::SeqCst);
+                return ending();
             }
         }
     }
@@ -588,6 +609,23 @@ pub fn request_switch(conn: &Connection, project: &str) -> Result<()> {
     };
     // SAFETY: a plain syscall, to the process just proven to be the pane.
     unsafe { libc::kill(pid, libc::SIGUSR1) };
+    Ok(())
+}
+
+/// The board's Ctrl+Q: asks the running pane to quit as its own Ctrl+Q does (SIGUSR2), which closes
+/// the layout, and waits up to `wait` for it to end. A board that quit at once would close its
+/// own block under the pane, which closes it too.
+pub fn request_quit(conn: &Connection, project: &str, wait: Duration) -> Result<()> {
+    let Some(pid) = live_pane(conn, project)? else {
+        return Ok(());
+    };
+    let started = proc::start_time(pid);
+    // SAFETY: a plain syscall, to the process just proven to be the pane.
+    unsafe { libc::kill(pid, libc::SIGUSR2) };
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline && proc::start_time(pid) == started {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -756,6 +794,28 @@ mod tests {
         assert_eq!(ended_by(&mut pane), Some(libc::SIGUSR1));
     }
 
+    /// The board's Ctrl+Q: SIGUSR2 to the pane, then a wait that ends with it.
+    #[test]
+    fn quit_signals_the_pane_and_waits_for_it() {
+        let (_dir, conn) = fresh();
+        let mut pane = fake_pane(&conn);
+        let pid = pane.id();
+        // Reaped as it ends, as the pane's own parent would.
+        let reaper = std::thread::spawn(move || pane.wait().unwrap());
+        let start = Instant::now();
+        request_quit(&conn, "demo", Duration::from_secs(5)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{pid} ended sooner"
+        );
+        assert_eq!(reaper.join().unwrap().signal(), Some(libc::SIGUSR2));
+
+        // No pane: nothing to wait for.
+        let start = Instant::now();
+        request_quit(&conn, "demo", Duration::from_secs(5)).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
     /// A pane killed with SIGKILL never clears its record: once its process is gone, what it
     /// showed no longer keeps §12 cleanup away from that thread.
     #[test]
@@ -797,6 +857,7 @@ mod tests {
         assert!(lines[0].contains("you left thread demo-a-1111"));
         assert_eq!(lines[2], "  ⏎  back to it");
         assert_eq!(lines[3], "  q  quit (sessions keep running)");
+        assert!(lines[5].contains("Ctrl+Q quits at once"));
     }
 
     #[test]

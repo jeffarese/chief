@@ -22,6 +22,9 @@ use super::ui::display_title;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
+    /// Quit chief: ask the pane to quit too, which closes the layout (Ctrl+Q, as in the
+    /// conversation).
+    QuitAll,
     /// Show this thread (None: the coordinator) in the main pane.
     Show(Option<String>),
     Wake(String),
@@ -463,8 +466,12 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return vec![Action::Quit];
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return vec![Action::Quit],
+                KeyCode::Char('q' | 'Q') => return vec![Action::QuitAll],
+                _ => {}
+            }
         }
         match &mut self.screen {
             Screen::Board => self.board_key(key),
@@ -988,6 +995,11 @@ pub(crate) mod tests {
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             [Action::Quit]
+        );
+        // Ctrl+Q quits chief, the pane too.
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            [Action::QuitAll]
         );
     }
 

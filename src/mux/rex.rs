@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{BlockInfo, BlockRef, BlockSpec, Mux, SessionRef, Split, kill_on_error};
 
@@ -94,6 +94,42 @@ impl Rex {
             bail!("`rex {words}` failed ({}): {why}", out.status);
         }
         Ok(out)
+    }
+
+    /// Gives `block` `ratio` percent of the split it made beside `anchor`. Rex records every
+    /// split `rex run` makes at half whatever `--ratio` says; `session.resize_pane` moves the
+    /// border, sized as the share of the block before it (left or above).
+    fn size_split(
+        &self,
+        session: &SessionRef,
+        anchor: &BlockRef,
+        block: &BlockRef,
+        split: Split,
+        ratio: u8,
+    ) -> Result<()> {
+        let ratio = ratio.min(100);
+        let (before, after, percent) = match split {
+            Split::Right | Split::Below => (anchor, block, 100 - ratio),
+            Split::Left | Split::Above => (block, anchor, ratio),
+        };
+        let direction = match split {
+            Split::Left | Split::Right => "horizontal",
+            Split::Above | Split::Below => "vertical",
+        };
+        let call = json!({
+            "session_id": session.0,
+            "direction": direction,
+            "before_block_id": before.0,
+            "after_block_id": after.0,
+            "ratio": f64::from(percent) / 100.0,
+        });
+        self.run(&[
+            "api".into(),
+            "call".into(),
+            "session.resize_pane".into(),
+            call.to_string().into(),
+        ])?;
+        Ok(())
     }
 
     /// The Rex block this process runs in, from the `REX_SESSION` and `REX_BLOCK` Rex sets in
@@ -193,10 +229,15 @@ impl Mux for Rex {
         }
         block_args(spec, &mut args);
         let out: Value = self.json(&args)?;
-        out["block_ids"][0]
+        let block = out["block_ids"][0]
             .as_str()
             .map(|id| BlockRef(id.to_string()))
-            .with_context(|| format!("`rex run` reported no block: {out}"))
+            .with_context(|| format!("`rex run` reported no block: {out}"))?;
+        if let Some((anchor, split)) = &spec.anchor {
+            // Cosmetic: the block is there either way, at half the split.
+            let _ = self.size_split(session, anchor, &block, *split, spec.ratio);
+        }
+        Ok(block)
     }
 
     fn blocks(&self, session: &SessionRef) -> Result<Vec<BlockInfo>> {

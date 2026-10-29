@@ -19,13 +19,15 @@ use ratatui::crossterm::event::{self, Event};
 
 use crate::config::ProjectConfig;
 use crate::text::shell_quote;
-use crate::{db, paths, tui};
+use crate::{db, pane, paths, tui};
 
 use app::{Action, App, Msg};
 use refresh::Sources;
 
 /// How long a frame waits for a key before redrawing and reading worker results.
 const POLL: Duration = Duration::from_millis(100);
+/// How long Ctrl+Q waits for the pane to quit, which closes the layout, board included.
+const PANE_QUIT_WAIT: Duration = Duration::from_secs(3);
 
 /// The board with its workers: what `chief board` runs, and the right side of the built-in
 /// layout (§9).
@@ -74,7 +76,15 @@ impl Board {
         })
     }
 
-    /// Runs an action off the UI thread. `Quit` and `Edit` need the terminal: the caller's.
+    /// Asks the pane to quit and waits for it (`pane::request_quit`). The board quits either way.
+    fn quit_pane(&self) {
+        if let Ok(conn) = db::open(&self.src.db) {
+            let _ = pane::request_quit(&conn, &self.src.slug, PANE_QUIT_WAIT);
+        }
+    }
+
+    /// Runs an action off the UI thread. `Quit`, `QuitAll` and `Edit` need the terminal: the
+    /// caller's.
     pub fn dispatch(&self, action: Action) {
         match action {
             Action::Show(target) => {
@@ -122,6 +132,10 @@ fn event_loop(terminal: &mut DefaultTerminal, board: &mut Board) -> Result<()> {
             for action in actions {
                 match action {
                     Action::Quit => return Ok(()),
+                    Action::QuitAll => {
+                        board.quit_pane();
+                        return Ok(());
+                    }
                     Action::Edit(path) => {
                         let msg = edit(terminal, &path);
                         board.app.say(msg);

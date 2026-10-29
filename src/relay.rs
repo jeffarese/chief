@@ -31,7 +31,7 @@ pub enum Ended {
     Exited(Option<ExitStatus>),
     /// chief ended it: the board wants another target.
     Switched,
-    /// chief ended it: the user pressed Ctrl+Q.
+    /// chief ended it: the user pressed Ctrl+Q, here or on the board.
     Quit,
     /// chief ended it: the pane's terminal hung up, or SIGHUP or SIGTERM arrived.
     HungUp,
@@ -40,6 +40,8 @@ pub enum Ended {
 /// What the relay asks the pane between waits. Each is looked at after every wait.
 pub struct Signals<'a> {
     pub hung_up: &'a dyn Fn() -> bool,
+    /// The board asked chief to quit (its Ctrl+Q).
+    pub quit: &'a dyn Fn() -> bool,
     /// The board asked for another target, and it still applies.
     pub switch: &'a dyn Fn() -> bool,
     /// The terminal changed size (SIGWINCH) since the last look.
@@ -62,6 +64,10 @@ pub fn relay(cmd: Command, signals: &Signals) -> io::Result<Ended> {
         if (signals.hung_up)() {
             pty.end();
             return Ok(Ended::HungUp);
+        }
+        if (signals.quit)() {
+            pty.end();
+            return Ok(Ended::Quit);
         }
         if (signals.switch)() {
             pty.end();

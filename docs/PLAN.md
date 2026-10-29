@@ -358,8 +358,17 @@ screen.
    and a second parser answers XTVERSION and DA3, which the crate never sees. DA1 now reports a
    VT102. alacritty_terminal panics on a kitty keyboard push 4096 deep; chief drops pushes past
    1024.
+4. **Where Ctrl+Q shows** (Rex, tmux, manual): Claude's screen is Claude's, so the board's key
+   bar ends with `^Q quit`, and Ctrl+Q there quits chief too (SIGUSR2 to the pane, which quits as
+   for its own Ctrl+Q). The "you left" screen says Ctrl+Q would have done it at once. A one-row
+   Rex block under Claude as a bar was tried and dropped: Rex gives a block at least 4 rows, plus
+   about 3 of divider.
+5. **Board width in Rex**: Rex 0.1 ignores `rex run --ratio` (every new split is recorded at
+   half), so the board took half the window. chief now sizes the split with
+   `session.resize_pane` after `rex run`: the board gets its 32 %.
 
 Tested with the fake `claude` (`tests/pane_cli.rs`, `tests/builtin_cli.rs`) and the emulator's
-unit tests (`embed::`). Not verified live yet: Ctrl+Q reaching chief through Rex, Claude's kitty
+unit tests (`embed::`); the resize call against Rex 0.1 by hand (a probe block given 25 % got 40
+of 167 columns). Not verified live yet: Ctrl+Q reaching chief through Rex, Claude's kitty
 keyboard query answered by the user's terminal through the relay, and a real `claude attach` in
 the alacritty_terminal emulator (Shift+Enter, the agent view's mouse and paste).

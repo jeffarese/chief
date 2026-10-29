@@ -111,9 +111,10 @@ too: click to select, click again to show, scroll to move.
 | s | Settings |
 | ? | Help |
 | q | Quit the board (the layout stays) |
+| Ctrl+Q | Quit chief: the conversation and the board |
 
-**Ctrl+Q** in the conversation quits chief at once, whatever Claude is doing, and closes the
-layout (in a Rex block, the board beside it). Leaving Claude in the left pane by hand (Ctrl+Z, or
+**Ctrl+Q** in the conversation or on the board quits chief at once, whatever Claude is doing, and
+closes the layout (in a Rex block, the board beside it). The board's key bar shows it. Leaving Claude in the left pane by hand (Ctrl+Z, or
 Ctrl+C out of its agent view) brings you to chief's own screen instead: ⏎ goes back, a pick on the
 board shows that instead, and `q` or Ctrl+Q closes the layout. The coordinator and threads keep
 running in the background either way; `chief` or `chief up <slug>` opens the layout again.

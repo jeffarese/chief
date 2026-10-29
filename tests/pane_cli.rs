@@ -347,6 +347,58 @@ fn ctrl_q_quits_while_claude_has_the_keys() {
     assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
 }
 
+/// The board's Ctrl+Q (`pane::request_quit`) quits the pane as its own does, closing the board.
+#[test]
+fn the_boards_ctrl_q_quits_the_pane() {
+    let home = coordinator_home(&[
+        ("attach.sleep", "30"),
+        ("version.stdout", "2.1.310 (Claude Code)\n"),
+    ]);
+    let conn = home.db();
+    home.rex
+        .set("list.exit", "0")
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:mine", "label": "work"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:shell", "label": "shell"}]}"#,
+        )
+        .set("run.stdout", r#"{"block_ids": ["block:board"]}"#);
+    let mut pane = Pane::spawn(
+        &home,
+        &["up", "demo"],
+        &[
+            ("REX_SESSION", "session:mine"),
+            ("REX_BLOCK", "block:shell"),
+        ],
+    );
+    wait_for("the attach", || {
+        attach_call(&home, "c0").is_some()
+            && db::get_pane_showing(&conn, "demo").unwrap().as_deref() == Some(COORD)
+    });
+    let attach = home.fake.pid(attach_call(&home, "c0").unwrap());
+
+    // The pane is this test's child: it stays a zombie until `exited` reaps it, so the wait
+    // can't see it end.
+    chief::pane::request_quit(&conn, "demo", Duration::from_millis(100)).unwrap();
+    let status = pane.exited().expect("the board's Ctrl+Q quits");
+    assert!(status.success(), "{status:?}");
+    assert!(gone(attach), "its attach was reaped");
+    let closes: Vec<_> = home
+        .rex
+        .calls_of("block")
+        .into_iter()
+        .filter(|c| c.get(1).map(String::as_str) == Some("close"))
+        .collect();
+    assert_eq!(
+        closes,
+        [vec!["block", "close", "block:board", "--autostart=false"]]
+    );
+    assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
+}
+
 /// A Rex session whose blocks are chief's `main` and `board`, stored as the project's layout.
 fn rex_layout(home: &Home) {
     db::set_rex_session(&home.db(), "demo", Some("session:7")).unwrap();

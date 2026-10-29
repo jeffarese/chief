@@ -86,7 +86,9 @@ impl Failure {
             Action::Show(_) => (FailureKind::Notice, "Switching the main pane".to_string()),
             Action::SetResolved { name, .. } => (FailureKind::Notice, format!("Resolving {name}")),
             Action::OpenUrl(_) => (FailureKind::Notice, "Opening the PR".to_string()),
-            Action::Quit | Action::Edit(_) => (FailureKind::Notice, "The action".to_string()),
+            Action::Quit | Action::QuitAll | Action::Edit(_) => {
+                (FailureKind::Notice, "The action".to_string())
+            }
         };
         Failure { kind, what }
     }
@@ -171,7 +173,7 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
             Ok(Msg::Trusted { text, check })
         }
         // The runner handles these itself: they need the terminal.
-        Action::Quit | Action::Edit(_) => Ok(Msg::Notice(String::new())),
+        Action::Quit | Action::QuitAll | Action::Edit(_) => Ok(Msg::Notice(String::new())),
     }
 }
 

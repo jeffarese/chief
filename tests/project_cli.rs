@@ -1243,6 +1243,21 @@ fn up_opens_then_reuses_the_rex_layout() {
             .map(String::from)
             .to_vec(),
             run,
+            // `rex run --ratio` leaves the split at half: the API sizes it.
+            vec![
+                "api".into(),
+                "call".into(),
+                "session.resize_pane".into(),
+                json!({
+                    "session_id": "session:new",
+                    "direction": "horizontal",
+                    "before_block_id": "block:main",
+                    "after_block_id": "block:board",
+                    "ratio": 0.68,
+                })
+                .to_string(),
+                "--autostart=false".into(),
+            ],
             ["focus", "block:main", "--autostart=false"]
                 .map(String::from)
                 .to_vec(),

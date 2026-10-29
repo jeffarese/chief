@@ -309,7 +309,8 @@ impl Split<'_> {
     ) -> Result<()> {
         self.start();
         loop {
-            if hung_up() {
+            // A board of its own's Ctrl+Q (`pane::request_quit`) quits as this one's does.
+            if hung_up() || pane::quit_requested() {
                 return Ok(());
             }
             if pane::take_switch() {
@@ -424,7 +425,7 @@ impl Split<'_> {
                 Side::Board => {
                     for action in board.app.on_key(key) {
                         match action {
-                            Action::Quit => return Ok(true),
+                            Action::Quit | Action::QuitAll => return Ok(true),
                             Action::Edit(path) => {
                                 let msg = edit(terminal, &path, input, enhanced);
                                 board.app.say(msg);
@@ -478,7 +479,7 @@ impl Split<'_> {
         } else if on_board {
             // The board's own clicks; Show and the like go to its workers as for keys.
             for action in board.app.on_mouse(m) {
-                if !matches!(action, Action::Quit | Action::Edit(_)) {
+                if !matches!(action, Action::Quit | Action::QuitAll | Action::Edit(_)) {
                     board.dispatch(action);
                 }
             }

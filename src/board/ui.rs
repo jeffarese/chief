@@ -35,6 +35,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("Tab", "detail (short terminals)"),
     ("s", "settings"),
     ("q", "quit the board"),
+    ("^Q", "quit chief: the board and the main pane"),
 ];
 
 const LEGEND: &[(Group, &str)] = &[
@@ -270,8 +271,8 @@ fn status_line(app: &App, width: usize) -> Option<Line<'static>> {
 }
 
 /// The keys that do something for the selection, most useful first; help always ends it, after
-/// the side switch in the built-in layout. Those are kept when the rest doesn't fit
-/// (`board_keys_kept`).
+/// one key for the conversation's side. Those two are kept when the rest doesn't fit
+/// (`KEPT_KEYS`).
 fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = vec![("⏎", "show")];
     if app.threads.iter().any(|r| group_of(r) == Group::Waiting) {
@@ -301,18 +302,20 @@ fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             }
         }
     }
-    if app.embedded {
-        keys.push(("^\\", "conversation"));
-    }
+    // In the built-in layout, the side switch, which nothing else on screen names (the bar below
+    // the conversation names Ctrl+Q); beside a pane of its own, Ctrl+Q, which nothing in Claude's
+    // screen names.
+    keys.push(if app.embedded {
+        ("^\\", "conversation")
+    } else {
+        ("^Q", "quit")
+    });
     keys.push(("?", "help"));
     keys
 }
 
-/// How many of `board_keys`' last keys the bar keeps: the side switch is the one key the built-in
-/// layout adds, and nothing else on screen names it.
-fn board_keys_kept(app: &App) -> usize {
-    if app.embedded { 2 } else { 1 }
-}
+/// How many of `board_keys`' last keys the bar keeps.
+const KEPT_KEYS: usize = 2;
 
 /// The key bar with the last `kept` keys kept at the end when the rest doesn't fit.
 fn keys_line(keys: &[(&str, &str)], kept: usize, width: usize) -> Line<'static> {
@@ -446,7 +449,7 @@ pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
     if let Some(line) = status {
         f.render_widget(Paragraph::new(line), status_area);
     }
-    let keys = keys_line(&board_keys(app), board_keys_kept(app), width);
+    let keys = keys_line(&board_keys(app), KEPT_KEYS, width);
     f.render_widget(Paragraph::new(keys), foot);
 
     if body.height >= SPLIT_MIN_BODY {
@@ -1135,7 +1138,7 @@ mod tests {
         // The coordinator is selected, and its detail says how to start.
         assert!(out.contains("╭ Coordinator "), "{out}");
         assert!(out.contains("Tell the coordinator"), "{out}");
-        assert!(out.contains("⏎ show  s settings  ? help"), "{out}");
+        assert!(out.contains("⏎ show  s settings  ^Q quit  ? help"), "{out}");
     }
 
     #[test]
@@ -1204,22 +1207,26 @@ mod tests {
         assert!(!tags(&row).iter().any(|t| t.contains("subagent")));
     }
 
-    /// The key bar names what works on the selection, and always keeps `? help`: `n` while a
-    /// thread waits, `S` on a running thread, `w` on an asleep one.
+    /// The key bar names what works on the selection, and always keeps `^Q quit` and `? help`: `n`
+    /// while a thread waits, `S` on a running thread, `w` on an asleep one.
     #[test]
     fn the_key_bar_follows_the_selection() {
         let mut app = busy_board();
-        let out = render(&app, 70, 24);
+        let out = render(&app, 80, 24);
         assert!(
-            out.contains("⏎ show  n next waiting  Esc coordinator  r resolve  S stop  ? help"),
+            out.contains(
+                "⏎ show  n next waiting  Esc coordinator  r resolve  S stop  ^Q quit  ? help"
+            ),
             "{out}"
         );
         let out = render(&app, 30, 24);
         let foot = out.lines().last().unwrap();
-        assert!(foot.ends_with("? help"), "{foot:?}");
+        assert!(foot.ends_with("^Q quit  ? help"), "{foot:?}");
         app.on_key(ch('g'));
         assert!(app.on_coordinator);
-        assert!(render(&app, 70, 24).contains("⏎ show  n next waiting  s settings  ? help"));
+        assert!(
+            render(&app, 70, 24).contains("⏎ show  n next waiting  s settings  ^Q quit  ? help")
+        );
         app.selected = Some("demo-pr-5e6f".into());
         app.on_coordinator = false;
         assert!(render(&app, 90, 24).contains("r resolve  w wake  o PR"));

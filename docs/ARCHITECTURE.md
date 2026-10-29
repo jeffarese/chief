@@ -1208,7 +1208,10 @@ with `--autostart=false` (no server means no layout, never a server chief starte
 timeout: `rex list --json`; `rex new <label> --cwd <dir> --keep-open --json -- <cmd>` then
 `rex block rename -s <s> <block> <label>` (`new` labels its first block "shell"); `rex run -s <s>
 --label <l> --focus=<bool> [-b <anchor> --split <dir> --ratio <n>] --cwd <dir> --keep-open --json
--- <cmd>`; `rex block ls -s <s> --json`; `rex block call -b <b> process` (running while it lists a
+-- <cmd>`, then, beside an anchor, `rex api call session.resize_pane '{"session_id", "direction"
+("horizontal" or "vertical"), "before_block_id", "after_block_id", "ratio"}'` with the share of
+the block left of or above the border (Rex 0.1 records every split `rex run` makes at half,
+whatever `--ratio` says; a failed resize is ignored, the block is there at half); `rex block ls -s <s> --json`; `rex block call -b <b> process` (running while it lists a
 `child`); `rex block close <b>`; `rex focus <b>`; `rex kill <s>`; and
 `rex do session.select session_id=<s>` for `show` (a client action: Rex picks the app when exactly
 one is connected, and fails otherwise). chief only touches the session `chief up` created, by the
@@ -1301,6 +1304,7 @@ thread for one nobody shows.
    the layout) and `q close chief's layout (sessions keep running)` (`q quit …` outside it), and
    waits: ⏎ or a switch request (SIGUSR1, below) goes back to 0; `q`, Ctrl+C or a hangup ends the
    loop. Keys in the first 300 ms are dropped: a third Ctrl+C meant for Claude isn't an answer.
+   Below that, `Next time, Ctrl+Q quits at once, even inside Claude.`
 
 Relay (`src/relay.rs`). attach runs on a pseudo-terminal of its own (`embed::Pty::open`: the
 child leads its own session with the slave as its controlling terminal, keeps the pane's `TERM`
@@ -1320,13 +1324,14 @@ rest, then goes on as it is (a lone Esc is a key). Claude Code doesn't bind Ctrl
 out of an attach is Ctrl+C twice, then twice more in its agent view, and lands in step 6.
 The relay ends when attach closes its terminal (then it gets 500 ms to be reaped, or is ended and
 counts as failed), when attach exits with its terminal still held open, or when chief ends it:
-for a switch, for Ctrl+Q (the loop then stops as for `q`) or for a hangup (SIGHUP or SIGTERM,
+for a switch, for Ctrl+Q or the board's quit request (the loop then stops as for `q`) or for a
+hangup (SIGHUP or SIGTERM,
 POLLHUP on stdin, a read of 0 or a failed write). chief ends it with SIGTERM to its process
 group, 2 s, then SIGKILL, and reaps it (`Pty::end`); SIGTERM leaves its session running. chief
 keeps the pane's terminal in raw mode the whole time.
 
-`q` or Ctrl+Q while chief has the terminal ends the loop, as Ctrl+Q does during a relay; so does
-the block being closed or the session killed. With `--layout` a `q` or Ctrl+Q (not a hangup) then closes the layout as `chief down` does
+`q` or Ctrl+Q while chief has the terminal ends the loop, as Ctrl+Q does during a relay; so do
+the board's Ctrl+Q (below), the block being closed and the session killed. With `--layout` a `q` or Ctrl+Q (not a hangup) then closes the layout as `chief down` does
 (`project::close_layout`: the Rex session, or the tmux window, or just chief's two blocks when
 the user added others), after the pane cleared its rows and restored the terminal, since closing
 hangs up the pane's own terminal; no session stops. It writes the lines `close_layout` reports
@@ -1379,6 +1384,14 @@ target before reading `pane_showing`, so a switch that sends nothing is always s
 next read; a SIGUSR1 that lands before attach starts leaves the flag set, and the relay's first
 look ends that attach at once. One pane per project receives switches and owns `pane_showing`: the
 latest one started.
+
+The board's Ctrl+Q quits chief, the pane too (`pane::request_quit`): to a live pane
+(`pane::live_pane`) it sends SIGUSR2, caught as SIGUSR1 is (a flag, no `SA_RESTART`, before the
+pane records its pid), then waits up to 3 s for that process to end before the board quits.
+The pane takes the flag as its own Ctrl+Q: the relay ends attach (`Ended::Quit`), a wait for keys
+ends, and the pane closes what `OnQuit` names, the layout or the board's block, so the board
+quitting first would close its block under the pane. The built-in layout catches SIGUSR2 as well
+and quits on it.
 
 ### Built-in layout (`src/builtin.rs`, `src/embed/`)
 
@@ -1483,8 +1496,9 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   bar: the keys that act on the selection, most useful first (`n next waiting` while a thread
   waits; on a thread `S stop` when it has a process, else `w wake`; on a resolved, uncleaned
   one `x clean up` and `X clean up all`), each `key what` with the key in
-  the accent colour, whole hints only, `? help` kept at the end when the rest doesn't fit (in the
-  built-in layout `^\ conversation` before it, §9). Above
+  the accent colour, whole hints only, `^Q quit` and `? help` kept at the end when the rest doesn't
+  fit (in the built-in layout `^\ conversation` instead of `^Q quit`, which the conversation's
+  bar names, §9). Above
   it, when there is one, the status line: a running worker, else the last action's result
   (cleared by the next key), else refresh errors, else the PR hint. Widths are counted per
   grapheme, as ratatui draws them (an emoji with a variation selector or a joiner is one). In
@@ -1540,7 +1554,8 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   until settings closes (the form's message says so), so it never throws a draft away; R show or
   hide resolved; Tab detail on
   short terminals; s settings; ? help (the keys, then what each mark and glyph means; any key or
-  click closes); q or Ctrl+C quit the board only. Wake and cleanup run one at a time on a worker
+  click closes); q or Ctrl+C quit the board only; Ctrl+Q quits chief, the main pane too, which
+  closes the layout (§9, `pane::request_quit`). Wake and cleanup run one at a time on a worker
   thread ("waking …" in the status line). Shows run in order on one worker of their own: picks
   that queue up while one runs are skipped for the newest, so the main pane ends on the last
   pick.
