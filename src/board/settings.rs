@@ -1,7 +1,7 @@
 //! The settings screen (`s`): a form over `project.toml`. Edits stay in a draft until Save, which
 //! validates it and hands it to the runner to write and regenerate `generated/*`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -161,8 +161,9 @@ pub struct SettingsForm {
     saved: ProjectConfig,
     dir: PathBuf,
     pub cursor: usize,
-    /// The text being typed into the field under the cursor.
-    pub editing: Option<String>,
+    /// The field being typed into and its text. The field is kept with the text: the cursor can
+    /// move under it (a trust check changes the list), and Enter must apply it where it was typed.
+    pub editing: Option<(Field, String)>,
     pub message: Option<String>,
     /// Esc was pressed once with unsaved changes.
     leaving: bool,
@@ -173,7 +174,9 @@ pub struct SettingsForm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrustCheck {
     NotChecked,
-    Checking,
+    /// Running; the last result's untrusted pairs stay listed, so the cursor doesn't land on
+    /// another field (Save) while the list is gone.
+    Checking(Option<PoolTrust>),
     Done(PoolTrust),
     Failed(String),
 }
@@ -194,9 +197,23 @@ impl SettingsForm {
 
     fn untrusted(&self) -> &[Untrusted] {
         match &self.trust {
-            TrustCheck::Done(found) => &found.untrusted,
+            TrustCheck::Done(found) | TrustCheck::Checking(Some(found)) => &found.untrusted,
             _ => &[],
         }
+    }
+
+    /// The text being typed, if a field is being edited.
+    pub fn edit_text(&self) -> Option<&str> {
+        self.editing.as_ref().map(|(_, text)| text.as_str())
+    }
+
+    /// Starts a check, keeping the last result's pairs listed while it runs.
+    fn start_check(&mut self) {
+        let last = match std::mem::replace(&mut self.trust, TrustCheck::NotChecked) {
+            TrustCheck::Done(found) | TrustCheck::Checking(Some(found)) => Some(found),
+            _ => None,
+        };
+        self.trust = TrustCheck::Checking(last);
     }
 
     /// The pool's trust check finished.
@@ -284,7 +301,7 @@ impl SettingsForm {
             },
             Field::PoolTrust => match &self.trust {
                 TrustCheck::NotChecked => "Enter checks the pool".to_string(),
-                TrustCheck::Checking => "checking…".to_string(),
+                TrustCheck::Checking(_) => "checking…".to_string(),
                 TrustCheck::Failed(e) => format!("check failed: {e}"),
                 TrustCheck::Done(found) if found.checked.is_empty() => {
                     "no agp pool: threads use the project's account".to_string()
@@ -336,18 +353,26 @@ impl SettingsForm {
         }
     }
 
-    /// After a successful save.
-    pub fn saved(&mut self, config: &ProjectConfig) {
+    /// project.toml now holds `config`, the draft as it was sent. Edits made while the save ran
+    /// stay in the draft, unsaved.
+    pub fn saved(&mut self, config: &ProjectConfig, warning: Option<String>) {
         self.saved = config.clone();
-        self.draft = config.clone();
-        self.message = Some(SAVED_MESSAGE.to_string());
         self.leaving = false;
+        self.message = Some(match warning {
+            Some(w) => format!(
+                "Saved, but generated/* wasn't rewritten: {w}. Sessions start with the old \
+                 settings until a save rewrites it."
+            ),
+            None if self.dirty() => {
+                "Saved what you had when you saved; later changes aren't saved yet.".to_string()
+            }
+            None => SAVED_MESSAGE.to_string(),
+        });
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Outcome {
         if self.editing.is_some() {
-            self.edit_key(key);
-            return Outcome::Stay;
+            return self.edit_key(key);
         }
         let field = self.current();
         if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -409,18 +434,23 @@ impl SettingsForm {
                     .unwrap_or_default(),
                 _ => self.value(field),
             };
-            self.editing = Some(start);
+            self.editing = Some((field, start));
             return Outcome::Stay;
         }
+        let checking = matches!(self.trust, TrustCheck::Checking(_));
         match field {
+            Field::PoolTrust | Field::Untrusted(_) if checking => {
+                self.message = Some("Wait: the trust check is still running.".to_string());
+                Outcome::Stay
+            }
             Field::PoolTrust => {
-                self.trust = TrustCheck::Checking;
+                self.start_check();
                 Outcome::Run(Action::CheckTrust(Box::new(self.draft.clone())))
             }
             Field::Untrusted(i) => match self.untrusted().get(i).cloned() {
                 Some(u) => {
                     self.message = Some(format!("Trusting {} in {}…", u.folder.display(), u.label));
-                    self.trust = TrustCheck::Checking;
+                    self.start_check();
                     Outcome::Run(Action::Trust(Box::new(u), Box::new(self.draft.clone())))
                 }
                 None => Outcome::Stay,
@@ -445,25 +475,45 @@ impl SettingsForm {
         }
     }
 
-    fn edit_key(&mut self, key: KeyEvent) {
-        let Some(text) = self.editing.as_mut() else {
-            return;
+    fn edit_key(&mut self, key: KeyEvent) -> Outcome {
+        let Some((_, text)) = self.editing.as_mut() else {
+            return Outcome::Stay;
         };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.editing = None,
             KeyCode::Backspace => {
                 text.pop();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => text.clear(),
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(c),
-            KeyCode::Enter => {
-                let text = self.editing.take().unwrap_or_default();
-                if let Err(e) = self.set_text(self.current(), &text) {
-                    self.message = Some(e);
-                    self.editing = Some(text);
+            KeyCode::Char('u') if ctrl => text.clear(),
+            // Ctrl+S saves from any field (§10): what is typed goes in first.
+            KeyCode::Char('s') if ctrl => {
+                if self.apply_edit() {
+                    return self.activate(Field::Save);
                 }
             }
+            KeyCode::Char(c) if !ctrl => text.push(c),
+            KeyCode::Enter => {
+                self.apply_edit();
+            }
             _ => {}
+        }
+        Outcome::Stay
+    }
+
+    /// Puts the typed text in the field it was typed into. On a bad value the edit stays open
+    /// with the reason, and this returns false.
+    fn apply_edit(&mut self) -> bool {
+        let Some((field, text)) = self.editing.take() else {
+            return true;
+        };
+        match self.set_text(field, &text) {
+            Ok(()) => true,
+            Err(e) => {
+                self.message = Some(e);
+                self.editing = Some((field, text));
+                false
+            }
         }
     }
 
@@ -502,7 +552,7 @@ impl SettingsForm {
                 if text.is_empty() {
                     return Ok(());
                 }
-                let path = expand_home(text);
+                let path = crate::tui::expand_home(text);
                 let (name, added) =
                     crate::project::add_repo(&mut c.repos, &path).map_err(|e| format!("{e:#}"))?;
                 if c.threads.default_repo.is_none() {
@@ -581,15 +631,6 @@ fn next(options: &[&str], current: &str, step: isize) -> String {
     options[i as usize].to_string()
 }
 
-fn expand_home(text: &str) -> PathBuf {
-    match text.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(text)),
-        None => Path::new(text).to_path_buf(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,7 +700,7 @@ mod tests {
         assert_eq!(f.value(Field::MaxUsage), "(none)");
         goto(&mut f, Field::ThreadAccounts);
         f.on_key(key(KeyCode::Enter));
-        assert_eq!(f.editing.as_deref(), Some("auto"));
+        assert_eq!(f.edit_text(), Some("auto"));
         f.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         type_text(&mut f, "cpb, cpe pb5");
         f.on_key(key(KeyCode::Enter));
@@ -673,13 +714,13 @@ mod tests {
             "(none: the project's account)"
         );
         f.on_key(key(KeyCode::Enter));
-        assert_eq!(f.editing.as_deref(), Some(""));
+        assert_eq!(f.edit_text(), Some(""));
         type_text(&mut f, "auto");
         f.on_key(key(KeyCode::Enter));
 
         goto(&mut f, Field::MaxUsage);
         f.on_key(key(KeyCode::Enter));
-        assert_eq!(f.editing.as_deref(), Some(""));
+        assert_eq!(f.edit_text(), Some(""));
         type_text(&mut f, "101");
         f.on_key(key(KeyCode::Enter));
         assert!(f.message.as_deref().unwrap().contains("1 to 100"));
@@ -761,6 +802,85 @@ mod tests {
         assert_eq!(f.value(Field::PoolTrust), "check failed: agp status failed");
     }
 
+    /// While a check runs, the untrusted pairs stay listed and the cursor stays on its pair: a
+    /// second Enter waits instead of landing on Save.
+    #[test]
+    fn enter_on_an_untrusted_pair_while_checking() {
+        let mut f = form();
+        let pair = Untrusted {
+            id: "cpb".into(),
+            label: "PB2".into(),
+            dir: Some("/acc/PB2".into()),
+            folder: "/r/web".into(),
+        };
+        f.trust_checked(Ok(PoolTrust {
+            checked: vec!["PB2".into()],
+            untrusted: vec![pair.clone()],
+            errors: Vec::new(),
+        }));
+        goto(&mut f, Field::Untrusted(0));
+        let Outcome::Run(Action::Trust(..)) = f.on_key(key(KeyCode::Enter)) else {
+            panic!("trusts")
+        };
+        assert_eq!(f.value(Field::PoolTrust), "checking…");
+        assert_eq!(f.current(), Field::Untrusted(0));
+        assert_eq!(f.value(Field::Untrusted(0)), "PB2 · web");
+        assert_eq!(f.on_key(key(KeyCode::Enter)), Outcome::Stay);
+        assert!(f.message.as_deref().unwrap().contains("still running"));
+        goto(&mut f, Field::PoolTrust);
+        assert_eq!(
+            f.on_key(key(KeyCode::Enter)),
+            Outcome::Stay,
+            "one check at a time"
+        );
+        f.trust_marked("Trusted /r/web (in PB2).".into(), Ok(PoolTrust::default()));
+        assert!(!f.fields().contains(&Field::Untrusted(0)));
+    }
+
+    /// Ctrl+S in a text field applies what is typed, then saves; a bad value stays to be fixed.
+    #[test]
+    fn ctrl_s_saves_while_editing() {
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let mut f = form();
+        goto(&mut f, Field::MaxParallel);
+        f.on_key(key(KeyCode::Enter));
+        f.on_key(key(KeyCode::Backspace));
+        type_text(&mut f, "0");
+        assert_eq!(f.on_key(ctrl_s), Outcome::Stay);
+        assert_eq!(f.edit_text(), Some("0"));
+        assert!(f.message.as_deref().unwrap().contains("whole number"));
+        f.on_key(key(KeyCode::Backspace));
+        type_text(&mut f, "7");
+        let Outcome::Run(Action::SaveSettings(saved)) = f.on_key(ctrl_s) else {
+            panic!("saves")
+        };
+        assert_eq!(saved.threads.max_parallel, 7);
+        assert_eq!(f.edit_text(), None);
+    }
+
+    /// A save reports the draft that was sent: edits made while it ran stay, unsaved.
+    #[test]
+    fn edits_made_during_a_save_are_kept() {
+        let mut f = form();
+        goto(&mut f, Field::Notify);
+        f.on_key(key(KeyCode::Enter));
+        let Outcome::Run(Action::SaveSettings(sent)) =
+            f.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        else {
+            panic!("saves")
+        };
+        goto(&mut f, Field::Cleanup);
+        f.on_key(key(KeyCode::Enter));
+        f.saved(&sent, None);
+        assert_eq!(f.draft.threads.cleanup, Cleanup::Manual, "kept");
+        assert!(!f.draft.ui.notify);
+        assert!(f.dirty());
+        assert!(f.message.as_deref().unwrap().contains("later changes"));
+        f.saved(&f.draft.clone(), Some("rewriting generated: denied".into()));
+        assert!(!f.dirty());
+        assert!(f.message.as_deref().unwrap().starts_with("Saved, but"));
+    }
+
     #[test]
     fn cycles_efforts_modes_and_toggles() {
         let mut f = form();
@@ -829,7 +949,7 @@ mod tests {
         type_text(&mut f, "0");
         f.on_key(key(KeyCode::Enter));
         assert!(f.message.as_deref().unwrap().contains("whole number ≥ 1"));
-        assert_eq!(f.editing.as_deref(), Some("0"), "stays editing to fix it");
+        assert_eq!(f.edit_text(), Some("0"), "stays editing to fix it");
         f.on_key(key(KeyCode::Backspace));
         type_text(&mut f, "5");
         f.on_key(key(KeyCode::Enter));
@@ -861,7 +981,7 @@ mod tests {
             panic!("save runs")
         };
         assert_eq!(saved.threads.model, "haiku");
-        f.saved(&saved);
+        f.saved(&saved, None);
         assert!(!f.dirty());
         assert_eq!(f.message.as_deref(), Some(SAVED_MESSAGE));
     }

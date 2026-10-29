@@ -3,7 +3,7 @@
 //! kicked after an action) and sends the rows, the other refreshes PRs every 30 s.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -13,8 +13,8 @@ use crate::accounts;
 use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::cleanup::Ctx;
 use crate::config::ProjectConfig;
-use crate::db;
 use crate::pr::{self, Gh};
+use crate::{db, tui};
 
 use super::app::{Msg, PrSummary, Snapshot};
 
@@ -76,28 +76,9 @@ pub fn spawn(src: Sources, tx: Sender<Msg>) -> Refresher {
             let _ = agents_tx.send(Msg::RefreshFailed(format!("pruning old events: {e:#}")));
         }
         let claude = agents_src.claude();
-        loop {
-            if agents_tx
-                .send(tick(&conn, &claude, &agents_src.slug))
-                .is_err()
-            {
-                return;
-            }
-            let deadline = Instant::now() + AGENTS_EVERY;
-            loop {
-                match kick_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(()) => {
-                        let msg = read(&conn, &agents_src.slug, None)
-                            .unwrap_or_else(|e| Msg::RefreshFailed(format!("{e:#}")));
-                        if agents_tx.send(msg).is_err() {
-                            return;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            }
-        }
+        keep_going(&agents_tx, AGENTS_EVERY, Msg::RefreshFailed, || {
+            agents_loop(&conn, &claude, &agents_src.slug, &agents_tx, &kick_rx)
+        });
     });
 
     let kicker = kick.clone();
@@ -108,25 +89,75 @@ pub fn spawn(src: Sources, tx: Sender<Msg>) -> Refresher {
         let claude = src.claude();
         // One `Gh` for the board's lifetime: its "no gh / not logged in" hint comes once.
         let gh = Gh::new(src.gh_bin.clone());
-        loop {
-            let msg = match pr_tick(&conn, &claude, &gh, &src.dir) {
-                Ok(summary) => Msg::Pr(summary),
-                Err(e) => Msg::PrFailed(format!("{e:#}")),
-            };
-            if tx.send(msg).is_err() {
-                return;
+        keep_going(&tx, PR_EVERY, Msg::PrFailed, || {
+            loop {
+                let msg = match pr_tick(&conn, &claude, &gh, &src.dir) {
+                    Ok(summary) => Msg::Pr(summary),
+                    Err(e) => Msg::PrFailed(format!("{e:#}")),
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+                let _ = kicker.send(());
+                match stop_rx.recv_timeout(PR_EVERY) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    _ => return,
+                }
             }
-            let _ = kicker.send(());
-            match stop_rx.recv_timeout(PR_EVERY) {
-                Err(RecvTimeoutError::Timeout) => {}
-                _ => return,
-            }
-        }
+        });
     });
 
     Refresher {
         kick,
         _stop_pr: stop_pr,
+    }
+}
+
+/// Runs `body` until it returns (the board is gone). A panic in it is reported with `failed`
+/// and, after `pause`, `body` starts again: a refresher that died would leave the board showing
+/// old rows with nothing saying so.
+pub fn keep_going(
+    tx: &Sender<Msg>,
+    pause: Duration,
+    failed: impl Fn(String) -> Msg,
+    mut body: impl FnMut(),
+) {
+    while let Err(panic) = tui::catch(&mut body) {
+        let text = format!("refresh crashed: {panic}; trying again");
+        if tx.send(failed(text)).is_err() {
+            return;
+        }
+        std::thread::sleep(pause);
+    }
+}
+
+/// `claude agents` every 2 s, and a database read whenever a worker kicks. Returns when the
+/// board is gone.
+fn agents_loop(
+    conn: &Connection,
+    claude: &Claude,
+    slug: &str,
+    tx: &Sender<Msg>,
+    kick_rx: &Receiver<()>,
+) {
+    loop {
+        if tx.send(tick(conn, claude, slug)).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + AGENTS_EVERY;
+        loop {
+            match kick_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(()) => {
+                    let msg = read(conn, slug, None)
+                        .unwrap_or_else(|e| Msg::RefreshFailed(format!("{e:#}")));
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 }
 
@@ -175,4 +206,32 @@ pub fn pr_tick(conn: &Connection, claude: &Claude, gh: &Gh, dir: &Path) -> Resul
         blocked: r.blocked.len(),
         errors: r.errors.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refresher that panics says so and starts again; one that returns is done.
+    #[test]
+    fn a_crashed_refresher_reports_and_restarts() {
+        let (tx, rx) = mpsc::channel();
+        let mut runs = 0;
+        keep_going(&tx, Duration::ZERO, Msg::RefreshFailed, || {
+            runs += 1;
+            if runs < 3 {
+                panic!("bad row {runs}");
+            }
+        });
+        assert_eq!(runs, 3);
+        drop(tx);
+        let msgs: Vec<Msg> = rx.iter().collect();
+        assert_eq!(
+            msgs,
+            [
+                Msg::RefreshFailed("refresh crashed: bad row 1; trying again".into()),
+                Msg::RefreshFailed("refresh crashed: bad row 2; trying again".into()),
+            ]
+        );
+    }
 }

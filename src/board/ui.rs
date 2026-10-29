@@ -527,8 +527,9 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             // The first page holds it: show the coordinator and the first header too.
             top = 0;
         } else if s < top {
-            // Show the group header above the first row of a group when scrolling up.
-            top = s.saturating_sub(1);
+            // Show the group header above the first row of a group when scrolling up, when
+            // there is room for both.
+            top = s.saturating_sub(usize::from(h > 1));
         } else if s >= top + h {
             top = s + 1 - h;
         }
@@ -773,9 +774,14 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
         if current {
             cursor_line = lines.len();
         }
-        let value = match (&form.editing, current) {
-            (Some(text), true) => format!("{text}▏"),
-            _ => form.value(*field),
+        let edited = form
+            .editing
+            .as_ref()
+            .filter(|(f, _)| f == field)
+            .map(|(_, text)| text);
+        let value = match edited {
+            Some(text) => format!("{text}▏"),
+            None => form.value(*field),
         };
         let label = match field {
             Field::Repo(_) => "repo",
@@ -787,7 +793,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
         } else {
             format!(" {:<label_w$} {value}", truncate(label, label_w))
         };
-        let text = if current && form.editing.is_some() {
+        let text = if edited.is_some() {
             tail(&text, width)
         } else {
             truncate(&text, width)
@@ -826,7 +832,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, form: &SettingsForm) {
     f.render_widget(Paragraph::new(shown), body);
 
     let (text, style) = match &form.message {
-        Some(m) if m.starts_with("Not saved") || m.contains("doesn't exist") => {
+        Some(m)
+            if m.starts_with("Not saved")
+                || m.starts_with("Saved, but")
+                || m.contains("doesn't exist") =>
+        {
             (m.clone(), Style::new().fg(Color::Red))
         }
         Some(m) => (m.clone(), Style::new()),
@@ -943,6 +953,57 @@ mod tests {
         }
     }
 
+    /// At every list height from 4 to 8 the selection stays in view while it moves down and back
+    /// up, and the last line says what is below, the collapsed Resolved header included.
+    #[test]
+    fn the_list_scrolls_and_says_what_is_below() {
+        let rows = [
+            "Coordinator",
+            "Approve the migration",
+            "A very long",
+            "Speed up",
+        ];
+        for list_h in 4..=8u16 {
+            let mut app = busy_board();
+            app.on_key(ch('g'));
+            // The list gets all but the key bar.
+            let mut walk: Vec<usize> = (0..rows.len()).collect();
+            walk.extend((0..rows.len() - 1).rev());
+            for (step, &at) in walk.iter().enumerate() {
+                if step > 0 {
+                    let down = at > walk[step - 1];
+                    app.on_key(ch(if down { 'j' } else { 'k' }));
+                }
+                let out = render(&app, 40, list_h + 1);
+                assert!(
+                    out.contains(rows[at]),
+                    "height {list_h}, step {step}: {:?} not shown\n{out}",
+                    rows[at]
+                );
+                let last = out.lines().nth(list_h as usize - 2).unwrap();
+                assert!(
+                    last.contains("↓") || last.contains("↑ more above"),
+                    "height {list_h}, step {step}: no fold line\n{out}"
+                );
+                if !out.contains("Speed up") {
+                    assert!(
+                        last.contains("Resolved 1 · R shows"),
+                        "height {list_h}: {last:?}\n{out}"
+                    );
+                }
+                for line in out.lines() {
+                    assert!(cols(line) <= 40, "{line:?}");
+                }
+            }
+        }
+        // At 8 the first page shows the goal, the coordinator and the first group.
+        let app = busy_board();
+        let out = render(&app, 40, 9);
+        assert!(out.contains("Ship it"), "{out}");
+        assert!(out.contains("Coordinator"), "{out}");
+        assert!(out.contains("↓ 2 more · Resolved 1 · R shows"), "{out}");
+    }
+
     #[test]
     fn wide_board_shows_resolved_tags_when_expanded() {
         let mut app = busy_board();
@@ -1045,6 +1106,9 @@ mod tests {
     #[test]
     fn settings_screen_renders_fields() {
         let mut app = busy_board();
+        let dir = tempfile::tempdir().unwrap();
+        app.config.save(&dir.path().join("project.toml")).unwrap();
+        app.dir = dir.path().into();
         app.on_key(ch('s'));
         let out = render(&app, 48, 40);
         for want in [

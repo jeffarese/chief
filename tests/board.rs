@@ -392,7 +392,13 @@ fn save_writes_settings_and_regenerates() {
     let mut config = ProjectConfig::load(&path).unwrap();
     config.threads.model = "haiku".into();
     let msg = jobs::run(&env.src, Action::SaveSettings(Box::new(config.clone())));
-    assert_eq!(msg, Msg::Saved(Box::new(config)));
+    assert_eq!(
+        msg,
+        Msg::Saved {
+            config: Box::new(config),
+            warning: None
+        }
+    );
     assert_eq!(ProjectConfig::load(&path).unwrap().threads.model, "haiku");
     for f in [
         "coordinator-settings.json",
@@ -408,6 +414,49 @@ fn save_writes_settings_and_regenerates() {
         panic!("invalid settings aren't saved")
     };
     assert!(text.contains("max_parallel"), "{text}");
+}
+
+/// When project.toml was written but `generated/*` couldn't be, the save happened: the board
+/// says Saved, with why the rest failed, not "Not saved".
+#[test]
+fn a_save_whose_regeneration_fails_is_still_saved() {
+    let env = Env::new();
+    let path = env.src.dir.join("project.toml");
+    let generated = env.src.dir.join("generated");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::write(&generated, "not a folder").unwrap();
+    let mut config = ProjectConfig::load(&path).unwrap();
+    config.threads.model = "haiku".into();
+    let Msg::Saved {
+        config: saved,
+        warning,
+    } = jobs::run(&env.src, Action::SaveSettings(Box::new(config.clone())))
+    else {
+        panic!("saved")
+    };
+    assert_eq!(*saved, config);
+    assert!(warning.unwrap().contains("generated"));
+    assert_eq!(ProjectConfig::load(&path).unwrap().threads.model, "haiku");
+}
+
+/// Shows run one at a time on one worker, and the main pane ends on the last pick.
+#[test]
+fn shows_run_in_order_and_the_last_pick_wins() {
+    let env = Env::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (kick, _kicks) = std::sync::mpsc::channel();
+    let shows = jobs::spawn_shows(env.src.clone(), tx, kick);
+    for target in [Some(NAME), None, Some(NAME), None] {
+        shows.send(target.map(String::from)).unwrap();
+    }
+    drop(shows);
+    let msgs: Vec<Msg> = rx.iter().collect();
+    assert_eq!(
+        msgs.last(),
+        Some(&Msg::Notice("Main pane: coordinator".into()))
+    );
+    assert!(msgs.len() <= 4, "{msgs:?}");
+    assert_eq!(db::get_pane_target(&env.conn, "demo").unwrap(), None);
 }
 
 /// The settings screen's trust check (§10): every pool account against the draft's repos, on a
