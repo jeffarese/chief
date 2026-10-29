@@ -44,23 +44,22 @@ impl Gh {
         Gh::new(bin)
     }
 
-    /// The PR whose head is `branch`, run in `repo_path`, opened from this repository no earlier
-    /// than `since` (the thread row's `created_at`, see `parse_pr_list`). A missing `gh`, a `gh`
-    /// that isn't logged in, or a repository without a GitHub remote is `Ok(None)` plus a hint
-    /// (`take_hint`); other failures are errors.
+    /// The thread's PR on `branch`, run in `repo_path`: the newest one opened from this repository
+    /// no earlier than `since` (the thread row's `created_at`, see `parse_pr_list`) whose head
+    /// commit is on the local branch (`owns_head`). A missing `gh`, a `gh` that isn't logged in,
+    /// or a repository without a GitHub remote is `Ok(None)` plus a hint (`take_hint`); other
+    /// failures, a missing `repo_path` among them, are errors, so the stored PR stays.
     pub fn poll(&self, repo_path: &Path, branch: &str, since: i64) -> Result<Option<PrInfo>> {
+        // Spawning in a folder that doesn't exist fails with NotFound too, which would read as
+        // "gh isn't installed".
+        if !repo_path.is_dir() {
+            bail!("{} isn't a folder", repo_path.display());
+        }
         let mut cmd = Command::new(&self.bin);
+        // gh finds the repository with git: not the one a git hook's `GIT_DIR` names.
+        crate::proc::without_repo_env(&mut cmd);
         cmd.current_dir(repo_path).args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "url,state,isDraft,reviewDecision,createdAt,isCrossRepository",
-            "--limit",
-            "10",
+            "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS, "--limit", "10",
         ]);
         let out = match crate::proc::output_with_timeout(&mut cmd, GH_TIMEOUT) {
             Ok(Some(out)) => out,
@@ -86,7 +85,22 @@ impl Gh {
                 out.status
             );
         }
-        parse_pr_list(&String::from_utf8_lossy(&out.stdout), since)
+        let listed = parse_pr_list(&String::from_utf8_lossy(&out.stdout), since)?;
+        if listed.is_empty() {
+            return Ok(None);
+        }
+        let reference = format!("refs/heads/{branch}");
+        if cleanup::branch_sha(repo_path, &reference)?.is_none() {
+            bail!("no local branch {branch} to match its pull requests on");
+        }
+        for pr in listed {
+            if let Some(head) = &pr.head
+                && owns_head(repo_path, &reference, head)?
+            {
+                return Ok(Some(pr.info));
+            }
+        }
+        Ok(None)
     }
 
     /// The first hint, once per `Gh`; None afterwards.
@@ -100,6 +114,39 @@ impl Gh {
         {
             *slot = Some(hint);
         }
+    }
+}
+
+/// The `gh pr list --json` fields chief reads.
+const PR_FIELDS: &str = "url,state,isDraft,reviewDecision,createdAt,isCrossRepository,headRefOid";
+
+/// Whether the PR head `oid` is on the thread's branch (`reference`, `refs/heads/<branch>`): its
+/// tip or an ancestor of it. A branch name says nothing about whose PR it is: a cleaned thread's
+/// remote branch stays, and a later thread can name its worktree the same. Its commits can't be
+/// on another thread's branch unless that branch was built on them. A commit this repository
+/// doesn't have isn't on the branch; a check that can't run is an error.
+fn owns_head(repo: &Path, reference: &str, oid: &str) -> Result<bool> {
+    let hex = (7..=64).contains(&oid.len()) && oid.chars().all(|c| c.is_ascii_hexdigit());
+    if !hex {
+        return Ok(false);
+    }
+    let commit = format!("{oid}^{{commit}}");
+    if !cleanup::git_output(repo, &["cat-file", "-e", &commit])?
+        .status
+        .success()
+    {
+        return Ok(false);
+    }
+    let out = cleanup::git_output(repo, &["merge-base", "--is-ancestor", oid, reference])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "`git merge-base --is-ancestor {oid} {reference}` failed in {} ({}): {}",
+            repo.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
     }
 }
 
@@ -138,35 +185,53 @@ struct GhPr {
     created_at: Option<String>,
     #[serde(default)]
     is_cross_repository: bool,
+    #[serde(default)]
+    head_ref_oid: Option<String>,
+}
+
+/// One PR that may be the thread's, before its head is checked (`owns_head`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed {
+    pub info: PrInfo,
+    /// `headRefOid`: the commit the PR's branch pointed at on GitHub.
+    pub head: Option<String>,
 }
 
 /// How far a PR's `createdAt` (GitHub's clock) may precede the thread row (this machine's clock)
 /// and still be the thread's.
 const CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 
-/// `gh pr list --json url,state,isDraft,reviewDecision,createdAt,isCrossRepository` output → the
-/// thread's PR: the newest one opened from this repository (a fork's branch can share the name)
-/// no earlier than `since` minus the clock-skew allowance. Worktree branch names come from thread
-/// names, so a new thread can reuse the branch of an old one whose PR merged long ago; that PR
-/// must not resolve and clean the new thread. A PR without a readable `createdAt` is ignored.
-pub fn parse_pr_list(json: &str, since: i64) -> Result<Option<PrInfo>> {
+/// `gh pr list --json <PR_FIELDS>` output → the PRs that may be the thread's, newest first: those
+/// opened from this repository (a fork's branch can share the name) no earlier than `since` minus
+/// the clock-skew allowance. Worktree branch names come from thread names, so a new thread can
+/// reuse the branch of an old one whose PR merged long ago; that PR must not resolve and clean the
+/// new thread. A PR without a readable `createdAt` is left out. `Gh::poll` then takes the first
+/// whose head is on the thread's branch.
+pub fn parse_pr_list(json: &str, since: i64) -> Result<Vec<Listed>> {
     let prs: Vec<GhPr> = serde_json::from_str(json).context("parsing `gh pr list` output")?;
     let created = |p: &GhPr| {
         let at = chrono::DateTime::parse_from_rfc3339(p.created_at.as_deref()?).ok()?;
         Some(at.timestamp_millis())
     };
-    let newest = prs
+    let mut listed: Vec<(i64, GhPr)> = prs
         .into_iter()
         .filter(|p| !p.is_cross_repository)
         .filter_map(|p| Some((created(&p)?, p)))
         .filter(|(at, _)| *at >= since - CLOCK_SKEW_MS)
-        .max_by_key(|(at, _)| *at);
-    Ok(newest.map(|(_, p)| PrInfo {
-        url: p.url,
-        state: p.state,
-        draft: p.is_draft,
-        review: p.review_decision.filter(|r| !r.is_empty()),
-    }))
+        .collect();
+    listed.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    Ok(listed
+        .into_iter()
+        .map(|(_, p)| Listed {
+            info: PrInfo {
+                url: p.url,
+                state: p.state,
+                draft: p.is_draft,
+                review: p.review_decision.filter(|r| !r.is_empty()),
+            },
+            head: p.head_ref_oid.filter(|h| !h.is_empty()),
+        })
+        .collect())
 }
 
 /// Threads whose PR is worth asking about, once their job state names a worktree and branch
@@ -203,11 +268,16 @@ pub fn poll_project(ctx: &Ctx, slug: &str) -> Result<Refresh> {
             continue;
         }
         // The job state's, not the hooks': a thread whose shell sits in the checkout reports
-        // that checkout's branch, often `main`.
-        let (Some(repo), Some(branch)) = (
-            row.repo_path.as_deref(),
-            cleanup::branch_of(ctx.claude, &row),
-        ) else {
+        // that checkout's branch, often `main`. A job state that can't be read says nothing:
+        // skipped, the stored PR kept.
+        let branch = match cleanup::branch_of(ctx.claude, &row) {
+            Ok(branch) => branch,
+            Err(e) => {
+                refresh.errors.push(format!("{}: {e:#}", row.name));
+                continue;
+            }
+        };
+        let (Some(repo), Some(branch)) = (row.repo_path.as_deref(), branch) else {
             continue;
         };
         refresh.polled += 1;
@@ -267,61 +337,63 @@ mod tests {
 
     #[test]
     fn pr_list_parsing() {
-        let json = r#"[{"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":true,"reviewDecision":"","createdAt":"2027-01-15T09:00:00Z","isCrossRepository":false}]"#;
+        let json = r#"[{"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":true,"reviewDecision":"","createdAt":"2027-01-15T09:00:00Z","isCrossRepository":false,"headRefOid":"abc123f"}]"#;
         assert_eq!(
             parse_pr_list(json, CREATED).unwrap(),
-            Some(PrInfo {
-                url: "https://github.com/o/r/pull/7".into(),
-                state: "OPEN".into(),
-                draft: true,
-                review: None,
-            })
+            [Listed {
+                info: PrInfo {
+                    url: "https://github.com/o/r/pull/7".into(),
+                    state: "OPEN".into(),
+                    draft: true,
+                    review: None,
+                },
+                head: Some("abc123f".into()),
+            }]
         );
         let approved = r#"[{"url":"u","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","createdAt":"2027-01-15T09:00:00+01:00","isCrossRepository":false}]"#;
-        assert_eq!(
-            parse_pr_list(approved, CREATED)
-                .unwrap()
-                .unwrap()
-                .review
-                .as_deref(),
-            Some("APPROVED")
-        );
-        assert_eq!(parse_pr_list("[]", CREATED).unwrap(), None);
+        let listed = parse_pr_list(approved, CREATED).unwrap();
+        assert_eq!(listed[0].info.review.as_deref(), Some("APPROVED"));
+        assert_eq!(listed[0].head, None, "no headRefOid: no head to match");
+        assert!(parse_pr_list("[]", CREATED).unwrap().is_empty());
         assert!(parse_pr_list("nope", CREATED).is_err());
     }
 
     /// A branch name reused by a new thread must not pick up the old thread's PR, nor a fork's.
     #[test]
-    fn only_this_threads_own_newest_pr_counts() {
-        let list = |prs: &[serde_json::Value]| {
+    fn only_this_threads_own_prs_are_listed_newest_first() {
+        let list = |prs: &[serde_json::Value]| -> Vec<String> {
             parse_pr_list(&serde_json::Value::from(prs.to_vec()).to_string(), CREATED)
                 .unwrap()
-                .map(|p| p.url)
+                .into_iter()
+                .map(|p| p.info.url)
+                .collect()
         };
         let old = pr("old", "MERGED", "2026-06-01T10:00:00Z", false);
-        assert_eq!(list(std::slice::from_ref(&old)), None, "before the thread");
+        assert!(
+            list(std::slice::from_ref(&old)).is_empty(),
+            "before the thread"
+        );
         let fork = pr("fork", "OPEN", "2027-01-15T09:00:00Z", true);
-        assert_eq!(
-            list(&[fork.clone(), old.clone()]),
-            None,
+        assert!(
+            list(&[fork.clone(), old.clone()]).is_empty(),
             "another repository"
         );
         // Within the clock-skew allowance (5 min) still counts.
         let skewed = pr("skewed", "OPEN", "2027-01-15T07:56:00Z", false);
-        assert_eq!(list(&[old.clone(), skewed]).as_deref(), Some("skewed"));
+        assert_eq!(list(&[old.clone(), skewed]), ["skewed"]);
         let early = pr("early", "OPEN", "2027-01-15T07:54:00Z", false);
-        assert_eq!(list(&[early]), None);
-        // The newest of the rest, whatever order gh lists them in.
+        assert!(list(&[early]).is_empty());
+        // Newest first, whatever order gh lists them in.
         let first = pr("first", "CLOSED", "2027-01-15T09:00:00Z", false);
         let second = pr("second", "OPEN", "2027-01-16T09:00:00Z", false);
         assert_eq!(
-            list(&[first.clone(), fork, second.clone(), old]).as_deref(),
-            Some("second")
+            list(&[first.clone(), fork, second.clone(), old]),
+            ["second", "first"]
         );
-        assert_eq!(list(&[second, first]).as_deref(), Some("second"));
+        assert_eq!(list(&[second, first]), ["second", "first"]);
         // No usable createdAt: can't tell whose it is.
         let undated = serde_json::json!([{"url": "u", "state": "MERGED"}]);
-        assert_eq!(list(undated.as_array().unwrap()), None);
+        assert!(list(undated.as_array().unwrap()).is_empty());
     }
 
     #[test]
