@@ -8,6 +8,8 @@ pub mod cleanup;
 pub mod config;
 pub mod context;
 pub mod db;
+#[cfg(feature = "builtin-layout")]
+pub mod embed;
 pub mod generated;
 pub mod guard;
 pub mod hook;
