@@ -172,8 +172,10 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief new` | you | The launcher, straight to the new-project wizard |
 | `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
 | `chief trust <slug>` | you | Mark every folder the project's sessions need as trusted (§3 "Trust") |
-| `chief up <slug> [--layout builtin]` | you | Start or revive the coordinator, open the layout (Rex, tmux, chief's own, or say how) |
+| `chief up <slug> [--layout builtin]` | you | Unarchive the project if it is archived, start or revive the coordinator, open the layout (Rex, tmux, chief's own, or say how) |
 | `chief down <slug> [--stop-threads]` | you | End the pane, close the layout; threads keep running unless asked |
+| `chief archive <slug>` | you | `chief down <slug> --stop-threads`, then put the project away (hidden from the launcher's list and `chief status`); nothing is deleted |
+| `chief unarchive <slug>` | you | Bring an archived project back; starts nothing |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
 | `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session |
 | `chief hook <event> --project <slug> --role <coordinator\|thread>` | Claude Code hooks | Record events, derive state, inject context |
@@ -217,7 +219,8 @@ exit non-zero after the rest.
 `chief up` (`project::up`, which prints what `project::up_with` reports: lines on stdout,
 warnings on stderr; the launcher shows the same reports in its window) loads project.toml, checks
 the version in the project's account (§3), rewrites
-`generated/*`, runs the coordinator step (§7), then opens the layout (§9): with Rex when it is
+`generated/*`, clears `projects.archived_at` when it is set (`Unarchived <name>.`: opening an
+archived project is wanting it back), runs the coordinator step (§7), then opens the layout (§9): with Rex when it is
 installed and its server runs (`rex list` succeeds), storing the session id in
 `ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux window, storing it
 in `ui_state.tmux_window`; else, on a terminal, it draws both sides itself, the built-in layout
@@ -227,8 +230,9 @@ the two commands to run side by side in terminals or splits of the user's own, `
 falls back the same way. `--layout builtin` skips Rex and tmux and opens the built-in layout; it
 fails before anything starts without a terminal or the feature.
 
-`chief down <slug> [--stop-threads]` first ends the running pane, wherever it runs: one `down`
-didn't open (in the user's own Rex block, §9 case 0, or run by hand) would otherwise attach again
+`chief down <slug> [--stop-threads]` (`project::down`, which prints what `project::down_with`
+reports: lines on stdout, warnings and failures on stderr) first ends the running pane, wherever
+it runs: one `down` didn't open (in the user's own Rex block, §9 case 0, or run by hand) would otherwise attach again
 and respawn the coordinator, or its target, seconds after `down` stopped it. When `pane_pid`'s
 start time matches `pane_started` (`pane::live_pane`) it sends SIGTERM, which ends the pane as a
 hangup does (it reaps its attach, clears its record, and closes the board it opened beside the
@@ -246,6 +250,19 @@ syncs `claude agents` (stored rows if it fails), and runs
 uncleaned thread with a process. Without it, it says how many threads keep running. It never runs
 `claude rm`. Each step prints what it did; any failure makes it exit non-zero after the rest ran.
 
+`chief archive <slug>` (`project::archive`, printing what `project::archive_with` reports, which
+the launcher shows in its window) puts a finished project away, reversibly. An archived project
+already says `<name> is archived already.` and exits 0. Otherwise it runs `down_with(slug,
+stop_threads: true)`, and only when that finished cleanly stores `projects.archived_at` and says
+`Archived <name>. Nothing was deleted: chief unarchive <slug> or chief up <slug> brings it back.`
+When down didn't finish cleanly (a stop or a close failed, the account unreadable) the project
+isn't archived, since something of it may still run and archived would hide it: it exits non-zero
+with `<name> isn't archived: … Run chief archive <slug> again once that is fixed.` Conversations,
+worktrees, branches and files all stay. `chief unarchive <slug>` clears `archived_at` and starts
+nothing (`Unarchived <name>. chief up <slug> opens it.`, or `<name> isn't archived.`). Archiving
+changes only what is listed: `chief gc` without a slug still goes through archived projects (their
+resolved threads still hold worktrees), and every command that takes a slug works on them.
+
 `chief status [<slug>]` polls `claude agents` once per account the projects shown use (their own
 accounts and their threads', §3; stored rows if it fails), syncs each project with those
 snapshots (§5), and prints
@@ -253,7 +270,10 @@ each project's coordinator and threads grouped in board order. A thread's line j
 its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>`, `account <label>` (the
 agp account it runs in, §7 "Thread account") (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
-it was last active (`5m ago`, `just now`).
+it was last active (`5m ago`, `just now`). Without a slug it leaves archived projects out and ends
+with `N archived project(s) not shown; chief status <slug> shows one.` when there are any; with
+the slug of an archived one, its first line is `<slug> (archived; chief unarchive <slug> brings it
+back)`.
 
 ## 3. Files
 
@@ -428,7 +448,8 @@ notify = true                      # macOS notifications on permission prompts a
 CREATE TABLE projects (
   slug        TEXT PRIMARY KEY,
   dir         TEXT NOT NULL,
-  created_at  INTEGER NOT NULL            -- unix ms
+  created_at  INTEGER NOT NULL,           -- unix ms
+  archived_at INTEGER                     -- when `chief archive` put it away, §2; NULL = live (migration 14)
 );
 
 CREATE TABLE sessions (                   -- coordinator and threads
@@ -1560,23 +1581,39 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
 
 `chief` with no command (`src/launcher/`): `app.rs` holds the state and turns keys and clicks into
 actions, `ui.rs` draws it, `wizard.rs` is the new-project wizard, `mod.rs` runs the loop and the
-worker. It needs a terminal on stdin and stdout; otherwise it fails with "chief needs a terminal;
-`chief --help` lists the commands for scripts". The look is the board's (§10 "Look"): one card,
+worker (which runs `up_with`, the create step and `archive_with`, so the launcher shows their
+reports instead of printing into its screen). It needs a terminal on stdin and stdout;
+otherwise it fails with "chief needs a terminal; `chief --help` lists the commands for scripts". The look is the board's (§10 "Look"): one card,
 at most 76 columns wide, centred, a line below the top, as tall as its content (wrapped lines
 counted as the drawing wraps them), the key bar right under it. On a short terminal a card's
 last lines (what Enter does, the trust box, the result or failure) stay whole at its bottom;
 the lines above are cut from the top, under `↑ more above`, so the newest notes and the folders
 next to the trust box are the ones that show. The terminal and worker panics are handled as on
-the board (§10 "Terminal"): a worker that panics ends the card with `Starting crashed: …`.
+the board (§10 "Terminal"): a worker that panics ends the card with `Starting crashed: …`
+(`Archiving crashed: …` on the Archiving card).
 
 - Project list (`Your projects`): each registered project's name in bold with a summary at the
   right, from project.toml and its stored rows only, so it opens at once (`1 waiting · 2 working`,
   in red while one waits; `no threads yet`; `all resolved`; `can't read project.toml: …`), and its
-  goal dim below. Then `+ New project`. ↑/↓, j/k, g/G and the wheel move; Enter or a click on the
-  selection opens the selected project, or the wizard on `+ New project`; n starts the wizard from
-  anywhere; ? explains what chief does and the keys; q or Esc quits. With no projects the
-  launcher opens on the wizard, and Esc from its first step quits. `chief new` opens on the
-  wizard too.
+  goal dim below. Archived projects (`projects.archived_at`, §2) come after the live ones,
+  folded into one line like the board's Resolved header, `Archived · N · A shows`; A (or a click
+  on that line) shows them under `Archived · N`, dim, each marked `archived` where the summary
+  goes, and hides them again. With every project archived the list says `Every project is
+  archived.` Then `+ New project`, which stays selected when A toggles. ↑/↓, j/k, g/G and the
+  wheel move over what is shown; Enter or a click on the selection opens the selected project
+  (an archived one too: `up_with` unarchives it, and says so in its reports), or the wizard on
+  `+ New project`; n starts the wizard from anywhere; ? explains what chief does and the keys; q
+  or Esc quits. With no projects the launcher opens on the wizard, and Esc from its first step
+  quits. `chief new` opens on the wizard too.
+- Archiving: a on a live project asks first, in a card of its own (`Archive <name>? Its
+  coordinator and threads stop; their conversations, worktrees and branches stay.`); y archives,
+  any other key or a click cancels. `project::archive_with` then runs on the worker, and the
+  "Archiving <name>" card shows its reports as the Starting card does (below), under a spinner,
+  then the outcome: under Archived now, or the error in red when it isn't archived. Enter or Esc
+  goes back to the list, which is re-read either way (sessions may have stopped). a on an
+  archived project unarchives it at once (`Unarchived <name>. ⏎ opens it.` in green below the
+  list) and starts nothing. The key bar names a's action for the selection (`a archive` or `a
+  unarchive`) and, when any project is archived, A's (`A show archived`, `A hide archived`).
 - Wizard, four steps, `New project · step N of 4` with `✓ About  ● Code  ○ Models  ○ Review`
   below the title. Esc (or Shift+Tab) goes back a step and keeps what was typed; on the first step
   it cancels.

@@ -32,9 +32,20 @@ pub fn entries() -> Result<Vec<Entry>> {
         let config = ProjectConfig::load(&Path::new(&dir).join("project.toml"))
             .map_err(|e| format!("{e:#}"));
         let rows = db::list_sessions(&conn, &slug, None).unwrap_or_default();
-        out.push(Entry::new(&slug, config, &rows));
+        let mut entry = Entry::new(&slug, config, &rows);
+        entry.archived = db::archived_at(&conn, &slug)?.is_some();
+        out.push(entry);
     }
     Ok(out)
+}
+
+/// `a` on an archived project: back in the list, nothing started.
+fn unarchive(slug: &str, name: &str) -> Result<String, String> {
+    let conn = db::open(&paths::db()).map_err(|e| format!("{e:#}"))?;
+    match db::unarchive_project(&conn, slug) {
+        Ok(_) => Ok(format!("Unarchived {name}. ⏎ opens it.")),
+        Err(e) => Err(format!("{name} isn't unarchived: {e:#}")),
+    }
 }
 
 /// What the wizard checks as it goes: free slugs, and folder trust in the account a new project
@@ -90,6 +101,17 @@ pub fn run(new: bool) -> Result<()> {
                         Action::Create(draft) => {
                             spawn(tx.clone(), move |send| create(&draft, send))
                         }
+                        Action::Archive(slug) => spawn_archive(tx.clone(), slug),
+                        Action::Unarchive(slug) => {
+                            let name = app
+                                .selected()
+                                .map_or_else(|| slug.clone(), |p| p.name.clone());
+                            let status = unarchive(&slug, &name);
+                            if let Ok(projects) = entries() {
+                                app.set_projects(projects, Some(&slug));
+                            }
+                            app.status = Some(status);
+                        }
                     }
                 }
             }
@@ -97,6 +119,10 @@ pub fn run(new: bool) -> Result<()> {
             while let Ok(msg) = rx.try_recv() {
                 if let Msg::Created(slug) = &msg {
                     finished = Some(slug.clone());
+                }
+                // Archived or not, its sessions may have stopped: the list shows what is now.
+                if let (Msg::Archived(_), app::Screen::Archiving(a)) = (&msg, &app.screen) {
+                    finished = Some(a.slug.clone());
                 }
                 let done = matches!(msg, Msg::Done(_));
                 // In a Rex block the board is beside it: this terminal becomes the conversation.
@@ -154,16 +180,34 @@ fn spawn(
     tx: mpsc::Sender<Msg>,
     job: impl FnOnce(&mut dyn FnMut(Msg)) -> Result<Where> + Send + 'static,
 ) {
+    on_worker(tx, job, "Starting", Msg::Done);
+}
+
+/// `chief archive` on a worker, reporting into the Archiving card.
+fn spawn_archive(tx: mpsc::Sender<Msg>, slug: String) {
+    let job = move |send: &mut dyn FnMut(Msg)| {
+        project::archive_with(&slug, &mut |note| send(Msg::Note(note)))
+    };
+    on_worker(tx, job, "Archiving", Msg::Archived);
+}
+
+/// Runs `job` on a worker: its notes come back as messages, then `done` with its result.
+fn on_worker<T: 'static>(
+    tx: mpsc::Sender<Msg>,
+    job: impl FnOnce(&mut dyn FnMut(Msg)) -> Result<T> + Send + 'static,
+    what: &'static str,
+    done: fn(std::result::Result<T, String>) -> Msg,
+) {
     std::thread::spawn(move || {
         let mut send = |msg: Msg| {
             let _ = tx.send(msg);
         };
-        // A panic must still end the Starting card's spinner.
+        // A panic must still end the card's spinner.
         let result = match tui::catch(|| job(&mut send)) {
-            Ok(done) => done.map_err(|e| format!("{e:#}")),
-            Err(panic) => Err(format!("Starting crashed: {panic}")),
+            Ok(result) => result.map_err(|e| format!("{e:#}")),
+            Err(panic) => Err(format!("{what} crashed: {panic}")),
         };
-        send(Msg::Done(result));
+        send(done(result));
     });
 }
 

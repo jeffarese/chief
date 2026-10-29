@@ -1,4 +1,4 @@
-//! Project lifecycle: init, up, down, status (ARCHITECTURE §2, §3, §7, §9).
+//! Project lifecycle: init, up, down, archive, status (ARCHITECTURE §2, §3, §7, §9).
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -325,11 +325,7 @@ pub enum CoordinatorAction {
 /// tmux window when this runs inside tmux, else chief draws both in this terminal, else it
 /// prints the two commands to run side by side.
 pub fn up(slug: &str, choice: LayoutChoice) -> Result<()> {
-    let mut print = |note: Note| match note {
-        Note::Did(line) | Note::Info(line) => println!("{line}"),
-        Note::Warn(line) => eprintln!("{line}"),
-    };
-    match up_with(slug, choice, &mut print)? {
+    match up_with(slug, choice, &mut print_note)? {
         Where::Here { board } => crate::pane::run(slug, crate::pane::OnQuit::Board(board)),
         Where::Builtin => run_builtin(slug),
         Where::Manual => {
@@ -364,13 +360,21 @@ pub fn run_builtin(slug: &str) -> Result<()> {
     );
 }
 
-/// A line `up` reports: what it did, what it didn't and why (no layout, say), or a warning
-/// (stderr on the command line).
+/// A line `up`, `down` or `archive` reports: what it did, what it didn't and why (no layout,
+/// say), or a warning or failure (stderr on the command line).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Note {
     Did(String),
     Info(String),
     Warn(String),
+}
+
+/// A note on the command line: lines on stdout, warnings on stderr.
+pub fn print_note(note: Note) {
+    match note {
+        Note::Did(line) | Note::Info(line) => println!("{line}"),
+        Note::Warn(line) => eprintln!("{line}"),
+    }
 }
 
 /// Where `up` put the layout (§9).
@@ -425,6 +429,10 @@ pub fn up_with(slug: &str, choice: LayoutChoice, note: &mut dyn FnMut(Note)) -> 
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
         db::register_project(&conn, slug, &dir, db::now_ms())?;
+    }
+    // Opening a project is wanting it back; nothing of it runs while archived.
+    if db::unarchive_project(&conn, slug)? {
+        note(Note::Did(format!("Unarchived {}.", config.name)));
     }
     let trust_config = claude.trust_config();
     let mut warn = |line: String| note(Note::Warn(line));
@@ -763,13 +771,19 @@ pub fn wait_for_pid(
 /// it) and stops the coordinator; with `stop_threads`, every live thread too. Stopping keeps
 /// conversations and worktrees (`claude stop`, never `claude rm`).
 pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
+    down_with(slug, stop_threads, &mut print_note)
+}
+
+/// `down`, reporting through `note` instead of printing, for `archive` and the launcher (§10a).
+/// An error once every step ran means some step failed (its note says which).
+pub fn down_with(slug: &str, stop_threads: bool, note: &mut dyn FnMut(Note)) -> Result<()> {
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, slug)?.is_none() {
         bail!("no chief project {slug:?}");
     }
-    let pane_ended = end_pane(&conn, slug)?;
+    let pane_ended = end_pane(&conn, slug, note)?;
     let mut failed = if pane_ended { 0 } else { 1 };
-    failed += close_layout(&conn, slug, &mut |line| println!("{line}"))?;
+    failed += close_layout(&conn, slug, note)?;
     // Left by a pane that couldn't record itself; one still running keeps what it shows.
     if pane_ended {
         db::set_pane_showing(&conn, slug, None)?;
@@ -778,16 +792,22 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     // showed would wake it right after `--stop-threads` stopped it.
     db::set_pane_target(&conn, slug, None)?;
 
-    let claude = match claude_for_slug(slug) {
-        Ok(claude) => claude,
+    let account = match account_of(slug) {
+        Ok(account) => account,
         Err(e) => {
-            println!("No session stopped: {e:#}");
+            note(Note::Warn(format!("No session stopped: {e:#}")));
             bail!("chief down {slug} didn't finish cleanly");
         }
     };
+    if let Some(n) = claude::account_note(slug, account.as_deref()) {
+        note(Note::Warn(n));
+    }
+    let claude = Claude::for_account(account);
     let listings = accounts::refresh(&conn, slug, &claude, AGENTS_TIMEOUT, db::now_ms)?;
     if let Some(e) = listings.error() {
-        eprintln!("warning: `claude agents` failed, using the last known state: {e}");
+        note(Note::Warn(format!(
+            "warning: `claude agents` failed, using the last known state: {e}"
+        )));
     }
     let mut left_running = 0;
     for row in db::list_sessions(&conn, slug, None)? {
@@ -795,7 +815,10 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
         let live = row.pid.is_some() && row.cleaned_at.is_none();
         let Some(short_id) = row.short_id.as_deref().filter(|_| live) else {
             if coordinator {
-                println!("Coordinator {} isn't running.", row.name);
+                note(Note::Info(format!(
+                    "Coordinator {} isn't running.",
+                    row.name
+                )));
             }
             continue;
         };
@@ -805,18 +828,21 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
         }
         let what = if coordinator { "coordinator" } else { "thread" };
         match claude.for_row(&row).stop(short_id) {
-            Ok(()) => println!("Stopped {what} {}.", row.name),
+            Ok(()) => note(Note::Did(format!("Stopped {what} {}.", row.name))),
             Err(e) => {
                 failed += 1;
-                println!("Could not stop {what} {}: {e:#}", row.name);
+                note(Note::Warn(format!(
+                    "Could not stop {what} {}: {e:#}",
+                    row.name
+                )));
             }
         }
     }
     if left_running > 0 {
-        println!(
+        note(Note::Info(format!(
             "{left_running} thread{} still running; chief down {slug} --stop-threads stops them.",
             if left_running == 1 { " is" } else { "s are" }
-        );
+        )));
     }
     if failed > 0 {
         bail!("chief down {slug} didn't finish cleanly");
@@ -824,12 +850,12 @@ pub fn down(slug: &str, stop_threads: bool) -> Result<()> {
     Ok(())
 }
 
-/// Ends the recorded `chief pane` (§9), wherever it runs, and says so; false when it still runs
-/// after `PANE_END_WAIT`. A pane `down` didn't open (in the user's own Rex block, or started by
-/// hand) would otherwise attach again and respawn the session `down` is about to stop. SIGTERM
-/// ends it as a hangup does: it reaps its attach, clears its record and closes a board it opened
-/// beside it, but not chief's layout, which `down` closes next.
-fn end_pane(conn: &Connection, slug: &str) -> Result<bool> {
+/// Ends the recorded `chief pane` (§9), wherever it runs, and says so through `note`; false when
+/// it still runs after `PANE_END_WAIT`. A pane `down` didn't open (in the user's own Rex block,
+/// or started by hand) would otherwise attach again and respawn the session `down` is about to
+/// stop. SIGTERM ends it as a hangup does: it reaps its attach, clears its record and closes a
+/// board it opened beside it, but not chief's layout, which `down` closes next.
+fn end_pane(conn: &Connection, slug: &str, note: &mut dyn FnMut(Note)) -> Result<bool> {
     let Some(pid) = crate::pane::live_pane(conn, slug)? else {
         return Ok(true);
     };
@@ -839,45 +865,45 @@ fn end_pane(conn: &Connection, slug: &str) -> Result<bool> {
     while Instant::now() < deadline {
         // Its record cleared, or it is gone without clearing it.
         if crate::pane::live_pane(conn, slug)? != Some(pid) {
-            println!("Ended chief pane (pid {pid}).");
+            note(Note::Did(format!("Ended chief pane (pid {pid}).")));
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    println!(
+    note(Note::Warn(format!(
         "chief pane (pid {pid}) is still running after {} s.",
         PANE_END_WAIT.as_secs()
-    );
+    )));
     Ok(false)
 }
 
 /// Closes the layout `chief up` opened (Rex session or tmux window, §9), saying what it did
-/// through `say`; how many closes failed. Sessions are left alone.
-pub fn close_layout(conn: &Connection, slug: &str, say: &mut dyn FnMut(String)) -> Result<usize> {
+/// through `note`; how many closes failed. Sessions are left alone.
+pub fn close_layout(conn: &Connection, slug: &str, note: &mut dyn FnMut(Note)) -> Result<usize> {
     let mut failed = 0;
     let label = layout::session_label(slug);
     let rex_session = db::get_rex_session(conn, slug)?.map(SessionRef);
     let tmux_window = db::get_tmux_window(conn, slug)?.map(SessionRef);
     if rex_session.is_none() && tmux_window.is_none() {
-        say("No layout of chief's is open.".into());
+        note(Note::Info("No layout of chief's is open.".into()));
     }
     if let Some(ours) = &rex_session {
         match layout::close(&Rex::from_env(), Some(ours)) {
             Ok(Closed::Killed(_)) => {
                 db::set_rex_session(conn, slug, None)?;
-                say(format!("Closed Rex session {label}."));
+                note(Note::Did(format!("Closed Rex session {label}.")));
             }
-            Ok(Closed::Blocks(_)) => say(format!(
+            Ok(Closed::Blocks(_)) => note(Note::Did(format!(
                 "Closed chief's blocks in Rex session {label}; it holds other blocks too, so it \
                  stays open."
-            )),
+            ))),
             Ok(Closed::Nothing) => {
                 db::set_rex_session(conn, slug, None)?;
-                say(format!("No Rex session {label} was open."));
+                note(Note::Info(format!("No Rex session {label} was open.")));
             }
             Err(e) => {
                 failed += 1;
-                say(format!("Rex session {label} not closed: {e:#}"));
+                note(Note::Warn(format!("Rex session {label} not closed: {e:#}")));
             }
         }
     }
@@ -890,41 +916,104 @@ pub fn close_layout(conn: &Connection, slug: &str, say: &mut dyn FnMut(String)) 
         match closed {
             Ok(Closed::Killed(_)) => {
                 db::set_tmux_window(conn, slug, None)?;
-                say(format!("Closed tmux window {label}."));
+                note(Note::Did(format!("Closed tmux window {label}.")));
             }
-            Ok(Closed::Blocks(_)) => say(format!(
+            Ok(Closed::Blocks(_)) => note(Note::Did(format!(
                 "Closed chief's panes in tmux window {label}; it holds other panes too, so it \
                  stays open."
-            )),
+            ))),
             Ok(Closed::Nothing) => {
                 db::set_tmux_window(conn, slug, None)?;
-                say(format!("No tmux window {label} was open."));
+                note(Note::Info(format!("No tmux window {label} was open.")));
             }
             Err(e) => {
                 failed += 1;
-                say(format!("tmux window {label} not closed: {e:#}"));
+                note(Note::Warn(format!("tmux window {label} not closed: {e:#}")));
             }
         }
     }
     Ok(failed)
 }
 
-/// Prints the board as text, grouped as on the board: one project, or all of them.
+/// The project's name from project.toml, or its slug when that can't be read.
+fn name_of(slug: &str) -> String {
+    ProjectConfig::load(&project_dir(slug).join("project.toml"))
+        .map(|c| c.name)
+        .unwrap_or_else(|_| slug.to_string())
+}
+
+/// `chief archive <slug>`: everything `chief down <slug> --stop-threads` does, then the project
+/// is archived (hidden from the launcher's list and `chief status`). Nothing is deleted.
+pub fn archive(slug: &str) -> Result<()> {
+    archive_with(slug, &mut print_note)
+}
+
+/// `archive`, reporting through `note`, for the launcher (§10a). When `down` didn't finish
+/// cleanly the project isn't archived: something of it may still run, and archived would hide it.
+pub fn archive_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<()> {
+    let conn = db::open(&paths::db())?;
+    if db::project_dir(&conn, slug)?.is_none() {
+        bail!("no chief project {slug:?}");
+    }
+    let name = name_of(slug);
+    if db::archived_at(&conn, slug)?.is_some() {
+        note(Note::Info(format!("{name} is archived already.")));
+        return Ok(());
+    }
+    if let Err(e) = down_with(slug, true, note) {
+        bail!(
+            "{name} isn't archived: {e:#}, and an archived project keeps nothing running. Run \
+             chief archive {slug} again once that is fixed."
+        );
+    }
+    db::archive_project(&conn, slug, db::now_ms())?;
+    note(Note::Did(format!(
+        "Archived {name}. Nothing was deleted: chief unarchive {slug} or chief up {slug} brings \
+         it back."
+    )));
+    Ok(())
+}
+
+/// `chief unarchive <slug>`: back in the launcher's list and `chief status`; starts nothing.
+pub fn unarchive(slug: &str) -> Result<()> {
+    let conn = db::open(&paths::db())?;
+    if db::project_dir(&conn, slug)?.is_none() {
+        bail!("no chief project {slug:?}");
+    }
+    let name = name_of(slug);
+    if db::unarchive_project(&conn, slug)? {
+        println!("Unarchived {name}. chief up {slug} opens it.");
+    } else {
+        println!("{name} isn't archived.");
+    }
+    Ok(())
+}
+
+/// Prints the board as text, grouped as on the board: one project, or all of them but the
+/// archived ones.
 pub fn status(slug: Option<&str>) -> Result<()> {
     let conn = db::open(&paths::db())?;
-    let projects = match slug {
+    let (projects, hidden) = match slug {
         Some(slug) => {
             if db::project_dir(&conn, slug)?.is_none() {
                 bail!("no chief project {slug:?}");
             }
-            vec![slug.to_string()]
+            (vec![slug.to_string()], 0)
         }
-        None => db::list_projects(&conn)?
-            .into_iter()
-            .map(|(slug, _)| slug)
-            .collect(),
+        None => {
+            let mut live = Vec::new();
+            let mut hidden = 0;
+            for (slug, _) in db::list_projects(&conn)? {
+                if db::archived_at(&conn, &slug)?.is_some() {
+                    hidden += 1;
+                } else {
+                    live.push(slug);
+                }
+            }
+            (live, hidden)
+        }
     };
-    if projects.is_empty() {
+    if projects.is_empty() && hidden == 0 {
         println!("No projects yet. Create one with chief init <name>.");
         return Ok(());
     }
@@ -968,15 +1057,32 @@ pub fn status(slug: Option<&str>) -> Result<()> {
         }
         let rows = db::list_sessions(&conn, slug, None)?;
         let prefix = claude::shell_prefix(account.flatten().as_deref());
-        out.push_str(&render_status(slug, &rows, &prefix, db::now_ms()));
+        let archived = db::archived_at(&conn, slug)?.is_some();
+        out.push_str(&render_status(slug, archived, &rows, &prefix, db::now_ms()));
+    }
+    if hidden > 0 {
+        out.push_str(&format!(
+            "{hidden} archived project{} not shown; chief status <slug> shows one.\n",
+            if hidden == 1 { "" } else { "s" }
+        ));
     }
     print!("{out}");
     Ok(())
 }
 
 /// One project's board as text; `prefix` goes before `claude attach` (`Claude::shell_prefix`).
-pub fn render_status(slug: &str, rows: &[SessionRow], prefix: &str, now: i64) -> String {
-    let mut out = format!("{slug}\n");
+pub fn render_status(
+    slug: &str,
+    archived: bool,
+    rows: &[SessionRow],
+    prefix: &str,
+    now: i64,
+) -> String {
+    let mut out = if archived {
+        format!("{slug} (archived; chief unarchive {slug} brings it back)\n")
+    } else {
+        format!("{slug}\n")
+    };
     match rows.iter().find(|r| r.role == Role::Coordinator.as_str()) {
         Some(c) => {
             let state = if c.pid.is_some() {

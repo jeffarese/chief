@@ -68,6 +68,11 @@ hears from it once they finish.
 `chief down <slug>` closes the layout `up` opened and stops the coordinator; threads keep running
 unless you add `--stop-threads`.
 
+A finished project can be put away: `chief archive <slug>` (or `a` in `chief`'s list) stops its
+coordinator and threads and hides it from the list and `chief status`. Its conversations,
+worktrees, branches and files stay; `chief unarchive <slug>`, or opening it again, brings it
+back.
+
 ## The layout
 
 Two panes side by side: `chief pane --project <slug>` on the left shows the coordinator or the
@@ -195,6 +200,8 @@ readable.
 | `chief trust <slug>` | Trust every folder the project's sessions need |
 | `chief up <slug>` | Start or revive the coordinator and open the layout |
 | `chief down <slug> [--stop-threads]` | Close the layout and stop the coordinator |
+| `chief archive <slug>` | Stop the coordinator and every thread and put the project away; nothing is deleted |
+| `chief unarchive <slug>` | Bring an archived project back (`chief up` does too) |
 | `chief pane --project <slug>` | The left pane on its own, for a layout of your own |
 | `chief board --project <slug>` | The board on its own |
 | `chief status [<slug>]` | The board as text |

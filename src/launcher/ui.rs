@@ -11,7 +11,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::project::{Note, Where};
 use crate::tui::{self, ACCENT, bold, cols, dim, key_bar, panel, tail, truncate};
 
-use super::app::{Hit, Launcher, Screen, Starting};
+use super::app::{Archiving, Hit, Launcher, Screen, Starting};
 use super::wizard::{Setting, Step, Wizard};
 
 const CARD_WIDTH: u16 = 76;
@@ -84,18 +84,15 @@ pub fn draw(f: &mut Frame, app: &Launcher) {
     let x = area.x + (area.width - width) / 2;
     let inner_w = tui::inside(&panel("", true), Rect::new(0, 0, width, 3)).width;
     let (card, keys) = match &app.screen {
-        Screen::List => (
-            list_card(app, inner_w as usize),
-            vec![
-                ("⏎", "open"),
-                ("n", "new project"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-        ),
+        Screen::List => (list_card(app, inner_w as usize), list_keys(app)),
         Screen::Help => (help_card(), vec![("any key", "back")]),
         Screen::Wizard(w) => (wizard_card(w, inner_w as usize), wizard_keys(w)),
         Screen::Starting(s) => (starting_card(s), starting_keys(s)),
+        Screen::ConfirmArchive(_, name) => (
+            confirm_archive_card(name),
+            vec![("y", "archive"), ("any other key", "cancel")],
+        ),
+        Screen::Archiving(a) => (archiving_card(a), archiving_keys(a)),
     };
     // The card fits its content, a line below the top, with the key bar right under it.
     let top = u16::from(area.height > 12);
@@ -188,23 +185,35 @@ fn list_card(app: &Launcher, width: usize) -> Card {
         (Line::styled("Your projects", bold()), None),
         (Line::raw(""), None),
     ];
+    let archived = app.archived_count();
     if app.projects.is_empty() {
         lines.push((Line::styled("No projects yet.", dim()), None));
+    } else if app.projects.len() == archived {
+        lines.push((Line::styled("Every project is archived.", dim()), None));
     }
-    for (i, p) in app.projects.iter().enumerate() {
+    for (i, p) in app.projects[..app.visible()].iter().enumerate() {
         let selected = i == app.cursor;
-        let summary_style = if p.waiting {
+        // Live projects come first: the header goes right before the first archived one.
+        if p.archived && (i == 0 || !app.projects[i - 1].archived) {
+            lines.push((Line::raw(""), None));
+            lines.push((archived_header(archived, false, width), Some(Hit::Archived)));
+        }
+        let summary_style = if p.waiting && !p.archived {
             Style::new().fg(Color::Red)
         } else {
             dim()
         };
-        let summary = truncate(&p.summary, width / 2);
+        let summary = if p.archived {
+            "archived".to_string()
+        } else {
+            truncate(&p.summary, width / 2)
+        };
         let name_room = width.saturating_sub(cols(&summary) + 4);
         let name = truncate(&p.name, name_room);
         let gap = width.saturating_sub(2 + cols(&name) + cols(&summary));
         let mut first = Line::from(vec![
             Span::styled(if selected { "▌ " } else { "  " }, Style::new().fg(ACCENT)),
-            Span::styled(name, bold()),
+            Span::styled(name, if p.archived { dim() } else { bold() }),
             Span::raw(" ".repeat(gap)),
             Span::styled(summary, summary_style),
         ]);
@@ -225,6 +234,10 @@ fn list_card(app: &Launcher, width: usize) -> Card {
             lines.push((second, Some(Hit::Row(i))));
         }
     }
+    if archived > 0 && !app.show_archived {
+        lines.push((Line::raw(""), None));
+        lines.push((archived_header(archived, true, width), Some(Hit::Archived)));
+    }
     lines.push((Line::raw(""), None));
     let new = app.on_new_row();
     let mut add = Line::from(vec![
@@ -235,13 +248,14 @@ fn list_card(app: &Launcher, width: usize) -> Card {
         add = add.style(tui::selected());
         pad(&mut add, width);
     }
-    lines.push((add, Some(Hit::Row(app.projects.len()))));
+    lines.push((add, Some(Hit::Row(app.visible()))));
     if let Some(status) = &app.status {
+        let (text, color) = match status {
+            Ok(text) => (text, Color::Green),
+            Err(text) => (text, Color::Red),
+        };
         lines.push((Line::raw(""), None));
-        lines.push((
-            Line::styled(status.clone(), Style::new().fg(Color::Red)),
-            None,
-        ));
+        lines.push((Line::styled(text.clone(), Style::new().fg(color)), None));
     }
 
     Card {
@@ -249,6 +263,81 @@ fn list_card(app: &Launcher, width: usize) -> Card {
         lines,
         foot: Vec::new(),
         wrap: false,
+    }
+}
+
+/// `Archived · N · A shows`, as the board's collapsed Resolved header.
+fn archived_header(count: usize, collapsed: bool, width: usize) -> Line<'static> {
+    let mut text = format!("  Archived · {count}");
+    if collapsed {
+        text.push_str(" · A shows");
+    }
+    Line::styled(truncate(&text, width), bold())
+}
+
+fn list_keys(app: &Launcher) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("⏎", "open")];
+    match app.selected() {
+        Some(p) if p.archived => keys.push(("a", "unarchive")),
+        Some(_) => keys.push(("a", "archive")),
+        None => {}
+    }
+    if app.archived_count() > 0 {
+        keys.push((
+            "A",
+            if app.show_archived {
+                "hide archived"
+            } else {
+                "show archived"
+            },
+        ));
+    }
+    keys.extend([("n", "new project"), ("?", "help"), ("q", "quit")]);
+    keys
+}
+
+fn confirm_archive_card(name: &str) -> Card {
+    let lines = vec![
+        Line::styled(
+            format!(
+                "Archive {name}? Its coordinator and threads stop; their conversations, \
+                 worktrees and branches stay."
+            ),
+            bold(),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "It moves under Archived in your projects; a there, or opening it, brings it back.",
+            dim(),
+        ),
+    ];
+    Card::new(format!("Archive {name}"), lines)
+}
+
+fn archiving_card(a: &Archiving) -> Card {
+    let mut lines = note_lines(&a.notes);
+    lines.push(Line::raw(""));
+    let foot = match &a.done {
+        None => {
+            let frame = FRAME.with(Cell::get) / 2 % SPINNER.len();
+            Line::from(vec![
+                Span::styled(format!("{} ", SPINNER[frame]), Style::new().fg(ACCENT)),
+                Span::styled("Stopping its sessions…", dim()),
+            ])
+        }
+        Some(Ok(())) => Line::styled(
+            "It is under Archived in your projects now; a there brings it back.",
+            bold(),
+        ),
+        Some(Err(e)) => Line::styled(e.clone(), Style::new().fg(Color::Red)),
+    };
+    Card::new(format!("Archiving {}", a.name), lines).with_foot(vec![foot])
+}
+
+fn archiving_keys(a: &Archiving) -> Vec<(&'static str, &'static str)> {
+    match &a.done {
+        None => vec![("q", "quit")],
+        Some(_) => vec![("⏎", "projects"), ("q", "quit")],
     }
 }
 
@@ -274,8 +363,17 @@ fn help_card() -> Card {
              comes back to the coordinator, s opens settings and ? lists every key.",
         ),
         Line::raw(""),
+        Line::styled("Archiving a project", bold()),
+        Line::raw(
+            "a stops its coordinator and threads and puts it under Archived; nothing is \
+             deleted. A shows the archived projects; a on one, or opening it, brings it back.",
+        ),
+        Line::raw(""),
         Line::styled("Keys here", bold()),
-        Line::raw("↑↓ or the mouse wheel move · ⏎ or a click opens · n new project · q quit"),
+        Line::raw(
+            "↑↓ or the mouse wheel move · ⏎ or a click opens · a archives or unarchives · A \
+             shows archived · n new project · q quit",
+        ),
     ];
     Card::new("chief · help", lines)
 }
@@ -510,9 +608,9 @@ fn wizard_keys(w: &Wizard) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-fn starting_card(s: &Starting) -> Card {
-    let mut lines: Vec<Line<'static>> = s
-        .notes
+/// What `up` or `archive` reported so far: `✓` done, `·` said, `!` warned.
+fn note_lines(notes: &[Note]) -> Vec<Line<'static>> {
+    notes
         .iter()
         .map(|n| match n {
             Note::Did(t) => Line::from(vec![
@@ -528,7 +626,11 @@ fn starting_card(s: &Starting) -> Card {
                 Span::raw(tui::home_relative(t)),
             ]),
         })
-        .collect();
+        .collect()
+}
+
+fn starting_card(s: &Starting) -> Card {
+    let mut lines = note_lines(&s.notes);
     lines.push(Line::raw(""));
     let mut foot = Vec::new();
     let label = crate::layout::session_label(&s.slug);
@@ -656,13 +758,84 @@ mod tests {
             "no threads yet",
             "Hold p95",
             "+ New project",
-            "⏎ open  n new project  ? help  q quit",
+            "⏎ open  a archive  n new project  ? help  q quit",
         ] {
             assert!(out.contains(want), "missing {want:?}\n{out}");
         }
+        assert!(!out.contains("Archived"), "{out}");
         for (w, h) in [(20, 5), (3, 2), (120, 50)] {
             render(&app, w, h);
         }
+    }
+
+    #[test]
+    fn archived_projects_fold_under_one_line() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let entry = |name: &str, slug: &str, archived: bool| Entry {
+            archived,
+            ..Entry::new(
+                slug,
+                Ok(ProjectConfig::new(name, slug, None, Vec::new())),
+                &[],
+            )
+        };
+        let mut app = Launcher::new(
+            vec![entry("Old work", "old", true), entry("Pay", "pay", false)],
+            None,
+            false,
+        );
+        let out = render(&app, 80, 20);
+        assert!(out.contains("Archived · 1 · A shows"), "{out}");
+        assert!(!out.contains("Old work"), "{out}");
+        assert!(out.contains("A show archived"), "{out}");
+
+        // A click on the header is A.
+        let y = out
+            .lines()
+            .position(|l| l.contains("Archived · 1"))
+            .unwrap() as u16;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.show_archived);
+        press(&mut app, KeyCode::Down);
+        let out = render(&app, 80, 20);
+        let line = out.lines().find(|l| l.contains("Old work")).unwrap();
+        assert!(line.ends_with("archived │"), "{out}");
+        assert!(!out.contains("A shows"), "{out}");
+        assert!(
+            out.contains("⏎ open  a unarchive  A hide archived"),
+            "{out}"
+        );
+
+        // a on a live project asks first, in its own card.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('a'));
+        let out = render(&app, 80, 20);
+        assert!(
+            out.contains("Archive Pay? Its coordinator and threads stop"),
+            "{out}"
+        );
+        assert!(out.contains("y archive  any other key cancel"), "{out}");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(render(&app, 80, 20).contains("Stopping its sessions…"));
+        app.apply(crate::launcher::app::Msg::Note(Note::Warn(
+            "Could not stop coordinator chief-pay: boom".into(),
+        )));
+        app.apply(crate::launcher::app::Msg::Archived(Err(
+            "Pay isn't archived: chief down pay didn't finish cleanly".into(),
+        )));
+        let out = render(&app, 80, 20);
+        assert!(out.contains("╭ Archiving Pay"), "{out}");
+        assert!(
+            out.contains("! Could not stop coordinator chief-pay"),
+            "{out}"
+        );
+        assert!(out.contains("Pay isn't archived"), "{out}");
+        assert!(out.contains("⏎ projects  q quit"), "{out}");
     }
 
     #[test]

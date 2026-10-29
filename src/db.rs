@@ -153,6 +153,9 @@ CREATE TABLE ui_state (
      ALTER TABLE sessions ADD COLUMN legacy_cleaned INTEGER NOT NULL DEFAULT 0;
      UPDATE sessions SET legacy_cleaned = 1
        WHERE cleaned_at IS NOT NULL AND removed_at IS NULL;",
+    // When the project was archived (§2 `chief archive`): nothing of it runs, and the launcher
+    // and `chief status` leave it out. NULL is a live project.
+    "ALTER TABLE projects ADD COLUMN archived_at INTEGER;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -411,6 +414,35 @@ pub fn project_dir(conn: &Connection, slug: &str) -> Result<Option<String>> {
             r.get(0)
         })
         .optional()?)
+}
+
+/// When the project was archived, if it is.
+pub fn archived_at(conn: &Connection, slug: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT archived_at FROM projects WHERE slug = ?1",
+            [slug],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+pub fn archive_project(conn: &Connection, slug: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE projects SET archived_at = ?2 WHERE slug = ?1",
+        params![slug, now],
+    )?;
+    Ok(())
+}
+
+/// Whether the project was archived (it isn't any more).
+pub fn unarchive_project(conn: &Connection, slug: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE projects SET archived_at = NULL WHERE slug = ?1 AND archived_at IS NOT NULL",
+        [slug],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
@@ -1128,7 +1160,7 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 13);
+        assert_eq!(MIGRATIONS.len(), 14);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
@@ -1508,6 +1540,22 @@ mod tests {
         let (_dir, conn) = fresh();
         let s = SessionRow::new("x", "unregistered", Role::Thread, 1);
         assert!(insert_session(&conn, &s).is_err());
+    }
+
+    #[test]
+    fn archiving_a_project_and_back() {
+        let (_dir, conn) = fresh();
+        register_project(&conn, "p", Path::new("/root/projects/p"), 1).unwrap();
+        assert_eq!(archived_at(&conn, "p").unwrap(), None);
+        assert!(!unarchive_project(&conn, "p").unwrap(), "wasn't archived");
+        archive_project(&conn, "p", 42).unwrap();
+        assert_eq!(archived_at(&conn, "p").unwrap(), Some(42));
+        // Registering again (chief up does when the row is missing) keeps it archived.
+        register_project(&conn, "p", Path::new("/root/projects/p"), 2).unwrap();
+        assert_eq!(archived_at(&conn, "p").unwrap(), Some(42));
+        assert!(unarchive_project(&conn, "p").unwrap());
+        assert_eq!(archived_at(&conn, "p").unwrap(), None);
+        assert_eq!(archived_at(&conn, "unknown").unwrap(), None);
     }
 
     #[test]

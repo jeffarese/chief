@@ -1063,7 +1063,7 @@ fn status_lines_show_cleanup_then_end_with_the_age() {
     cleaned.cleaned_at = Some(1);
     let mut blocked = thread("payments-latency-b-2222");
     blocked.cleanup_blocked = Some("2 unpushed commits".into());
-    let text = chief::project::render_status(SLUG, &[cleaned, blocked], "", now);
+    let text = chief::project::render_status(SLUG, false, &[cleaned, blocked], "", now);
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("    ")).collect();
     assert_eq!(lines.len(), 2, "{text}");
     for (line, state) in lines
@@ -1772,17 +1772,18 @@ fn down_ends_the_running_pane_first() {
     assert_eq!(db::get_pane_process(&home.db(), SLUG).unwrap(), None);
     assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
 
-    // A pane that doesn't end: `down` goes on, keeps what it shows, and fails.
+    // A pane that doesn't end: `down` goes on, keeps what it shows, and fails (on stderr).
     let (pid, waiter) = pane(true);
     let out = home.run(&["down", SLUG], "");
     assert!(!out.status.success());
-    let text = stdout(&out);
     assert!(
-        text.starts_with(&format!(
+        stderr(&out).starts_with(&format!(
             "chief pane (pid {pid}) is still running after 3 s.\n"
         )),
-        "{text}"
+        "{}",
+        stderr(&out)
     );
+    let text = stdout(&out);
     assert!(
         text.contains("Stopped coordinator chief-payments-latency."),
         "{text}"
@@ -1805,6 +1806,127 @@ fn down_ends_the_running_pane_first() {
     );
     assert_eq!(db::get_pane_process(&home.db(), SLUG).unwrap(), None);
     assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
+}
+
+/// `chief archive` is `down --stop-threads`, and archives only when that finished cleanly.
+/// `status` then leaves the project out, `gc` still cleans it, and `unarchive` or `up` brings it
+/// back.
+#[test]
+fn archive_stops_everything_then_puts_the_project_away() {
+    let home = Home::new();
+    running_project(&home);
+    {
+        let mut t = db::SessionRow::new(
+            "payments-latency-a-1111",
+            SLUG,
+            chief::state::Role::Thread,
+            db::now_ms(),
+        );
+        t.short_id = Some("t1".into());
+        t.session_id = Some("t1-sid".into());
+        db::insert_session(&home.db(), &t).unwrap();
+    }
+    home.fake.set(
+        "agents.stdout",
+        &json!([
+            agent(
+                "c0ffee",
+                "coord-sid",
+                "chief-payments-latency",
+                "done",
+                Some(74112)
+            ),
+            agent(
+                "t1",
+                "t1-sid",
+                "payments-latency-a-1111",
+                "working",
+                Some(5)
+            ),
+        ])
+        .to_string(),
+    );
+
+    // A stop that fails: still running, so not archived (nothing keeps running hidden).
+    home.fake.set("stop.exit", "1");
+    let out = home.run(&["archive", SLUG], "");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("Could not stop coordinator chief-payments-latency"),
+        "{err}"
+    );
+    assert!(
+        err.contains("Payments Latency isn't archived: chief down payments-latency didn't finish"),
+        "{err}"
+    );
+    assert_eq!(db::archived_at(&home.db(), SLUG).unwrap(), None);
+
+    home.fake.unset("stop.exit");
+    let out = home.run(&["archive", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "No layout of chief's is open.\n\
+         Stopped coordinator chief-payments-latency.\n\
+         Stopped thread payments-latency-a-1111.\n\
+         Archived Payments Latency. Nothing was deleted: chief unarchive payments-latency or \
+         chief up payments-latency brings it back.\n"
+    );
+    assert_eq!(home.fake.calls_of("stop").len(), 4);
+    assert!(home.fake.calls_of("rm").is_empty());
+    assert!(db::archived_at(&home.db(), SLUG).unwrap().is_some());
+
+    // Archived already: said, nothing stopped again.
+    let out = home.run(&["archive", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "Payments Latency is archived already.\n");
+    assert_eq!(home.fake.calls_of("stop").len(), 4);
+
+    let out = home.run(&["status"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "1 archived project not shown; chief status <slug> shows one.\n"
+    );
+    let out = home.run(&["status", SLUG], "");
+    assert!(
+        stdout(&out).starts_with(
+            "payments-latency (archived; chief unarchive payments-latency brings it back)\n"
+        ),
+        "{}",
+        stdout(&out)
+    );
+    // Its resolved threads still hold worktrees: gc goes through archived projects too.
+    let out = home.run(&["gc", "--dry-run"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("payments-latency\n"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = home.run(&["unarchive", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "Unarchived Payments Latency. chief up payments-latency opens it.\n"
+    );
+    assert_eq!(db::archived_at(&home.db(), SLUG).unwrap(), None);
+    assert!(home.fake.calls_of("respawn").is_empty(), "starts nothing");
+    let out = home.run(&["unarchive", SLUG], "");
+    assert_eq!(stdout(&out), "Payments Latency isn't archived.\n");
+
+    // `up` on an archived project brings it back first.
+    assert!(home.run(&["archive", SLUG], "").status.success());
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("Unarchived Payments Latency.\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(db::archived_at(&home.db(), SLUG).unwrap(), None);
 }
 
 /// `chief` alone is the launcher (§10a); without a terminal it says so instead of drawing.

@@ -23,6 +23,8 @@ pub struct Entry {
     /// `2 waiting · 1 working`, `no threads yet`, or why project.toml can't be read.
     pub summary: String,
     pub waiting: bool,
+    /// Listed under `Archived`, hidden until A shows it.
+    pub archived: bool,
 }
 
 impl Entry {
@@ -70,6 +72,7 @@ impl Entry {
             goal,
             summary,
             waiting,
+            archived: false,
         }
     }
 }
@@ -96,6 +99,10 @@ pub enum Action {
     Create(Box<Draft>),
     /// Leave the TUI and show the conversation in this terminal (no Rex, no tmux).
     Pane(String),
+    /// `chief archive` the project, reporting into the Archiving screen.
+    Archive(String),
+    /// `chief unarchive` the project (at once: it starts nothing).
+    Unarchive(String),
 }
 
 /// What the worker sends back.
@@ -105,6 +112,7 @@ pub enum Msg {
     /// The project exists now: a later failure leaves it in the list, not in the wizard.
     Created(String),
     Done(Result<Where, String>),
+    Archived(Result<(), String>),
 }
 
 /// A project being created or opened.
@@ -119,27 +127,45 @@ pub struct Starting {
     pub wizard: Option<Box<Wizard>>,
 }
 
+/// A project being archived: `down --stop-threads`'s reports, then the outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Archiving {
+    pub slug: String,
+    pub name: String,
+    pub notes: Vec<Note>,
+    /// None while it runs.
+    pub done: Option<Result<(), String>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
     List,
     Wizard(Box<Wizard>),
     Starting(Box<Starting>),
     Help,
+    /// Asks before archiving the project (slug, name).
+    ConfirmArchive(String, String),
+    Archiving(Box<Archiving>),
 }
 
 /// What a click lands on, recorded by the last draw.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
-    /// A list row: a project, or `projects.len()` for "New project".
+    /// A list row: a shown project, or `visible()` for "New project".
     Row(usize),
+    /// The `Archived · N` header: shows or hides the archived projects.
+    Archived,
 }
 
 pub struct Launcher {
+    /// Live projects first, then the archived ones.
     pub projects: Vec<Entry>,
-    /// Over the projects, then "New project" last.
+    /// Over the shown projects, then "New project" last.
     pub cursor: usize,
     pub screen: Screen,
-    pub status: Option<String>,
+    /// Below the list: what the last key did (Ok) or why it couldn't (Err).
+    pub status: Option<Result<String, String>>,
+    pub show_archived: bool,
     /// Where a new project's repo list starts (the launcher's own folder).
     pub cwd: Option<std::path::PathBuf>,
     pub hits: RefCell<Vec<(u16, Hit)>>,
@@ -149,49 +175,83 @@ pub struct Launcher {
 
 impl Launcher {
     /// With no projects, straight to the wizard.
-    pub fn new(projects: Vec<Entry>, cwd: Option<std::path::PathBuf>, new: bool) -> Self {
+    pub fn new(mut projects: Vec<Entry>, cwd: Option<std::path::PathBuf>, new: bool) -> Self {
         let first_run = projects.is_empty();
         let screen = if new || first_run {
             Screen::Wizard(Box::new(Wizard::new(cwd.as_deref())))
         } else {
             Screen::List
         };
+        projects.sort_by_key(|p| p.archived);
         Launcher {
             projects,
             cursor: 0,
             screen,
             status: None,
+            show_archived: false,
             cwd,
             hits: RefCell::new(Vec::new()),
             first_run,
         }
     }
 
-    pub fn on_new_row(&self) -> bool {
-        self.cursor >= self.projects.len()
+    /// How many projects the list shows: the archived ones (last) only once A showed them.
+    pub fn visible(&self) -> usize {
+        let live = self.projects.iter().filter(|p| !p.archived).count();
+        if self.show_archived {
+            self.projects.len()
+        } else {
+            live
+        }
     }
 
-    pub fn set_projects(&mut self, projects: Vec<Entry>, select: Option<&str>) {
+    pub fn archived_count(&self) -> usize {
+        self.projects.iter().filter(|p| p.archived).count()
+    }
+
+    pub fn on_new_row(&self) -> bool {
+        self.cursor >= self.visible()
+    }
+
+    /// The selected project, unless "New project" is.
+    pub fn selected(&self) -> Option<&Entry> {
+        self.projects[..self.visible()].get(self.cursor)
+    }
+
+    pub fn set_projects(&mut self, mut projects: Vec<Entry>, select: Option<&str>) {
+        projects.sort_by_key(|p| p.archived);
         self.projects = projects;
         if let Some(slug) = select
             && let Some(i) = self.projects.iter().position(|p| p.slug == slug)
+            && i < self.visible()
         {
             self.cursor = i;
         }
-        self.cursor = self.cursor.min(self.projects.len());
+        self.cursor = self.cursor.min(self.visible());
+    }
+
+    /// A shows or hides the archived projects; "New project" stays selected when it was.
+    fn toggle_archived(&mut self) {
+        let on_new = self.on_new_row();
+        self.show_archived = !self.show_archived;
+        self.cursor = if on_new {
+            self.visible()
+        } else {
+            self.cursor.min(self.visible())
+        };
     }
 
     pub fn apply(&mut self, msg: Msg) {
-        let Screen::Starting(s) = &mut self.screen else {
-            return;
-        };
-        match msg {
-            Msg::Note(note) => s.notes.push(note),
-            Msg::Created(slug) => {
+        match (&mut self.screen, msg) {
+            (Screen::Starting(s), Msg::Note(note)) => s.notes.push(note),
+            (Screen::Starting(s), Msg::Created(slug)) => {
                 s.slug = slug;
                 s.wizard = None;
             }
-            Msg::Done(result) => s.done = Some(result),
+            (Screen::Starting(s), Msg::Done(result)) => s.done = Some(result),
+            (Screen::Archiving(a), Msg::Note(note)) => a.notes.push(note),
+            (Screen::Archiving(a), Msg::Archived(result)) => a.done = Some(result),
+            _ => {}
         }
     }
 
@@ -256,12 +316,35 @@ impl Launcher {
                     _ => Vec::new(),
                 }
             }
+            // y archives; any other key cancels.
+            Screen::ConfirmArchive(slug, name) => {
+                let (slug, name) = (slug.clone(), name.clone());
+                if !matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                    self.screen = Screen::List;
+                    return Vec::new();
+                }
+                self.screen = Screen::Archiving(Box::new(Archiving {
+                    slug: slug.clone(),
+                    name,
+                    notes: Vec::new(),
+                    done: None,
+                }));
+                vec![Action::Archive(slug)]
+            }
+            Screen::Archiving(a) => match (a.done.is_some(), key.code) {
+                (_, KeyCode::Char('q')) => vec![Action::Quit],
+                (true, KeyCode::Esc | KeyCode::Enter) => {
+                    self.screen = Screen::List;
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            },
         }
     }
 
     fn list_key(&mut self, key: KeyEvent) -> Vec<Action> {
         self.status = None;
-        let last = self.projects.len();
+        let last = self.visible();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return vec![Action::Quit],
             KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
@@ -270,6 +353,8 @@ impl Launcher {
             KeyCode::End | KeyCode::Char('G') => self.cursor = last,
             KeyCode::Char('?') => self.screen = Screen::Help,
             KeyCode::Char('n') => self.new_project(),
+            KeyCode::Char('a') => return self.archive(),
+            KeyCode::Char('A') if self.archived_count() > 0 => self.toggle_archived(),
             KeyCode::Enter if self.on_new_row() => self.new_project(),
             KeyCode::Enter => return self.open(),
             _ => {}
@@ -281,8 +366,20 @@ impl Launcher {
         self.screen = Screen::Wizard(Box::new(Wizard::new(self.cwd.as_deref())));
     }
 
+    /// `a`: a live project asks first (its sessions stop); an archived one comes back at once.
+    fn archive(&mut self) -> Vec<Action> {
+        let Some(p) = self.selected() else {
+            return Vec::new();
+        };
+        if p.archived {
+            return vec![Action::Unarchive(p.slug.clone())];
+        }
+        self.screen = Screen::ConfirmArchive(p.slug.clone(), p.name.clone());
+        Vec::new()
+    }
+
     fn open(&mut self) -> Vec<Action> {
-        let Some(p) = self.projects.get(self.cursor) else {
+        let Some(p) = self.selected() else {
             return Vec::new();
         };
         let slug = p.slug.clone();
@@ -296,14 +393,17 @@ impl Launcher {
         vec![Action::Open(slug)]
     }
 
-    /// In the list a click selects (a click on the selection opens it) and the wheel moves;
-    /// elsewhere a click on help closes it.
+    /// In the list a click selects (a click on the selection opens it, one on the Archived header
+    /// is A) and the wheel moves; elsewhere a click on help closes it, and one on the archive
+    /// question cancels it.
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Vec<Action> {
         match (&self.screen, ev.kind) {
-            (Screen::Help, MouseEventKind::Down(_)) => self.screen = Screen::List,
+            (Screen::Help | Screen::ConfirmArchive(..), MouseEventKind::Down(_)) => {
+                self.screen = Screen::List
+            }
             (Screen::List, MouseEventKind::ScrollUp) => self.cursor = self.cursor.saturating_sub(1),
             (Screen::List, MouseEventKind::ScrollDown) => {
-                self.cursor = (self.cursor + 1).min(self.projects.len())
+                self.cursor = (self.cursor + 1).min(self.visible())
             }
             (Screen::List, MouseEventKind::Down(MouseButton::Left)) => {
                 let hit = self
@@ -312,11 +412,13 @@ impl Launcher {
                     .iter()
                     .find(|(y, _)| *y == ev.row)
                     .map(|(_, h)| *h);
-                if let Some(Hit::Row(i)) = hit {
-                    if i == self.cursor {
+                match hit {
+                    Some(Hit::Row(i)) if i == self.cursor => {
                         return self.list_key(KeyEvent::from(KeyCode::Enter));
                     }
-                    self.cursor = i;
+                    Some(Hit::Row(i)) => self.cursor = i,
+                    Some(Hit::Archived) => self.toggle_archived(),
+                    None => {}
                 }
             }
             _ => {}
@@ -422,6 +524,93 @@ mod tests {
         l.on_key(key(KeyCode::Esc), &Free);
         l.on_key(key(KeyCode::Char('n')), &Free);
         assert!(matches!(l.screen, Screen::Wizard(_)));
+    }
+
+    fn archived(slug: &str) -> Entry {
+        Entry {
+            archived: true,
+            ..entry(slug)
+        }
+    }
+
+    #[test]
+    fn archived_projects_hide_behind_a_toggle() {
+        // Listed by slug: the archived one goes last whatever its slug.
+        let mut l = Launcher::new(vec![archived("a"), entry("b"), entry("c")], None, false);
+        let slugs: Vec<_> = l.projects.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, ["b", "c", "a"]);
+        assert_eq!(l.visible(), 2);
+        l.on_key(key(KeyCode::Char('G')), &Free);
+        assert!(l.on_new_row());
+        assert_eq!(l.cursor, 2);
+
+        // Shown, it sits above "New project", which stays selected.
+        l.on_key(key(KeyCode::Char('A')), &Free);
+        assert_eq!(l.visible(), 3);
+        assert!(l.on_new_row());
+        l.on_key(key(KeyCode::Up), &Free);
+        assert_eq!(l.selected().map(|p| p.slug.as_str()), Some("a"));
+        // a on an archived project brings it back at once; Enter opens it (up unarchives).
+        assert_eq!(
+            l.on_key(key(KeyCode::Char('a')), &Free),
+            [Action::Unarchive("a".into())]
+        );
+        assert_eq!(l.screen, Screen::List);
+        assert_eq!(
+            l.on_key(key(KeyCode::Enter), &Free),
+            [Action::Open("a".into())]
+        );
+
+        // Hidden again with the selection on it: the selection moves to what is shown.
+        let mut l = Launcher::new(vec![archived("a"), entry("b")], None, false);
+        l.on_key(key(KeyCode::Char('A')), &Free);
+        l.on_key(key(KeyCode::Down), &Free);
+        l.on_key(key(KeyCode::Char('A')), &Free);
+        assert!(l.on_new_row());
+        // A refreshed list never selects a hidden project.
+        l.cursor = 0;
+        l.set_projects(vec![archived("a"), entry("b")], Some("a"));
+        assert_eq!(l.cursor, 0);
+        // A does nothing without archived projects.
+        let mut l = Launcher::new(vec![entry("b")], None, false);
+        l.on_key(key(KeyCode::Char('A')), &Free);
+        assert!(!l.show_archived);
+    }
+
+    #[test]
+    fn archiving_asks_first_then_shows_its_reports() {
+        let mut l = Launcher::new(vec![entry("a"), entry("b")], None, false);
+        assert_eq!(l.on_key(key(KeyCode::Char('a')), &Free), []);
+        assert_eq!(l.screen, Screen::ConfirmArchive("a".into(), "a".into()));
+        // Any key but y cancels.
+        assert_eq!(l.on_key(key(KeyCode::Enter), &Free), []);
+        assert_eq!(l.screen, Screen::List);
+
+        l.on_key(key(KeyCode::Char('a')), &Free);
+        assert_eq!(
+            l.on_key(key(KeyCode::Char('y')), &Free),
+            [Action::Archive("a".into())]
+        );
+        let Screen::Archiving(a) = &l.screen else {
+            panic!("archiving")
+        };
+        assert_eq!(a.slug, "a");
+        // Nothing but q while it runs.
+        assert_eq!(l.on_key(key(KeyCode::Enter), &Free), []);
+        l.apply(Msg::Note(Note::Did("Stopped coordinator chief-a.".into())));
+        l.apply(Msg::Archived(Ok(())));
+        let Screen::Archiving(a) = &l.screen else {
+            panic!("archiving")
+        };
+        assert_eq!(a.notes.len(), 1);
+        assert_eq!(a.done, Some(Ok(())));
+        l.on_key(key(KeyCode::Enter), &Free);
+        assert_eq!(l.screen, Screen::List);
+
+        // Nothing to archive on "New project".
+        l.on_key(key(KeyCode::Char('G')), &Free);
+        assert_eq!(l.on_key(key(KeyCode::Char('a')), &Free), []);
+        assert_eq!(l.screen, Screen::List);
     }
 
     #[test]

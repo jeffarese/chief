@@ -50,6 +50,10 @@ enum Command {
         #[arg(long)]
         stop_threads: bool,
     },
+    /// Stop everything of a project and put it away; nothing is deleted
+    Archive { slug: String },
+    /// Bring an archived project back to the list; starts nothing
+    Unarchive { slug: String },
     /// The board TUI
     Board {
         #[arg(long)]
@@ -214,6 +218,8 @@ fn main() -> Result<()> {
             },
         ),
         Command::Down { slug, stop_threads } => chief::project::down(&slug, stop_threads),
+        Command::Archive { slug } => chief::project::archive(&slug),
+        Command::Unarchive { slug } => chief::project::unarchive(&slug),
         Command::Board { project } => chief::board::run(&project),
         Command::Pane { project, layout } => {
             let on_quit = if layout {

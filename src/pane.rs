@@ -165,7 +165,10 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
         // this terminal too, so it comes last.
         OnQuit::Layout if result.is_ok() && !HUNG_UP.load(Ordering::SeqCst) => {
             // Not `println!`: it panics once the terminal has hung up.
-            project::close_layout(&conn, project, &mut |line| {
+            project::close_layout(&conn, project, &mut |note| {
+                let (project::Note::Did(line)
+                | project::Note::Info(line)
+                | project::Note::Warn(line)) = note;
                 let _ = writeln!(std::io::stdout(), "{line}");
             })?;
         }
