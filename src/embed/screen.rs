@@ -146,6 +146,12 @@ impl Screen {
         self.size.get()
     }
 
+    /// The wheel scrolled the view back into history; a key, a paste or the wheel brings it
+    /// back to the live screen.
+    pub fn in_history(&self) -> bool {
+        !self.term.viewport_active().unwrap_or(true)
+    }
+
     /// Copies the screen into `area` of `buf`; returns where the cursor goes when it shows.
     pub fn draw(&mut self, area: Rect, buf: &mut Buffer) -> Result<Option<Position>> {
         let mut view = self.view.borrow_mut();
@@ -668,6 +674,26 @@ mod tests {
         assert_eq!(s.mouse(click, area).unwrap(), Some(&b"\x1b[<0;4;2M"[..]));
         let wheel = s.mouse(ev(MouseEventKind::ScrollDown), area).unwrap();
         assert_eq!(wheel, Some(&b"\x1b[<65;4;2M\x1b[<65;4;2m"[..]));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_history_until_a_key_comes() {
+        let (mut s, _) = screen();
+        let area = Rect::new(0, 0, 20, 4);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        for i in 0..20 {
+            s.feed(format!("line {i}\r\n").as_bytes());
+        }
+        assert!(!s.in_history());
+        s.mouse(wheel(MouseEventKind::ScrollUp), area).unwrap();
+        assert!(s.in_history());
+        key(&mut s, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(!s.in_history());
     }
 
     #[test]

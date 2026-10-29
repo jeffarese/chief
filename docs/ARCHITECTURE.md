@@ -1387,7 +1387,9 @@ board, sharing a screen instead of a multiplexer.
   attach while it runs; otherwise `q` quits (also Ctrl+C in the "you left" wait, whose ⏎ goes
   back and whose first 300 ms of keys are dropped, as in step 6). On the board side keys are the
   board's, and its `q` quits. The mouse goes to the side under it: to attach as its mouse
-  reporting asks, else the wheel scrolls the conversation's history; paste goes to attach. Focus
+  reporting asks, else the wheel scrolls the conversation's history, marked `↑ history · a key
+  returns` at its top right (and no cursor) until a key, a paste or the wheel brings back the live
+  screen; paste goes to attach. Focus
   reports follow the side with the keys. chief turns on bracketed paste, focus reports and, where
   the terminal answers the query, the kitty keyboard protocol's disambiguated codes (so Shift+Enter
   reaches Claude as itself), and turns them off on exit.

@@ -352,7 +352,9 @@ impl Split<'_> {
                 .draw(areas.conv, f.buffer_mut())
                 .ok()
                 .flatten();
-            if let Some(at) = cursor
+            if self.conv.screen.in_history() {
+                history_mark(f, areas.conv);
+            } else if let Some(at) = cursor
                 && self.focus == Side::Conversation
                 && self.conv.attached()
             {
@@ -649,6 +651,21 @@ impl Split<'_> {
             State::Waiting { .. } | State::Left { .. } => self.start(),
         }
     }
+}
+
+/// Top right of the conversation while it shows history: otherwise the earlier output looks like
+/// the live screen, and typing seems to go nowhere.
+fn history_mark(f: &mut Frame, conv: Rect) {
+    const MARK: &str = " ↑ history · a key returns ";
+    let width = tui::cols(MARK) as u16;
+    if conv.width < width || conv.height == 0 {
+        return;
+    }
+    let at = Rect::new(conv.right() - width, conv.y, width, 1);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(MARK).style(tui::selected()),
+        at,
+    );
 }
 
 /// The terminal's title: the project, and how many threads wait on the user, so a terminal tab
