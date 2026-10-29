@@ -682,6 +682,32 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     }
 }
 
+/// `claude stop` for a thread: its process ends, and the turn it was in with it. Its
+/// conversation and worktree stay, and `wake_thread` brings it back. The main pane leaves it
+/// first: a pane showing it would respawn it to attach again.
+pub fn stop_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
+    let row = project_thread(ctx, &args.name)?;
+    let name = row.name.clone();
+    if row.cleaned_at.is_some() {
+        bail!(crate::guard::cleaned_message(&name));
+    }
+    // Its own account's `claude agents` is the one that knows whether it has a process.
+    accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)?;
+    let row = project_thread(ctx, &name)?;
+    if row.removed_at.is_some() {
+        bail!(crate::guard::removed_message(&name));
+    }
+    let Some(short_id) = row.short_id.as_deref().filter(|_| row.pid.is_some()) else {
+        return Ok(json!({"name": name, "stopped": false, "note": "It is asleep already."}));
+    };
+    if db::get_pane_target(ctx.conn, ctx.slug())?.as_deref() == Some(name.as_str()) {
+        db::set_pane_target(ctx.conn, ctx.slug(), None)?;
+        crate::pane::request_switch(ctx.conn, ctx.slug())?;
+    }
+    ctx.claude.for_row(&row).stop(short_id)?;
+    Ok(json!({"name": name, "stopped": true}))
+}
+
 pub fn resolve_thread(ctx: &ToolCtx, args: &ResolveThreadArgs) -> Result<Value> {
     let row = project_thread(ctx, &args.name)?;
     let resolve = !args.reopen.unwrap_or(false);

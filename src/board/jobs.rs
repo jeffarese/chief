@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::agp::Agp;
 use crate::claude::{Claude, RESOLVE_TIMEOUT};
-use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome};
+use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome, Verdict};
 use crate::config::ProjectConfig;
 use crate::pr::Gh;
 use crate::tools::{self, NameArgs, ToolCtx};
@@ -77,6 +77,8 @@ impl Failure {
     pub fn of(action: &Action) -> Self {
         let (kind, what) = match action {
             Action::Wake(name) => (FailureKind::Busy, format!("Waking {name}")),
+            Action::Stop(name) => (FailureKind::Busy, format!("Stopping {name}")),
+            Action::CleanAll => (FailureKind::Busy, "Cleaning up".to_string()),
             Action::Clean { name, .. } => (FailureKind::Busy, format!("Cleaning up {name}")),
             Action::SaveSettings(_) => (FailureKind::Save, "Saving".to_string()),
             Action::CheckTrust(_) => (FailureKind::Trust, "The trust check".to_string()),
@@ -121,6 +123,8 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
             }))
         }
         Action::Wake(name) => wake(src, &name),
+        Action::Stop(name) => stop(src, &name),
+        Action::CleanAll => clean_all(src),
         Action::SetResolved { name, resolved } => {
             let conn = db::open(&src.db)?;
             registry::set_resolved(&conn, &name, resolved, "user", db::now_ms())?;
@@ -176,12 +180,17 @@ fn pool_trust(src: &Sources, config: &ProjectConfig) -> Result<placement::PoolTr
     placement::pool_trust(&config.threads, &Agp::new(src.agp_bin.clone()), &repos)
 }
 
-fn wake(src: &Sources, name: &str) -> Result<Msg> {
+/// Runs a coordinator tool on `name` with the context `chief mcp` would give it.
+fn thread_tool(
+    src: &Sources,
+    name: &str,
+    tool: fn(&ToolCtx, &NameArgs) -> Result<serde_json::Value>,
+) -> Result<serde_json::Value> {
     let conn = db::open(&src.db)?;
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
     let claude = src.claude();
     let trust_config = claude.trust_config();
-    // Waking never picks an account; only start_thread reads agp.
+    // Waking and stopping never pick an account; only start_thread reads agp.
     let agp = Agp::new(src.agp_bin.clone());
     let ctx = ToolCtx {
         conn: &conn,
@@ -195,12 +204,16 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
         wake_timeout: WAKE_TIMEOUT,
         poll_interval: POLL_INTERVAL,
     };
-    let out = tools::wake_thread(
+    tool(
         &ctx,
         &NameArgs {
             name: name.to_string(),
         },
-    )?;
+    )
+}
+
+fn wake(src: &Sources, name: &str) -> Result<Msg> {
+    let out = thread_tool(src, name, tools::wake_thread)?;
     let alive = out["alive"].as_bool().unwrap_or(false);
     let respawned = out["respawned"].as_bool().unwrap_or(false);
     Ok(Msg::Done(match (alive, respawned) {
@@ -211,6 +224,50 @@ fn wake(src: &Sources, name: &str) -> Result<Msg> {
             .unwrap_or("Respawned, but no process showed up yet.")
             .to_string(),
     }))
+}
+
+fn stop(src: &Sources, name: &str) -> Result<Msg> {
+    let out = thread_tool(src, name, tools::stop_thread)?;
+    Ok(Msg::Done(if out["stopped"].as_bool().unwrap_or(false) {
+        format!("Stopped {name}; w wakes it.")
+    } else {
+        format!("{name} is asleep already.")
+    }))
+}
+
+/// `chief gc` for this project, said in one line.
+fn clean_all(src: &Sources) -> Result<Msg> {
+    let conn = db::open(&src.db)?;
+    let claude = src.claude();
+    let gh = Gh::new(src.gh_bin.clone());
+    let ctx = Ctx {
+        conn: &conn,
+        claude: &claude,
+        gh: &gh,
+        now: db::now_ms,
+    };
+    let gc = cleanup::gc(&ctx, &src.slug, false)?;
+    Ok(Msg::Done(gc_summary(&gc)))
+}
+
+fn gc_summary(gc: &cleanup::Gc) -> String {
+    let count = |f: fn(&Verdict) -> bool| gc.verdicts.iter().filter(|(_, v)| f(v)).count();
+    let cleaned = count(|v| matches!(v, Verdict::Cleaned));
+    let kept = count(|v| matches!(v, Verdict::Blocked(_) | Verdict::Skipped(_)));
+    let threads = |n: usize| format!("{n} thread{}", if n == 1 { "" } else { "s" });
+    let mut text = match (cleaned, kept) {
+        (0, 0) => "No resolved thread was left to clean up.".to_string(),
+        (n, 0) => format!("Cleaned up {}.", threads(n)),
+        (n, k) => format!(
+            "Cleaned up {}; {} would lose work or couldn't be checked (x on one says why).",
+            threads(n),
+            threads(k)
+        ),
+    };
+    if let Some(first) = gc.warnings.first() {
+        text.push_str(&format!(" Warning: {first}"));
+    }
+    text
 }
 
 fn clean(src: &Sources, name: &str, mode: Mode) -> Result<Msg> {
@@ -299,6 +356,34 @@ mod tests {
 
     fn config() -> Box<ProjectConfig> {
         Box::new(ProjectConfig::new("Demo", "demo", None, Vec::new()))
+    }
+
+    #[test]
+    fn a_clean_up_of_all_says_what_stayed() {
+        let gc = |verdicts: Vec<Verdict>, warnings: Vec<&str>| cleanup::Gc {
+            verdicts: verdicts
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (format!("t{i}"), v))
+                .collect(),
+            warnings: warnings.into_iter().map(String::from).collect(),
+        };
+        assert_eq!(
+            gc_summary(&gc(vec![], vec![])),
+            "No resolved thread was left to clean up."
+        );
+        assert_eq!(
+            gc_summary(&gc(vec![Verdict::Cleaned, Verdict::Cleaned], vec![])),
+            "Cleaned up 2 threads."
+        );
+        assert_eq!(
+            gc_summary(&gc(
+                vec![Verdict::Cleaned, Verdict::Blocked("unpushed".into())],
+                vec!["gh isn't signed in"]
+            )),
+            "Cleaned up 1 thread; 1 thread would lose work or couldn't be checked (x on one says \
+             why). Warning: gh isn't signed in"
+        );
     }
 
     /// A worker that panics still answers, in the message its action reports failures with: a

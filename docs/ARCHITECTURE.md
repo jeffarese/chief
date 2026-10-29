@@ -323,7 +323,7 @@ may run in another, which `start_thread` picks from agp's pool when it starts (�
 never changes after. The row stores it (`account_id`, `account_label`, `account_dir`, §4); a row
 without `account_id` runs in the project's account (`SessionRow::account`). Every Claude Code
 call about a thread runs in the thread's account (`Claude::for_row`): its spawn, `attach` in the
-pane, `respawn` (wake, the pane), `stop` (`chief down --stop-threads`), `rm` (cleanup), its job
+pane, `respawn` (wake, the pane), `stop` (`chief down --stop-threads`, `stop_thread` and the board's S), `rm` (cleanup), its job
 state (worktree, branch, PR polling) and its trust check. Syncing takes one `claude agents` per
 account the project uses (the project's, plus the account of every thread not cleaned up;
 `accounts::in_use`), in parallel, and applies each listing only to the rows of its account
@@ -925,6 +925,7 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text; with background work (§5) also `running` and a `note` that the thread isn't finished and reports when it is |
 | `wake_thread` | `name` | Refreshes from its own account; if no live pid: `claude respawn <short_id>` there, poll its account's `claude agents` up to 20 s for a pid (each poll bounded by the time left, so a hanging listing ends the wait at 20 s; database busy waits are bounded only per statement, §4). Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there). A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
+| `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. The prompt (§8) says to use it only when the user asks or a thread is off track and a message didn't help |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
@@ -1395,6 +1396,10 @@ board, sharing a screen instead of a multiplexer.
   otherwise. crossterm's reader spins on a hung-up terminal, so the loop itself ends on SIGHUP or
   SIGTERM, or when `poll` reports POLLHUP or POLLNVAL on stdin; process exit then stops that
   thread.
+- Title. The terminal's title is `chief · <name>`, with ` · <n> waiting` while threads wait on
+  the user (set when it changes, and again after the board's editor), so a terminal tab in the
+  background says when it needs them. The terminal's own title is pushed on start and popped on
+  exit (XTWINOPS 22 and 23, which terminals without them ignore).
 - Quitting ends the attach (sessions keep running), joins the enders, clears `pane_showing` and
   the pane record (while they are still its own), turns the terminal modes off and restores the
   terminal.
@@ -1425,7 +1430,9 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
 - Look (`src/tui.rs`, shared with the launcher): rounded panels with a bold title, a one-column
   margin inside when the panel has 34 columns to spare, one accent colour (cyan) for focus, keys
   and marks, the selection in reverse video across the width. The last line is always the key
-  bar: the keys that act on the selection, most useful first, each `key what` with the key in
+  bar: the keys that act on the selection, most useful first (`n next waiting` while a thread
+  waits; on a thread `S stop` when it has a process, else `w wake`; on a resolved, uncleaned
+  one `x clean up` and `X clean up all`), each `key what` with the key in
   the accent colour, whole hints only, `? help` kept at the end when the rest doesn't fit (in the
   built-in layout `^\ conversation` before it, §9). Above
   it, when there is one, the status line: a running worker, else the last action's result
@@ -1461,7 +1468,15 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   because there were none; one the user selected stays selected across refreshes. Enter shows the
   selection in the main pane (a thread: refused for a cleaned one or one removed outside chief);
   Esc or c shows the coordinator from anywhere; on the coordinator's row the thread keys (w, r,
-  o, x) say they act on a thread; w wake (`tools::wake_thread`, refused for cleaned or removed); r resolve
+  o, x, S) say they act on a thread; n shows the next thread in Waiting after the one the main
+  pane shows (wrapping) and selects it, or says nothing waits, or that the only waiting one is
+  shown already; w wake (`tools::wake_thread`, refused for cleaned or removed); S stop, for a
+  thread with a process (refused for cleaned, removed or asleep): a small modal `Stop <title>?`
+  says what stopping keeps, y runs `tools::stop_thread` on a worker ("stopping …") and moves the
+  board's own `pane_target` off it at once, any other key cancels (`<name> keeps running.`);
+  X clean up every resolved, uncleaned thread: `cleanup::gc` for the project on a worker, then one
+  line (`Cleaned up 2 threads; 1 thread would lose work or couldn't be checked (x on one says
+  why).`, plus gc's first warning); r resolve
   or reopen (`registry::set_resolved`, reason `user`; reopening a cleaned or removed thread is
   refused with its message; the row flips on the board at once, so a second r before the
   refresh undoes the first rather than sending it again); o open the PR URL

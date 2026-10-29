@@ -92,8 +92,10 @@ fn the_layout_shows_both_sides_and_switches_like_a_pane() {
         .unwrap()
         .expect("recorded as the pane");
     assert_eq!(pid, ui.pid());
-    // The board is beside it.
+    // The board is beside it, and the terminal's title names the project.
     wait_until_shown(&ui, "Coordinator");
+    // An escape sequence, not cells: its spaces are there as written.
+    wait_until_shown(&ui, "\x1b]0;chief · demo\x07");
     let first = home.fake.pid(attach_call(&home, "c0").unwrap());
 
     db::set_pane_target(&conn, "demo", Some(THREAD)).unwrap();

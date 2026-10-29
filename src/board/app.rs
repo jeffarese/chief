@@ -16,6 +16,7 @@ use crate::state::{Group, Role};
 use crate::tools;
 
 use super::settings::{self, SettingsForm};
+use super::ui::display_title;
 
 /// Something the board asks its runner to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +25,8 @@ pub enum Action {
     /// Show this thread (None: the coordinator) in the main pane.
     Show(Option<String>),
     Wake(String),
+    /// Stop this thread's process (`tools::stop_thread`).
+    Stop(String),
     SetResolved {
         name: String,
         resolved: bool,
@@ -33,6 +36,8 @@ pub enum Action {
         name: String,
         mode: Mode,
     },
+    /// A safe cleanup of every resolved thread (`cleanup::gc`).
+    CleanAll,
     SaveSettings(Box<ProjectConfig>),
     /// Open a file in `$EDITOR` on this terminal.
     Edit(PathBuf),
@@ -109,6 +114,11 @@ pub enum Screen {
     Board,
     Help,
     Confirm(Confirm),
+    /// Stop this thread? `label` is its title, else its name.
+    Stop {
+        name: String,
+        label: String,
+    },
     Settings(Box<SettingsForm>),
 }
 
@@ -463,6 +473,7 @@ impl App {
                 Vec::new()
             }
             Screen::Confirm(_) => self.confirm_key(key),
+            Screen::Stop { .. } => self.stop_key(key),
             Screen::Settings(form) => match form.on_key(key) {
                 settings::Outcome::Stay => Vec::new(),
                 settings::Outcome::Close => {
@@ -495,7 +506,10 @@ impl App {
             KeyCode::Esc | KeyCode::Char('c') => return self.show_coordinator(),
             KeyCode::Enter if self.on_coordinator => return self.show_coordinator(),
             KeyCode::Enter => return self.on_thread(|app, row| app.show(row)),
+            KeyCode::Char('n') => return self.next_waiting(),
             KeyCode::Char('w') => return self.on_thread(|app, row| app.wake(row)),
+            KeyCode::Char('S') => return self.on_thread(|app, row| app.ask_stop(row)),
+            KeyCode::Char('X') => return self.clean_all(),
             KeyCode::Char('r') => return self.on_thread(|app, row| app.resolve(row)),
             KeyCode::Char('o') => return self.on_thread(|app, row| app.open_pr(row)),
             KeyCode::Char('x') => return self.on_thread(|app, row| app.clean(row)),
@@ -573,6 +587,84 @@ impl App {
         }
         self.busy = Some(format!("waking {}…", row.name));
         vec![Action::Wake(row.name)]
+    }
+
+    /// Shows the next thread waiting on the user after the one the main pane shows (wrapping),
+    /// and selects it, so answering them in turn needs no looking.
+    fn next_waiting(&mut self) -> Vec<Action> {
+        let waiting: Vec<&SessionRow> = self
+            .threads
+            .iter()
+            .filter(|r| group_of(r) == Group::Waiting)
+            .collect();
+        let shown = self
+            .pane_target
+            .as_deref()
+            .and_then(|n| waiting.iter().position(|r| r.name == n));
+        let next = match (waiting.len(), shown) {
+            (0, _) => return self.refuse("Nothing is waiting on you.".to_string()),
+            (1, Some(_)) => {
+                return self.refuse(format!(
+                    "{} is the only thread waiting on you, and the main pane shows it.",
+                    display_title(waiting[0])
+                ));
+            }
+            (n, shown) => waiting[shown.map_or(0, |i| (i + 1) % n)].clone(),
+        };
+        self.select(&Hit::Thread(next.name.clone()));
+        self.show(next)
+    }
+
+    fn ask_stop(&mut self, row: SessionRow) -> Vec<Action> {
+        if row.removed_at.is_some() {
+            return self.refuse(crate::guard::removed_message(&row.name));
+        }
+        if row.cleaned_at.is_some() {
+            return self.refuse(crate::guard::cleaned_message(&row.name));
+        }
+        if row.pid.is_none() {
+            return self.refuse(format!("{} is asleep: there is nothing to stop.", row.name));
+        }
+        if let Some(busy) = &self.busy {
+            return self.refuse(format!("Wait: {busy}"));
+        }
+        self.screen = Screen::Stop {
+            label: display_title(&row),
+            name: row.name,
+        };
+        Vec::new()
+    }
+
+    /// y stops; any other key leaves it running.
+    fn stop_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let Screen::Stop { name, .. } = std::mem::replace(&mut self.screen, Screen::Board) else {
+            return Vec::new();
+        };
+        if key.code != KeyCode::Char('y') {
+            self.status = Some(format!("{name} keeps running."));
+            return Vec::new();
+        }
+        // The main pane leaves it first (the worker does that too): it would respawn it.
+        if self.pane_target.as_deref() == Some(name.as_str()) {
+            self.pane_target = None;
+        }
+        self.busy = Some(format!("stopping {name}…"));
+        vec![Action::Stop(name)]
+    }
+
+    fn clean_all(&mut self) -> Vec<Action> {
+        let any = self
+            .threads
+            .iter()
+            .any(|r| r.resolved && r.cleaned_at.is_none());
+        if !any {
+            return self.refuse("No resolved thread is left to clean up.".to_string());
+        }
+        if let Some(busy) = &self.busy {
+            return self.refuse(format!("Wait: {busy}"));
+        }
+        self.busy = Some("cleaning up resolved threads…".to_string());
+        vec![Action::CleanAll]
     }
 
     fn resolve(&mut self, row: SessionRow) -> Vec<Action> {
@@ -709,6 +801,65 @@ pub(crate) mod tests {
             thread("work-2", Group::Working, 4),
             thread("done-1", Group::Resolved, 9),
         ])
+    }
+
+    /// n shows the waiting threads in turn, after whichever the main pane shows.
+    #[test]
+    fn n_shows_the_next_thread_waiting() {
+        let mut app = app_with(vec![
+            thread("wait-1", Group::Waiting, 2),
+            thread("work-1", Group::Working, 3),
+            thread("wait-2", Group::Waiting, 1),
+        ]);
+        let first = app.on_key(ch('n'));
+        let Action::Show(Some(first)) = &first[0] else {
+            panic!("{first:?}")
+        };
+        assert_eq!(app.selected.as_deref(), Some(first.as_str()));
+        let second = app.on_key(ch('n'));
+        let Action::Show(Some(second)) = &second[0] else {
+            panic!("{second:?}")
+        };
+        assert_ne!(first, second);
+        assert_eq!(app.on_key(ch('n')), vec![Action::Show(Some(first.clone()))]);
+
+        let mut one = app_with(vec![thread("wait-1", Group::Waiting, 2)]);
+        one.on_key(ch('n'));
+        assert!(one.on_key(ch('n')).is_empty());
+        assert!(one.status.as_deref().unwrap().contains("the only thread"));
+        let mut none = app_with(vec![thread("work-1", Group::Working, 3)]);
+        assert!(none.on_key(ch('n')).is_empty());
+        assert_eq!(none.status.as_deref(), Some("Nothing is waiting on you."));
+    }
+
+    /// S asks before stopping a running thread and refuses an asleep one; the main pane leaves
+    /// a thread being stopped. X cleans up every resolved thread, one worker at a time.
+    #[test]
+    fn stop_and_clean_all() {
+        let mut asleep = thread("idle-1", Group::Idle, 1);
+        asleep.pid = None;
+        let mut app = app_with(vec![
+            thread("work-1", Group::Working, 3),
+            asleep,
+            thread("done-1", Group::Resolved, 2),
+        ]);
+        app.selected = Some("work-1".into());
+        app.pane_target = Some("work-1".into());
+        assert!(app.on_key(ch('S')).is_empty());
+        assert!(matches!(app.screen, Screen::Stop { .. }));
+        assert_eq!(app.on_key(ch('y')), vec![Action::Stop("work-1".into())]);
+        assert_eq!(app.pane_target, None);
+        assert!(app.on_key(ch('X')).is_empty(), "one worker at a time");
+        app.apply(Msg::Done("Stopped work-1; w wakes it.".into()));
+
+        app.selected = Some("idle-1".into());
+        assert!(app.on_key(ch('S')).is_empty());
+        assert_eq!(app.screen, Screen::Board);
+        assert!(app.status.as_deref().unwrap().contains("asleep"));
+
+        assert_eq!(app.on_key(ch('X')), vec![Action::CleanAll]);
+        let mut none = app_with(vec![thread("work-1", Group::Working, 3)]);
+        assert!(none.on_key(ch('X')).is_empty());
     }
 
     #[test]

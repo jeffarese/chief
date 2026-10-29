@@ -92,6 +92,13 @@ impl ChiefMcp {
     }
 
     #[tool(
+        description = "Stop a thread's process: its current turn ends unfinished and it sends no report for it. Its conversation, worktree and branch stay; wake_thread brings it back. Only when the user asks, or a thread is clearly off track and messaging it hasn't helped."
+    )]
+    async fn stop_thread(&self, Parameters(args): Parameters<NameArgs>) -> CallToolResult {
+        self.call(move |ctx| tools::stop_thread(ctx, &args)).await
+    }
+
+    #[tool(
         description = "Mark a thread resolved (done), or reopen it with reopen=true. Resolved threads can't be messaged."
     )]
     async fn resolve_thread(

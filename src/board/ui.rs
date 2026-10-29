@@ -24,10 +24,13 @@ pub const HELP: &[(&str, &str)] = &[
     ("↑↓ j k", "move (or the mouse wheel)"),
     ("⏎ click", "show it in the main pane"),
     ("Esc c", "back to the coordinator"),
-    ("w", "wake (respawn) a thread"),
+    ("n", "show the next thread waiting on you"),
+    ("w", "wake (respawn) an asleep thread"),
+    ("S", "stop a running thread (asks first)"),
     ("r", "resolve / reopen"),
     ("o", "open the pull request"),
     ("x", "clean up a resolved thread"),
+    ("X", "clean up every resolved thread that loses nothing"),
     ("R", "show / hide resolved"),
     ("Tab", "detail (short terminals)"),
     ("s", "settings"),
@@ -271,6 +274,9 @@ fn status_line(app: &App, width: usize) -> Option<Line<'static>> {
 /// (`board_keys_kept`).
 fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = vec![("⏎", "show")];
+    if app.threads.iter().any(|r| group_of(r) == Group::Waiting) {
+        keys.push(("n", "next waiting"));
+    }
     match app.selected_row() {
         None => keys.push(("s", "settings")),
         Some(row) => {
@@ -279,10 +285,16 @@ fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 keys.push(("r", "reopen"));
                 if row.cleaned_at.is_none() {
                     keys.push(("x", "clean up"));
+                    keys.push(("X", "clean up all"));
                 }
             } else {
                 keys.push(("r", "resolve"));
-                keys.push(("w", "wake"));
+                // A running thread needs no wake; an asleep one has nothing to stop.
+                keys.push(if row.pid.is_some() {
+                    ("S", "stop")
+                } else {
+                    ("w", "wake")
+                });
             }
             if row.pr_url.is_some() {
                 keys.push(("o", "PR"));
@@ -454,6 +466,7 @@ pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
     match &app.screen {
         Screen::Help => draw_help(f, area),
         Screen::Confirm(c) => draw_confirm(f, area, c),
+        Screen::Stop { label, .. } => draw_stop(f, area, label),
         Screen::Board | Screen::Settings(_) => {}
     }
 }
@@ -701,6 +714,28 @@ fn draw_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     );
     let input = tail(&format!("> {}▏", c.input), input_area.width as usize);
     f.render_widget(Paragraph::new(input), input_area);
+}
+
+fn draw_stop(f: &mut Frame, area: Rect, label: &str) {
+    let width = area.width.min(56);
+    let text = "Its process ends, and the turn it is in with it: it sends no report for that \
+                turn. Its conversation, worktree and branch stay, and w wakes it.";
+    let block = panel(&format!("Stop {label}?"), true).border_style(Style::new().fg(Color::Yellow));
+    let body = Paragraph::new(text).wrap(Wrap { trim: true });
+    // The panel's borders and the foot line, around the text as it wraps.
+    let inner_width = block.inner(Rect::new(0, 0, width, 3)).width;
+    let lines = body.line_count(inner_width) as u16;
+    let rect = tui::centred(area, width, lines + 3);
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let [text_area, foot] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    f.render_widget(body, text_area);
+    f.render_widget(
+        Paragraph::new(Line::styled("y stops · any other key cancels", bold())),
+        foot,
+    );
 }
 
 fn settings_keys(form: &SettingsForm) -> Vec<(&'static str, &'static str)> {
@@ -1169,13 +1204,14 @@ mod tests {
         assert!(!tags(&row).iter().any(|t| t.contains("subagent")));
     }
 
-    /// The key bar names what works on the selection, and always keeps `? help`.
+    /// The key bar names what works on the selection, and always keeps `? help`: `n` while a
+    /// thread waits, `S` on a running thread, `w` on an asleep one.
     #[test]
     fn the_key_bar_follows_the_selection() {
         let mut app = busy_board();
         let out = render(&app, 70, 24);
         assert!(
-            out.contains("⏎ show  Esc coordinator  r resolve  w wake  ? help"),
+            out.contains("⏎ show  n next waiting  Esc coordinator  r resolve  S stop  ? help"),
             "{out}"
         );
         let out = render(&app, 30, 24);
@@ -1183,11 +1219,33 @@ mod tests {
         assert!(foot.ends_with("? help"), "{foot:?}");
         app.on_key(ch('g'));
         assert!(app.on_coordinator);
-        assert!(render(&app, 70, 24).contains("⏎ show  s settings  ? help"));
+        assert!(render(&app, 70, 24).contains("⏎ show  n next waiting  s settings  ? help"));
+        app.selected = Some("demo-pr-5e6f".into());
+        app.on_coordinator = false;
+        assert!(render(&app, 90, 24).contains("r resolve  w wake  o PR"));
         app.on_key(ch('R'));
         app.on_key(ch('G'));
-        let out = render(&app, 70, 30);
-        assert!(out.contains("r reopen  x clean up"), "{out}");
+        let out = render(&app, 110, 30);
+        assert!(
+            out.contains("r reopen  x clean up  X clean up all"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn stopping_asks_first() {
+        let mut app = busy_board();
+        app.on_key(ch('S'));
+        let out = render(&app, 70, 24);
+        assert!(out.contains("Stop Approve the migration?"), "{out}");
+        assert!(out.contains("y stops · any other key cancels"), "{out}");
+        assert!(app.on_key(ch('n')).is_empty(), "n cancels here");
+        assert_eq!(app.screen, Screen::Board);
+        app.on_key(ch('S'));
+        assert_eq!(
+            app.on_key(ch('y')),
+            vec![super::super::app::Action::Stop("demo-perm-1a2b".into())]
+        );
     }
 
     /// Beside its conversation, the board's narrow key bar still names the side switch.
@@ -1195,9 +1253,12 @@ mod tests {
     fn the_embedded_key_bar_keeps_the_side_switch() {
         let mut app = busy_board();
         app.embedded = true;
-        let out = render(&app, 100, 24);
+        let out = render(&app, 110, 24);
         assert!(
-            out.contains("⏎ show  Esc coordinator  r resolve  w wake  ^\\ conversation  ? help"),
+            out.contains(
+                "⏎ show  n next waiting  Esc coordinator  r resolve  S stop  ^\\ conversation  \
+                 ? help"
+            ),
             "{out}"
         );
         let out = render(&app, 41, 24);

@@ -121,6 +121,7 @@ fn serves_the_tools_over_stdio() {
             "read_report",
             "resolve_thread",
             "start_thread",
+            "stop_thread",
             "wake_thread"
         ]
     );

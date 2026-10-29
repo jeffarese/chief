@@ -1109,6 +1109,52 @@ fn wake_thread_respawns_and_waits_for_a_pid() {
     assert!(err.to_string().contains("never started"), "{err}");
 }
 
+/// `stop_thread` stops a running thread in its own account, after moving the main pane off it
+/// (a pane showing it would respawn it), and says when there is nothing to stop.
+#[test]
+fn stop_thread_stops_a_running_thread_and_moves_the_pane_off_it() {
+    let env = Env::new();
+    env.insert("demo-s-1111", |r| {
+        r.short_id = Some("s1".into());
+        r.session_id = Some("sid-s1".into());
+    });
+    let stop = || {
+        env.with(|ctx| {
+            tools::stop_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-s-1111".into(),
+                },
+            )
+        })
+    };
+    db::set_pane_target(&env.conn, "demo", Some("demo-s-1111")).unwrap();
+    env.agents(&[agent("s1", "sid-s1", "demo-s-1111", "working", Some(9))]);
+    assert_eq!(
+        stop().unwrap(),
+        json!({"name": "demo-s-1111", "stopped": true})
+    );
+    assert_eq!(env.fake.calls_of("stop"), [vec!["stop", "s1"]]);
+    assert_eq!(db::get_pane_target(&env.conn, "demo").unwrap(), None);
+
+    // Asleep: nothing to stop.
+    env.agents(&[agent("s1", "sid-s1", "demo-s-1111", "done", None)]);
+    assert_eq!(stop().unwrap()["stopped"], false);
+    assert_eq!(env.fake.calls_of("stop").len(), 1);
+
+    let err = env
+        .with(|ctx| {
+            tools::stop_thread(
+                ctx,
+                &NameArgs {
+                    name: "chief-demo".into(),
+                },
+            )
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("not a thread"), "{err}");
+}
+
 /// `wake_thread`'s wait is a bound (§7): a `claude agents` that hangs after the respawn gets only
 /// the time left, not its own 15 s.
 #[test]

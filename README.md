@@ -104,10 +104,13 @@ too: click to select, click again to show, scroll to move.
 | ↑ ↓ / j k, g G | Move; first (the coordinator) / last |
 | Enter | Show the selection in the left pane (answer a thread's prompt, talk to it directly) |
 | Esc / c | Back to the coordinator |
+| n | Show the next thread waiting on you (again for the one after) |
 | w | Wake an asleep thread |
+| S | Stop a running thread (asks first; `w` wakes it again) |
 | r | Resolve or reopen |
 | o | Open the pull request |
 | x | Clean up a resolved thread (see below) |
+| X | Clean up every resolved thread that loses nothing (`chief gc` for this project) |
 | R | Show or hide resolved threads |
 | s | Settings |
 | ? | Help |

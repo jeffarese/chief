@@ -18,19 +18,19 @@ use ratatui::crossterm::event::{
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+use ratatui::crossterm::terminal::{SetTitle, supports_keyboard_enhancement};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 
-use crate::board::app::Action;
+use crate::board::app::{Action, App, group_of};
 use crate::board::{self, Board, ui};
 use crate::claude::Claude;
 use crate::db::{self, SessionRow};
 use crate::embed::{Output, Pty, Screen};
 use crate::pane::{self, OnQuit};
-use crate::state::Role;
+use crate::state::{Group, Role};
 use crate::{paths, proc, project, tui};
 
 /// How long the loop waits for an event before it looks at timers and the board's workers.
@@ -74,7 +74,11 @@ pub fn run(project: &str) -> Result<()> {
     let mut terminal = tui::init()?;
     let enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
     modes_on(enhanced);
+    // The terminal's own title comes back on exit (XTWINOPS push and pop title; terminals
+    // without them ignore both).
+    print_raw(b"\x1b[22;0t");
     let result = run_in(project, &conn, &mut terminal, &mut board, enhanced);
+    print_raw(b"\x1b[23;0t");
     modes_off(enhanced);
     tui::restore();
     result
@@ -109,6 +113,7 @@ fn run_in(
         focus: Side::Conversation,
         conv: Conversation::new(Areas::of(area, Side::Conversation).conv_size()),
         enders: Vec::new(),
+        title: String::new(),
     };
     let result = split.run(terminal, board, &rx, &input, enhanced);
 
@@ -272,6 +277,8 @@ struct Split<'a> {
     conv: Conversation,
     /// Attaches being ended off the UI thread; joined before chief exits.
     enders: Vec<JoinHandle<()>>,
+    /// The terminal title last set.
+    title: String,
 }
 
 impl Split<'_> {
@@ -297,6 +304,11 @@ impl Split<'_> {
                 self.start();
             }
             board.app.now = db::now_ms();
+            let title = title(&board.app);
+            if title != self.title {
+                let _ = execute!(stdout(), SetTitle(&title));
+                self.title = title;
+            }
             let size = terminal.size()?;
             let areas = Areas::of(Rect::new(0, 0, size.width, size.height), self.focus);
             self.conv.resize(areas.conv_size());
@@ -393,6 +405,8 @@ impl Split<'_> {
                             Action::Edit(path) => {
                                 let msg = edit(terminal, &path, input, enhanced);
                                 board.app.say(msg);
+                                // The editor may have set a title of its own.
+                                self.title.clear();
                             }
                             other => board.dispatch(other),
                         }
@@ -637,6 +651,27 @@ impl Split<'_> {
     }
 }
 
+/// The terminal's title: the project, and how many threads wait on the user, so a terminal tab
+/// in the background says when it needs them.
+fn title(app: &App) -> String {
+    let name = &app.config.name;
+    match app
+        .threads
+        .iter()
+        .filter(|r| group_of(r) == Group::Waiting)
+        .count()
+    {
+        0 => format!("chief · {name}"),
+        n => format!("chief · {name} · {n} waiting"),
+    }
+}
+
+fn print_raw(bytes: &[u8]) {
+    let mut out = stdout();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
 /// Ctrl+\ switches sides; Claude Code doesn't bind it. Legacy terminals report it as Ctrl+4.
 fn switches_side(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
@@ -839,6 +874,15 @@ mod tests {
         assert!(!a.conv_shown());
         // Claude keeps its size while the board is over it.
         assert_eq!(a.conv_size(), (80, 24));
+    }
+
+    #[test]
+    fn the_title_counts_what_waits() {
+        use crate::board::app::tests::{app_with, thread};
+        let app = app_with(vec![thread("w-1", Group::Waiting, 1)]);
+        assert_eq!(title(&app), "chief · Demo · 1 waiting");
+        let app = app_with(vec![thread("w-1", Group::Working, 1)]);
+        assert_eq!(title(&app), "chief · Demo");
     }
 
     #[test]
