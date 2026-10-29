@@ -3,11 +3,13 @@
 use std::path::PathBuf;
 
 /// `$CHIEF_HOME`, else `$XDG_DATA_HOME/chief`, else `~/.local/share/chief`; made absolute, since
-/// the generated files carry it to sessions that run in other folders (§3).
+/// the generated files carry it to sessions that run in other folders (§3). An empty variable
+/// counts as unset: made absolute, it would be the current folder.
 pub fn root() -> PathBuf {
-    let root = if let Some(home) = std::env::var_os("CHIEF_HOME") {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let root = if let Some(home) = var("CHIEF_HOME") {
         PathBuf::from(home)
-    } else if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+    } else if let Some(xdg) = var("XDG_DATA_HOME") {
         PathBuf::from(xdg).join("chief")
     } else {
         dirs::home_dir()

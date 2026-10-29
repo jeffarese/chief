@@ -241,6 +241,7 @@ it was last active (`5m ago`, `just now`).
 ## 3. Files
 
 `<root>` = `$CHIEF_HOME`, else `$XDG_DATA_HOME/chief`, else `~/.local/share/chief`, made absolute.
+An empty variable counts as unset (made absolute, it would be the current folder).
 
 ```
 <root>/chief.db
@@ -316,8 +317,11 @@ a folder trusted the way accepting Claude's trust dialog records it (`claude::ma
 `projects[<canonical path>].hasTrustDialogAccepted = true` in the account's `.claude.json`
 (`claude_config_path`), keeping every other key, value and the key order (serde_json's
 `preserve_order`). It writes a temporary file beside the target (through a symlink, to the
-symlink's target), gives it the target's permissions (0600 for a new file), renames it over, then
-reads the trust back; Claude Code rewrites this file itself, so a write that lost that race is tried
+symlink's target: a dangling link is followed with `read_link`, relative to the link's folder, so
+the target is created and the link stays a link), created with `create_new` and mode 0600 under a
+name of its own (pid and a per-process counter: board workers and the wizard can mark at once),
+gives it the target's permissions (0600 for a new file), renames it over, then reads the trust
+back; Claude Code rewrites this file itself, so a write that lost that race is tried
 once more before it fails. A file that doesn't parse is never replaced. chief marks only after a
 yes: its own project folder needs none (chief made it, and the coordinator runs there), so `init`,
 the wizard and `up` (`ensure_coordinator`, before a first spawn, for projects made before this)
@@ -918,11 +922,19 @@ the whole group gets SIGKILL and the call fails as a timeout, without waiting fo
 stuck on a pipe (a grandchild such as `sh -c 'sleep 60 & exit 0'` would hold it open). The pipes
 are awaited before the child is reaped, and the group is signalled only while the child is still
 unreaped: until then its pid, the group's id, can't be reused, so the kill can't reach another
-process group.
+process group. The child itself is killed too (still unreaped), so a leader that moved to another
+group can't hold the call past its deadline. `git`, `gh` and `claude` run without the variables
+that tie git to one repository (`proc::without_repo_env`, the list `git rev-parse
+--local-env-vars` prints: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`,
+`GIT_OBJECT_DIRECTORY`, …): a git hook exports them, and chief run from one would otherwise ask
+about, or reset, the hook's repository instead of the folder it names.
 
-Trust (`claude::is_trusted_in`) walks up both the path as given and its canonical form (macOS
-`/tmp` is `/private/tmp`), stopping at the first folder that holds `.git`: any trusted folder on
-the way counts. It reads the config file of the account the session runs in (§3,
+Trust (`claude::is_trusted_in`) walks up the canonical path (macOS `/tmp` is `/private/tmp`),
+stopping at the first folder that holds `.git`, as Claude Code does on the real path. The path as
+given is walked too, but only while each of its ancestors is the same folder as the canonical
+ancestor at that depth, so it never goes past where the canonical walk stops: with
+`/Users/me/work` a link to `/mono/projects` and `.git` in `/mono`, a trusted `/Users/me` doesn't
+count. A path that doesn't exist is walked as given. Any trusted folder on the way counts. It reads the config file of the account the session runs in (§3,
 `Claude::trust_config`): `<account folder>/.claude.json`, or for the default account
 `$CHIEF_CLAUDE_CONFIG` (tests) else `~/.claude.json`.
 
@@ -1201,7 +1213,8 @@ are tested without a terminal (`TestBackend`).
   for an immediate re-read (database only). Every 30 s (first at start): `pr::refresh_project` with
   one `Gh` kept for the board's lifetime and `project.toml` re-read each time (§12), which runs
   `gh pr list --head <branch> --state all --json
-  url,state,isDraft,reviewDecision,createdAt,isCrossRepository --limit 10` in `repo_path` and,
+  url,state,isDraft,reviewDecision,createdAt,isCrossRepository,headRefOid --limit 10` in
+  `repo_path` and,
   with `cleanup = "merged"`, cleans up merged threads. Its one-time `hint`
   (no `gh`, not logged in, no GitHub remote) stays in the status line; blocked and error counts
   prefix it (`PR 1 blocked, 2 errors · …`). At start the board deletes `events` older than 30 days
@@ -1387,21 +1400,29 @@ The worktree is the one `claude rm` itself deletes: the session's job state,
 `<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is the
 thread's account folder (§3: its own account's, else the project's `claude_config_dir`, or for
 the default account `$CHIEF_CLAUDE_DIR` in tests, else `~/.claude`); its refresh (step 1) and
-its `claude rm` run in that account too. It counts only as a `<repo>/.claude/worktrees/<name>` folder, and while it exists
+its `claude rm` run in that account too. It counts only as a `<repo>/.claude/worktrees/<name>` folder
+(the innermost such match, so a repository that itself lies under one still works), and while it exists
 `git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
 answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
 anywhere, another thread's worktree included, and never a name derived from the thread's. No state
 file or no `worktreePath` means the thread has no worktree of its own: nothing to lose, and nothing
-is reset or cleaned.
+is reset or cleaned. A state file that exists but can't be read or doesn't parse (the supervisor
+may be rewriting it), or a short id that isn't a plain name, is an error, never "no worktree"
+(`claude::read_job_state`): `inspect` fails, PR polling skips the thread with an error line, and
+cleanup blocks (below). Only the sync's display of a thread's branch and its record of a removal
+(§5) read it leniently (`claude::job_state`).
 
-`inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s): whether the worktree
-exists, its branch (`git branch --show-current`, else the job state's `worktreeBranch`),
-`git status --porcelain --untracked-files=normal` lines (ignored files aren't listed, as Claude
-Code ignores them), and unpushed commits as Claude Code means them:
+`inspect(row)` (all git calls through `proc::output_with_timeout`, 10 s, without the repository
+variables of §7): whether the worktree exists, its branch (the job state's `worktreeBranch`, the
+one `claude rm` deletes, whatever HEAD is on now; `git branch --show-current` only when the job
+state names none), `git status --porcelain --untracked-files=normal` lines (ignored files aren't
+listed, as Claude Code ignores them), and unpushed commits as Claude Code means them:
 `git rev-list --count HEAD refs/heads/<branch> --not --remotes`, listed with
-`git log --format='%h %s' -n20 …`, and the head they end at (`git rev-parse HEAD`). When the
-worktree is gone, commits are checked in `repo_path` if the branch still exists there, and the
-head is the branch's sha.
+`git log --format='%h %s' -n20 …`, and the head they end at (`git rev-parse HEAD`). So commits on
+the job's branch count even when HEAD is on another branch, and `render_loss` names that branch.
+A branch that doesn't exist (`rev-parse --verify --quiet` exits 1) is left out; any other failure
+fails the inspection. When the worktree is gone, commits are checked in `repo_path` if the branch
+still exists there, and the head is the branch's sha.
 
 `clean(ctx, name, mode)`:
 
@@ -1415,7 +1436,8 @@ head is the branch's sha.
    worktree, it is already clean. Removed outside chief with the worktree still there
    (`removed_at` set, not cleaned): no `claude rm` (it has no session to remove); cleaned when the
    job state's worktree is gone, otherwise blocked with `session removed outside chief; worktree
-   remains at <path>` (the folder is the user's to delete).
+   remains at <path>` (the folder is the user's to delete), or, when the job state can't be read,
+   `session removed outside chief; chief can't tell whether its worktree remains: <error>`.
 2. Refuse (error, nothing run) unless the thread is resolved and, derived as if it weren't
    resolved, neither working nor waiting, and isn't the session `chief pane` shows
    (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
@@ -1424,12 +1446,15 @@ head is the branch's sha.
 4. Either mode: when the job state of another session registered in this chief home (read in
    that session's own account folder: its own account's, else its project's) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
    `cleanup_blocked` and stop without calling `claude rm` (it would delete the worktree and its
-   branch under that session); `chief gc --dry-run` reports it as blocked, and neither the board
-   nor `chief clean` offers a discard for it (they say to finish and clean up the other thread
-   first).
-   `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails, store the reason
-   in `cleanup_blocked` (`2 unpushed commits`, `uncommitted changes: 3 files`, both joined with
-   `, `) and stop without calling `claude rm`.
+   branch under that session). Another session's job state that can't be read may name it, so it
+   blocks the same way: `<wt> is possibly also the worktree of <other>, whose job state can't be
+   read (<error>); chief won't remove or reset it`. `chief gc --dry-run` reports either as
+   blocked, and neither the board nor `chief clean` offers a discard for it (both reasons contain
+   `cleanup::SHARED_WORKTREE`; they say to finish and clean up the other thread first).
+   `Safe`: if `inspect` finds uncommitted changes or unpushed commits, or fails (an unreadable
+   job state included), store the reason in `cleanup_blocked` (`2 unpushed commits`,
+   `uncommitted changes: 3 files`, both joined with `, `; `could not inspect the worktree: …`)
+   and stop without calling `claude rm`. `Discard` fails on an inspection that fails.
    `Discard(confirmed)` carries the inspection the user was shown and confirmed. It is refused
    (stored in `cleanup_blocked`, nothing run) when a fresh `inspect` differs from it ("the
    worktree changed after you confirmed …"); otherwise in a dirty worktree run
@@ -1438,7 +1463,7 @@ head is the branch's sha.
 5. Steps 1 and 2 again, with a fresh `claude agents`, right before anything is reset or
    stopped (the thread may have got a message, or the pane attached to it, meanwhile); then the
    `Discard` reset from step 4.
-6. `claude rm <short_id>`. `Discard` retries an unpushed refusal once with
+6. `claude rm <short_id>` (120 s: it deletes the worktree before it answers). `Discard` retries an unpushed refusal once with
    `--discard-unpushed <token>` only when the confirmed inspection itself listed unpushed commits
    and the token's head sha (`<sha>@<worktree-id>`) equals the head it saw (`git rev-parse HEAD`
    in the worktree, else the branch's sha). Otherwise `claude rm` counts work nobody was shown,
@@ -1447,21 +1472,30 @@ head is the branch's sha.
    `cleanup_blocked`. A row that is cleaned by then (a sync found it removed) keeps its
    `cleaned_at` and never gets a `cleanup_blocked`.
 
-`claude rm` output (`claude::parse_rm`): a `removed <id>` line is removed (exit status alone isn't:
+`claude rm` output (`claude::parse_rm`, after dropping CSI and OSC escape sequences, so an OSC 8
+link around an id doesn't hide it; `parse_bg_short_id` does the same): a `removed <id>` line is removed (exit status alone isn't:
 a stale token printed usage and exited 0); `kept <id> — …` with a `--discard-unpushed <hex>@<hex>`
 line is unpushed (its `unpushed commit` summary lines kept); `kept` with "uncommitted changes" is
 dirty; anything else is `Other` with the text.
 
 PR status (`pr.rs`): `Gh::poll(repo_path, branch, since)` runs the §10 `gh pr list` (10 s) and
 takes the thread's PR: the newest listed one that isn't cross-repository (a fork's branch can share
-the name) and whose `createdAt` is no earlier than the thread row's `created_at` minus 5 minutes of
-clock skew. Worktree branches are named after threads, so a new thread can reuse the branch of an
-old one whose PR merged long ago; that PR must not resolve and clean the new thread. A PR without a
-readable `createdAt` is ignored. A missing `gh`,
+the name), whose `createdAt` is no earlier than the thread row's `created_at` minus 5 minutes of
+clock skew, and whose `headRefOid` is on the thread's branch: `git cat-file -e <oid>^{commit}`
+and `git merge-base --is-ancestor <oid> refs/heads/<branch>` in `repo_path` (the head or an
+ancestor of it). A branch name says nothing about whose PR it is: a new thread can reuse the
+branch name of an old one whose PR merged long ago, or of a cleaned one whose remote branch stays
+and whose PR merges later; that PR must not resolve and clean the new thread. Its head is on the
+new thread's branch only if that branch was built on it. A PR without a readable `createdAt`, or
+without a `headRefOid`, is ignored, and so is one whose head the repository doesn't have (GitHub
+updated the branch, say). When the check can't run (no local branch, git fails) the poll is an
+error: no PR is attributed and the stored one stays. A `repo_path` that isn't a folder is an error
+too (spawning gh there would fail like a missing `gh`). A missing `gh`,
 a `gh` that isn't logged in, or a repository without a GitHub remote is no PR plus a hint returned
 once per `Gh`; other failures are errors. `poll_project` polls, on that branch, threads whose job
 state names their own worktree and a `worktreeBranch` (`cleanup::branch_of`; never the hooks'
-`cwd` or `sessions.branch`) and that aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
+`cwd` or `sessions.branch`; a job state that can't be read skips the thread with an error line)
+and that aren't cleaned: every unresolved one, and resolved ones whose PR isn't merged or
 closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
 auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
 `cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is
@@ -1471,7 +1505,10 @@ working one is tried again on the next refresh. `cleanup = "manual"` never clean
 
 `chief gc [<slug>] [--dry-run]` per project, in that project's account (§3; a project whose
 project.toml can't say is skipped with a warning): `poll_project`, sync `claude agents`, then
-`clean(Safe)` on every resolved, uncleaned thread (dry: what it would do, from `inspect`). It prints
+`clean(Safe)` on every resolved, uncleaned thread (dry: what it would do, from the same checks in
+the same order, writing nothing: working, waiting or showing in the pane is skipped, a thread
+removed outside chief is judged as step 1 would, then `inspect` and step 4; only another process's
+claim isn't checked). It prints
 `cleaned` / `would clean` / `blocked <reason>` / `skipped <why>` (working or waiting, or an error)
 per thread, or `nothing to clean`; warnings go to stderr. `--dry-run` still stores PR status, as
 the board would.
