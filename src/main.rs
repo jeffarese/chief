@@ -37,7 +37,13 @@ enum Command {
     /// Mark every folder the project's sessions need as trusted by Claude Code
     Trust { slug: String },
     /// Start or revive the coordinator and open the layout
-    Up { slug: String },
+    Up {
+        slug: String,
+        /// builtin: draw the conversation and the board in this terminal, even where Rex or
+        /// tmux would open them
+        #[arg(long, value_enum, default_value_t = UpLayout::Auto)]
+        layout: UpLayout,
+    },
     /// Close the layout; threads keep running unless --stop-threads
     Down {
         slug: String,
@@ -92,6 +98,13 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UpLayout {
+    /// Rex, tmux, else the built-in layout
+    Auto,
+    Builtin,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -193,7 +206,13 @@ fn main() -> Result<()> {
             no_trust_prompt,
         } => chief::project::init(&name, goal.as_deref(), &repos, !no_trust_prompt),
         Command::Trust { slug } => chief::project::trust(&slug),
-        Command::Up { slug } => chief::project::up(&slug),
+        Command::Up { slug, layout } => chief::project::up(
+            &slug,
+            match layout {
+                UpLayout::Auto => chief::project::LayoutChoice::Auto,
+                UpLayout::Builtin => chief::project::LayoutChoice::Builtin,
+            },
+        ),
         Command::Down { slug, stop_threads } => chief::project::down(&slug, stop_threads),
         Command::Board { project } => chief::board::run(&project),
         Command::Pane { project, layout } => {

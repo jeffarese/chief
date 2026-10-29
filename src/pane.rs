@@ -36,12 +36,12 @@ use crate::state::Role;
 use crate::{accounts, names, paths, proc, project};
 
 /// How often a failed attach is retried.
-const RETRY: Duration = Duration::from_millis(500);
+pub(crate) const RETRY: Duration = Duration::from_millis(500);
 /// How long a respawned session gets to show a process.
 const WAKE_WAIT: Duration = Duration::from_secs(20);
 /// An attach that ends sooner than this counts as a failed start: wait before the next try so a
 /// session that keeps refusing doesn't spin.
-const SHORT_ATTACH: Duration = Duration::from_secs(1);
+pub(crate) const SHORT_ATTACH: Duration = Duration::from_secs(1);
 /// How long attach gets to exit after a hangup or a switch before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(2);
 /// How often the wait for attach looks at the child and the signal flags.
@@ -53,10 +53,10 @@ const WAIT_TICK: Duration = Duration::from_millis(50);
 const TERMINAL_RESET: &str = "\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\
                               \x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[>4m\x1b[0m\x1b[2J\x1b[H";
 /// How often an unusable project.toml is read again.
-const CONFIG_RETRY: Duration = Duration::from_secs(5);
+pub(crate) const CONFIG_RETRY: Duration = Duration::from_secs(5);
 /// After the user leaves a session, keys this soon are still the ones that closed Claude (a
 /// third Ctrl+C), not an answer to the pane.
-const SETTLE: Duration = Duration::from_millis(300);
+pub(crate) const SETTLE: Duration = Duration::from_millis(300);
 /// The longest one look for keys lasts. A signal interrupts a look, but one that lands just
 /// before it starts is only seen once it ends.
 const KEY_SLICE: Duration = Duration::from_millis(200);
@@ -92,6 +92,22 @@ fn catch_hangup() {
 /// its pid: SIGUSR1's default action would end it.
 fn catch_switch() {
     catch(&[libc::SIGUSR1], on_switch);
+}
+
+/// Both, for a pane that isn't `chief pane`: the built-in layout's conversation (§9).
+pub fn catch_signals() {
+    catch_hangup();
+    catch_switch();
+}
+
+/// SIGHUP or SIGTERM arrived.
+pub fn hung_up() -> bool {
+    HUNG_UP.load(Ordering::SeqCst)
+}
+
+/// Whether a switch request arrived since the last call.
+pub fn take_switch() -> bool {
+    SWITCH.swap(false, Ordering::SeqCst)
 }
 
 fn catch(signals: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
@@ -165,7 +181,7 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
 }
 
 /// What the pane shows once the user left `name` by hand.
-fn left_lines(name: &str, coordinator: bool, on_quit: &OnQuit) -> Vec<String> {
+pub(crate) fn left_lines(name: &str, coordinator: bool, on_quit: &OnQuit) -> Vec<String> {
     let what = if coordinator {
         format!("the coordinator ({name})")
     } else {
@@ -209,7 +225,7 @@ pub fn resolve_target(conn: &Connection, project: &str) -> Result<Option<Session
 
 /// project.toml as it is now, or the lines the pane shows while it can't be read or doesn't
 /// validate: the pane then neither attaches nor rewrites or respawns from stale files.
-fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
+pub(crate) fn project_config(dir: &Path) -> Result<ProjectConfig, Vec<String>> {
     ProjectConfig::load(&dir.join("project.toml")).map_err(|e| {
         let mut lines = vec!["chief · project.toml can't be used:".to_string()];
         lines.extend(format!("{e:#}").lines().map(|l| format!("  {l}")));
@@ -263,7 +279,10 @@ fn pane_loop(
         let name = row.name.clone();
         let short_id = row.short_id.clone().context("target has no short id")?;
         tty.say(&format!("chief · {name} …"))?;
-        if let Err(e) = wake(conn, claude, (&dir, &config), &row, tty) {
+        let mut say = |line: &str| {
+            let _ = tty.say(line);
+        };
+        if let Err(e) = wake(conn, claude, (&dir, &config), &row, &mut say) {
             tty.say(&format!("chief · {name}: {e:#} · retrying · q quits"))?;
             if tty.quit_pressed(RETRY) {
                 return Ok(());
@@ -340,12 +359,12 @@ fn pane_loop(
 /// Respawns `row` when `claude agents` shows no process for it and waits for one, from the
 /// project.toml just read (`claude` is the project's account). A failing `claude agents` is no
 /// reason not to try attaching.
-fn wake(
+pub(crate) fn wake(
     conn: &Connection,
     claude: &Claude,
     (dir, config): (&Path, &ProjectConfig),
     row: &SessionRow,
-    tty: &Tty,
+    say: &mut dyn FnMut(&str),
 ) -> Result<()> {
     // Its own account's `claude agents` is the one that can see it.
     if accounts::refresh_row(conn, claude, row, AGENTS_TIMEOUT, db::now_ms).is_err() {
@@ -356,7 +375,7 @@ fn wake(
     if row.pid.is_some() {
         return Ok(());
     }
-    tty.say(&format!("chief · waking {} …", row.name))?;
+    say(&format!("chief · waking {} …", row.name));
     project::respawn(conn, claude, dir, config, &row, WAKE_WAIT)?;
     Ok(())
 }

@@ -172,7 +172,7 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief new` | you | The launcher, straight to the new-project wizard |
 | `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
 | `chief trust <slug>` | you | Mark every folder the project's sessions need as trusted (§3 "Trust") |
-| `chief up <slug>` | you | Start or revive the coordinator, open the layout (Rex, tmux, or say how) |
+| `chief up <slug> [--layout builtin]` | you | Start or revive the coordinator, open the layout (Rex, tmux, chief's own, or say how) |
 | `chief down <slug> [--stop-threads]` | you | End the pane, close the layout; threads keep running unless asked |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
 | `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session |
@@ -220,9 +220,12 @@ the version in the project's account (§3), rewrites
 `generated/*`, runs the coordinator step (§7), then opens the layout (§9): with Rex when it is
 installed and its server runs (`rex list` succeeds), storing the session id in
 `ui_state.rex_session`; else, when it runs inside tmux (`$TMUX` set), in a tmux window, storing it
-in `ui_state.tmux_window`; else it prints why and the two commands to run side by side in
-terminals or splits of the user's own, `chief pane --project <slug>` and `chief board --project
-<slug>`. When opening the chosen layout fails it prints why and the same two commands.
+in `ui_state.tmux_window`; else, on a terminal, it draws both sides itself, the built-in layout
+(§9); else (no terminal, or a chief built without the `builtin-layout` feature) it prints why and
+the two commands to run side by side in terminals or splits of the user's own, `chief pane
+--project <slug>` and `chief board --project <slug>`. When opening the chosen layout fails it
+falls back the same way. `--layout builtin` skips Rex and tmux and opens the built-in layout; it
+fails before anything starts without a terminal or the feature.
 
 `chief down <slug> [--stop-threads]` first ends the running pane, wherever it runs: one `down`
 didn't open (in the user's own Rex block, §9 case 0, or run by hand) would otherwise attach again
@@ -1133,11 +1136,12 @@ with a marker, then the board itself. The memory marker (36 bytes) takes the pla
 (7 bytes), so it is used only when the cut context fits; a board that leaves less room than that
 is cut instead, and memory is left out.
 
-## 9. Layout (`chief up`: Rex, tmux, or the user's own)
+## 9. Layout (`chief up`: Rex, tmux, chief's own, or the user's own)
 
 The layout is two panes side by side: `chief pane` on the left, `chief board` on the right.
 Nothing in it depends on a multiplexer: the board switches the pane by signalling it (below), so
-any two terminals or splits work. `chief up` opens it for the user with the first that applies:
+any two terminals or splits work. `chief up` opens it for the user with the first that applies
+(`--layout builtin`: 3 straight away):
 
 0. Inside a Rex block (`REX_SESSION` and `REX_BLOCK`, which Rex sets in each block's
    environment) on a terminal, when `rex list --json` succeeds: the user's own block becomes the
@@ -1148,10 +1152,14 @@ any two terminals or splits work. `chief up` opens it for the user with the firs
    pane ends, by `q` or a hangup, it closes that board block and the user's block is back at its
    shell. No session is created, nothing is stored in `ui_state`, and no app has to switch or
    focus anything, so this works with several Rex apps connected. A failure here prints why and
-   falls back to 3, not to a new session.
+   falls back to 3 (else 4), not to a new session.
 1. Rex, when `rex list --json` succeeds (installed, server running): the Rex session below.
 2. tmux, when `$TMUX` is set (chief runs inside tmux): a tmux window, below.
-3. Neither: it prints why and the two commands, `chief pane --project <slug>` and
+3. Neither, on a terminal: the built-in layout (below), in this terminal: `up_with` returns
+   `Where::Builtin` and `chief up` (or the launcher, §10a) runs it. `chief down` has nothing to
+   close then, but ends it as it ends any pane.
+4. Without a terminal, or in a chief built without the `builtin-layout` cargo feature (it needs
+   Zig to build libghostty): it prints why and the two commands, `chief pane --project <slug>` and
    `chief board --project <slug>`, to run side by side (two windows, iTerm or Ghostty splits,
    anything). `chief down` has nothing to close then. From the launcher (§10a), Enter runs the
    pane in the launcher's own terminal instead, after printing the board's command.
@@ -1332,12 +1340,72 @@ next read; a SIGUSR1 that lands before attach starts leaves the flag set, and th
 wait ends that attach at once. One pane per project receives switches and owns `pane_showing`: the
 latest one started.
 
+### Built-in layout (`src/builtin.rs`, `src/embed/`)
+
+One chief process draws both sides in the terminal it runs in, for a terminal with neither Rex
+nor tmux: the conversation on the left, the board on the right. It is the pane loop above and the
+board, sharing a screen instead of a multiplexer.
+
+- Conversation. The pane loop's steps 0 to 6, with the same constants, messages and
+  `left_lines` (as for `OnQuit::Layout`), but `claude attach <short_id>` runs on a pseudo-terminal
+  of its own (`embed::Pty`: `openpty`, the child leads its own session with the slave as its
+  controlling terminal, `TERM=xterm-256color`, `COLORTERM=truecolor`, no `TERM_PROGRAM`,
+  SIGTSTP/SIGHUP/SIGINT/SIGTERM at their defaults) instead of on this terminal. libghostty
+  (`libghostty-vt`, Ghostty's terminal emulator, a git dependency at a pinned commit) emulates it
+  (`embed::Screen`): it parses attach's output, answers its queries (DA1/DA2/DA3, DSR, OSC 10/11
+  from a dark default, XTVERSION `chief`, the size report, DECRQM), and encodes the keys, mouse,
+  paste and focus reports chief sends it in whatever modes attach asked for (application cursor
+  keys, the kitty keyboard protocol, SGR mouse, bracketed paste with control bytes neutralised).
+  libghostty's types are single-threaded, so the UI thread owns the emulator and a reader thread
+  only moves the pty's bytes. The screen is copied into ratatui's buffer each frame, palette
+  colours as indices so the outer terminal's theme applies; during a synchronized update (mode
+  2026) the last complete frame stays, for at most 500 ms. chief's own lines (`chief · <name> …`,
+  the retry and "you left" lines) are written on a fresh emulated screen, or below attach's own
+  output when it failed. Each pass of the loop has a generation number, so output of an attach
+  that was ended, or the result of a wake for an earlier target, is dropped. The wake step
+  (`pane::wake`: `claude agents`, then `claude respawn` and its wait) runs on a worker with its own
+  database connection, so the screen stays live. An attach being ended (switch, quit) gets
+  SIGTERM, 2 s, then SIGKILL, to its whole process group, on a thread that chief joins before it
+  exits.
+- Pane record. It catches SIGHUP, SIGTERM and SIGUSR1 as `chief pane` does, records itself in
+  `pane_pid`/`pane_started` and writes `pane_showing` through `set_pane_showing_as`, so the
+  board's switch (its own, or one in another terminal) and `chief down` reach it exactly as they
+  reach `chief pane`: the board beside it writes `pane_target` and signals its own process.
+- Board. `board::Board` (the app, the refresher and the Show worker, as in `chief board`) drawn
+  with `ui::draw_in` in the right part of the frame; `App::embedded` adds `^\ conversation` to
+  its key bar. Its Edit action pauses the input thread and the layout's terminal modes around the
+  editor, so neither takes the editor's keys.
+- Screen. 100 columns or more: the board gets 32 % (at least 36 columns), a dim `│` divider, the
+  conversation the rest. Narrower: the focused side fills the screen; the conversation keeps its
+  size while the board is over it, so switching sides doesn't make Claude redraw. The side without
+  the keyboard is drawn dim, and the cursor shows only while the conversation has the keys and
+  attach runs.
+- Keys. Ctrl+\ (which Claude Code doesn't bind; legacy terminals report it as Ctrl+4) switches
+  sides, and a click focuses the side clicked. On the conversation side every other key goes to
+  attach while it runs; otherwise `q` quits (also Ctrl+C in the "you left" wait, whose ⏎ goes
+  back and whose first 300 ms of keys are dropped, as in step 6). On the board side keys are the
+  board's, and its `q` quits. The mouse goes to the side under it: to attach as its mouse
+  reporting asks, else the wheel scrolls the conversation's history; paste goes to attach. Focus
+  reports follow the side with the keys. chief turns on bracketed paste, focus reports and, where
+  the terminal answers the query, the kitty keyboard protocol's disambiguated codes (so Shift+Enter
+  reaches Claude as itself), and turns them off on exit.
+- Input. crossterm reads keys on a thread of its own so the loop can wait on keys, pty output and
+  workers at once (one channel), drawing at most every 8 ms during a burst and every 100 ms
+  otherwise. crossterm's reader spins on a hung-up terminal, so the loop itself ends on SIGHUP or
+  SIGTERM, or when `poll` reports POLLHUP or POLLNVAL on stdin; process exit then stops that
+  thread.
+- Quitting ends the attach (sessions keep running), joins the enders, clears `pane_showing` and
+  the pane record (while they are still its own), turns the terminal modes off and restores the
+  terminal.
+
 ## 10. Board
 
 `chief board --project <slug>` (`src/board/`): `app.rs` holds the state and turns keys into actions
 (`App::on_key(KeyEvent) -> Vec<Action>`), `ui.rs` draws it, `refresh.rs` polls in the background,
-`jobs.rs` runs actions on worker threads, `settings.rs` is the settings form. Logic and rendering
-are tested without a terminal (`TestBackend`).
+`jobs.rs` runs actions on worker threads, `settings.rs` is the settings form, and `mod.rs`'s
+`Board` holds the app with its workers for `chief board` and the built-in layout (§9), which
+draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested without a terminal
+(`TestBackend`).
 
 - Refresh: two background threads, each with its own SQLite connection, send results to the UI over
   a channel; the UI never waits on them. Every 2 s: take `taken_at`, run
@@ -1517,8 +1585,10 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
   spinner, then where the conversation is: Rex (`Open in Rex session chief-<slug>: the
   conversation with the coordinator on the left, its threads on the right.`, or to switch to it in
   the app when Rex couldn't), tmux likewise, in a Rex block (§9 step 0) the launcher leaves at
-  once and runs `chief pane` in its own terminal beside the new board, or neither: Enter leaves the launcher, prints
-  `chief board --project <slug>` to run elsewhere, and runs `chief pane` in this terminal (§9).
+  once and runs `chief pane` in its own terminal beside the new board, with neither it leaves at
+  once and runs the built-in layout in its own terminal (§9 step 3), and in a chief built without
+  that layout Enter leaves the launcher, prints `chief board --project <slug>` to run elsewhere,
+  and runs `chief pane` in this terminal (§9).
   A failure shows in red; before the project existed (`Msg::Created`), Enter goes back to the
   wizard as it was, after it back to the list. The list is re-read once a project is made or
   opened. q quits at any time; the worker's session keeps starting.
@@ -1540,7 +1610,9 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
   files first); the test home's link is missing until a test installs it, so agp counts as not
   installed and no test reaches the real one. Layout logic is also tested against an in-memory `Mux`, and the tmux backend
   against a real tmux server on a private socket (`-L chief-test-…`, no config) that the test kills.
-  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps;
+  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps,
+  and so is the built-in layout (`tests/builtin_cli.rs`: both sides drawn, a switch, the board's
+  `q`, a hangup); its emulator and pty are unit-tested (`embed::`) with no Claude at all;
   a hangup by closing the pty's master side, which the test opens close-on-exec so neither the
   pane nor its attach holds it. `claude rm` outputs from the live M2b probe are in
   `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare

@@ -35,13 +35,14 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
 
 impl Pty {
     /// Starts `cmd` with the pty as its controlling terminal. `wrap` turns each read into the
-    /// caller's event type, so one channel can carry the pty and the outer terminal's input.
+    /// caller's event type, so one channel carries the pty, the outer terminal's input and the
+    /// workers, and output from an earlier child can be told apart.
     pub fn spawn<E: Send + 'static>(
         mut cmd: Command,
         cols: u16,
         rows: u16,
         tx: Sender<E>,
-        wrap: fn(Output) -> E,
+        wrap: impl Fn(Output) -> E + Send + 'static,
     ) -> io::Result<Pty> {
         let (mut m, mut s) = (0, 0);
         let mut ws = winsize(cols, rows);

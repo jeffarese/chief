@@ -541,7 +541,7 @@ fn starting_card(s: &Starting) -> Card {
             ]));
         }
         // Only for a moment: the launcher hands this terminal to the conversation.
-        Some(Ok(Where::Here { .. })) => foot.push(Line::styled(
+        Some(Ok(Where::Here { .. } | Where::Builtin)) => foot.push(Line::styled(
             "Opening the conversation here, its threads on the right…",
             bold(),
         )),

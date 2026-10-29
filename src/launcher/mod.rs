@@ -16,7 +16,7 @@ use ratatui::crossterm::event::{self, Event};
 use crate::claude::{self, Claude};
 use crate::config::ProjectConfig;
 use crate::pane::OnQuit;
-use crate::project::{self, Note, Where};
+use crate::project::{self, LayoutChoice, Note, Where};
 use crate::{db, generated, paths, trust, tui};
 
 use app::{Action, Entry, Launcher, Msg};
@@ -73,7 +73,7 @@ pub fn run(new: bool) -> Result<()> {
     let (tx, rx) = mpsc::channel();
 
     let mut terminal = tui::init()?;
-    let exit = (|| -> Result<Option<(String, OnQuit)>> {
+    let exit = (|| -> Result<Option<Next>> {
         loop {
             terminal.draw(|f| ui::draw(f, &app))?;
             if event::poll(POLL)? {
@@ -85,7 +85,7 @@ pub fn run(new: bool) -> Result<()> {
                 for action in actions {
                     match action {
                         Action::Quit => return Ok(None),
-                        Action::Pane(slug) => return Ok(Some((slug, OnQuit::Nothing))),
+                        Action::Pane(slug) => return Ok(Some(Next::Pane(slug, OnQuit::Nothing))),
                         Action::Open(slug) => spawn(tx.clone(), move |send| open(&slug, send)),
                         Action::Create(draft) => {
                             spawn(tx.clone(), move |send| create(&draft, send))
@@ -100,13 +100,19 @@ pub fn run(new: bool) -> Result<()> {
                 }
                 let done = matches!(msg, Msg::Done(_));
                 // In a Rex block the board is beside it: this terminal becomes the conversation.
+                // Without Rex or tmux it becomes the built-in layout, both sides.
                 let here = match &msg {
-                    Msg::Done(Ok(Where::Here { board })) => Some(board.clone()),
+                    Msg::Done(Ok(Where::Here { board })) => Some(Some(board.clone())),
+                    Msg::Done(Ok(Where::Builtin)) => Some(None),
                     _ => None,
                 };
                 app.apply(msg);
                 if let (Some(board), app::Screen::Starting(s)) = (here, &app.screen) {
-                    return Ok(Some((s.slug.clone(), OnQuit::Board(board))));
+                    let slug = s.slug.clone();
+                    return Ok(Some(match board {
+                        Some(board) => Next::Pane(slug, OnQuit::Board(board)),
+                        None => Next::Builtin(slug),
+                    }));
                 }
                 if done && let app::Screen::Starting(s) = &app.screen {
                     finished = Some(s.slug.clone());
@@ -122,16 +128,25 @@ pub fn run(new: bool) -> Result<()> {
     })();
     tui::restore();
     match exit? {
-        Some((slug, OnQuit::Nothing)) => {
+        Some(Next::Builtin(slug)) => project::run_builtin(&slug),
+        Some(Next::Pane(slug, OnQuit::Nothing)) => {
             println!(
                 "Showing the conversation with the coordinator. For its threads, run in another \
                  terminal: chief board --project {slug}"
             );
             crate::pane::run(&slug, OnQuit::Nothing)
         }
-        Some((slug, on_quit)) => crate::pane::run(&slug, on_quit),
+        Some(Next::Pane(slug, on_quit)) => crate::pane::run(&slug, on_quit),
         None => Ok(()),
     }
+}
+
+/// What this terminal shows once the launcher closes.
+enum Next {
+    /// `chief pane`, closing `OnQuit` when it ends.
+    Pane(String, OnQuit),
+    /// The built-in layout (§9): the conversation and the board.
+    Builtin(String),
 }
 
 /// Runs `job` on a worker; its notes and its result come back as messages.
@@ -153,7 +168,7 @@ fn spawn(
 }
 
 fn open(slug: &str, send: &mut dyn FnMut(Msg)) -> Result<Where> {
-    project::up_with(slug, &mut |note| send(Msg::Note(note)))
+    project::up_with(slug, LayoutChoice::Auto, &mut |note| send(Msg::Note(note)))
 }
 
 /// The wizard's draft: `chief init` with the quick settings, trust as agreed, then `chief up`.

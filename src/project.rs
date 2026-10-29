@@ -322,20 +322,46 @@ pub enum CoordinatorAction {
 
 /// Starts or respawns the coordinator, then opens the layout (§9): in a Rex block, the board
 /// beside it and the conversation right here; else a Rex session when its server runs, else a
-/// tmux window when this runs inside tmux, else it prints the two commands to run side by side.
-pub fn up(slug: &str) -> Result<()> {
+/// tmux window when this runs inside tmux, else chief draws both in this terminal, else it
+/// prints the two commands to run side by side.
+pub fn up(slug: &str, choice: LayoutChoice) -> Result<()> {
     let mut print = |note: Note| match note {
         Note::Did(line) | Note::Info(line) => println!("{line}"),
         Note::Warn(line) => eprintln!("{line}"),
     };
-    match up_with(slug, &mut print)? {
+    match up_with(slug, choice, &mut print)? {
         Where::Here { board } => crate::pane::run(slug, crate::pane::OnQuit::Board(board)),
+        Where::Builtin => run_builtin(slug),
         Where::Manual => {
             print_manual_layout(slug);
             Ok(())
         }
         Where::Rex { .. } | Where::Tmux => Ok(()),
     }
+}
+
+/// Which layout `up` opens (§9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutChoice {
+    /// Rex, tmux, then the built-in layout, as they apply.
+    #[default]
+    Auto,
+    /// The built-in layout, even where Rex or tmux would do.
+    Builtin,
+}
+
+/// Whether this chief can draw the layout itself: built with the default `builtin-layout`
+/// feature, which needs Zig to build libghostty.
+pub const BUILTIN_LAYOUT: bool = cfg!(feature = "builtin-layout");
+
+/// The built-in layout in this terminal (§9), until the user quits it.
+pub fn run_builtin(slug: &str) -> Result<()> {
+    #[cfg(feature = "builtin-layout")]
+    return crate::builtin::run(slug);
+    #[cfg(not(feature = "builtin-layout"))]
+    bail!(
+        "chief {slug} · this chief was built without its built-in layout (cargo feature builtin-layout)"
+    );
 }
 
 /// A line `up` reports: what it did, what it didn't and why (no layout, say), or a warning
@@ -359,12 +385,25 @@ pub enum Where {
         shown: bool,
     },
     Tmux,
-    /// Neither: the user runs the pane and the board (the reason is in the notes).
+    /// Neither, on a terminal: the caller runs the built-in layout in it.
+    Builtin,
+    /// None of them: the user runs the pane and the board (the reason is in the notes).
     Manual,
 }
 
 /// `up`, reporting through `note` instead of printing, for the launcher (§10a).
-pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
+pub fn up_with(slug: &str, choice: LayoutChoice, note: &mut dyn FnMut(Note)) -> Result<Where> {
+    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if choice == LayoutChoice::Builtin {
+        if !BUILTIN_LAYOUT {
+            bail!(
+                "this chief was built without its built-in layout (cargo feature builtin-layout)"
+            );
+        }
+        if !terminal {
+            bail!("the built-in layout needs a terminal");
+        }
+    }
     let dir = project_dir(slug);
     let config = ProjectConfig::load(&dir.join("project.toml"))
         .with_context(|| format!("no usable chief project {slug:?}; create it with chief init"))?;
@@ -398,11 +437,37 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
     };
     note(Note::Did(format!("Coordinator {} {verb}.", row.name)));
 
+    if choice == LayoutChoice::Builtin {
+        return Ok(Where::Builtin);
+    }
+    let found = open_layout(slug, (&dir, &exe, &env), &conn, terminal, note)?;
+    Ok(match found {
+        // Neither Rex nor tmux: chief draws both sides itself.
+        Where::Manual if BUILTIN_LAYOUT && terminal => {
+            note(Note::Info(
+                "Drawing the layout in this terminal: the conversation on the left, its \
+                 threads on the right (Ctrl+\\ switches sides)."
+                    .into(),
+            ));
+            Where::Builtin
+        }
+        found => found,
+    })
+}
+
+/// The first of a Rex block, a Rex session and a tmux window that opens (§9), else `Manual`.
+fn open_layout(
+    slug: &str,
+    (dir, exe, env): (&Path, &Path, &[(String, String)]),
+    conn: &Connection,
+    terminal: bool,
+    note: &mut dyn FnMut(Note),
+) -> Result<Where> {
     let label = layout::session_label(slug);
     let rex = Rex::from_env();
     let open = |mux: &dyn Mux, ours: Option<String>| {
         let ours = ours.map(SessionRef);
-        layout::open(mux, slug, &dir, &exe, &env, ours.as_ref())
+        layout::open(mux, slug, dir, exe, env, ours.as_ref())
     };
     let done = |opened: &layout::Layout| match opened.opened {
         Opened::Created => "opened",
@@ -415,11 +480,10 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
         _ => stored,
     };
     // In a Rex block on a terminal: nothing opens elsewhere (and no app needs to switch).
-    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if let Some((session, here)) = Rex::here().filter(|_| terminal) {
         let beside = rex
             .check()
-            .and_then(|()| layout::open_beside(&rex, slug, (&dir, &exe, &env), &session, &here));
+            .and_then(|()| layout::open_beside(&rex, slug, (dir, exe, env), &session, &here));
         return Ok(match beside {
             Ok((board, opened)) => {
                 let verb = match opened {
@@ -437,12 +501,12 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
         });
     }
     let shown = match rex.check() {
-        Ok(()) => match open(&rex, db::get_rex_session(&conn, slug)?) {
+        Ok(()) => match open(&rex, db::get_rex_session(conn, slug)?) {
             Ok(opened) => {
                 store(
                     &rex,
                     &opened,
-                    db::set_rex_session(&conn, slug, Some(&opened.session.0)),
+                    db::set_rex_session(conn, slug, Some(&opened.session.0)),
                 )?;
                 note(Note::Did(format!("Rex session {label} {}.", done(&opened))));
                 if !opened.shown {
@@ -463,9 +527,9 @@ pub fn up_with(slug: &str, note: &mut dyn FnMut(Note)) -> Result<Where> {
             }
         },
         Err(why) => match Tmux::current() {
-            Some(tmux) => match open(&tmux, db::get_tmux_window(&conn, slug)?) {
+            Some(tmux) => match open(&tmux, db::get_tmux_window(conn, slug)?) {
                 Ok(opened) => {
-                    let stored = db::set_tmux_window(&conn, slug, Some(&opened.session.0));
+                    let stored = db::set_tmux_window(conn, slug, Some(&opened.session.0));
                     store(&tmux, &opened, stored)?;
                     note(Note::Did(format!("tmux window {label} {}.", done(&opened))));
                     Where::Tmux

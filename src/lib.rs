@@ -3,6 +3,8 @@
 pub mod accounts;
 pub mod agp;
 pub mod board;
+#[cfg(feature = "builtin-layout")]
+pub mod builtin;
 pub mod claude;
 pub mod cleanup;
 pub mod config;

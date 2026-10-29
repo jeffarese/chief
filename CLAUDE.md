@@ -20,11 +20,13 @@ the milestones.
 
 ## Commands
 
-Before `cargo`, run `. ~/.cargo/env` if `cargo` isn't on PATH.
+Before `cargo`, run `. ~/.cargo/env` if `cargo` isn't on PATH. The default `builtin-layout`
+feature builds libghostty with Zig 0.17: when `zig` isn't on PATH, prefix cargo with
+`mise exec zig@0.17.0 --`.
 
 - `cargo build`
 - `cargo test` (run targeted tests first: `cargo test state::`)
-- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`, and again with `--no-default-features`
 - `cargo fmt`
 
 A milestone is done when build, tests, clippy and fmt are clean.

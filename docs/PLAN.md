@@ -288,3 +288,28 @@ Not verified live yet: that a background session accepts a folder chief marked (
 value match what M2b read from Claude's own dialog, but no live session has started in a
 chief-marked folder). Check with `chief new` on a fresh repo: the coordinator must start, and so
 must the first thread.
+
+## Built-in layout (built, 2026-10-29)
+
+Problem (user request): without Rex or tmux, `chief up` printed two commands to run side by side.
+chief now draws the layout itself in the terminal it runs in (ARCHITECTURE §9 "Built-in layout"):
+`claude attach` on a pseudo-terminal of its own, emulated by libghostty and drawn into ratatui's
+buffer on the left, the board on the right, Ctrl+\ or a click to switch sides.
+
+1. **Emulator** (`src/embed/`): libghostty-vt from libghostty-rs at a pinned commit, not
+   crates.io's 0.2.2. That release pins a Ghostty that needs exactly Zig 0.15.2, which can't link
+   native binaries against the macOS 26 SDK (its `libSystem.tbd` lists only arm64e). The pinned
+   commit builds with Zig 0.17. A spike checked the queries Claude Code's terminal layer sends
+   (DA1, DSR, OSC 10/11, XTVERSION, DECRQM 2026, kitty keyboard, size), colours, wide characters
+   and vim on the alternate screen through the real pty path. libghostty's
+   `key::Encoder::encode_to_vec` fails on any key whose first try runs out of room (it reserves
+   from the length, not the capacity), so chief encodes into a stack buffer.
+2. **Layout** (`src/builtin.rs`): the pane loop's steps on the embedded terminal, the wake on a
+   worker, the same pane record and signals as `chief pane`, so the board's switch and
+   `chief down` work unchanged. `chief up --layout builtin` forces it.
+3. **Optional**: the `builtin-layout` cargo feature, on by default; `--no-default-features`
+   builds without Zig and keeps the printed commands.
+
+Tested on a pseudo-terminal with the fake `claude` (`tests/builtin_cli.rs`). Not verified live
+yet: a real `claude attach` in the embedded terminal (its prompt, Shift+Enter, the agent view's
+mouse and paste). Check with `chief up <slug> --layout builtin` on a live project.
