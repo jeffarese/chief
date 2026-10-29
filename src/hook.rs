@@ -1149,11 +1149,13 @@ pub fn log_error(log: &Path, event: &str, project: &str, error: &str) {
         .open(log)
     {
         let error = error.replace('\n', " | ");
-        let _ = writeln!(
-            f,
-            "{} hook {event} --project {project}: {error}",
+        // One write per line: hooks run at once, and `writeln!` writes each piece on its own, so
+        // their pieces would interleave even in append mode.
+        let line = format!(
+            "{} hook {event} --project {project}: {error}\n",
             db::now_ms()
         );
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
