@@ -5,18 +5,12 @@ Code sessions ("threads") that each own one task on their own git branch, routes
 to the right thread, and reports back. A board beside the conversation parks every thread by
 status, and you can open any thread's own conversation from it.
 
-```
-┌──────────────────────────────── chief-<project> ─────────────────────────────────┐
-│ main: the coordinator (or the thread you opened)│ board                          │
-│                                                 │ Waiting on you 1               │
-│ ❯ add rate limiting to the API, and fix the     │  ! Approve the migration       │
-│   flaky checkout test                           │ Working 2                      │
-│ ⏺ Started two threads: …                        │  ● Rate limiting               │
-│                                                 │  ● Flaky checkout test         │
-│                                                 │ Ready for review 1             │
-│                                                 │  ◆ Speed up search  PR open    │
-└─────────────────────────────────────────────────┴────────────────────────────────┘
-```
+![A new project in chief: you ask the coordinator for three things, it starts a thread for each,
+the board shows the one waiting on you, you answer it there, and a pull request lands in Ready for
+review](docs/demo.gif)
+
+<sub>A scripted run (<a href="docs/demo.mp4">MP4</a>): the launcher, board and pane are chief itself,
+the Claude sessions behind them a replay. <code>scripts/demo/demo.sh</code> records it again.</sub>
 
 ## Requirements
 
@@ -220,3 +214,8 @@ Tests never start real Claude sessions: they use fake `claude`, `gh`, `rex` and 
 (`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`) and a temporary
 `CHIEF_HOME`. The tmux backend is also tested against a real tmux server on a private socket,
 which the test kills; your own tmux server is never touched.
+
+`scripts/demo/demo.sh` records the demo above (`docs/demo.gif`, `docs/demo.mp4`) with
+[VHS](https://github.com/charmbracelet/vhs): the release build in its own tmux server, against a
+fake `claude` and `gh` (`scripts/demo/bin/`) under a temporary `HOME`. It needs `vhs`, `tmux`, `jq`
+and `python3`, and starts no real Claude session.

@@ -1,0 +1,37 @@
+#!/bin/bash
+# The demo's `claude`: background sessions are rows in world/agents, and `attach` plays a scene.
+# Never starts a real Claude session.
+. "$(dirname "$0")/../lib.sh"
+
+case "$1" in
+  --version) echo "2.1.310 (Claude Code)" ;;
+  agents)
+    rows=("$WORLD"/agents/*.json)
+    if [ -e "${rows[0]}" ]; then jq -cs . "${rows[@]}"; else echo '[]'; fi
+    ;;
+  --bg)
+    shift
+    while [ $# -gt 1 ]; do
+      [ "$1" = --name ] && name=$2
+      shift
+    done
+    short=$(short_of "$name")
+    # Threads work in a worktree of their own, as Claude Code makes it; the board reads it and
+    # its branch from the job state to look up the pull request.
+    case "$name" in
+      chief-*) ;;
+      *)
+        tree=$PWD/.claude/worktrees/$name
+        git worktree add --quiet -b "worktree-$name" "$tree" > /dev/null 2>&1
+        mkdir -p "$HOME/.claude/jobs/$short"
+        printf '{"daemonShort":"%s","state":"running","worktreePath":"%s","worktreeBranch":"worktree-%s"}' \
+          "$short" "$tree" "$name" > "$HOME/.claude/jobs/$short/state.json"
+        ;;
+    esac
+    agent_set "$short" "$name" "$PWD" working busy
+    case "$name" in chief-*) agent_state "$short" done idle ;; esac
+    echo "backgrounded · $short · $name"
+    ;;
+  attach) exec "$DEMO/scene" "$2" ;;
+  *) ;;
+esac

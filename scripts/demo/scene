@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""The demo's `claude attach <short>`: a Claude Code look-alike for one scripted session.
+
+The coordinator takes the prompt typed into it, starts the threads through chief's real MCP
+server (so the board shows them as chief registers them) and posts what the director sends. A
+thread shows its scripted work; the rate limiting one asks a question and waits for the answer.
+What each session has shown is kept in world/, so switching away and back replays it.
+
+`scene director` is the timeline that moves the threads along, started once by the coordinator.
+"""
+
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+import tty
+
+DEMO = os.path.dirname(os.path.abspath(__file__))
+WORLD = os.path.join(DEMO, "world")
+SLUG = "payments-api"
+
+ORANGE = "\x1b[38;2;215;119;87m"
+GREEN = "\x1b[38;2;78;186;101m"
+GRAY = "\x1b[38;2;140;140;150m"
+DIM = "\x1b[38;2;100;100;110m"
+WHITE = "\x1b[38;2;235;235;240m"
+BLUE = "\x1b[38;2;130;170;255m"
+BOLD = "\x1b[1m"
+USER_BG = "\x1b[48;2;48;48;56m"
+RESET = "\x1b[0m"
+SPIN = "·✢✳✶✻✽✻✶✳✢"
+
+THREADS = [
+    {
+        "key": "rate-limiting",
+        "title": "Rate limiting",
+        "task": "Add a token bucket per API key to every /v1 route, with a 429 and Retry-After.",
+        "brief": "token bucket per API key on /v1/*",
+    },
+    {
+        "key": "flaky-checkout-test",
+        "title": "Flaky checkout test",
+        "task": "checkout.spec.ts fails about one run in five on CI. Find the race and fix it.",
+        "brief": "find the race in checkout.spec.ts",
+    },
+    {
+        "key": "speed-up-search",
+        "title": "Speed up search",
+        "task": "GET /search takes 900 ms at p95. Profile it and get it under 200 ms.",
+        "brief": "profile GET /search, p95 under 200 ms",
+    },
+]
+
+
+def world(*parts):
+    return os.path.join(WORLD, *parts)
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return default
+
+
+def write(path, text):
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def agent(short):
+    return json.loads(read(world("agents", short + ".json"), "{}") or "{}")
+
+
+def short_of(key):
+    for f in sorted(os.listdir(world("agents"))):
+        row = json.loads(read(world("agents", f)))
+        if key in row.get("name", ""):
+            return row["id"]
+    return None
+
+
+def set_state(short, state, status):
+    row = agent(short)
+    row.update(state=state, status=status)
+    write(world("agents", short + ".json"), json.dumps(row))
+
+
+def post(lines):
+    """Queues a coordinator message (a list of lines) for the coordinator scene to show."""
+    with open(world("coord.inbox"), "a") as f:
+        f.write(json.dumps(lines) + "\n")
+
+
+class Screen:
+    """A scrolling transcript above a fixed prompt box, as Claude Code draws it."""
+
+    def __init__(self, log):
+        self.log = log
+        self.cols, self.rows = os.get_terminal_size()
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        signal.signal(signal.SIGTERM, self.quit)
+        signal.signal(signal.SIGHUP, self.quit)
+        bottom = self.rows - 4
+        self.emit(f"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[1;{bottom}r\x1b[1;1H")
+        self.box("")
+
+    def quit(self, *_):
+        termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+        self.emit("\x1b[r\x1b[?25h\x1b[?1049l")
+        sys.exit(0)
+
+    def emit(self, s):
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    def line(self, s="", keep=True):
+        self.emit("\r\x1b[K" + s + RESET + "\n")
+        if keep:
+            with open(self.log, "a") as f:
+                f.write(s + RESET + "\n")
+
+    def replay(self):
+        for s in read(self.log).splitlines():
+            self.emit("\r\x1b[K" + s + "\n")
+
+    def box(self, text, hint="⏵⏵ auto mode on (shift+tab to cycle)"):
+        w = self.cols - 2
+        top = self.rows - 3
+        inner = f" {WHITE}>{RESET} {text}{GRAY}▌{RESET}"
+        pad = w - 5 - len(text)
+        self.emit(
+            f"\x1b7\x1b[{top};1H{DIM}╭{'─' * (w - 1)}╮{RESET}"
+            f"\x1b[{top + 1};1H\x1b[K{DIM}│{RESET}{inner}{' ' * max(pad, 0)}{DIM}│{RESET}"
+            f"\x1b[{top + 2};1H{DIM}╰{'─' * (w - 1)}╯{RESET}"
+            f"\x1b[{top + 3};1H\x1b[K  {GRAY}{hint}{RESET}\x1b8"
+        )
+
+    def wrap(self, text, first, rest):
+        width = min(self.cols - 6, 88)
+        out = textwrap.wrap(text, width) or [""]
+        return [first + out[0]] + [rest + t for t in out[1:]]
+
+    def say(self, text):
+        """An assistant message: ⏺ and the text, wrapped."""
+        self.line()
+        for i, t in enumerate(text.split("\n")):
+            lead = f"{WHITE}⏺{RESET} " if i == 0 else "  "
+            for w in self.wrap(t, lead, "  "):
+                self.line(w)
+
+    def tool(self, call, result, ok=True):
+        self.line()
+        dot = GREEN if ok else ORANGE
+        self.line(f"{dot}⏺{RESET} {BOLD}{call[0]}{RESET}{GRAY}({call[1]}){RESET}")
+        self.line(f"  {GRAY}⎿  {result}{RESET}")
+
+    def user(self, text):
+        self.line()
+        for w in self.wrap(text, "> ", "  "):
+            self.line(f"{USER_BG}{GRAY}{w}{' ' * max(0, min(self.cols - 6, 90) - len(w))}")
+
+    def spin(self, verb, seconds, until=None):
+        """Claude's spinner on the current line for `seconds`, or until `until()` holds."""
+        start = time.time()
+        i = 0
+        while time.time() - start < seconds or (until and not until()):
+            if until and until() and time.time() - start >= seconds:
+                break
+            elapsed = int(time.time() - start)
+            self.emit(
+                f"\r\x1b[K{ORANGE}{SPIN[i % len(SPIN)]} {verb}…{RESET} "
+                f"{GRAY}({elapsed}s · esc to interrupt){RESET}"
+            )
+            i += 1
+            time.sleep(0.12)
+        self.emit("\r\x1b[K")
+
+    def key(self, timeout):
+        """One key pressed within `timeout` seconds, or None."""
+        if select.select([self.fd], [], [], timeout)[0]:
+            return os.read(self.fd, 1).decode(errors="ignore")
+        return None
+
+    def prompt(self, idle=None):
+        """Reads a line typed into the prompt box; calls `idle()` while waiting."""
+        text = ""
+        while True:
+            k = self.key(0.1)
+            if k is None:
+                if idle:
+                    idle()
+                continue
+            if k in "\r\n":
+                if text:
+                    self.box("")
+                    return text
+            elif k == "\x1b":
+                # Arrow keys and the like: swallow the sequence.
+                while self.key(0.02) not in (None, "~"):
+                    pass
+                continue
+            elif k in "\x7f\b":
+                text = text[:-1]
+            elif k.isprintable():
+                text += k
+            self.box(text)
+
+
+def mcp(title, task):
+    """`start_thread` through `chief mcp`, as the coordinator's MCP client would call it."""
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "demo", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "start_thread", "arguments": {"title": title, "task": task}}},
+    ]
+    out = subprocess.run(
+        ["chief", "mcp", "--project", SLUG],
+        input="".join(json.dumps(m) + "\n" for m in msgs),
+        capture_output=True, text=True,
+    ).stdout
+    for line in out.splitlines():
+        reply = json.loads(line)
+        if reply.get("id") == 2:
+            return json.loads(reply["result"]["content"][0]["text"])
+    return {}
+
+
+def header(s, title, sub):
+    """Claude Code's welcome box, sized to its text."""
+    w = min(s.cols - 2, max(len(title), len(sub)) + 8)
+    rows = [("", 0), (f"{ORANGE}✻{RESET} {BOLD}{title}{RESET}", len(title) + 2), ("", 0),
+            (f"  {GRAY}{sub}{RESET}", len(sub) + 2), ("", 0)]
+    s.line(f"{ORANGE}╭{'─' * (w - 2)}╮")
+    for text, width in rows:
+        s.line(f"{ORANGE}│{RESET} {text}{' ' * (w - 4 - width)} {ORANGE}│")
+    s.line(f"{ORANGE}╰{'─' * (w - 2)}╯")
+
+
+def coordinator(short):
+    s = Screen(world("coord.log"))
+    if os.path.exists(world("coord.log")) and read(world("coord.log")):
+        s.replay()
+    else:
+        header(s, "Claude Code · coordinator of Payments API",
+               "cwd: ~/.local/share/chief/projects/payments-api")
+    shown = int(read(world("coord.inbox.read"), "0") or 0)
+
+    def drain():
+        nonlocal shown
+        lines = read(world("coord.inbox")).splitlines()
+        for raw in lines[shown:]:
+            msg = json.loads(raw)
+            s.spin("Reading", 0.8)
+            s.say("\n".join(msg))
+            shown += 1
+            write(world("coord.inbox.read"), str(shown))
+
+    if not os.path.exists(world("delegated")):
+        s.user(s.prompt())
+        write(world("delegated"), "")
+        set_state(short, "working", "busy")
+        s.spin("Planning", 1.6)
+        s.say("Three separate pieces of work, so one thread each.")
+        started = []
+        for t in THREADS:
+            s.spin("Starting a thread", 0.5)
+            r = mcp(t["title"], t["task"])
+            started.append(r.get("name", t["key"]))
+            s.tool(("chief - start_thread (MCP)", f'title: "{t["title"]}"'),
+                   f"Started {r.get('name')} · {r.get('model')} · {r.get('effort')}")
+        s.spin("Writing", 0.8)
+        s.say("They're on it, each on its own branch:\n"
+              + "\n".join(f"• {t['title']}: {t['brief']}" for t in THREADS)
+              + "\nI'll tell you when one needs you or has a pull request.")
+        set_state(short, "done", "idle")
+        subprocess.Popen([sys.executable, __file__, "director"], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    while True:
+        drain()
+        s.user(s.prompt(idle=drain))
+        s.spin("Thinking", 1.2)
+        s.say("Noted. I'll pass it to the thread that owns that work.")
+
+
+THREAD_WORK = {
+    "rate-limiting": [
+        (("Read", "src/api/router.ts"), "Read 182 lines"),
+        (("Search", 'pattern: "rateLimit|throttle", path: "src"'), "Found 0 files"),
+        (("Write", "src/api/middleware/rateLimit.ts"), "Wrote 64 lines"),
+    ],
+    "flaky-checkout-test": [
+        (("Bash", "npm test -- checkout.spec.ts --repeat 20"), "4 of 20 runs failed: cart total is 0"),
+        (("Read", "test/fixtures/cart.ts"), "Read 58 lines"),
+        (("Update", "test/fixtures/cart.ts"), "Await the inventory reservation before seeding the cart"),
+        (("Bash", "npm test -- checkout.spec.ts --repeat 50"), "50 of 50 runs passed"),
+        (("Bash", "gh pr create --fill"), "https://github.com/acme/payments-api/pull/482"),
+    ],
+    "speed-up-search": [
+        (("Bash", "npm run bench -- search"), "p95 912 ms over 500 requests"),
+        (("Read", "src/search/query.ts"), "Read 240 lines"),
+        (("Search", 'pattern: "findMany", path: "src/search"'), "Found 3 files"),
+    ],
+}
+
+
+def thread(short):
+    name = agent(short).get("name", "")
+    t = next((t for t in THREADS if t["key"] in name), THREADS[0])
+    key = t["key"]
+    log = world(f"thread-{key}.log")
+    s = Screen(log)
+    if read(log):
+        s.replay()
+    else:
+        header(s, f"Claude Code · thread {t['title']}",
+               f"cwd: ~/work/payments-api/.claude/worktrees/{name}")
+        s.user(t["task"])
+        for call, result in THREAD_WORK[key]:
+            s.tool(call, result)
+        if key == "flaky-checkout-test":
+            s.say("Opened PR #482. The cart fixture seeded the cart before the inventory "
+                  "mock reserved stock, so the total was 0 about one run in five. 50 runs "
+                  "pass in a row now.")
+    if key == "rate-limiting" and not os.path.exists(world("answered")):
+        s.say("Before I wire it in: what limit should each API key get?")
+        answer = ask(s, "Limit", "What limit should each API key get?",
+                     ["100 requests a minute (Recommended)", "1,000 requests a minute",
+                      "By plan: free 60, pro 600"])
+        write(world("answered"), answer)
+        s.line(f"  {GRAY}⎿  {answer}{RESET}")
+        set_state(short, "working", "busy")
+        limit = answer.split(" requests")[0].replace(",", "_")
+        mount = f"rateLimit({{ perMinute: {limit} }})" if "plan" not in answer else "rateLimit.byPlan()"
+        s.tool(("Update", "src/api/router.ts"), f"Mounted {mount} on /v1")
+    if agent(short).get("status") == "busy":
+        verbs = {"rate-limiting": "Writing tests", "speed-up-search": "Profiling"}
+        s.line()
+        s.spin(verbs.get(key, "Working"), 10**6)
+    while True:
+        s.key(1)
+
+
+def ask(s, label, question, options):
+    """Claude Code's question picker; returns the option picked with Enter or its number."""
+    pick = 0
+
+    def draw(first):
+        if not first:
+            s.emit(f"\x1b[{len(options) + 3}A")
+        s.emit(f"\r\x1b[K  {BLUE}☐ {label}{RESET}\n\r\x1b[K  {BOLD}{question}{RESET}\n")
+        for i, o in enumerate(options):
+            mark = f"{BLUE}❯{RESET}" if i == pick else " "
+            colour = BLUE if i == pick else WHITE
+            s.emit(f"\r\x1b[K  {mark} {colour}{i + 1}. {o}{RESET}\n")
+        s.emit(f"\r\x1b[K  {GRAY}Enter to select · ↑↓ to navigate · Esc to cancel{RESET}\n")
+
+    s.line(keep=False)
+    draw(True)
+    while True:
+        k = s.key(0.2)
+        if k in ("\r", "\n"):
+            break
+        if k and k.isdigit() and 1 <= int(k) <= len(options):
+            pick = int(k) - 1
+            draw(False)
+            time.sleep(0.3)
+            break
+        if k == "\x1b":
+            seq = (s.key(0.05) or "") + (s.key(0.05) or "")
+            step = {"B": 1, "A": -1}.get(seq[-1:], 0)
+            pick = (pick + step) % len(options)
+            draw(False)
+    # The picker's lines go; the answer stays, as in Claude Code.
+    s.emit(f"\x1b[{len(options) + 3}A\x1b[J")
+    s.box("")
+    s.line(f"{GREEN}⏺{RESET} {BOLD}User answered{RESET}{GRAY}({label}){RESET}")
+    return options[pick].replace(" (Recommended)", "")
+
+
+def director():
+    """The threads' timeline after they start: the flaky test opens a PR, rate limiting asks."""
+    flaky, rate = short_of("flaky-checkout-test"), short_of("rate-limiting")
+    branch = f"worktree-{agent(flaky)['name']}"
+    time.sleep(4)
+    subprocess.run(["bash", "-c", f'. "{DEMO}/lib.sh"; pr_set "{branch}" "" 482'])
+    time.sleep(3.5)
+    set_state(rate, "blocked", "waiting")
+    post(["Rate limiting needs you: it asks what limit each API key should get. "
+          "Open it from the board to answer."])
+    # The board polls pull requests every 30 s. The thread ends its turn once the board has
+    # seen the PR, so it goes from Working straight to Ready for review.
+    give_up = time.time() + 120
+    while not os.path.exists(world("pr", branch + ".served")):
+        if time.time() > give_up or not os.path.isdir(WORLD):
+            return
+        time.sleep(0.2)
+    set_state(flaky, "done", "idle")
+    time.sleep(1.5)
+    post(["Flaky checkout test has PR #482 up for review. The cart fixture seeded the cart "
+          "before the inventory mock reserved stock; it waits for the reservation now, and "
+          "50 runs in a row pass."])
+
+
+def main():
+    if sys.argv[1:] == ["director"]:
+        director()
+        return
+    short = sys.argv[1]
+    if agent(short).get("name", "").startswith("chief-"):
+        coordinator(short)
+    else:
+        thread(short)
+
+
+if __name__ == "__main__":
+    main()

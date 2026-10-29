@@ -1,0 +1,15 @@
+#!/bin/bash
+# The demo's `gh`: `gh pr list --head <branch>` serves world/pr/<branch>.json.
+. "$(dirname "$0")/../lib.sh"
+
+while [ $# -gt 0 ]; do
+  [ "$1" = --head ] && branch=$2
+  shift
+done
+if [ -n "$branch" ] && [ -f "$WORLD/pr/$branch.json" ]; then
+  cat "$WORLD/pr/$branch.json"
+  # The director waits for the board to have seen it.
+  touch "$WORLD/pr/$branch.served"
+else
+  echo '[]'
+fi
