@@ -536,6 +536,27 @@ fn cleanup_checks_again_right_before_claude_rm() {
     );
 }
 
+/// A pane killed with SIGKILL leaves `pane_showing` behind. Once its recorded process is gone,
+/// that no longer keeps the thread from being cleaned up.
+#[test]
+fn a_gone_pane_doesnt_block_cleanup() {
+    let env = Env::new();
+    let mut pane = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = pane.id() as i32;
+    let started = chief::proc::start_time(pid).unwrap();
+    db::set_pane_process(&env.conn, "demo", pid, &started).unwrap();
+    db::set_pane_showing(&env.conn, "demo", Some(NAME)).unwrap();
+    let err = env.clean(Mode::Safe).unwrap_err().to_string();
+    assert!(err.contains("is showing in the pane"), "{err}");
+    pane.kill().unwrap();
+    pane.wait().unwrap();
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::Cleaned);
+    assert_eq!(db::get_pane_showing(&env.conn, "demo").unwrap(), None);
+}
+
 #[test]
 fn discard_resets_the_worktree_and_retries_with_the_token() {
     let env = Env::new();

@@ -1,6 +1,7 @@
 //! `project.toml` (ARCHITECTURE §3).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -130,17 +131,14 @@ impl ProjectConfig {
         Ok(config)
     }
 
-    /// Validates, then writes through a temp file so readers never see a half-written file.
+    /// Validates, then writes through a temp file (`replace_file`).
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let text = toml::to_string_pretty(self)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        replace_file(path, &text)
     }
 
     /// Only `claude_config_dir` from a project.toml: hooks and cross-project commands find the
@@ -162,8 +160,8 @@ impl ProjectConfig {
         }
     }
 
-    /// Rejects unknown efforts and permission modes, duplicate repo names, a default_repo
-    /// that names no repo, and max_parallel = 0.
+    /// Rejects unknown efforts and permission modes, relative repo paths, duplicate repo names,
+    /// a default_repo that names no repo, and max_parallel = 0.
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("name is empty");
@@ -222,6 +220,11 @@ impl ProjectConfig {
             bail!("threads.max_usage {max} must be a percent from 1 to 100");
         }
         for repo in &self.repos {
+            // A relative path means one folder in the coordinator's deny rule (resolved where
+            // the files are generated) and another in its `--add-dir` (resolved from its cwd).
+            if !repo.path.is_absolute() {
+                bail!("the repo path {} must be absolute", repo.path.display());
+            }
             // Each repo becomes a permission-rule glob for the coordinator (§3).
             if let Some(c) = repo
                 .path
@@ -256,6 +259,26 @@ impl ProjectConfig {
     pub fn repo(&self, name: &str) -> Option<&Repo> {
         self.repos.iter().find(|r| r.name == name)
     }
+}
+
+/// Writes `path` through a temp file of this write's own in the same folder, renamed over it:
+/// readers never see half a file, and writers at once (`chief up`, the pane's respawn,
+/// `start_thread` in the MCP server) never share a temp file, so none renames another's half
+/// written one or loses its own. The temp file is removed when the write fails.
+pub fn replace_file(path: &Path, contents: &str) -> Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{name}.{}-{n}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, contents)
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -314,7 +337,10 @@ mod tests {
         assert_eq!(ProjectConfig::load(&path).unwrap(), c);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[repos]]"), "{text}");
-        assert!(!dir.path().join("sub/project.toml.tmp").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("sub")).unwrap().count(),
+            1
+        );
 
         let bare = ProjectConfig::new("Bare", "bare", None, vec![]);
         bare.save(&path).unwrap();
@@ -392,7 +418,7 @@ notify = true
     #[test]
     fn validate_rejects() {
         type Edit = fn(&mut ProjectConfig);
-        let cases: [(&str, Edit); 14] = [
+        let cases: [(&str, Edit); 15] = [
             ("empty name", |c| c.name = " ".into()),
             ("bad slug", |c| c.slug = "Payments Latency".into()),
             ("empty slug", |c| c.slug = String::new()),
@@ -410,6 +436,9 @@ notify = true
             }),
             ("unknown default repo", |c| {
                 c.threads.default_repo = Some("nope".into())
+            }),
+            ("relative repo path", |c| {
+                c.repos[0].path = "work/payments-api".into()
             }),
             ("blank account", |c| c.threads.accounts = vec![" ".into()]),
             ("account with a space", |c| {
@@ -470,6 +499,39 @@ notify = true
         assert!(ProjectConfig::read_account(&path).unwrap().is_some());
         std::fs::write(&path, "name = \"x\"\n").unwrap();
         assert_eq!(ProjectConfig::read_account(&path).unwrap(), None);
+    }
+
+    /// Writers at once (`chief up`, the pane's respawn, `start_thread`) each finish with a whole
+    /// file and leave no temp file. With one shared temp name, one would rename another's half
+    /// written file or find its own gone.
+    #[test]
+    fn writers_at_once_never_share_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let texts: Vec<String> = (0..8).map(|i| format!("{i}").repeat(64 * 1024)).collect();
+        std::thread::scope(|scope| {
+            for text in &texts {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        replace_file(path, text).unwrap();
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(texts.contains(&text), "a whole file of one writer");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // A rename that fails (a folder in the way) leaves no temp file behind.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(replace_file(&blocked, "text").is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 
     #[test]

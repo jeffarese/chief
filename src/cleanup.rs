@@ -256,6 +256,7 @@ pub fn cleanable(ctx: &Ctx, name: &str) -> Result<Option<SessionRow>> {
 
 /// `claude rm` stops the session even when it refuses: never while the thread works, waits on
 /// the user, or shows in the pane (the user may be typing into it; hooks only fire on submit).
+/// A pane that is gone shows nothing (`pane::showing`).
 fn ensure_idle(conn: &Connection, row: &SessionRow) -> Result<()> {
     let name = &row.name;
     if active(row) {
@@ -264,7 +265,7 @@ fn ensure_idle(conn: &Connection, row: &SessionRow) -> Result<()> {
         let group = state::derive(&facts).group.label().to_lowercase();
         bail!("{name} is {group}; clean it up once it is idle (cleanup stops its session)");
     }
-    if db::get_pane_showing(conn, &row.project_slug)?.as_deref() == Some(name.as_str()) {
+    if crate::pane::showing(conn, &row.project_slug)?.as_deref() == Some(name.as_str()) {
         bail!(
             "{name} is showing in the pane; show another session there first (cleanup stops \
              its session)"

@@ -172,7 +172,7 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
 | `chief trust <slug>` | you | Mark every folder the project's sessions need as trusted (§3 "Trust") |
 | `chief up <slug>` | you | Start or revive the coordinator, open the layout (Rex, tmux, or say how) |
-| `chief down <slug> [--stop-threads]` | you | Close the layout; threads keep running unless asked |
+| `chief down <slug> [--stop-threads]` | you | End the pane, close the layout; threads keep running unless asked |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
 | `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session |
 | `chief hook <event> --project <slug> --role <coordinator\|thread>` | Claude Code hooks | Record events, derive state, inject context |
@@ -200,7 +200,10 @@ and in each pool account but the project's own (`  <repo> (in <label>)`). When s
 are terminals (and without `--no-trust-prompt`) it asks once, "Trust them now, as accepting
 Claude's trust prompt would? [Y/n]", and marks them all, one `Trusted …` line each; otherwise it
 prints `To trust them later: chief trust <slug>`. An account agp can't name a folder for is
-listed as not checked; a failing `agp status` is one line, and `init` still succeeds. It ends with
+listed as not checked; a failing `agp status` is one line, and `init` still succeeds. So is a
+trust check that fails once the project exists (an unreadable `.claude.json`: `chief couldn't
+check which folders Claude Code trusts: …`, then `To trust them later: chief trust <slug>`):
+failing then would leave a project a second `init` finds taken. It ends with
 `Next: chief up <slug> (or run chief and pick it)`.
 
 `chief trust <slug>` marks every folder `trust::check` lists for the project (its own folder, then
@@ -218,11 +221,19 @@ in `ui_state.tmux_window`; else it prints why and the two commands to run side b
 terminals or splits of the user's own, `chief pane --project <slug>` and `chief board --project
 <slug>`. When opening the chosen layout fails it prints why and the same two commands.
 
-`chief down <slug> [--stop-threads]` closes the layout `chief up` opened, and only that: the Rex
-session and the tmux window it stored, each when stored (§9 `close`: kills the session or window
-when it holds only chief's blocks, else closes just `main` and `board`), or nothing when none is
-stored (`No layout of chief's is open.`, as for a layout the user made). It clears
-`ui_state.pane_showing` and `ui_state.pane_target` (the next `chief up` shows the coordinator; a
+`chief down <slug> [--stop-threads]` first ends the running pane, wherever it runs: one `down`
+didn't open (in the user's own Rex block, §9 case 0, or run by hand) would otherwise attach again
+and respawn the coordinator, or its target, seconds after `down` stopped it. When `pane_pid`'s
+start time matches `pane_started` (`pane::live_pane`) it sends SIGTERM, which ends the pane as a
+hangup does (it reaps its attach, clears its record, and closes the board it opened beside the
+user's block, but not chief's layout), and waits up to 3 s for the record to clear or the process
+to go (`Ended chief pane (pid <pid>).`); a pane still running then is a failure (`chief pane
+(pid <pid>) is still running after 3 s.`). A record whose process is gone is cleared, silently.
+Then it closes the layout `chief up` opened, and only that: the Rex session and the tmux window it
+stored, each when stored (§9 `close`: kills the session or window when it holds only chief's
+blocks, else closes just `board` and `main`), or nothing when none is stored (`No layout of
+chief's is open.`, as for a layout the user made). It clears `ui_state.pane_showing` (unless the
+pane still runs) and `ui_state.pane_target` (the next `chief up` shows the coordinator; a
 pane back on the thread it last showed would respawn it right after `--stop-threads` stopped it),
 syncs `claude agents` (stored rows if it fails), and runs
 `claude stop` on the coordinator when it has a process; with `--stop-threads` also on every
@@ -258,8 +269,11 @@ it was last active (`5m ago`, `just now`).
 right before every spawn and respawn (`start_thread`, `wake_thread`, the pane's respawn, `chief up`):
 Claude Code reads hooks and permissions when a session starts, so an edit to these files (one that
 drops the guard, say) never reaches a later start. A rewrite that fails stops the spawn or
-respawn. Commands inside them use the canonical absolute path of the `chief` binary
-(`std::env::current_exe()`), so install with `cargo install --path .`: `chief up` prints a
+respawn. Each file, and project.toml, is written through a temp file of that write's own in the
+same folder (`<name>.<pid>-<n>.tmp`, `config::replace_file`), renamed over it and removed when
+the write fails: a session starting mid-write never reads half a file, and writers at once (`chief
+up`, the pane's respawn, `start_thread` in the MCP server) never share a temp file. Commands
+inside them use the canonical absolute path of the `chief` binary (`std::env::current_exe()`), so install with `cargo install --path .`: `chief up` prints a
 one-line warning when that path is inside a cargo `target/` folder (an ancestor named `target`
 beside a `Cargo.toml`), since `cargo clean` would disable chief's hooks and guard. Every word of a
 hook command is shell-quoted.
@@ -354,7 +368,9 @@ in every agp pool account but the project's own (§7 "Thread account").
   permissions through a project or user settings file; and state stays chief's. Memory and
   `instructions.md` stay editable (another project's too). Since §1 shows paths in rules are read
   as globs, `ProjectConfig::validate` (init, settings save, every load) refuses a repo path
-  holding `( ) * ? [ ] { } \` and says to rename or move the folder.
+  holding `( ) * ? [ ] { } \` and says to rename or move the folder. It refuses a relative repo
+  path too: the deny rule (resolved where the files are generated) and `--add-dir` (resolved
+  from the coordinator's cwd) would name different folders.
 - `mcp.json`: `{"mcpServers": {"chief": {"type": "stdio", "command": <chief>, "args": ["mcp",
   "--project", <slug>], "env": {...}}}}`.
 
@@ -1086,7 +1102,11 @@ below), block `board` split right of it at 32 % running
 chief path, behind `env K=V…` with the §3 passthrough variables when any is set. `open`:
 
 1. No stored session, or the stored id is gone: create `chief-<slug>` with `main`, add `board`
-   with `--focus=false`. `up` stores the new id.
+   with `--focus=false`. `up` stores the new id. Any error once the session exists (Rex's
+   rename of its first block, tmux's mark of its pane, the `board` block, `show`, storing the
+   id) kills it, best effort, before the error is reported (`mux::kill_on_error`): a session
+   whose id is never stored is nobody's, the next `up` would make another, and a `q` in its
+   pane would close the stored layout.
 2. Both blocks there and running: reuse.
 3. One running: close the other if it is there but ended, and run it again beside the running one
    (`board` right of `main` at 32 %, or `main` left of `board` at 68 %).
@@ -1096,7 +1116,9 @@ chief path, behind `env K=V…` with the §3 passthrough variables when any is s
 
 `close` (for `chief down`): nothing stored or the id gone → nothing to close. A session holding
 only `main` and `board` is killed and the stored id cleared; one that holds other blocks too (the
-user added them) keeps running with those, and only `main` and `board` are closed.
+user added them) keeps running with those, and only `main` and `board` are closed, `board`
+first: `main` runs the pane, which may be the one closing the layout (its `q`), and closing its
+block hangs it up.
 
 Then focus `main` and `show` the session. Focus is best-effort: Rex refuses it as a client action
 when several apps are connected, and failing there would lose the id of a session just made, so
@@ -1105,7 +1127,11 @@ the next `up` would make another. When Rex's `show` returns false, `up` prints
 
 `chief pane` loop (`src/pane.rs`). On start it catches its signals (below), then records its pid
 and start time in `ui_state.pane_pid` / `pane_started` (`proc::start_time`: `proc_pidinfo` on
-macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are still its own.
+macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, with `pane_showing`, only while they
+are still its own. It writes and clears `pane_showing` only while `pane_pid` is its own pid (or
+NULL, for a pane that couldn't record itself: `db::set_pane_showing_as`), so an older pane still
+running neither overwrites nor clears what the newest one shows; §12 would otherwise take that
+thread for one nobody shows.
 
 0. Read `project.toml`. When it can't be read, doesn't parse or doesn't validate, print
    `chief · project.toml can't be used:`, the error indented below it, and
@@ -1144,12 +1170,22 @@ macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, only while they are
 killed. With `--layout` a `q` (not a hangup) then closes the layout as `chief down` does
 (`project::close_layout`: the Rex session, or the tmux window, or just chief's two blocks when
 the user added others), after the pane cleared its rows and restored the terminal, since closing
-hangs up the pane's own terminal; no session stops. Then the pty hangs up and the kernel sends SIGHUP to the session leader, chief, not to
-`claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
+hangs up the pane's own terminal; no session stops. It writes the lines `close_layout` reports
+ignoring errors: that terminal may have hung up already. Then the pty hangs up and the kernel
+sends SIGHUP to the session leader, chief, not to `claude attach`. chief catches SIGHUP (and SIGTERM) with a handler that only sets a flag, without
 `SA_RESTART`, so the default action can't end it before cleanup: the wait sees the flag, passes
 SIGHUP on to attach, gives it 2 s to exit, then SIGKILLs it, and reaps it either way; the loop
 then stops. On exit `pane_showing` is cleared (a stale one would keep §12 cleanup away from that
 thread).
+
+Keys: while chief has the terminal it reads them itself, with `poll` on stdin in slices of at most
+200 ms and `read`, looking at the signal flags between slices (a signal also interrupts a
+slice). Only `q`, Enter (CR or LF) and Ctrl+C (0x03) count; the bytes of a read from an ESC on
+are an escape sequence (an arrow key, a mouse report, a paste), never a key. POLLHUP, POLLERR or
+POLLNVAL, a read of 0 bytes, or a read error other than EINTR or EAGAIN is a hangup, as SIGHUP
+is. Not crossterm's event reader: on a hung-up terminal it retries a read that returns 0 or EIO
+forever, so its poll never returns, the flags go unread, and a pane waiting for a key ran at full
+CPU until SIGKILL (seen live after its tmux server was killed; SIGTERM didn't end it).
 
 Ctrl+Z: the user can detach by hand with Claude's own Ctrl+Z inside `claude attach`; the loop then
 waits as in step 6. While chief itself has the terminal, the terminal is in raw mode
@@ -1168,23 +1204,25 @@ coordinator's name), or no pane is recorded, do nothing. A NULL `pane_showing` i
 the pane may be waiting after the user left (step 6), where the signal attaches the target, even
 the one just left; between attaches the flag stays set and the next wait drops it when the target
 is the one being attached.
-Otherwise check that the recorded pid's start time still matches `pane_started`; if not, the pane
-is gone and the pid may be another process's by now, so clear the record (only while it holds that
-pid) and send nothing. Else send it SIGUSR1. The pane catches SIGUSR1 like SIGHUP (a handler that
-only sets a flag, no `SA_RESTART`), before it records its pid, since the default action would end
-it. When the wait sees the flag it clears it and reads the target again: a target it already shows
+Otherwise check that the recorded pid's start time still matches `pane_started`
+(`pane::live_pane`); if not, the pane is gone and the pid may be another process's by now, so
+clear the record and its `pane_showing` (only while it holds that pid) and send nothing. Else
+send it SIGUSR1. The pane catches SIGUSR1 like SIGHUP (a handler that only sets a flag, no
+`SA_RESTART`), before it records its pid, since the default action would end it. When the wait sees the flag it clears it and reads the target again: a target it already shows
 (the board saw the pane just before it moved on) is ignored. Otherwise it sends SIGTERM to `claude
 attach`, gives it 2 s to exit, then SIGKILLs it, and reaps it. SIGTERM ends the attach client and
 leaves the background session running (verified on Claude Code 2.1.310: still listed, idle, with
 its pid). A killed attach leaves its screen behind, so the pane then restores the terminal mode it
-started with and writes a reset: leave the alternate screen (`ESC[?1049l`), show the cursor
+started with and writes a reset: end synchronized output first (`ESC[?2026l`: until then the
+terminal holds back the rest), leave the alternate screen (`ESC[?1049l`), show the cursor
 (`ESC[?25h`), turn off mouse reporting (`ESC[?1000l ESC[?1002l ESC[?1003l ESC[?1006l`), bracketed
-paste (`ESC[?2004l`) and focus events (`ESC[?1004l`), reset attributes (`ESC[0m`), clear
-(`ESC[2J ESC[H`); then it takes raw mode back, clears `pane_showing` and attaches to the new
-target. The pane writes `pane_showing` before its last read of the target and the board writes the
+paste (`ESC[?2004l`) and focus events (`ESC[?1004l`), pop the kitty keyboard flags (`ESC[<u`),
+reset modifyOtherKeys (`ESC[>4m`), reset attributes (`ESC[0m`), clear (`ESC[2J ESC[H`); then it
+takes raw mode back, clears `pane_showing` and attaches to the new target. The pane writes `pane_showing` before its last read of the target and the board writes the
 target before reading `pane_showing`, so a switch that sends nothing is always seen by the pane's
 next read; a SIGUSR1 that lands before attach starts leaves the flag set, and the first look of the
-wait ends that attach at once. One pane per project receives switches: the latest one started.
+wait ends that attach at once. One pane per project receives switches and owns `pane_showing`: the
+latest one started.
 
 ## 10. Board
 
@@ -1360,8 +1398,10 @@ under it.
   files first); the test home's link is missing until a test installs it, so agp counts as not
   installed and no test reaches the real one. Layout logic is also tested against an in-memory `Mux`, and the tmux backend
   against a real tmux server on a private socket (`-L chief-test-…`, no config) that the test kills.
-  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps. `claude rm` outputs from the live
-  M2b probe are in `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
+  The switch is tested with `chief pane` on a pseudo-terminal and a fake `attach` that sleeps;
+  a hangup by closing the pty's master side, which the test opens close-on-exec so neither the
+  pane nor its attach holds it. `claude rm` outputs from the live M2b probe are in
+  `tests/fixtures/rm/`. Cleanup tests use real temporary git repositories (a bare
   remote, a clone, worktrees under `.claude/worktrees/`); git is the only real tool tests run. `CHIEF_HOME` points
   tests at a temp dir, `CHIEF_CLAUDE_CONFIG` replaces the default account's `~/.claude.json`,
   `CHIEF_CLAUDE_DIR` replaces the default account's folder `~/.claude` (job state; never written
@@ -1419,7 +1459,11 @@ head is the branch's sha.
 2. Refuse (error, nothing run) unless the thread is resolved and, derived as if it weren't
    resolved, neither working nor waiting, and isn't the session `chief pane` shows
    (`ui_state.pane_showing`: the user may be typing into it, and hooks fire only on submit):
-   `claude rm` stops the session even when it refuses.
+   `claude rm` stops the session even when it refuses. A `pane_showing` whose recorded pane is
+   gone (`pane_pid`'s start time no longer matches `pane_started`: a pane killed with SIGKILL
+   never clears it) shows nothing, and that record is cleared (`pane::showing`); otherwise it
+   would keep the thread from cleanup for good. One with no pane recorded (a pane that couldn't
+   record itself) counts.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
 4. Either mode: when the job state of another session registered in this chief home (read in
    that session's own account folder: its own account's, else its project's) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
@@ -1465,7 +1509,8 @@ state names their own worktree and a `worktreeBranch` (`cleanup::branch_of`; nev
 closed and that were active in the last 7 days. It stores results with `registry::set_pr`, which
 auto-resolves merged ones. `refresh_project` (the board, every 30 s) adds, with
 `cleanup = "merged"`, `clean(Safe)` for every resolved, uncleaned thread with a merged PR that is
-neither working nor waiting nor showing in the pane and has no `cleanup_blocked`: a blocked
+neither working nor waiting nor showing in the pane (`pane::showing`, as in step 2) and has no
+`cleanup_blocked`: a blocked
 thread waits for the user, a
 working one is tried again on the next refresh. `cleanup = "manual"` never cleans on its own.
 

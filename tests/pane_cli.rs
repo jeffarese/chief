@@ -4,10 +4,12 @@
 mod common;
 
 use std::io::Read;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chief::db::{self, SessionRow};
@@ -18,12 +20,20 @@ use serde_json::json;
 const COORD: &str = "chief-demo";
 const THREAD: &str = "demo-a-1111";
 
+/// Held from `openpty` until the pane is spawned: until its master is close-on-exec, a process
+/// another test spawns would inherit it and keep that pty from ever hanging up.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
 /// `chief pane` running on a pty it leads (its own session, so its process group holds it and
 /// every attach it starts). Dropping it kills that whole group and reaps the pane.
 struct Pane {
     child: Child,
     output: Arc<Mutex<Vec<u8>>>,
-    input: std::fs::File,
+    /// The pty's master side; None once `hang_up` closed it.
+    input: Option<std::fs::File>,
+    /// Tells the reader to close its copy of the master.
+    closing: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl Pane {
@@ -39,6 +49,7 @@ impl Pane {
 
     /// `chief <args>` on a terminal of its own, with `env` added.
     fn spawn(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Pane {
+        let spawning = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize {
             ws_row: 24,
@@ -57,6 +68,12 @@ impl Pane {
             )
         };
         assert_eq!(r, 0, "openpty");
+        // The pane and its attach must not hold the master, or closing it here hangs up nothing.
+        // SAFETY: sets a flag on the descriptor just opened.
+        assert_eq!(
+            unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
         // SAFETY: fresh descriptors from openpty, owned once each.
         let (master, slave) =
             unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
@@ -76,31 +93,57 @@ impl Pane {
         }
         let child = cmd.spawn().unwrap();
         drop(cmd);
+        drop(spawning);
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = output.clone();
+        let closing = Arc::new(AtomicBool::new(false));
+        let stop = closing.clone();
         let mut master = std::fs::File::from(master);
         let input = master.try_clone().unwrap();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            // Ends with EIO once the pane and its children have closed the pty.
-            while let Ok(n) = master.read(&mut buf) {
-                if n == 0 {
-                    break;
+            // Short polls, so `hang_up` can make it drop the master. Reads end with EIO once
+            // the pane and its children have closed the pty.
+            while !stop.load(Ordering::SeqCst) {
+                let mut fd = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one live pollfd.
+                if unsafe { libc::poll(&mut fd, 1, 50) } <= 0 {
+                    continue;
                 }
-                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                match master.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
             }
         });
         Pane {
             child,
             output,
-            input,
+            input: Some(input),
+            closing,
+            reader: Some(reader),
         }
     }
 
     /// Types `keys` into the pane's terminal.
     fn send(&mut self, keys: &str) {
         use std::io::Write;
-        self.input.write_all(keys.as_bytes()).unwrap();
+        let input = self.input.as_mut().expect("not hung up");
+        input.write_all(keys.as_bytes()).unwrap();
+    }
+
+    /// Closes the pty's master side, as a terminal window closing or a killed tmux server
+    /// does: the pane's terminal hangs up.
+    fn hang_up(&mut self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.input = None;
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
     }
 
     fn says(&self, text: &str) -> bool {
@@ -412,4 +455,174 @@ fn up_in_a_rex_block_shows_the_conversation_there() {
         "only the board closed"
     );
     assert!(home.rex.calls_of("kill").is_empty());
+}
+
+/// A home whose coordinator runs (a pid in `claude agents`), with the fake's files `fake` set.
+fn coordinator_home(fake: &[(&str, &str)]) -> Home {
+    let home = Home::new();
+    home.register("demo");
+    let mut row = SessionRow::new(COORD, "demo", Role::Coordinator, 1);
+    row.short_id = Some("c0".into());
+    row.session_id = Some("c0-sid".into());
+    db::insert_session(&home.db(), &row).unwrap();
+    home.fake.set(
+        "agents.stdout",
+        &json!([agent("c0", "c0-sid", COORD, "done", Some(4001))]).to_string(),
+    );
+    for (file, text) in fake {
+        home.fake.set(file, text);
+    }
+    home
+}
+
+/// The two waits the pane reads keys in: after the user left a session, and before a retry
+/// (here of an attach that keeps failing, as one did live with exit 126).
+const WAITS: [(&str, &str, &str); 2] = [
+    ("attach.sleep", "1.2", "you left the coordinator"),
+    ("attach.exit", "126", "· retrying · q quits"),
+];
+
+/// A terminal that hangs up while the pane waits for a key (its window closed, its tmux server
+/// killed) ends the pane: before, the key reader retried its read of the hung-up terminal
+/// forever, at full CPU, and SIGTERM couldn't stop it. A hangup isn't a `q`: the layout stays
+/// for `chief down`.
+#[test]
+fn a_hangup_ends_a_waiting_pane() {
+    for (file, text, waiting) in WAITS {
+        let home = coordinator_home(&[(file, text)]);
+        let conn = home.db();
+        db::set_rex_session(&conn, "demo", Some("session:7")).unwrap();
+        let mut pane = Pane::start_with(&home, &["--layout"]);
+        wait_for(waiting, || pane.says(waiting));
+        assert!(db::get_pane_process(&conn, "demo").unwrap().is_some());
+        pane.hang_up();
+        assert!(pane.exited().is_some(), "{waiting}: the pane ends");
+        assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
+        assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+        assert!(home.rex.calls().is_empty(), "{waiting}: the layout stays");
+    }
+}
+
+/// SIGTERM (`kill <pid>`, `chief down`) ends a pane waiting for a key, as it ends one attached.
+#[test]
+fn sigterm_ends_a_waiting_pane() {
+    for (file, text, waiting) in WAITS {
+        let home = coordinator_home(&[(file, text)]);
+        let conn = home.db();
+        let mut pane = Pane::start(&home);
+        wait_for(waiting, || pane.says(waiting));
+        // SAFETY: our own child.
+        unsafe { libc::kill(pane.pid(), libc::SIGTERM) };
+        let status = pane.exited().expect("the pane ends on SIGTERM");
+        assert!(status.success(), "{waiting}: {status:?}");
+        assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
+        assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+    }
+}
+
+/// `q` in chief's layout closes it, and closing it hangs up the pane's own terminal while the
+/// pane still reports what it closed: that line is lost, and the pane still ends cleanly
+/// (`println!` panicked there, exit 101).
+#[test]
+fn closing_the_layout_survives_its_own_hangup() {
+    let home = coordinator_home(&[("attach.sleep", "1.2")]);
+    let conn = home.db();
+    db::set_rex_session(&conn, "demo", Some("session:7")).unwrap();
+    home.rex
+        .set("list.exit", "0")
+        .set(
+            "list.stdout",
+            r#"{"sessions": [{"session_id": "session:7", "label": "chief-demo"}]}"#,
+        )
+        .set(
+            "block.stdout",
+            r#"{"blocks": [{"block_id": "block:main", "label": "main"},
+                           {"block_id": "block:board", "label": "board"}]}"#,
+        )
+        // The session's end hangs up the pane's terminal before `rex kill` returns.
+        .set("kill.sleep", "1");
+    let mut pane = Pane::start_with(&home, &["--layout"]);
+    wait_for("the coordinator is left", || {
+        pane.says("you left the coordinator")
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    pane.send("q");
+    wait_for("rex kill", || !home.rex.calls_of("kill").is_empty());
+    pane.hang_up();
+    let status = pane.exited().expect("the pane ends");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(db::get_rex_session(&conn, "demo").unwrap(), None);
+}
+
+/// `chief down` ends a pane it didn't open (run by hand here, or in the user's own Rex block)
+/// before it stops the coordinator: the pane would otherwise attach again and respawn it.
+#[test]
+fn down_ends_a_pane_it_did_not_open() {
+    let home = coordinator_home(&[("attach.sleep", "30")]);
+    let conn = home.db();
+    let mut pane = Pane::start(&home);
+    wait_for("the attach", || {
+        attach_call(&home, "c0").is_some()
+            && db::get_pane_showing(&conn, "demo").unwrap().as_deref() == Some(COORD)
+    });
+    let attach = home.fake.pid(attach_call(&home, "c0").unwrap());
+    let out = home.run(&["down", "demo"], "");
+    let text = common::stdout(&out);
+    assert!(out.status.success(), "{text}{}", common::stderr(&out));
+    assert!(
+        text.starts_with(&format!("Ended chief pane (pid {}).\n", pane.pid())),
+        "{text}"
+    );
+    assert!(text.contains("Stopped coordinator chief-demo."), "{text}");
+    assert!(pane.exited().expect("ended").success());
+    assert!(gone(attach), "its attach was reaped");
+    assert_eq!(attach_calls(&home, "c0"), 1, "not attached again");
+    assert_eq!(db::get_pane_process(&conn, "demo").unwrap(), None);
+    assert_eq!(db::get_pane_showing(&conn, "demo").unwrap(), None);
+}
+
+/// `pane_showing` belongs to the pane recorded last: an older pane still running neither
+/// overwrites it nor clears it when it ends, so cleanup never takes the newest pane's thread
+/// for one nobody shows.
+#[test]
+fn an_older_pane_leaves_the_newest_ones_showing_alone() {
+    let home = coordinator_home(&[("attach.sleep", "30")]);
+    let conn = home.db();
+    let mut row = SessionRow::new(THREAD, "demo", Role::Thread, 1);
+    row.short_id = Some("t1".into());
+    row.session_id = Some("t1-sid".into());
+    db::insert_session(&conn, &row).unwrap();
+    home.fake.set(
+        "agents.stdout",
+        &json!([
+            agent("c0", "c0-sid", COORD, "done", Some(4001)),
+            agent("t1", "t1-sid", THREAD, "done", Some(4002)),
+        ])
+        .to_string(),
+    );
+    let recorded = |pane: &Pane| {
+        db::get_pane_process(&conn, "demo")
+            .unwrap()
+            .map(|(pid, _)| pid)
+            == Some(pane.pid())
+    };
+    let mut older = Pane::start(&home);
+    wait_for("the older pane's attach", || attach_calls(&home, "c0") == 1);
+    let newer = Pane::start(&home);
+    wait_for("the newer pane's record", || recorded(&newer));
+    wait_for("the newer pane's attach", || attach_calls(&home, "c0") == 2);
+
+    db::set_pane_target(&conn, "demo", Some(THREAD)).unwrap();
+    chief::pane::request_switch(&conn, "demo").unwrap();
+    wait_for("the newer pane on the thread", || {
+        db::get_pane_showing(&conn, "demo").unwrap().as_deref() == Some(THREAD)
+    });
+    // SAFETY: our own child.
+    unsafe { libc::kill(older.pid(), libc::SIGTERM) };
+    assert!(older.exited().is_some(), "the older pane ends");
+    assert_eq!(
+        db::get_pane_showing(&conn, "demo").unwrap().as_deref(),
+        Some(THREAD)
+    );
+    assert!(recorded(&newer));
 }

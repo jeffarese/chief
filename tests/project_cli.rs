@@ -594,6 +594,35 @@ fn init_rejects_bad_input_without_leaving_files() {
     assert!(out.status.success(), "{}", stderr(&out));
 }
 
+/// Once the project is made, a trust check that fails (an unreadable `.claude.json`) is a line,
+/// and `init` still succeeds: failing then would leave a project a second `init` finds taken.
+#[test]
+fn init_finishes_when_trust_cant_be_checked() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    std::fs::write(&home.trust, "{ not json").unwrap();
+    let out = init(&home, &a, &b);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Created project"), "{text}");
+    assert!(
+        text.contains("chief couldn't check which folders Claude Code trusts: parsing"),
+        "{text}"
+    );
+    assert!(
+        text.contains("To trust them later: chief trust payments-latency"),
+        "{text}"
+    );
+    assert!(text.ends_with("(or run chief and pick it)\n"), "{text}");
+    assert!(db::project_dir(&home.db(), SLUG).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_to_string(&home.trust).unwrap(),
+        "{ not json",
+        "never replaced"
+    );
+}
+
 /// Hook commands written by init run from any cwd, without CHIEF_HOME in the environment.
 #[test]
 fn generated_hook_commands_reach_this_home() {
@@ -1279,6 +1308,59 @@ fn up_opens_then_reuses_the_rex_layout() {
     assert_eq!(home.rex.calls_of("run").len(), 1);
 }
 
+/// A session `up` created but couldn't finish (its first block not renamed in Rex, its pane not
+/// marked in tmux) is killed: its id is never stored, so the next `up` would make another, and a
+/// `q` in its pane would close the stored layout instead.
+#[test]
+fn up_kills_a_layout_it_could_not_finish() {
+    let home = Home::new();
+    running_project(&home);
+    home.rex
+        .set("list.stdout", r#"{"sessions": []}"#)
+        .set(
+            "new.stdout",
+            r#"{"session_id": "session:new", "initial_windows": [{"window_id": "window:1", "block_ids": ["block:main"]}]}"#,
+        )
+        .set("block.rename.exit", "1");
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("No Rex layout: `rex block rename"), "{text}");
+    assert_eq!(
+        home.rex.calls_of("kill"),
+        [vec!["kill", "session:new", "--autostart=false"]]
+    );
+    assert!(home.rex.calls_of("run").is_empty());
+    assert_eq!(db::get_rex_session(&home.db(), SLUG).unwrap(), None);
+
+    home.rex
+        .set("list.exit", "1")
+        .set("list.stderr", "Error: no Rex server is running\n");
+    home.tmux
+        .set("new-window.stdout", "%5 @3 4242\n")
+        .set("set-option.exit", "1");
+    let sock = "/tmp/tmux-501/default";
+    let out = home.run_env(
+        &["up", SLUG],
+        &[("TMUX", "/tmp/tmux-501/default,4242,0")],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("No tmux layout: "),
+        "{}",
+        stdout(&out)
+    );
+    let calls = tmux_calls(&home, sock);
+    assert_eq!(
+        calls.last().unwrap(),
+        &strings(&["kill-window", "-t", "@3"]),
+        "{calls:?}"
+    );
+    assert!(!calls.iter().any(|c| c[0] == "split-window"), "{calls:?}");
+    assert_eq!(db::get_tmux_window(&home.db(), SLUG).unwrap(), None);
+}
+
 /// The fake tmux's calls, without the leading `-S <socket>` chief always passes.
 fn tmux_calls(home: &Home, socket: &str) -> Vec<Vec<String>> {
     home.tmux
@@ -1630,14 +1712,99 @@ fn down_closes_the_layout_and_stops_sessions() {
     assert_eq!(
         closed,
         [
-            vec!["block", "close", "block:main", "--autostart=false"],
-            vec!["block", "close", "block:board", "--autostart=false"]
-        ]
+            vec!["block", "close", "block:board", "--autostart=false"],
+            vec!["block", "close", "block:main", "--autostart=false"]
+        ],
+        "main, the pane, last"
     );
     assert_eq!(
         db::get_rex_session(&home.db(), SLUG).unwrap().as_deref(),
         Some("session:7")
     );
+}
+
+/// `chief down` ends the running pane first, one it didn't open too (in the user's own Rex
+/// block, or run by hand): left running, it would attach again and respawn the coordinator
+/// seconds after `down` stopped it.
+#[test]
+fn down_ends_the_running_pane_first() {
+    use std::os::unix::process::ExitStatusExt;
+    let home = Home::new();
+    running_project(&home);
+    // A stand-in for the pane, reaped as soon as it ends, as its shell would. It never clears
+    // its record: `down` sees it gone.
+    let pane = |ignore_term: bool| {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        if ignore_term {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: signal() is async-signal-safe; the ignore survives exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let started = chief::proc::start_time(pid).unwrap();
+        let conn = home.db();
+        db::set_pane_process(&conn, SLUG, pid, &started).unwrap();
+        db::set_pane_showing(&conn, SLUG, Some("chief-payments-latency")).unwrap();
+        (pid, std::thread::spawn(move || child.wait().unwrap()))
+    };
+    let (pid, waiter) = pane(false);
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with(&format!(
+            "Ended chief pane (pid {pid}).\nNo layout of chief's is open.\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Stopped coordinator chief-payments-latency."),
+        "{text}"
+    );
+    assert_eq!(waiter.join().unwrap().signal(), Some(libc::SIGTERM));
+    assert_eq!(db::get_pane_process(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
+
+    // A pane that doesn't end: `down` goes on, keeps what it shows, and fails.
+    let (pid, waiter) = pane(true);
+    let out = home.run(&["down", SLUG], "");
+    assert!(!out.status.success());
+    let text = stdout(&out);
+    assert!(
+        text.starts_with(&format!(
+            "chief pane (pid {pid}) is still running after 3 s.\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Stopped coordinator chief-payments-latency."),
+        "{text}"
+    );
+    assert_eq!(
+        db::get_pane_showing(&home.db(), SLUG).unwrap().as_deref(),
+        Some("chief-payments-latency")
+    );
+    // SAFETY: our own child, not reaped until the waiter returns.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    waiter.join().unwrap();
+
+    // Gone without clearing its record: nothing to end, and the record is forgotten.
+    let out = home.run(&["down", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).starts_with("No layout of chief's is open.\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(db::get_pane_process(&home.db(), SLUG).unwrap(), None);
+    assert_eq!(db::get_pane_showing(&home.db(), SLUG).unwrap(), None);
 }
 
 /// `chief` alone is the launcher (§10a); without a terminal it says so instead of drawing.
