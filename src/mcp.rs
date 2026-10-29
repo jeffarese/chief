@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde_json::Value;
 
 use crate::claude::{Claude, RESOLVE_TIMEOUT};
@@ -57,8 +58,16 @@ impl ChiefMcp {
     #[tool(
         description = "Start a thread: a background Claude Code session that owns one task on its own branch, in the Claude account with the most room. Returns its name and address; then subscribe with SendMessage(to=address, notify_when_idle=true) and no message, as `next` says."
     )]
-    async fn start_thread(&self, Parameters(args): Parameters<StartThreadArgs>) -> CallToolResult {
-        self.call(move |ctx| tools::start_thread(ctx, &args)).await
+    async fn start_thread(
+        &self,
+        Parameters(args): Parameters<StartThreadArgs>,
+        request: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        // rmcp cancels the token on the client's notifications/cancelled, and on shutdown, but
+        // the blocking tool runs on: it checks the token itself right before the spawn.
+        let token = request.ct;
+        self.call(move |ctx| tools::start_thread_unless(ctx, &args, &|| token.is_cancelled()))
+            .await
     }
 
     #[tool(

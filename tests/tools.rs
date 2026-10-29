@@ -788,6 +788,124 @@ fn start_thread_keeps_the_row_when_it_cannot_tell() {
     assert_eq!(rows[0].short_id, None);
 }
 
+/// Runs `start` while `during` works on its own connection to the database, from the moment the
+/// fake's `--bg` starts until `start` returns (`during`'s receiver gets a message then). Give
+/// the fake a `bg.sleep` so `during` has time to act before the spawn returns.
+fn while_spawning<T>(
+    env: &Env,
+    start: impl FnOnce() -> T,
+    during: impl FnOnce(&Connection, &std::sync::mpsc::Receiver<()>) + Send,
+) -> T {
+    let db_path = env.root.path().join("chief.db");
+    let spawning = env.fake.dir.path().join("bg.count");
+    let (done, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let conn = db::open(&db_path).unwrap();
+            while !spawning.exists() {
+                if done_rx.try_recv().is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            during(&conn, &done_rx);
+        });
+        let out = start();
+        let _ = done.send(());
+        out
+    })
+}
+
+/// Once `claude --bg` returned an id the thread runs: a database that refuses its ids (locked,
+/// here) must not turn that into a failure, or the coordinator would start it again.
+#[test]
+fn start_thread_succeeds_when_its_ids_cannot_be_stored() {
+    let env = Env::new();
+    env.conn.busy_timeout(Duration::from_millis(50)).unwrap();
+    env.fake
+        .set("agents.stdout.1", "[]")
+        .set("bg.stdout", "backgrounded · abc123 · whatever\n")
+        .set("bg.sleep", "0.5");
+    env.agents(&[agent(
+        "abc123",
+        "sid-abc",
+        "demo-fix-xxxx",
+        "working",
+        Some(77),
+    )]);
+    let out = while_spawning(
+        &env,
+        || env.with(|ctx| tools::start_thread(ctx, &start_args("Fix", "Fix it"))),
+        |conn, done| {
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let _ = done.recv();
+            conn.execute_batch("ROLLBACK").unwrap();
+        },
+    )
+    .unwrap();
+    let name = out["name"].as_str().unwrap();
+    assert_eq!(out["short_id"], "abc123");
+    assert_eq!(out["address"], name);
+    let warning = out["warning"].as_str().unwrap();
+    assert!(
+        warning.contains("couldn't store its session ids"),
+        "{warning}"
+    );
+    assert!(warning.contains("don't start it again"), "{warning}");
+    // Kept, for its hooks to attach by name.
+    let row = env.row(name).unwrap();
+    assert_eq!((row.short_id, row.session_id), (None, None));
+    assert_eq!(env.fake.calls_of("--bg").len(), 1);
+}
+
+/// A failed `claude --bg` whose session isn't listed yet, but whose hooks already attached the
+/// row (they stored its session id), started: the row is kept and the call succeeds.
+#[test]
+fn start_thread_keeps_a_row_its_hooks_attached() {
+    let env = Env::new();
+    env.agents(&[]);
+    env.fake
+        .set("bg.stdout", "something chief can't read\n")
+        .set("bg.sleep", "0.5");
+    let out = while_spawning(
+        &env,
+        || env.with(|ctx| tools::start_thread(ctx, &start_args("Fix", "Fix it"))),
+        |conn, _| {
+            let mut rows = db::list_sessions(conn, "demo", Some(Role::Thread)).unwrap();
+            let mut row = rows.pop().expect("the row is inserted before the spawn");
+            row.session_id = Some("sid-hooked".into());
+            db::update_session(conn, &row).unwrap();
+        },
+    )
+    .unwrap();
+    let name = out["name"].as_str().unwrap();
+    assert_eq!(out["short_id"], Value::Null);
+    assert_eq!(out["address"], name);
+    let warning = out["warning"].as_str().unwrap();
+    assert!(warning.contains("hooks already ran"), "{warning}");
+    assert!(warning.contains("something chief can't read"), "{warning}");
+    let row = env.row(name).unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("sid-hooked"));
+}
+
+/// A call the client cancelled starts nothing: nobody would get its address or `next`.
+#[test]
+fn a_cancelled_start_thread_starts_nothing() {
+    let env = Env::new();
+    env.agents(&[]);
+    env.fake.set("bg.stdout", "backgrounded · abc123 · x\n");
+    let err = env
+        .with(|ctx| tools::start_thread_unless(ctx, &start_args("Fix", "Fix it"), &|| true))
+        .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+    assert!(env.fake.calls_of("--bg").is_empty());
+    assert!(
+        db::list_sessions(&env.conn, "demo", None)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn repo_resolution() {
     let env = Env::new();
@@ -989,6 +1107,57 @@ fn wake_thread_respawns_and_waits_for_a_pid() {
         })
         .unwrap_err();
     assert!(err.to_string().contains("never started"), "{err}");
+}
+
+/// `wake_thread`'s wait is a bound (§7): a `claude agents` that hangs after the respawn gets only
+/// the time left, not its own 15 s.
+#[test]
+fn wake_thread_stops_waiting_at_its_deadline() {
+    let env = Env::new();
+    env.insert("demo-w-1111", |r| {
+        r.short_id = Some("w1".into());
+        r.session_id = Some("sid-w1".into());
+    });
+    let bin = env.fake.dir.path().join("claude-slow-after-respawn");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+case "$1" in
+  respawn) : > "$dir/respawned" ;;
+  agents)
+    [ -f "$dir/respawned" ] && exec sleep 30
+    echo '[{"id":"w1","sessionId":"sid-w1","name":"demo-w-1111","state":"done"}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let claude = chief::claude::Claude {
+        bin,
+        account: None,
+        config_dir: env.fake.config_dir(),
+    };
+    let start = std::time::Instant::now();
+    let out = env
+        .with_claude(&claude, |ctx| {
+            tools::wake_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-w-1111".into(),
+                },
+            )
+        })
+        .unwrap();
+    let took = start.elapsed();
+    assert_eq!(
+        (out["alive"].as_bool(), out["respawned"].as_bool()),
+        (Some(false), Some(true)),
+        "{out}"
+    );
+    // The wake timeout is 1 s here; the listing alone would take 15 s.
+    assert!(took < Duration::from_secs(5), "took {took:?}");
 }
 
 /// A thread in another account (§3): only that account's `claude agents` lists it, so it is

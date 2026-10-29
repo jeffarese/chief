@@ -174,6 +174,16 @@ pub fn refresh(ctx: &ToolCtx) -> Result<Listings> {
 }
 
 pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
+    start_thread_unless(ctx, args, &|| false)
+}
+
+/// `start_thread` that starts nothing once `cancelled()` is true: the client gave up the call
+/// (§7), so nobody would get the thread's address or its `next`.
+pub fn start_thread_unless(
+    ctx: &ToolCtx,
+    args: &StartThreadArgs,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value> {
     let title = args.title.trim();
     if title.is_empty() {
         bail!("title is empty");
@@ -257,23 +267,34 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
         ),
         prompt: Some(task_prompt(&args.task)),
     };
-    let (short_id, adopted, warning) = match claude.spawn_bg(&spec) {
-        Ok(id) => (id, None, None),
+    // The last moment the call can still be given up without leaving a thread nobody follows.
+    if cancelled() {
+        if let Err(e) = db::delete_session(ctx.conn, &name) {
+            eprintln!("chief mcp: could not remove {name} after a cancelled start: {e:#}");
+        }
+        bail!("start_thread was cancelled before {name} started; nothing was started");
+    }
+    let mut warnings = Vec::new();
+    let (short_id, adopted) = match claude.spawn_bg(&spec) {
+        Ok(id) => (Some(id), None),
         Err(e) => {
-            let (agent, warning) = after_failed_spawn(ctx, &claude, &name, &live, &spec.cwd, e)?;
-            let id = agent
-                .id
-                .clone()
-                .context("an adopted session has a short id")?;
-            (id, Some(agent), Some(warning))
+            let (kept, warning) = after_failed_spawn(ctx, &claude, &name, &live, &spec.cwd, e)?;
+            warnings.push(warning);
+            match kept {
+                Kept::Listed(agent) => (agent.id.clone(), Some(agent)),
+                Kept::Attached => (None, None),
+            }
         }
     };
-    // Hooks from the new session may already be writing this row: read-modify-write in one
-    // transaction.
-    let set_ids = |agent: Option<&AgentRow>| {
-        db::immediate(ctx.conn, |conn| {
+    // From here on the session runs, so nothing may fail the call: a coordinator told it failed
+    // would start the thread again. Hooks match it by name until its ids are stored.
+    let mut stored = true;
+    let mut store_ids = |short_id: &str, agent: Option<&AgentRow>| {
+        // Hooks from the new session may already be writing this row: read-modify-write in
+        // one transaction.
+        let written = db::immediate(ctx.conn, |conn| {
             let mut row = db::get_session(conn, &name)?.context("thread row vanished")?;
-            row.short_id = Some(short_id.clone());
+            row.short_id = Some(short_id.to_string());
             if let Some(a) = agent
                 && row.session_id.is_none()
             {
@@ -282,26 +303,50 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
             }
             row.updated_at = (ctx.now)();
             db::update_session(conn, &row)
-        })
-    };
-    let started = if let Some(agent) = adopted {
-        set_ids(Some(&agent))?;
-        Some(agent)
-    } else {
-        set_ids(None)?;
-        // Not fatal: hooks match the session by title and sync matches it by short id.
-        match claude.resolve_session(&short_id, ctx.resolve_timeout) {
-            Ok(agent) => {
-                set_ids(Some(&agent))?;
-                Some(agent)
-            }
-            Err(e) => {
-                eprintln!("chief mcp: {e:#}");
-                None
-            }
+        });
+        if let Err(e) = written {
+            eprintln!("chief mcp: {name} started, but storing its ids failed: {e:#}");
+            stored = false;
         }
     };
-    let row = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
+    let started = match (&short_id, adopted) {
+        (Some(id), Some(agent)) => {
+            store_ids(id, Some(&agent));
+            Some(agent)
+        }
+        (Some(id), None) => {
+            store_ids(id, None);
+            // Not fatal: hooks match the session by title and sync matches it by short id.
+            match claude.resolve_session(id, ctx.resolve_timeout) {
+                Ok(agent) => {
+                    store_ids(id, Some(&agent));
+                    Some(agent)
+                }
+                Err(e) => {
+                    eprintln!("chief mcp: {e:#}");
+                    None
+                }
+            }
+        }
+        (None, _) => None,
+    };
+    if !stored {
+        warnings.push(format!(
+            "{name} started, but chief couldn't store its session ids (the database was busy or \
+             failing); its hooks store them by its name when they next run. It is in \
+             list_threads: don't start it again."
+        ));
+    }
+    // What was stored, else what chief knows.
+    let row = match db::get_session(ctx.conn, &name) {
+        Ok(Some(stored)) => stored,
+        _ => SessionRow {
+            short_id: short_id.clone(),
+            session_id: started.as_ref().map(|a| a.session_id.clone()),
+            pid: started.as_ref().and_then(|a| a.pid),
+            ..row
+        },
+    };
     let address = address(ctx, &row, started.as_slice());
     let mut out = json!({
         "name": name,
@@ -316,8 +361,8 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
     if let Some(note) = placed.note {
         out["account_note"] = json!(note);
     }
-    if let Some(w) = warning {
-        out["warning"] = json!(w);
+    if !warnings.is_empty() {
+        out["warning"] = json!(warnings.join(" "));
     }
     Ok(out)
 }
@@ -367,11 +412,21 @@ fn subscribe(lead: &str, row: &SessionRow, address: Option<&str>) -> String {
     )
 }
 
+/// What a failed `claude --bg` started anyway, which chief keeps.
+enum Kept {
+    /// `claude agents` lists it: adopt its ids.
+    Listed(AgentRow),
+    /// A hook of the session already stored its session id in the row: it started, though no
+    /// listing showed it yet.
+    Attached,
+}
+
 /// A `claude --bg` in `cwd` that failed (a timeout, output chief doesn't recognise) may have
 /// started the session anyway; deleting its row would leave it working unseen, and the guard
 /// would refuse it. So: when `claude agents` lists it (by name, in `cwd`), return it with a
-/// warning to adopt; when it doesn't, delete the row and return the spawn's error; when chief
-/// can't tell, keep the row (its hooks match it by title if it did start) and say so.
+/// warning to adopt; when a hook already attached the row, keep it with a warning; otherwise
+/// delete the row and return the spawn's error; when chief can't tell, keep the row (its hooks
+/// match it by title if it did start) and say so.
 fn after_failed_spawn(
     ctx: &ToolCtx,
     claude: &Claude,
@@ -379,7 +434,7 @@ fn after_failed_spawn(
     before: &[AgentRow],
     cwd: &Path,
     err: anyhow::Error,
-) -> Result<(AgentRow, String)> {
+) -> Result<(Kept, String)> {
     // An untrusted folder starts nothing.
     let found = match err.downcast_ref::<ClaudeError>() {
         Some(ClaudeError::NotTrusted(_)) => Ok(None),
@@ -392,9 +447,31 @@ fn after_failed_spawn(
                  The failure: {err:#}"
             );
             eprintln!("chief mcp: {warning}");
-            Ok((agent, warning))
+            Ok((Kept::Listed(agent), warning))
         }
         Ok(None) => {
+            // Only a running session's hooks store a session id in the row (§4).
+            let attached = db::get_session(ctx.conn, name)
+                .map(|row| row.is_some_and(|r| r.session_id.is_some()));
+            match attached {
+                Ok(true) => {
+                    let warning = format!(
+                        "`claude --bg` reported a failure, and `claude agents` doesn't list \
+                         {name} yet, but its hooks already ran, so it started and chief kept \
+                         it. The failure: {err:#}"
+                    );
+                    eprintln!("chief mcp: {warning}");
+                    return Ok((Kept::Attached, warning));
+                }
+                Ok(false) => {}
+                Err(read) => {
+                    return Err(err.context(format!(
+                        "chief couldn't read {name}'s row to check whether it started anyway \
+                         ({read:#}), so the row is kept: if it started, its hooks attach it; \
+                         if it never shows up in list_threads, resolve it"
+                    )));
+                }
+            }
             if let Err(del) = db::delete_session(ctx.conn, name) {
                 eprintln!("chief mcp: could not remove {name} after a failed spawn: {del:#}");
             }
@@ -556,16 +633,17 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     }
     // Its own account's `claude agents` is the one that can see it; Some(row) once it has a
     // process, with its address from that fresh listing (§7).
-    let alive = |ctx: &ToolCtx| -> Result<Option<(SessionRow, Option<String>)>> {
-        let listing = accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)?;
-        let now = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
-        if now.pid.is_none() {
-            return Ok(None);
-        }
-        let address = address(ctx, &now, listing.agents()?);
-        Ok(Some((now, address)))
-    };
-    if let Some((_, address)) = alive(ctx)? {
+    let alive =
+        |ctx: &ToolCtx, timeout: Duration| -> Result<Option<(SessionRow, Option<String>)>> {
+            let listing = accounts::refresh_row(ctx.conn, ctx.claude, &row, timeout, ctx.now)?;
+            let now = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
+            if now.pid.is_none() {
+                return Ok(None);
+            }
+            let address = address(ctx, &now, listing.agents()?);
+            Ok(Some((now, address)))
+        };
+    if let Some((_, address)) = alive(ctx, AGENTS_TIMEOUT)? {
         return Ok(json!({"name": name, "alive": true, "respawned": false, "address": address}));
     }
     // After the refresh, which undoes a removal verdict for a session that is listed again.
@@ -581,10 +659,18 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     generated::rewrite(ctx.project_dir, ctx.config)?;
     ctx.claude.for_row(&row).respawn(&short_id)?;
     let deadline = Instant::now() + ctx.wake_timeout;
+    let left = || deadline.saturating_duration_since(Instant::now());
     loop {
-        std::thread::sleep(ctx.poll_interval);
-        // A failed poll is retried until the deadline.
-        if let Some((now, address)) = alive(ctx).unwrap_or(None) {
+        std::thread::sleep(ctx.poll_interval.min(left()));
+        // A poll gets only the time left, so a slow `claude agents` can't run past the
+        // deadline; a failed one is retried until then.
+        let poll = left().min(AGENTS_TIMEOUT);
+        let found = if poll.is_zero() {
+            None
+        } else {
+            alive(ctx, poll).unwrap_or(None)
+        };
+        if let Some((now, address)) = found {
             let mut out =
                 json!({"name": name, "alive": true, "respawned": true, "address": address});
             // A socket address names the old process: the subscription must follow.
