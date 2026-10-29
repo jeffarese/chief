@@ -114,6 +114,9 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
     }
     let payload: Value = serde_json::from_str(&input).context("parsing the hook payload")?;
     let conn = db::open(&paths::db())?;
+    if event == "Stop" {
+        learn_session_id(&conn, project, &payload);
+    }
     let ctx = Ctx {
         project,
         role,
@@ -153,6 +156,44 @@ fn dispatch(event: &str, project: &str, role: Role) -> Result<Option<String>> {
         return coordinator_context(&conn, project).map(Some);
     }
     Ok(None)
+}
+
+/// §4 "Matching a hook to a session": after `/clear` a session runs under a new session id,
+/// which no row has until a sync finds it under the row's short id (§5), and a Stop carries no
+/// title to match by. A Stop in that window would lose its report, so a Stop whose session id no
+/// row has syncs the project first, as a board poll would (bounded like the coordinator's
+/// context). Only then, and only while the project has a session the sync could match: other
+/// Stops never wait on `claude agents`. A failure is logged, and the Stop is recorded unmatched.
+fn learn_session_id(conn: &Connection, project: &str, payload: &Value) {
+    let Some(sid) = payload.get("session_id").and_then(Value::as_str) else {
+        return;
+    };
+    let unknown = || -> Result<bool> {
+        if db::get_session_by_session_id(conn, sid)?.is_some() {
+            return Ok(false);
+        }
+        Ok(db::list_sessions(conn, project, None)?
+            .iter()
+            .any(|r| r.short_id.is_some() && r.cleaned_at.is_none() && r.removed_at.is_none()))
+    };
+    let failed = match unknown() {
+        Ok(false) => None,
+        Ok(true) => {
+            let claude = project_claude(project);
+            accounts::refresh(conn, project, &claude, CONTEXT_AGENTS_TIMEOUT, db::now_ms)
+                .map(|listings| listings.error())
+                .unwrap_or_else(|e| Some(format!("{e:#}")))
+        }
+        Err(e) => Some(format!("{e:#}")),
+    };
+    if let Some(e) = failed {
+        log_error(
+            &paths::hook_error_log(),
+            "Stop",
+            project,
+            &format!("couldn't look up session {sid} in claude agents: {e}"),
+        );
+    }
 }
 
 /// A Bash call with `run_in_background` from one of `session`'s recorded subagents (§5
@@ -739,6 +780,21 @@ fn listed_tasks(payload: &Value, kind: impl Fn(&str) -> bool) -> u32 {
         })
 }
 
+/// The ids of the `background_tasks` entries of type `kind` a Stop lists as running.
+fn listed_ids(payload: &Value, kind: &str) -> Vec<String> {
+    fn field<'a>(t: &'a Value, k: &str) -> Option<&'a str> {
+        t.get(k).and_then(Value::as_str)
+    }
+    payload
+        .get("background_tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| field(t, "type") == Some(kind) && field(t, "status") == Some("running"))
+        .filter_map(|t| field(t, "id").map(str::to_string))
+        .collect()
+}
+
 /// §5 "Background work". A thread's Stop while an in-process teammate works told its
 /// coordinator it was idle (§1), so it is marked; async agents and background commands keep it
 /// busy, so they don't. The next Stop that finds nothing running clears the mark and is due to
@@ -825,15 +881,20 @@ fn record_teammates(
                 db::set_teammate_busy(conn, session, agent, false)?;
             }
         }
-        // The session's own Stop lists the subagents it still has (a teammate even while idle,
-        // an async agent until its hand-back): every task that isn't a `shell`. With none
-        // listed, none can be mid-turn, whatever SubagentStop chief missed.
+        // The session's own Stop lists the subagents it still has: a teammate even while idle,
+        // an async agent (a `subagent`, by its agent id) until its hand-back. So an agent it
+        // doesn't list can't be mid-turn, whatever SubagentStop chief missed (one that hit the
+        // busy timeout, say). A teammate is listed under a task id, not its agent id, and busy
+        // or not, so while one is listed (or a task of a type chief doesn't know) nothing is
+        // cleared.
         "Stop"
             if text(Some(payload), "agent_id").is_none()
                 && payload.get("background_tasks").is_some_and(Value::is_array)
-                && listed_tasks(payload, |k| k != "shell") == 0 =>
+                && listed_tasks(payload, |k| k != "shell" && k != "subagent") == 0 =>
         {
-            db::idle_teammates(conn, session)?;
+            let running = listed_ids(payload, "subagent");
+            let running: Vec<&str> = running.iter().map(String::as_str).collect();
+            db::idle_teammates(conn, session, &running)?;
         }
         "PostToolUse" if text(Some(payload), "tool_name") == Some("Agent") => {
             let response = payload.get("tool_response");
@@ -856,37 +917,38 @@ fn record_teammates(
 /// stops counting until the next poll. Returns the new report, if the hook carried one. The cwd
 /// is kept for display only: the thread's worktree and branch come from its job state (sync).
 fn apply(row: &mut SessionRow, kind: HookKind, payload: &Value, now: i64) -> Option<String> {
+    use HookKind::*;
     let str_field = |k: &str| payload.get(k).and_then(Value::as_str);
     row.last_hook = Some(kind.as_str().to_string());
     row.last_hook_at = Some(now);
     row.cc_fresh = false;
     row.updated_at = now;
-    if kind != HookKind::IdleNotification {
+    if kind != IdleNotification {
         row.last_activity_at = now;
     }
+    // A subagent's tool calls carry its lead's session id (§1) and so match the lead's row:
+    // they show the process works, but they don't answer the lead's permission prompt (rule 3
+    // keeps it waiting), and their cwd isn't the lead's.
+    let own = str_field("agent_id").is_none_or(str::is_empty);
+    if own && matches!(kind, UserPromptSubmit | PreToolUse | PostToolUse | Stop) {
+        row.pending_permission = false;
+    }
+    if own
+        && matches!(kind, PostToolUse | Stop)
+        && let Some(cwd) = str_field("cwd")
+    {
+        row.cwd = Some(cwd.to_string());
+    }
+    if kind == PermissionNotification {
+        row.pending_permission = true;
+    }
     let mut report = None;
-    match kind {
-        HookKind::SessionStart | HookKind::IdleNotification => {}
-        HookKind::UserPromptSubmit | HookKind::PreToolUse => row.pending_permission = false,
-        HookKind::PostToolUse => {
-            row.pending_permission = false;
-            if let Some(cwd) = str_field("cwd") {
-                row.cwd = Some(cwd.to_string());
-            }
-        }
-        HookKind::PermissionNotification => row.pending_permission = true,
-        HookKind::Stop => {
-            row.pending_permission = false;
-            if let Some(cwd) = str_field("cwd") {
-                row.cwd = Some(cwd.to_string());
-            }
-            if let Some(text) = str_field("last_assistant_message").filter(|r| !r.trim().is_empty())
-            {
-                row.last_report = Some(text.to_string());
-                row.last_report_at = Some(now);
-                report = Some(text.to_string());
-            }
-        }
+    if kind == Stop
+        && let Some(text) = str_field("last_assistant_message").filter(|r| !r.trim().is_empty())
+    {
+        row.last_report = Some(text.to_string());
+        row.last_report_at = Some(now);
+        report = Some(text.to_string());
     }
     registry::rederive(row);
     report
@@ -1606,6 +1668,133 @@ mod tests {
             assert_eq!(get(&conn, name).stopped_early_at, None, "{name}");
         }
         assert_eq!(row(&conn, "spike-sub2"), (0, 0, "idle".into()));
+    }
+
+    /// A subagent's tool calls carry its lead's session id (§1), so they match the lead's row.
+    /// They don't answer the lead's permission prompt (rule 3 comes before rule 5), and their
+    /// cwd isn't the lead's; the lead's own next hook clears the prompt.
+    #[test]
+    fn teammate_tool_calls_keep_the_leads_permission_prompt() {
+        let (_dir, conn) = wait_setup();
+        let lines = subagent_wait_fixture();
+        replay_range(&conn, &lines, 0..=5);
+        let lead_cwd = get(&conn, "spike-lead2").cwd;
+        assert!(lead_cwd.is_some());
+        let mut prompt = lines[1].clone();
+        prompt["hook_event_name"] = "Notification".into();
+        prompt["notification_type"] = "permission_prompt".into();
+        prompt["message"] = "Claude needs your permission".into();
+        replay(&conn, &prompt, 6);
+        let waiting = |conn: &Connection| {
+            let r = get(conn, "spike-lead2");
+            (r.pending_permission, r.group_name, r.waiting_reason)
+        };
+        let permission = (true, "waiting".to_string(), Some("permission".to_string()));
+        assert_eq!(waiting(&conn), permission);
+
+        // The teammate works on: its PostToolUse, PreToolUse and PostToolUse (7, 8, 9).
+        for (i, line) in lines.iter().enumerate().take(10).skip(7) {
+            let mut call = line.clone();
+            assert!(call["agent_id"].as_str().is_some_and(|a| !a.is_empty()));
+            call["cwd"] = "/elsewhere/teammate-worktree".into();
+            replay(&conn, &call, 10 + i as i64);
+            assert_eq!(waiting(&conn), permission, "line {i}");
+        }
+        let r = get(&conn, "spike-lead2");
+        assert_eq!(r.cwd, lead_cwd, "a teammate's cwd isn't the lead's");
+        assert_eq!(
+            (r.last_hook.as_deref(), r.last_hook_at),
+            (Some("PostToolUse"), Some(19))
+        );
+        // A fresh `claude agents` row saying busy changes nothing either.
+        let mut polled = r.clone();
+        polled.cc_status = Some("busy".into());
+        polled.cc_state = Some("working".into());
+        polled.cc_fresh = true;
+        registry::rederive(&mut polled);
+        assert_eq!(polled.waiting_reason.as_deref(), Some("permission"));
+
+        // The lead's own next call (10, no agent_id) ends the prompt.
+        replay(&conn, &lines[10], 20);
+        assert_eq!(waiting(&conn), (false, "working".to_string(), None));
+    }
+
+    /// §5 "Background work": a lost SubagentStop doesn't keep an async agent mid-turn for good.
+    /// The lead's own Stop lists each async agent by its agent id until its hand-back, so an
+    /// agent it doesn't list is done; a listed one stays busy.
+    #[test]
+    fn a_lost_subagent_stop_ends_at_the_leads_next_stop() {
+        let lines: Vec<Value> = include_str!("../tests/fixtures/hooks/async-wait-events.jsonl")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let (_dir, conn) = wait_setup();
+        for name in ["spike-sub2", "spike-sh2"] {
+            db::insert_session(&conn, &SessionRow::new(name, "demo", Role::Thread, 0)).unwrap();
+        }
+        replay_range(&conn, &lines, 0..=11);
+        let first = lines[7]["agent_id"].as_str().unwrap();
+        assert_eq!(lines[11]["background_tasks"][0]["id"], first);
+        // A second async agent starts; the first one's SubagentStop (19) never lands.
+        let mut start = lines[7].clone();
+        start["agent_id"] = "asecond-1".into();
+        replay(&conn, &start, 12);
+        assert_eq!(get(&conn, "spike-sub2").subagents_busy, 2);
+
+        let mut stop = lines[20].clone();
+        stop["background_tasks"] = serde_json::json!([
+            {"id": "asecond-1", "type": "subagent", "status": "running", "description": "x"},
+            {"id": "b1", "type": "shell", "status": "running", "description": "y"},
+        ]);
+        let out = replay(&conn, &stop, 13);
+        let row = get(&conn, "spike-sub2");
+        assert_eq!((row.subagents_busy, row.background_running), (1, 1));
+        assert_eq!((out.notices.len(), row.group_name.as_str()), (0, "working"));
+        // A teammate listed (under a task id, idle or not) leaves every turn as it is.
+        let mut start = lines[7].clone();
+        start["agent_id"] = "athird-2".into();
+        replay(&conn, &start, 14);
+        stop["background_tasks"] = serde_json::json!([
+            {"id": "t5yzdiksp", "type": "teammate", "status": "running", "description": "z"},
+        ]);
+        replay(&conn, &stop, 15);
+        assert_eq!(get(&conn, "spike-sub2").subagents_busy, 2);
+        stop["background_tasks"] = serde_json::json!([]);
+        replay(&conn, &stop, 16);
+        let row = get(&conn, "spike-sub2");
+        assert_eq!((row.subagents_busy, row.group_name.as_str()), (0, "idle"));
+    }
+
+    /// A Stop without `background_tasks` says nothing about subagents (they keep their turn)
+    /// and lists no running command; its report is kept as any Stop's.
+    #[test]
+    fn a_stop_without_background_tasks() {
+        let (_dir, conn) = wait_setup();
+        let lines = subagent_wait_fixture();
+        replay_range(&conn, &lines, 36..=40);
+        replay(&conn, &lines[46], 46);
+        let row = get(&conn, "spike-lead4");
+        assert_eq!((row.subagents_busy, row.background_running), (1, 2));
+
+        let mut stop = lines[49].clone();
+        stop.as_object_mut().unwrap().remove("background_tasks");
+        stop["last_assistant_message"] = "still waiting on runner".into();
+        let out = replay(&conn, &stop, 50);
+        let row = get(&conn, "spike-lead4");
+        assert_eq!(
+            (
+                row.subagents_busy,
+                row.background_running,
+                row.group_name.as_str()
+            ),
+            (1, 0, "working")
+        );
+        assert_eq!(row.last_report.as_deref(), Some("still waiting on runner"));
+        // Still waiting: no notice, no report asked for, the early Stop (46) still marked.
+        assert_eq!(
+            (out.notices.len(), out.final_report, row.stopped_early_at),
+            (0, false, Some(46))
+        );
     }
 
     /// Only a recorded subagent's Bash call in the background (§5).

@@ -300,6 +300,18 @@ mod tests {
                 Waiting,
                 Some(Permission),
             ),
+            (
+                // A subagent's tool calls go on while its lead's prompt waits (§5 hook updates).
+                "permission beats a subagent's working hook and background work",
+                Facts {
+                    pending_permission: true,
+                    last_hook: Some(PostToolUse),
+                    background_work: true,
+                    ..base()
+                },
+                Waiting,
+                Some(Permission),
+            ),
             // 4. blocked
             (
                 "blocked beats busy status",

@@ -115,9 +115,10 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
     its subagents' last SubagentStop. A subagent's `SendMessage(to: "team-lead")` can wake the
     lead before the subagent's own SubagentStop.
   - Stop and SubagentStop carry `background_tasks`: `[{id, type: "teammate" | "subagent" |
-    "shell", status: "running", description, command?}]`. A teammate stays listed while idle; an
-    async agent is listed as `subagent` (its `id` the agent id) until its hand-back; a subagent's
-    background commands are listed in its lead's.
+    "shell", status: "running", description, command?}]`. A teammate stays listed while idle,
+    under a task id (`t5yzdiksp`), not its agent id: only its `description` matches the Agent
+    call's. An async agent is listed as `subagent` (its `id` the agent id) until its hand-back; a
+    subagent's background commands are listed in its lead's.
   - In auto permission mode, a PreToolUse can carry an `agent_id` that never had a
     SubagentStart (seen repeating a subagent's own Bash call), presumably an agent auto mode
     runs.
@@ -183,9 +184,11 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief clean <slug> <thread> [--discard] [--yes]` | you | Clean up one resolved thread; `--discard` throws away unsaved work after confirming (§12) |
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
-`<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision and the coordinator's
-UserPromptSubmit context. The `claude agents` call inside the guard is bounded at 10 s, inside the
-coordinator's context at 5 s.
+`<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision, the coordinator's
+UserPromptSubmit context, and the two outputs of §5 "Background work": the PreToolUse denial of a
+subagent's background command and the Stop decision that asks a thread for its final report. The
+`claude agents` call inside the guard is bounded at 10 s; inside the coordinator's context, the
+final report's Stop and a Stop chief can't match yet (§4 "Matching a hook to a session") at 5 s.
 
 `chief init` validates first (Claude Code version, name → slug with ≥1 letter or digit, slug not
 taken, every `--repo` an existing folder, stored canonical and named after its folder with `-2`, `-3`
@@ -451,7 +454,9 @@ CREATE TABLE sessions (                   -- coordinator and threads
   account_dir     TEXT,                   -- that account's config folder; NULL with an account_id = the default account (migration 10)
   subagents_busy  INTEGER NOT NULL DEFAULT 0, -- its subagents mid-turn, §5 "Background work" (migration 12)
   background_running INTEGER NOT NULL DEFAULT 0, -- background commands its last Stop listed running (migration 12)
-  stopped_early_at INTEGER                -- a thread's last Stop while background work ran; its final report is due (migration 12)
+  stopped_early_at INTEGER,               -- a thread's last Stop while background work ran; its final report is due (migration 12)
+  reason_before_removed TEXT,             -- the resolved_reason a reopened thread kept when a sync marked it removed; put back if the session is listed again, §5 (migration 13)
+  legacy_cleaned  INTEGER NOT NULL DEFAULT 0 -- 1 = cleaned before migration 13, possibly by a removed verdict from before migration 6, §5 (migration 13)
 );
 
 CREATE TABLE events (
@@ -502,7 +507,10 @@ CREATE TABLE teammates (                  -- a session's subagents in its curren
 );
 ```
 
-Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
+Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Every hook opens the
+database, so opening reads `user_version` first and a database at the current version takes no
+write lock. One behind it is migrated in a `BEGIN IMMEDIATE` transaction that reads the version
+again, so processes opening it at once migrate it once.
 
 ### Matching a hook to a session
 
@@ -514,6 +522,15 @@ Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
 
 Matching, the event row and the session update run in one `BEGIN IMMEDIATE` transaction.
 
+After `/clear` a session runs under a new `session_id`, which no row has until a sync finds it
+under the row's `short_id` (§5); its title matches a row that has the old id, so rule 2 doesn't
+apply either. A Stop in that window would lose its report (Stop carries no title). So before that
+transaction, a Stop whose `session_id` no row has syncs the project first, as a board poll does
+(`claude agents` in each account it uses, 5 s), when the project has a session the sync could
+match (a `short_id`, not cleaned, not removed). Then it matches as above. A failed listing is
+logged and the Stop is recorded unmatched. Any other hook in that window is recorded unmatched
+until a sync learns the id; a Stop that matches never waits on `claude agents`.
+
 ## 5. Thread state and board groups
 
 `src/state.rs` holds a pure function; everything else stores its result in `group_name` and
@@ -524,14 +541,23 @@ Hook updates (per matched session):
 | Hook | Effect |
 | --- | --- |
 | SessionStart | `last_activity_at`; unless `source` is `compact`, `background_running = 0` and `stopped_early_at = NULL` (a new process runs none of the old one's work) |
-| UserPromptSubmit, PreToolUse | `pending_permission = 0`; provisional group `working` |
-| PostToolUse | `pending_permission = 0`; update `cwd`; provisional `working` |
-| Notification `permission_prompt` | `pending_permission = 1` |
+| UserPromptSubmit, PreToolUse | `pending_permission = 0` (not from a subagent, below); provisional group `working` |
+| PostToolUse | `pending_permission = 0` and update `cwd` (neither from a subagent); provisional `working` |
+| Notification `permission_prompt` | `pending_permission = 1`, whoever's prompt it is (below) |
 | Notification `idle_prompt` | nothing beyond `last_hook` |
 | Stop | `pending_permission = 0`; store `last_assistant_message` in `last_report` and `reports` (skipped when empty); update `cwd` (shown only; a thread's branch comes from its job state on sync, below); `background_running` and the final report (below) |
 
 Every hook above also sets `last_hook`, `updated_at` and `cc_fresh = 0`, re-derives the group, and
-(except Notification `idle_prompt`) sets `last_activity_at`. Other events (SubagentStart,
+(except Notification `idle_prompt`) sets `last_activity_at`.
+
+A subagent's own tool calls carry its lead's `session_id` (§1) and match the lead's row; the
+payload's non-empty `agent_id` tells them apart. They set `last_hook`, `last_hook_at` and the rest
+above (the process works), but never clear `pending_permission` or update `cwd`: they answer no
+prompt of the lead's, and the subagent's cwd isn't the lead's. Rule 3 comes before rule 5, so a lead
+waiting on a permission stays **waiting** while its subagents work. A Notification carries no
+`agent_id`, so a subagent's own permission prompt marks its lead's row too; it clears at the lead's
+next own UserPromptSubmit, PreToolUse or PostToolUse, at its Stop, or when the process is gone
+(below), not when the subagent goes on. Other events (SubagentStart,
 SubagentStop, SessionEnd, other notification types) are only recorded in `events`, apart from
 `teammates` and the background work (below): when one changes `subagents_busy` or
 `background_running`, it sets `updated_at` and re-derives the group. Coordinator Stops store
@@ -612,16 +638,33 @@ them comes from another account's supervisor (another project of this chief home
 verdict. A thread in another account than the project's is judged only by its own account's
 snapshot, where the coordinator isn't: there, the verdict needs another of the project's
 threads listed in that account, and without one there is none. The row gets `removed_at` = taken-at and, if it wasn't resolved, `resolved = 1` with
-`resolved_reason = 'removed'`. When its worktree is gone too (job state names none, §12, or the
+`resolved_reason = 'removed'`; a reopened thread's kept reason moves to `reason_before_removed`.
+When its worktree is gone too (job state names none, §12, or the
 folder no longer exists) it also gets `cleaned_at` = taken-at and `cleanup_blocked = NULL`;
 otherwise `cleanup_blocked = 'session removed outside chief; worktree remains at <path>'`, and a
 later sync that finds that folder gone sets `cleaned_at`. The coordinator row is never marked.
 A row with `removed_at` has no session left (`claude respawn` would fail), so it can't be woken,
 reopened, messaged or shown in the pane (§6, §7, §9, §10), cleaned or not; the refusal says the
 session was removed outside chief and to start a new thread.
-If a later snapshot lists the session again, the sync undoes only what it did: `removed_at`
-cleared, `cleaned_at` cleared when it equals `removed_at`, `resolved`/`resolved_reason` cleared when
-the reason is `removed`, and the `session removed outside chief…` `cleanup_blocked` cleared.
+If a later snapshot lists the session again, the sync undoes only what the verdict did:
+`removed_at` cleared; `cleaned_at` cleared when it is no earlier than `removed_at` (set with the
+verdict, or once its worktree was found gone; no `claude rm` runs on a removed row, §12); when the
+reason is `removed`, `resolved` cleared and `resolved_reason` set back to `reason_before_removed`,
+so a reopened thread stays reopened and isn't resolved again automatically (NULL for a thread
+never resolved); `reason_before_removed` cleared; and the `session removed outside chief…`
+`cleanup_blocked` cleared.
+
+Before migration 6 a removed verdict on a resolved row set only `cleaned_at` (clearing
+`cleanup_blocked`), and migration 6's backfill gave such a row no `removed_at`, so it kept
+`cleaned_at` while its session lived on. It looks like a row `claude rm` removed, so migration 13
+sets `legacy_cleaned = 1` on every row cleaned until then (`cleaned_at` set, no `removed_at`).
+chief's own cleanup sets `cleaned_at` only after `claude rm` removed the session (§12), which then
+disappears from `claude agents --all` (§1). So a sync whose snapshot lists a `legacy_cleaned` row's
+session (by `session_id` or `short_id`) and was taken after its `cleaned_at` clears `cleaned_at`
+and `legacy_cleaned`; the row keeps its resolution. A snapshot taken earlier may have run while
+`claude rm` did, and proves nothing. Rows cleaned since are never flagged: their `cleaned_at` comes
+from `claude rm`, from a removed verdict that set `removed_at`, or from a thread that never
+started.
 
 A snapshot taken before a row's last hook (`last_hook_at` > taken-at) is stale for that row: it keeps
 `cc_fresh = 0` and its `cc_state`/`cc_status`, so the hook's provisional group stands. Ids are still
@@ -650,9 +693,16 @@ chief counts them from the hooks, in the same transaction as the rest (§4 `sess
 `background_running`, `stopped_early_at`; `teammates.busy`):
 
 - **Subagents mid-turn.** SubagentStart marks its teammate row `busy` (recording the row first,
-  as above); SubagentStop clears it. A Stop of the session's own (no `agent_id`) whose
-  `background_tasks` lists no task but `shell`s clears every row: no teammate or async agent is
-  left (a TaskStop, say).
+  as above); SubagentStop clears it. A SubagentStop chief missed (its hook hit the busy timeout,
+  say) is caught at the session's own next Stop (no `agent_id`), whose `background_tasks` lists
+  every subagent the session still has (§1): an async agent as a `subagent` under its agent id
+  until its hand-back, a teammate as a `teammate` under a task id, idle or not. When that list
+  has no `teammate` (nor a type chief doesn't know), every busy row whose agent isn't listed as a
+  running `subagent` is cleared: it can't be mid-turn (with nothing listed but `shell`s, every
+  row, as after a TaskStop). A listed teammate doesn't say which agent works, so then nothing is
+  cleared: a teammate whose SubagentStop was missed stays busy until its next turn ends, a Stop
+  lists no teammate, a new process starts (below), or the process is gone (background work
+  doesn't count then). A Stop without `background_tasks` clears nothing.
   `subagents_busy` counts the busy rows under the payload's `session_id`.
 - **Background commands.** `background_running` is the number of `background_tasks` entries
   of type `shell` and status `running` at the session's last Stop. A command of the session's own
@@ -1349,7 +1399,8 @@ under it.
 - Unit tests: §5 derivation (table-driven), §6 guard (table-driven), hook payload parsing against
   `tests/fixtures/hooks/spike-events.jsonl` and, for subagents, the raw payloads in
   `tests/fixtures/hooks/teammate-events.jsonl` (§1), `claude agents` parsing against
-  `tests/fixtures/agents/agents-sample.json`, config round trip, migrations on a fresh DB.
+  `tests/fixtures/agents/agents-sample.json`, config round trip, migrations on a fresh DB and
+  upgrades from older versions (their backfills).
 - `CHIEF_CLAUDE_BIN` overrides the `claude` binary; integration tests use a fake script
   (`tests/fake-claude.sh`) that records its arguments and prints canned output. `CHIEF_GH_BIN`
   overrides `gh` the same way (the same script, linked as `gh`), and `CHIEF_REX_BIN` overrides
