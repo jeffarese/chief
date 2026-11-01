@@ -21,6 +21,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{SetTitle, supports_keyboard_enhancement};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
+use ratatui::text::Line;
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 
@@ -321,6 +322,11 @@ impl Split<'_> {
             {
                 self.start();
             }
+            if let State::Attached(a) = &mut self.conv.state
+                && a.exited_but_held()
+            {
+                self.attach_ended(true);
+            }
             board.app.now = db::now_ms();
             let title = title(&board.app);
             if title != self.title {
@@ -379,7 +385,7 @@ impl Split<'_> {
                 f.set_cursor_position(at);
             }
             if let Some(bar) = areas.bar {
-                draw_bar(f, bar, &self.conv.label());
+                draw_bar(f, bar, &self.conv.label(), &bar_keys(waiting(&board.app)));
             }
         }
         if let Some(div) = areas.divider {
@@ -432,7 +438,7 @@ impl Split<'_> {
                                 // The editor may have set a title of its own.
                                 self.title.clear();
                             }
-                            other => board.dispatch(other),
+                            other => self.dispatch(board, other),
                         }
                     }
                 }
@@ -456,10 +462,17 @@ impl Split<'_> {
         let on_conv = shown && areas.conv.contains(at);
         if let Some(bar) = areas.bar.filter(|b| shown && b.contains(at)) {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-                match placed(&BAR_KEYS, bar)
+                match placed(&bar_keys(waiting(&board.app)), bar)
                     .into_iter()
                     .find(|(_, r)| r.contains(at))
                 {
+                    Some((BarKey::Waiting(_), _)) => {
+                        for action in board.app.next_waiting() {
+                            self.dispatch(board, action);
+                        }
+                        // The one thread waiting may be the one shown already.
+                        self.set_focus(Side::Conversation);
+                    }
                     Some((BarKey::Quit, _)) => return true,
                     Some((BarKey::Board, _)) => self.set_focus(Side::Board),
                     None => {}
@@ -480,11 +493,21 @@ impl Split<'_> {
             // The board's own clicks; Show and the like go to its workers as for keys.
             for action in board.app.on_mouse(m) {
                 if !matches!(action, Action::Quit | Action::QuitAll | Action::Edit(_)) {
-                    board.dispatch(action);
+                    self.dispatch(board, action);
                 }
             }
         }
         false
+    }
+
+    /// A board action for its workers. What the board shows is there to be answered, so a show
+    /// gives the conversation the keys: the next thing typed is the answer.
+    fn dispatch(&mut self, board: &mut Board, action: Action) {
+        let shows = matches!(action, Action::Show(_));
+        board.dispatch(action);
+        if shows {
+            self.set_focus(Side::Conversation);
+        }
     }
 
     fn set_focus(&mut self, side: Side) {
@@ -500,7 +523,7 @@ impl Split<'_> {
         }
         match out {
             Output::Bytes(bytes) => self.conv.screen.feed(&bytes),
-            Output::Exited => self.attach_ended(),
+            Output::Exited => self.attach_ended(false),
         }
     }
 
@@ -600,10 +623,7 @@ impl Split<'_> {
         })
         .map_err(anyhow::Error::from)
         .and_then(|pty| {
-            let mut replies = pty.replies()?;
-            let screen = Screen::new(cols, rows, move |bytes| {
-                let _ = replies.write_all(bytes);
-            })?;
+            let screen = Screen::new(cols, rows, pty.replies())?;
             Ok((pty, screen))
         });
         match attached {
@@ -614,6 +634,7 @@ impl Split<'_> {
                     short_id,
                     pty,
                     started: Instant::now(),
+                    exited_at: None,
                 });
                 if self.focus != Side::Conversation {
                     self.conv.focus(false);
@@ -629,18 +650,23 @@ impl Split<'_> {
         }
     }
 
-    /// §9 steps 5 and 6: attach closed its terminal by itself.
-    fn attach_ended(&mut self) {
+    /// §9 steps 5 and 6: attach closed its terminal by itself, or exited while something it
+    /// started still holds the terminal (`held`), which then goes with it.
+    fn attach_ended(&mut self, held: bool) {
         let State::Attached(mut a) = std::mem::replace(&mut self.conv.state, State::idle()) else {
             return;
         };
+        // The reader of a terminal held open still reads: neither what it reads nor its end (which
+        // would end whatever this conversation shows by then) is this pass's any more.
+        self.conv.generation += 1;
         let deadline = Instant::now() + EXIT_WAIT;
         let mut status = a.pty.exited();
         while status.is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
             status = a.pty.exited();
         }
-        if status.is_none() {
+        // What attach left on its terminal goes too, as the relay's closing the terminal hangs it up.
+        if status.is_none() || held {
             self.enders.push(std::thread::spawn(move || a.pty.end()));
         }
         self.showing(None);
@@ -710,15 +736,18 @@ fn history_mark(f: &mut Frame, conv: Rect) {
 /// in the background says when it needs them.
 fn title(app: &App) -> String {
     let name = &app.config.name;
-    match app
-        .threads
-        .iter()
-        .filter(|r| group_of(r) == Group::Waiting)
-        .count()
-    {
+    match waiting(app) {
         0 => format!("chief · {name}"),
         n => format!("chief · {name} · {n} waiting"),
     }
+}
+
+/// How many threads wait on the user.
+fn waiting(app: &App) -> usize {
+    app.threads
+        .iter()
+        .filter(|r| group_of(r) == Group::Waiting)
+        .count()
 }
 
 fn print_raw(bytes: &[u8]) {
@@ -740,18 +769,26 @@ fn quits(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
 }
 
-/// chief's keys on the bar below the conversation.
+/// What chief puts on the right of the bar below the conversation: its keys, and before them
+/// what waits on the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarKey {
+    /// How many threads wait on the user, marked as the board marks them; a click shows the next
+    /// one, as the board's `n` does.
+    Waiting(usize),
     Quit,
     Board,
 }
 
 impl BarKey {
-    fn hint(self) -> (&'static str, &'static str) {
+    fn line(self) -> Line<'static> {
         match self {
-            BarKey::Quit => ("^Q", "quit"),
-            BarKey::Board => ("^\\", "board"),
+            BarKey::Waiting(n) => Line::styled(
+                format!("{} {n} waiting", ui::glyph(Group::Waiting)),
+                ui::style_of(Group::Waiting),
+            ),
+            BarKey::Quit => tui::key_bar(&[("^Q", "quit")], usize::MAX),
+            BarKey::Board => tui::key_bar(&[("^\\", "board")], usize::MAX),
         }
     }
 }
@@ -759,16 +796,19 @@ impl BarKey {
 /// Columns between the bar's hints, and between the label and the first.
 const BAR_GAP: u16 = 2;
 
-/// The bar's keys, most important first.
-const BAR_KEYS: [BarKey; 2] = [BarKey::Quit, BarKey::Board];
+/// The bar's hints, most important first: what waits on the user, then quit and the side switch.
+fn bar_keys(waiting: usize) -> Vec<BarKey> {
+    let waits = (waiting > 0).then_some(BarKey::Waiting(waiting));
+    waits
+        .into_iter()
+        .chain([BarKey::Quit, BarKey::Board])
+        .collect()
+}
 
 /// Where each of `keys` that fits goes on `bar`: right-aligned, in order, whole hints only (the
 /// first ones win), each a column inside the bar so a click can find it.
 fn placed(keys: &[BarKey], bar: Rect) -> Vec<(BarKey, Rect)> {
-    let width = |k: BarKey| {
-        let (key, what) = k.hint();
-        (tui::cols(key) + 1 + tui::cols(what)) as u16
-    };
+    let width = |k: BarKey| k.line().width() as u16;
     let mut fit = Vec::new();
     let mut used = 0;
     for &k in keys {
@@ -791,8 +831,8 @@ fn placed(keys: &[BarKey], bar: Rect) -> Vec<(BarKey, Rect)> {
 
 /// The bar: what the conversation shows on the left, chief's keys on the right, which work
 /// whatever Claude is doing.
-fn draw_bar(f: &mut Frame, bar: Rect, label: &str) {
-    let keys = placed(&BAR_KEYS, bar);
+fn draw_bar(f: &mut Frame, bar: Rect, label: &str, keys: &[BarKey]) {
+    let keys = placed(keys, bar);
     let room = keys
         .first()
         .map_or(bar.width, |(_, at)| (at.x - bar.x).saturating_sub(BAR_GAP));
@@ -802,8 +842,7 @@ fn draw_bar(f: &mut Frame, bar: Rect, label: &str) {
         Rect { width: room, ..bar },
     );
     for (k, at) in keys {
-        let (key, what) = k.hint();
-        f.render_widget(tui::key_bar(&[(key, what)], usize::from(at.width)), at);
+        f.render_widget(k.line(), at);
     }
 }
 
@@ -859,6 +898,21 @@ struct Attach {
     short_id: String,
     pty: Pty,
     started: Instant,
+    /// When attach was first seen exited while its terminal was still open.
+    exited_at: Option<Instant>,
+}
+
+impl Attach {
+    /// Attach exited `EXIT_WAIT` ago and its terminal is still open: something it started holds
+    /// it, so the reader never sees the end (§9 relay: "attach exits with its terminal still held
+    /// open"; Linux, since macOS revokes the terminal when attach, its session's leader, exits).
+    /// The usual end, the reader's, comes first.
+    fn exited_but_held(&mut self) -> bool {
+        if self.pty.exited().is_none() {
+            return false;
+        }
+        self.exited_at.get_or_insert_with(Instant::now).elapsed() >= EXIT_WAIT
+    }
 }
 
 impl Conversation {
@@ -941,7 +995,10 @@ impl Conversation {
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
             }
-            _ => key.code == KeyCode::Char('q') && key.modifiers.is_empty(),
+            State::Waiting { .. } => key.code == KeyCode::Char('q') && key.modifiers.is_empty(),
+            // A show gives the conversation the keys at once, so a key typed while its target
+            // wakes is the start of an answer, not a `q` for chief: it goes nowhere.
+            State::Waking { .. } => false,
         }
     }
 
@@ -997,6 +1054,35 @@ fn blank(cols: u16, rows: u16) -> Screen {
 mod tests {
     use super::*;
 
+    /// An attach that exited counts as ended `EXIT_WAIT` later whatever its reader saw: on Linux a
+    /// process it started can keep its terminal open, and the reader would wait for good (macOS
+    /// revokes a session's terminal when its leader exits, so there the reader sees the end).
+    #[test]
+    fn an_attach_that_exited_counts_as_ended_after_the_wait() {
+        let (tx, _rx) = mpsc::channel();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        let pty = Pty::spawn(cmd, 20, 4, tx, |o| o).unwrap();
+        let mut a = Attach {
+            row: SessionRow::new("demo-coordinator", "demo", Role::Coordinator, 0),
+            short_id: "c1".into(),
+            pty,
+            started: Instant::now(),
+            exited_at: None,
+        };
+        let started = Instant::now();
+        while !a.exited_but_held() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "never seen ending"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seen = a.exited_at.expect("seen exited");
+        assert!(seen.elapsed() >= EXIT_WAIT);
+        a.pty.end();
+    }
+
     #[test]
     fn wide_terminals_split_and_narrow_ones_show_the_focused_side() {
         let a = Areas::of(Rect::new(0, 0, 140, 40), Side::Conversation);
@@ -1031,20 +1117,31 @@ mod tests {
     #[test]
     fn the_bar_puts_its_keys_on_the_right_and_drops_what_does_not_fit() {
         let bar = Rect::new(0, 23, 80, 1);
-        let keys = placed(&BAR_KEYS, bar);
         // `^Q quit` (7) and `^\ board` (8), two apart, flush right.
         assert_eq!(
-            keys,
+            placed(&bar_keys(0), bar),
             [
                 (BarKey::Quit, Rect::new(63, 23, 7, 1)),
                 (BarKey::Board, Rect::new(72, 23, 8, 1)),
             ]
         );
-        // Short of room, the board's hint goes first.
+        // What waits on the user comes before them: `! 2 waiting` (11).
+        assert_eq!(
+            placed(&bar_keys(2), bar)[0],
+            (BarKey::Waiting(2), Rect::new(50, 23, 11, 1))
+        );
+        // Short of room, the board's hint goes first, then quit's.
         let narrow = Rect::new(0, 0, 10, 1);
         assert_eq!(
-            placed(&BAR_KEYS, narrow),
+            placed(&bar_keys(0), narrow),
             [(BarKey::Quit, Rect::new(3, 0, 7, 1))]
+        );
+        assert_eq!(
+            placed(&bar_keys(2), Rect::new(0, 0, 20, 1)),
+            [
+                (BarKey::Waiting(2), Rect::new(0, 0, 11, 1)),
+                (BarKey::Quit, Rect::new(13, 0, 7, 1)),
+            ]
         );
     }
 
@@ -1052,16 +1149,47 @@ mod tests {
     fn the_bar_says_whom_it_shows_and_its_keys() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let mut t = Terminal::new(TestBackend::new(60, 1)).unwrap();
-        t.draw(|f| draw_bar(f, f.area(), "chief · coordinator"))
-            .unwrap();
-        let row: String = (0..60)
-            .map(|x| t.backend().buffer()[(x, 0)].symbol().to_string())
-            .collect();
+        let bar = |keys: &[BarKey]| {
+            let mut t = Terminal::new(TestBackend::new(60, 1)).unwrap();
+            t.draw(|f| draw_bar(f, f.area(), "chief · coordinator", keys))
+                .unwrap();
+            t.backend().buffer().clone()
+        };
+        let text = |b: &ratatui::buffer::Buffer| {
+            (0..60)
+                .map(|x| b[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
         assert_eq!(
-            row.trim_end(),
+            text(&bar(&bar_keys(0))).trim_end(),
             format!("chief · coordinator{}^Q quit  ^\\ board", " ".repeat(24))
         );
+        let waits = bar(&bar_keys(2));
+        assert_eq!(
+            text(&waits).trim_end(),
+            format!(
+                "chief · coordinator{}! 2 waiting  ^Q quit  ^\\ board",
+                " ".repeat(11)
+            )
+        );
+        // In the board's colours for what waits.
+        let (cell, want) = (&waits[(30, 0)], ui::style_of(Group::Waiting));
+        assert_eq!((Some(cell.fg), cell.modifier), (want.fg, want.add_modifier));
+    }
+
+    /// `q` quits from chief's own lines, but not while a target wakes: a show gave the
+    /// conversation the keys, and what is typed then is meant for the session.
+    #[test]
+    fn q_quits_from_chiefs_lines_but_not_while_a_target_wakes() {
+        let q = KeyEvent::from(KeyCode::Char('q'));
+        let mut conv = Conversation::new((20, 4));
+        conv.state = State::Waiting { at: Instant::now() };
+        assert!(conv.key(q));
+        conv.state = State::Waking {
+            row: SessionRow::new("demo-coordinator", "demo", Role::Coordinator, 0),
+            claude: Claude::for_account(None),
+        };
+        assert!(!conv.key(q));
     }
 
     #[test]

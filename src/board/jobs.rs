@@ -18,6 +18,7 @@ use crate::{db, generated, pane, placement, registry, trust, tui};
 
 use super::app::{Action, Msg};
 use super::refresh::Sources;
+use super::report::REPORTS_READ;
 
 const WAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -86,6 +87,7 @@ impl Failure {
             Action::Show(_) => (FailureKind::Notice, "Switching the main pane".to_string()),
             Action::SetResolved { name, .. } => (FailureKind::Notice, format!("Resolving {name}")),
             Action::OpenUrl(_) => (FailureKind::Notice, "Opening the PR".to_string()),
+            Action::Reports(name) => (FailureKind::Notice, format!("Reading {name}'s reports")),
             Action::Quit | Action::QuitAll | Action::Edit(_) => {
                 (FailureKind::Notice, "The action".to_string())
             }
@@ -123,6 +125,11 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
                 Some(name) => format!("Main pane: {name}"),
                 None => "Main pane: coordinator".to_string(),
             }))
+        }
+        Action::Reports(name) => {
+            let conn = db::open(&src.db)?;
+            let reports = db::recent_reports(&conn, &name, REPORTS_READ)?;
+            Ok(Msg::Reports { name, reports })
         }
         Action::Wake(name) => wake(src, &name),
         Action::Stop(name) => stop(src, &name),

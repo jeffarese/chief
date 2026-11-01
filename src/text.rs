@@ -22,6 +22,17 @@ pub fn ago(now: i64, ts: i64) -> String {
     }
 }
 
+/// How long ago `ts` was, in its largest whole unit: `12s`, `5m`, `3h`, `2d`.
+pub fn age(now: i64, ts: i64) -> String {
+    let secs = (now - ts).max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
 /// What runs beside a session's own turn (§5 "Background work"): `2 subagents, 1 background
 /// command`; None when nothing does.
 pub fn background_work(subagents: u32, commands: u32) -> Option<String> {
@@ -65,6 +76,15 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_is_compact() {
+        assert_eq!(age(90_000, 78_000), "12s");
+        assert_eq!(age(400_000, 0), "6m");
+        assert_eq!(age(3 * 3_600_000 + 5, 0), "3h");
+        assert_eq!(age(0, 1_000), "0s");
+        assert_eq!(age(2 * 86_400_000, 0), "2d");
+    }
 
     #[test]
     fn background_work_counts() {

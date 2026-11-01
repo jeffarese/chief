@@ -2,6 +2,7 @@
 //! never waits on `claude agents` or `gh`: one polls `claude agents` every 2 s (or right away when
 //! kicked after an action) and sends the rows, the other refreshes PRs every 30 s.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -14,14 +15,18 @@ use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::cleanup::Ctx;
 use crate::config::ProjectConfig;
 use crate::pr::{self, Gh};
+use crate::state::{Group, Role};
 use crate::{db, tui};
 
-use super::app::{Msg, PrSummary, Snapshot};
+use super::app::{Msg, PrSummary, Snapshot, group_of};
 
 pub const AGENTS_EVERY: Duration = Duration::from_secs(2);
 pub const PR_EVERY: Duration = Duration::from_secs(30);
 /// Events older than this are deleted when the board starts.
 pub const EVENTS_KEPT_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// How many of a working or waiting thread's latest events the detail gets (§10): a tool call
+/// is two, before and after, and the detail tells of four.
+const ACTIVITY_EVENTS: usize = 12;
 
 /// Where the refresher looks; tests point it at temp dirs and fakes.
 #[derive(Debug, Clone)]
@@ -182,8 +187,19 @@ pub fn tick(conn: &Connection, claude: &Claude, slug: &str) -> Msg {
 }
 
 fn read(conn: &Connection, slug: &str, error: Option<String>) -> Result<Msg> {
+    let sessions = db::list_sessions(conn, slug, None)?;
+    let mut activity = HashMap::new();
+    for row in &sessions {
+        if row.role == Role::Thread.as_str()
+            && matches!(group_of(row), Group::Working | Group::Waiting)
+        {
+            let events = db::session_events(conn, &row.name, ACTIVITY_EVENTS)?;
+            activity.insert(row.name.clone(), events);
+        }
+    }
     Ok(Msg::Rows(Snapshot {
-        sessions: db::list_sessions(conn, slug, None)?,
+        sessions,
+        activity,
         denials: db::count_guard_denials(conn, slug)?,
         pane_target: db::get_pane_target(conn, slug)?,
         error: error.map(|e| e.split_whitespace().collect::<Vec<_>>().join(" ")),
@@ -211,6 +227,49 @@ pub fn pr_tick(conn: &Connection, claude: &Claude, gh: &Gh, dir: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SessionRow;
+
+    /// A working or waiting thread's latest events come with the rows, newest first; an idle
+    /// one's and the coordinator's don't.
+    #[test]
+    fn the_rows_bring_what_busy_threads_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("chief.db")).unwrap();
+        db::register_project(&conn, "demo", dir.path(), 0).unwrap();
+        let rows = [
+            ("busy", Role::Thread, Group::Working),
+            ("asks", Role::Thread, Group::Waiting),
+            ("idle", Role::Thread, Group::Idle),
+            ("chief-demo", Role::Coordinator, Group::Working),
+        ];
+        for (name, role, group) in rows {
+            let mut row = SessionRow::new(name, "demo", role, 0);
+            row.group_name = group.as_str().to_string();
+            db::insert_session(&conn, &row).unwrap();
+            for (ts, call) in [(1, "Read: a.rs"), (2, "Bash: ls")] {
+                let event = db::Event {
+                    session_name: Some(name.to_string()),
+                    session_id: None,
+                    project_slug: "demo".into(),
+                    hook: "PreToolUse".into(),
+                    ts,
+                    summary: Some(call.into()),
+                };
+                db::insert_event(&conn, &event).unwrap();
+            }
+        }
+        let Msg::Rows(snapshot) = read(&conn, "demo", None).unwrap() else {
+            panic!("not rows");
+        };
+        let mut names: Vec<&str> = snapshot.activity.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["asks", "busy"]);
+        let calls: Vec<_> = snapshot.activity["busy"]
+            .iter()
+            .map(|e| e.summary.as_deref().unwrap())
+            .collect();
+        assert_eq!(calls, ["Bash: ls", "Read: a.rs"]);
+    }
 
     /// A refresher that panics says so and starts again; one that returns is done.
     #[test]

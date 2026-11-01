@@ -1,10 +1,10 @@
 //! SQLite registry (ARCHITECTURE §4). Migrations run on open, tracked by `PRAGMA user_version`.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::state::Role;
 
@@ -156,19 +156,27 @@ CREATE TABLE ui_state (
     // When the project was archived (§2 `chief archive`): nothing of it runs, and the launcher
     // and `chief status` leave it out. NULL is a live project.
     "ALTER TABLE projects ADD COLUMN archived_at INTEGER;",
+    // The board reads a thread's latest events for its detail every refresh, and its reports for
+    // the report view (§10): by session, newest first, without reading every project's rows.
+    "CREATE INDEX events_by_session ON events(session_name, id);
+     CREATE INDEX reports_by_session ON reports(session_name, id);",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
 pub const CLEANUP_CLAIM_STALE_MS: i64 = 10 * 60 * 1000;
 
-/// Opens (creating if needed) the database with WAL, busy_timeout=5000 and foreign keys on, then
-/// migrates it to the latest schema.
+/// How long a statement waits for another process's lock before it fails with "database is
+/// locked".
+pub const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+/// Opens (creating if needed) the database with WAL, a `BUSY_WAIT` busy handler and foreign keys
+/// on, then migrates it to the latest schema.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-    conn.busy_timeout(Duration::from_millis(5000))?;
+    conn.busy_handler(Some(busy_wait(BUSY_WAIT)))?;
     conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     migrate(&mut conn)?;
@@ -203,19 +211,38 @@ pub fn schema_version(conn: &Connection) -> Result<usize> {
     user_version(conn)
 }
 
-/// Runs `f` inside `BEGIN IMMEDIATE`, so a read-modify-write of a row can't interleave with a
-/// hook or board poll in another process. Rolls back on error, a failed COMMIT included: that
-/// leaves the transaction open, and a long-lived connection (the board's) would stay in it.
-pub fn immediate<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = f(conn).and_then(|v| {
-        conn.execute_batch("COMMIT")?;
-        Ok(v)
-    });
-    if result.is_err() && !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
+/// A busy handler that retries for `limit` of real time. SQLite's own `busy_timeout` adds up the
+/// sleeps it asks for, not the time that passes: with the bundled SQLite on macOS a hook held up
+/// by a locked database waited about 12 s for its 5000 ms.
+fn busy_wait(limit: Duration) -> impl FnMut(i32) -> bool + Send + 'static {
+    // SQLite's own schedule: most locks are short, so the first tries come quickly.
+    const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+    let mut since = Instant::now();
+    move |count| {
+        // `count` starts at 0 for each lock the statement waits on.
+        if count == 0 {
+            since = Instant::now();
+        }
+        let left = limit.saturating_sub(since.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        let delay = DELAYS_MS[usize::try_from(count).unwrap_or(0).min(DELAYS_MS.len() - 1)];
+        std::thread::sleep(Duration::from_millis(delay).min(left));
+        true
     }
-    result
+}
+
+/// Runs `f` inside `BEGIN IMMEDIATE`, so a read-modify-write of a row can't interleave with a
+/// hook or board poll in another process. Rolls back on error, a failed COMMIT included, and when
+/// a panic unwinds through it: either would leave the transaction open, and a long-lived
+/// connection (the board's refresher, which starts again after a panic) would keep the write
+/// lock every hook waits on.
+pub fn immediate<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let value = f(&tx)?;
+    tx.commit()?;
+    Ok(value)
 }
 
 /// A `sessions` row.
@@ -768,18 +795,32 @@ pub fn recent_events(conn: &Connection, project_slug: &str, limit: usize) -> Res
          WHERE project_slug = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![project_slug, limit as i64], |r| {
-            Ok(Event {
-                session_name: r.get(0)?,
-                session_id: r.get(1)?,
-                project_slug: r.get(2)?,
-                hook: r.get(3)?,
-                ts: r.get(4)?,
-                summary: r.get(5)?,
-            })
-        })?
+        .query_map(params![project_slug, limit as i64], event_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// A session's latest events, newest first.
+pub fn session_events(conn: &Connection, session_name: &str, limit: usize) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_name, session_id, project_slug, hook, ts, summary FROM events
+         WHERE session_name = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![session_name, limit as i64], event_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
+    Ok(Event {
+        session_name: r.get(0)?,
+        session_id: r.get(1)?,
+        project_slug: r.get(2)?,
+        hook: r.get(3)?,
+        ts: r.get(4)?,
+        summary: r.get(5)?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1136,10 +1177,6 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1);
-        let timeout: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(timeout, 5000);
         let mut tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .unwrap()
@@ -1160,11 +1197,56 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 14);
+        assert_eq!(MIGRATIONS.len(), 15);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+    }
+
+    /// A statement held up by another connection's lock gives up after the handler's limit of
+    /// real time, and the next statement waits the whole limit again.
+    #[test]
+    fn a_busy_wait_ends_after_its_limit() {
+        let (dir, holder) = fresh();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut waiter = Connection::open(dir.path().join("nested/chief.db")).unwrap();
+        let limit = Duration::from_millis(300);
+        waiter.busy_handler(Some(busy_wait(limit))).unwrap();
+        for _ in 0..2 {
+            let started = Instant::now();
+            let err = waiter.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            let waited = started.elapsed();
+            assert_eq!(
+                err.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            assert!(waited >= limit, "{waited:?}");
+            assert!(waited < Duration::from_secs(2), "{waited:?}");
+        }
+        holder.execute_batch("ROLLBACK").unwrap();
+        waiter.execute_batch("BEGIN IMMEDIATE; COMMIT").unwrap();
+    }
+
+    /// A panic inside `immediate` rolls its transaction back: the board's refresher starts again
+    /// on the same connection after one, and must not keep the write lock.
+    #[test]
+    fn a_panic_inside_immediate_rolls_back() {
+        let (dir, conn) = fresh();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            immediate::<()>(&conn, |c| {
+                register_project(c, "p", Path::new("/p"), 0)?;
+                panic!("bad row");
+            })
+        }));
+        assert!(crashed.is_err());
+        assert!(conn.is_autocommit());
+        assert!(list_projects(&conn).unwrap().is_empty());
+        // Another connection writes at once, and so does this one.
+        let other = open(&dir.path().join("nested/chief.db")).unwrap();
+        immediate(&other, |c| register_project(c, "q", Path::new("/q"), 0)).unwrap();
+        immediate(&conn, |c| register_project(c, "p", Path::new("/p"), 0)).unwrap();
+        assert_eq!(list_projects(&conn).unwrap().len(), 2);
     }
 
     /// A database as an older chief left it: the first `version` migrations, nothing else.

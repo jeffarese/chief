@@ -1,13 +1,13 @@
 //! A child program on its own pseudo-terminal: emulated (`spawn`, the built-in layout, whose
-//! reader thread only moves bytes to the UI thread's emulator), or relayed to the user's terminal
-//! (`open`, the pane: the caller polls and reads it).
+//! reader and writer threads only move bytes between the pty and the UI thread's emulator), or
+//! relayed to the user's terminal (`open`, the pane: the caller polls, reads and writes it).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 /// How long the child gets to exit after SIGTERM before it is killed.
@@ -22,6 +22,8 @@ pub enum Output {
 pub struct Pty {
     master: OwnedFd,
     writer: File,
+    /// `spawn`: bytes for the child, written on a thread of their own (`write`).
+    input: Option<Sender<Vec<u8>>>,
     child: Child,
 }
 
@@ -50,7 +52,7 @@ impl Pty {
             .env("COLORTERM", "truecolor")
             .env_remove("TERM_PROGRAM")
             .env_remove("TERM_PROGRAM_VERSION");
-        let pty = Pty::start(cmd, cols, rows)?;
+        let mut pty = Pty::start(cmd, cols, rows)?;
         let mut reader = File::from(pty.master.try_clone()?);
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 1 << 16];
@@ -69,6 +71,20 @@ impl Pty {
             }
             let _ = tx.send(wrap(Output::Exited));
         });
+        // A child that stops reading its input (a long paste into a Claude that is busy, or one
+        // that hangs) fills the pty's queue, and a blocking write on the UI thread would stop the
+        // whole layout with it, Ctrl+Q included. So the writes go through a thread of their own,
+        // which ends with the child's terminal (a failed write) or with the last sender.
+        let (input, queued) = mpsc::channel::<Vec<u8>>();
+        let mut writer = File::from(pty.master.try_clone()?);
+        std::thread::spawn(move || {
+            for bytes in queued {
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        pty.input = Some(input);
         Ok(pty)
     }
 
@@ -104,8 +120,15 @@ impl Pty {
         }
         // SAFETY: openpty just returned these fds, owned by nobody else.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
-        // SAFETY: plain fcntl on our own fd: the child must not inherit the master side.
-        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        // No child may inherit either side: not the master, and not the slave, which any child
+        // another thread starts meanwhile (the board's `claude agents`, say) would hold open, so
+        // on Linux the master would not see this child's end (macOS revokes the terminal when
+        // its session's leader exits). The child itself gets the slave as its stdio through
+        // `dup2`, which clears the flag on the copy.
+        for fd in [&master, &slave] {
+            // SAFETY: plain fcntl on our own fd.
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
 
         cmd.stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
@@ -126,17 +149,27 @@ impl Pty {
         Ok(Pty {
             writer: File::from(master.try_clone()?),
             master,
+            input: None,
             child,
         })
     }
 
-    /// A second handle on the master, for the emulator's replies to the child's queries.
-    pub fn replies(&self) -> io::Result<File> {
-        self.writer.try_clone()
+    /// Where the emulator's replies to the child's queries go (`spawn`): the queue `write` uses,
+    /// so they keep their order with the keys.
+    pub fn replies(&self) -> impl FnMut(&[u8]) + Send + 'static {
+        let input = self.input.clone();
+        move |bytes| {
+            if let Some(input) = &input {
+                let _ = input.send(bytes.to_vec());
+            }
+        }
     }
 
-    pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
+    /// Queues `bytes` for the child (`spawn`); never waits for it to read them.
+    pub fn write(&self, bytes: &[u8]) {
+        if let Some(input) = &self.input {
+            let _ = input.send(bytes.to_vec());
+        }
     }
 
     /// The master, for `poll`.
@@ -235,6 +268,29 @@ mod tests {
         let out = String::from_utf8_lossy(&out);
         assert!(out.contains("9 41"), "{out:?}");
         assert!(out.contains("xterm-ghostty rex"), "{out:?}");
+        pty.end();
+    }
+
+    /// A child that reads nothing never holds up its writer: what doesn't fit in the pty waits in
+    /// the queue, keys and replies alike. Its terminal is raw, as Claude's is: a cooked one drops
+    /// input that doesn't fit instead of blocking.
+    #[test]
+    fn writes_to_a_child_that_reads_nothing_return_at_once() {
+        let (tx, rx) = mpsc::channel();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "stty raw -echo; echo ready; exec sleep 30"]);
+        let pty = Pty::spawn(cmd, 20, 4, tx, |o| o).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Output::Bytes(b)) => assert!(String::from_utf8_lossy(&b).contains("ready")),
+            _ => panic!("no output"),
+        }
+        let mut reply = pty.replies();
+        let started = Instant::now();
+        for _ in 0..64 {
+            pty.write(&[b'x'; 16 * 1024]);
+            reply(b"\x1b[0n");
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
         pty.end();
     }
 

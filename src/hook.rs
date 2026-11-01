@@ -1081,7 +1081,7 @@ fn notice_for(project: &str, row: &SessionRow, kind: HookKind) -> Option<Notice>
 pub fn summary(event: &str, payload: &Value) -> String {
     let field = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
     let text = match event {
-        "PreToolUse" | "PostToolUse" => field("tool_name").to_string(),
+        "PreToolUse" | "PostToolUse" => tool_call(payload),
         "UserPromptSubmit" => field("prompt").to_string(),
         "Notification" => format!("{}: {}", field("notification_type"), field("message")),
         "Stop" => field("last_assistant_message").to_string(),
@@ -1091,6 +1091,57 @@ pub fn summary(event: &str, payload: &Value) -> String {
         _ => String::new(),
     };
     one_line(&text, SUMMARY_CHARS)
+}
+
+/// The tool input fields that say what a call acts on, the first a call has winning: Bash's
+/// command, the file of Read, Edit and Write, Grep's and Glob's pattern, WebFetch's url,
+/// WebSearch's and ToolSearch's query, Agent's description, SendMessage's recipient, Skill's
+/// name.
+const TOOL_ARGS: &[&str] = &[
+    "command",
+    "file_path",
+    "notebook_path",
+    "pattern",
+    "url",
+    "query",
+    "description",
+    "to",
+    "skill",
+    "name",
+    "task_id",
+    "path",
+];
+
+/// `<tool>: <what it acts on>`, or the tool alone, for the board's detail (§10): a path in the
+/// session's folder shown from there, AskUserQuestion's first question.
+fn tool_call(payload: &Value) -> String {
+    fn text(v: Option<&Value>) -> Option<&str> {
+        v.and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    }
+    let tool = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let input = payload.get("tool_input");
+    let what = match tool {
+        "AskUserQuestion" => text(input.and_then(|i| i.pointer("/questions/0/question"))),
+        _ => TOOL_ARGS
+            .iter()
+            .find_map(|k| text(input.and_then(|i| i.get(*k)))),
+    };
+    let Some(what) = what else {
+        return tool.to_string();
+    };
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty());
+    let what = cwd
+        .and_then(|c| what.strip_prefix(c))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(what);
+    format!("{tool}: {what}")
 }
 
 /// `ui.notify` from project.toml. A missing file means no notifications; a broken one is logged.
@@ -1172,6 +1223,36 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool call's event says what the call acts on, a path from the session's folder.
+    #[test]
+    fn a_tool_calls_summary_says_what_it_acts_on() {
+        let call = |tool: &str, input: Value| {
+            let payload = json!({"tool_name": tool, "tool_input": input, "cwd": "/w/r"});
+            summary("PreToolUse", &payload)
+        };
+        let bash = json!({"command": "npm test\n  --ci", "description": "Run"});
+        assert_eq!(call("Bash", bash), "Bash: npm test --ci");
+        let edit = json!({"file_path": "/w/r/src/api.rs", "old_string": "a"});
+        assert_eq!(call("Edit", edit), "Edit: src/api.rs");
+        // Only inside the folder: a sibling whose name starts the same keeps its whole path.
+        let read = json!({"file_path": "/w/rx/a.rs"});
+        assert_eq!(call("Read", read), "Read: /w/rx/a.rs");
+        let grep = json!({"pattern": "fn main", "path": "/w/r/src"});
+        assert_eq!(call("Grep", grep), "Grep: fn main");
+        let ask = json!({"questions": [{"question": "Which limit?", "header": "Limit"}]});
+        assert_eq!(
+            call("AskUserQuestion", ask),
+            "AskUserQuestion: Which limit?"
+        );
+        let agent = json!({"description": "Run tests", "prompt": "Run"});
+        assert_eq!(call("Agent", agent), "Agent: Run tests");
+        assert_eq!(call("TodoWrite", json!({"todos": []})), "TodoWrite");
+        assert_eq!(call("Bash", json!({"command": "  "})), "Bash");
+        assert_eq!(call("Bash", json!("not an object")), "Bash");
+        let long = call("Bash", json!({"command": "x".repeat(500)}));
+        assert_eq!(long.chars().count(), SUMMARY_CHARS);
+    }
 
     const THREAD_A: &str = "f8627ea8-50af-4cce-b12d-936669f85ed0";
     const COORD: &str = "20dc103a-4f18-4895-8bae-4454c193c7e6";
@@ -1396,6 +1477,27 @@ mod tests {
         assert_eq!(
             perm_event.summary.as_deref(),
             Some("permission_prompt: Claude needs your permission")
+        );
+        // What the board's detail reads (§10): the call a permission prompt is for comes just
+        // before it and says what it runs; a file is named from the session's folder.
+        let perm = db::session_events(&conn, "spike-thread-perm", 100).unwrap();
+        let prompt = perm
+            .iter()
+            .position(|e| e.hook == "Notification" && e.summary == perm_event.summary)
+            .unwrap();
+        let call = perm[prompt..]
+            .iter()
+            .find(|e| e.hook == "PreToolUse")
+            .unwrap();
+        assert_eq!(
+            call.summary.as_deref(),
+            Some("Bash: curl -sI https://example.com | head -1")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.summary.as_deref() == Some("Write: hello.txt")),
+            "{events:?}"
         );
 
         // Notices: one permission prompt and one per thread Stop; none for the coordinator.

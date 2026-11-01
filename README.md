@@ -75,8 +75,10 @@ first that applies:
   session, the pane on the left and the board on the right.
 - **Anything else**: chief draws both itself, in the terminal you ran it in: the conversation on
   the left, the board on the right. **Ctrl+\\** switches sides (or click one); the side without
-  the keyboard is dimmed, and below 100 columns the focused side fills the screen. The
-  conversation's last row is chief's: what it shows, and `^Q quit` and `^\ board`, which you can
+  the keyboard is dimmed, and below 100 columns the focused side fills the screen. Showing
+  something from the board (Enter, `n`, Esc) gives the conversation the keyboard, so you can
+  answer at once. The conversation's last row is chief's: what it shows, `! 2 waiting` while
+  threads wait on you (click it for the next one), and `^Q quit` and `^\ board`, which you can
   click. Ctrl+Q, or `q` on the board, closes it; sessions keep running. `chief up <slug> --layout
   builtin` opens it even where Rex or tmux would. Without a terminal, chief prints the two
   commands instead, to run side by side in two windows or splits of your terminal (iTerm,
@@ -91,9 +93,12 @@ ends the pane wherever it runs.
 The coordinator is the first row, then the threads by group, in order: **Waiting on you** (a
 permission prompt or a question), **Working**, **Ready for review** (open pull request), **Landing**
 (approved pull request), **Idle** (marked *asleep* when its process has ended), **Failed**,
-**Resolved** (hidden until you press `R`). `▸` marks what the left pane shows. The bottom line
-always lists the keys that work on the selection, and `?` explains every mark. The mouse works
-too: click to select, click again to show, scroll to move.
+**Resolved** (hidden until you press `R`). `▸` marks what the left pane shows. The panel below
+the list tells about the selection: for a working or waiting thread, what it runs or asks right
+now (`wants to run npm publish`, `asks Which limit should each key get?`) and its calls before,
+then its task and its last report, which `v` shows in full. The bottom line always lists the
+keys that work on the selection, and `?` explains every mark. The mouse works too: click to
+select, click again to show, scroll to move.
 
 | Key | Does |
 | --- | --- |
@@ -105,6 +110,7 @@ too: click to select, click again to show, scroll to move.
 | S | Stop a running thread (asks first; `w` wakes it again) |
 | r | Resolve or reopen |
 | o | Open the pull request |
+| v | Read the thread's reports in full: ↑ ↓ scroll, ← → older and newer, Esc back |
 | x | Clean up a resolved thread (see below) |
 | X | Clean up every resolved thread that loses nothing (`chief gc` for this project) |
 | R | Show or hide resolved threads |

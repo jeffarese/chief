@@ -101,8 +101,9 @@ fn stop_hook_updates_the_database() {
     assert_eq!(db::recent_events(&conn, "demo", 10).unwrap().len(), 1);
 }
 
-/// Another process holds the write lock past the 5 s busy timeout: a hook that can't record its
-/// event still exits 0 with nothing on stdout and logs why, whatever the event.
+/// Another process holds the write lock past the 5 s busy wait: a hook that can't record its
+/// event still exits 0 with nothing on stdout and logs why, whatever the event, and gives up after
+/// about 5 s of real time (SQLite's own busy_timeout took about 12 s for 5000 ms).
 #[test]
 fn hooks_against_a_locked_database_log_and_exit_zero() {
     let home = tempfile::tempdir().unwrap();
@@ -129,6 +130,7 @@ fn hooks_against_a_locked_database_log_and_exit_zero() {
         })
         .to_string()
     };
+    let started = std::time::Instant::now();
     let outs: Vec<Output> = std::thread::scope(|scope| {
         let runs: Vec<_> = ["Stop", "PreToolUse", "PostToolUse"]
             .map(|event| {
@@ -146,7 +148,9 @@ fn hooks_against_a_locked_database_log_and_exit_zero() {
             .collect();
         runs.into_iter().map(|r| r.join().unwrap()).collect()
     });
+    let waited = started.elapsed();
     lock.execute_batch("ROLLBACK").unwrap();
+    assert!(waited < std::time::Duration::from_secs(10), "{waited:?}");
     for out in &outs {
         assert_silent_success(out);
     }

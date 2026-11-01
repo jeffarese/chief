@@ -7,13 +7,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
-use crate::db::SessionRow;
+use crate::db::{Event, SessionRow};
 use crate::registry;
 use crate::state::Group;
-use crate::text::ago;
+use crate::text::{age, ago, one_line};
 use crate::tui::{self, bold, cols, dim, key_bar, panel, tail, truncate};
 
 use super::app::{App, Confirm, Hit, Item, Screen, group_of};
+use super::report;
 use super::settings::{Field, SettingsForm};
 
 /// Below this many body lines the detail panel replaces the list (Tab) instead of sharing.
@@ -29,6 +30,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("S", "stop a running thread (asks first)"),
     ("r", "resolve / reopen"),
     ("o", "open the pull request"),
+    ("v", "read the thread's reports in full"),
     ("x", "clean up a resolved thread"),
     ("X", "clean up every resolved thread that loses nothing"),
     ("R", "show / hide resolved"),
@@ -48,7 +50,7 @@ const LEGEND: &[(Group, &str)] = &[
     (Group::Resolved, "resolved"),
 ];
 
-fn style_of(group: Group) -> Style {
+pub fn style_of(group: Group) -> Style {
     let s = Style::new();
     match group {
         Group::Waiting => s.fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -61,7 +63,7 @@ fn style_of(group: Group) -> Style {
     }
 }
 
-fn glyph(group: Group) -> &'static str {
+pub fn glyph(group: Group) -> &'static str {
     match group {
         Group::Waiting => "!",
         Group::Working => "●",
@@ -300,6 +302,9 @@ fn board_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             if row.pr_url.is_some() {
                 keys.push(("o", "PR"));
             }
+            if row.last_report.is_some() {
+                keys.push(("v", "report"));
+            }
         }
     }
     // In the built-in layout, the side switch, which nothing else on screen names (the bar below
@@ -389,6 +394,15 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
         state.push_str(" · asleep");
     }
     lines.push(Line::styled(state, style_of(group)));
+    let events = app.activity.get(&row.name).map_or(&[][..], Vec::as_slice);
+    let doing = doing(row, group, events, app.now);
+    if let Some((label, text, _)) = &doing {
+        lines.push(field(label, text.clone()));
+    }
+    if let Some(task) = row.task.as_deref().filter(|t| !t.trim().is_empty()) {
+        let room = width.saturating_sub(cols("task "));
+        lines.push(field("task", truncate(&one_line(task, room + 1), room)));
+    }
     if let Some(b) = &row.branch {
         lines.push(field("branch", b.clone()));
     }
@@ -413,6 +427,23 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
     } else if let Some(why) = &row.cleanup_blocked {
         lines.push(field("cleanup blocked", why.clone()));
     }
+    // The calls before the one `doing` tells of, one line each.
+    let since = doing.as_ref().map_or(0, |(_, _, rest)| *rest);
+    let before: Vec<&Event> = events[since..]
+        .iter()
+        .filter(|e| e.hook == "PreToolUse")
+        .take(EARLIER_CALLS)
+        .collect();
+    if !before.is_empty() {
+        lines.push(Line::styled("earlier", dim()));
+        for e in before {
+            let call = e.summary.as_deref().unwrap_or(&e.hook);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>3} ", age(app.now, e.ts)), dim()),
+                Span::raw(truncate(call, width.saturating_sub(4))),
+            ]));
+        }
+    }
     match row.last_report.as_deref().filter(|r| !r.trim().is_empty()) {
         Some(report) => {
             lines.push(Line::raw(""));
@@ -421,6 +452,69 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
         None => lines.push(Line::styled("No report yet.", dim())),
     }
     lines
+}
+
+/// How many of a working or waiting thread's calls before the latest the detail lists.
+const EARLIER_CALLS: usize = 3;
+
+/// What a working or waiting thread does or asks, from its latest events (newest first): the
+/// call a permission prompt is for (PreToolUse comes before the permission check), the question
+/// it asks, or the call it runs, else the one it ran last. The label, the text, and where the
+/// events before that call start.
+fn doing(
+    row: &SessionRow,
+    group: Group,
+    events: &[Event],
+    now: i64,
+) -> Option<(&'static str, String, usize)> {
+    let text = |e: &Event| e.summary.clone().unwrap_or_else(|| e.hook.clone());
+    let is_call = |e: &Event| matches!(e.hook.as_str(), "PreToolUse" | "PostToolUse");
+    // The first call to start at or after `i`, and where the events before it start.
+    let started = |i: usize| {
+        let at = i + events[i..].iter().position(|e| e.hook == "PreToolUse")?;
+        Some((&events[at], at + 1))
+    };
+    match group {
+        Group::Waiting if row.waiting_reason.as_deref() == Some("permission") => {
+            let prompt = events.iter().position(|e| {
+                e.hook == "Notification" && text(e).starts_with("permission_prompt")
+            })?;
+            let (call, rest) = started(prompt)?;
+            let call = text(call);
+            Some(match call.strip_prefix("Bash: ") {
+                Some(command) => ("wants to run", command.to_string(), rest),
+                None => ("wants to use", call, rest),
+            })
+        }
+        Group::Waiting => {
+            // A question still open: the latest call asks it and hasn't ended.
+            let latest = events.iter().position(is_call)?;
+            let call = text(&events[latest]);
+            let question = call.strip_prefix("AskUserQuestion: ")?;
+            (events[latest].hook == "PreToolUse")
+                .then(|| ("asks", question.to_string(), latest + 1))
+        }
+        Group::Working => {
+            let latest = events.iter().position(is_call)?;
+            let e = &events[latest];
+            if e.hook == "PreToolUse" {
+                Some((
+                    "now",
+                    format!("{} · {}", text(e), age(now, e.ts)),
+                    latest + 1,
+                ))
+            } else {
+                // The call ended: the ones before start after its own start.
+                let rest = started(latest).map_or(latest + 1, |(_, rest)| rest);
+                Some((
+                    "last",
+                    format!("{} · {} ago", text(e), age(now, e.ts)),
+                    rest,
+                ))
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -434,9 +528,10 @@ pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if let Screen::Settings(form) = &app.screen {
-        draw_settings(f, area, app, form);
-        return;
+    match &app.screen {
+        Screen::Settings(form) => return draw_settings(f, area, app, form),
+        Screen::Report(view) => return report::draw(f, area, view, app.now),
+        _ => {}
     }
     let width = area.width as usize;
     let status = status_line(app, width);
@@ -470,7 +565,7 @@ pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
         Screen::Help => draw_help(f, area),
         Screen::Confirm(c) => draw_confirm(f, area, c),
         Screen::Stop { label, .. } => draw_stop(f, area, label),
-        Screen::Board | Screen::Settings(_) => {}
+        Screen::Board | Screen::Settings(_) | Screen::Report(_) => {}
     }
 }
 
@@ -625,7 +720,18 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let inner = tui::inside(&block, area);
     f.render_widget(block, area);
     let lines = detail(app, inner.width as usize);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // The rest is in the report view: the last line says so when the text runs past it.
+    let cut = text.line_count(inner.width) > usize::from(inner.height);
+    let reported = app.selected_row().is_some_and(|r| r.last_report.is_some());
+    if cut && reported && inner.height > 1 {
+        let [body, more] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        f.render_widget(text, body);
+        f.render_widget(Line::styled("↓ more · v reads it all", dim()), more);
+    } else {
+        f.render_widget(text, inner);
+    }
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -996,6 +1102,131 @@ mod tests {
         for line in out.lines() {
             assert!(cols(line) <= 44, "{line:?}");
         }
+    }
+
+    /// Events as the hook records them, newest first: `(hook, summary, seconds ago)`.
+    fn events(list: &[(&str, &str, i64)]) -> Vec<Event> {
+        list.iter()
+            .map(|(hook, summary, secs)| Event {
+                session_name: Some("t".into()),
+                session_id: None,
+                project_slug: "demo".into(),
+                hook: hook.to_string(),
+                ts: NOW - secs * 1000,
+                summary: Some(summary.to_string()),
+            })
+            .collect()
+    }
+
+    /// What the line under a thread's state says, from its events: the call a permission prompt
+    /// is for, an open question, the call running or the last one; and where earlier calls start.
+    #[test]
+    fn the_detail_says_what_a_thread_does_or_asks() {
+        let mut perm = thread("t", Group::Waiting, 1);
+        perm.waiting_reason = Some("permission".into());
+        let asked = events(&[
+            (
+                "Notification",
+                "permission_prompt: Claude needs your permission",
+                1,
+            ),
+            ("PreToolUse", "Bash: npm publish", 2),
+            ("PostToolUse", "Read: package.json", 3),
+            ("PreToolUse", "Read: package.json", 4),
+        ]);
+        let said = doing(&perm, Group::Waiting, &asked, NOW);
+        assert_eq!(said, Some(("wants to run", "npm publish".into(), 2)));
+        let edit = events(&[
+            (
+                "Notification",
+                "permission_prompt: Claude needs your permission",
+                1,
+            ),
+            ("PreToolUse", "Edit: src/api.rs", 2),
+        ]);
+        let said = doing(&perm, Group::Waiting, &edit, NOW);
+        assert_eq!(said, Some(("wants to use", "Edit: src/api.rs".into(), 2)));
+
+        let mut question = thread("t", Group::Waiting, 1);
+        question.waiting_reason = Some("question".into());
+        let open = events(&[("PreToolUse", "AskUserQuestion: What limit per key?", 5)]);
+        let said = doing(&question, Group::Waiting, &open, NOW);
+        assert_eq!(said, Some(("asks", "What limit per key?".into(), 1)));
+        let answered = events(&[
+            ("PostToolUse", "AskUserQuestion: What limit per key?", 1),
+            ("PreToolUse", "AskUserQuestion: What limit per key?", 5),
+        ]);
+        assert_eq!(doing(&question, Group::Waiting, &answered, NOW), None);
+
+        let working = thread("t", Group::Working, 1);
+        let running = events(&[("PreToolUse", "Bash: cargo test", 12)]);
+        let said = doing(&working, Group::Working, &running, NOW);
+        assert_eq!(said, Some(("now", "Bash: cargo test · 12s".into(), 1)));
+        let ran = events(&[
+            ("PostToolUse", "Edit: src/a.rs", 3),
+            ("PreToolUse", "Edit: src/a.rs", 4),
+            ("PreToolUse", "Read: src/a.rs", 9),
+        ]);
+        let said = doing(&working, Group::Working, &ran, NOW);
+        assert_eq!(said, Some(("last", "Edit: src/a.rs · 3s ago".into(), 2)));
+
+        let idle = thread("t", Group::Idle, 1);
+        assert_eq!(doing(&idle, Group::Idle, &ran, NOW), None);
+    }
+
+    /// The detail of a working thread: what it runs under its state, its task on one line, and
+    /// the calls before, newest first.
+    #[test]
+    fn the_detail_shows_a_threads_task_and_calls() {
+        let mut working = thread("demo-api-1a2b", Group::Working, 1);
+        working.title = Some("Rate limits".into());
+        working.task =
+            Some("Add per-key rate limits to the public API, with a\nlimit per plan".into());
+        let mut app = app_with(vec![working]);
+        app.activity.insert(
+            "demo-api-1a2b".into(),
+            events(&[
+                ("PreToolUse", "Bash: cargo test limits", 12),
+                ("PostToolUse", "Edit: src/api/router.rs", 40),
+                ("PreToolUse", "Edit: src/api/router.rs", 41),
+                ("PreToolUse", "Read: src/api/router.rs", 90),
+            ]),
+        );
+        app.on_key(ch('j'));
+        let out = render(&app, 60, 30);
+        for want in [
+            "now Bash: cargo test limits · 12s",
+            "task Add per-key rate limits to the public API, with a …",
+            "earlier",
+            "41s Edit: src/api/router.rs",
+            " 1m Read: src/api/router.rs",
+        ] {
+            assert!(out.contains(want), "missing {want:?} in\n{out}");
+        }
+        // The running call isn't listed again.
+        assert_eq!(out.matches("cargo test limits").count(), 1, "{out}");
+    }
+
+    /// A report longer than the detail ends in a line saying where the rest is; `v` is on the
+    /// key bar for a thread with a report.
+    #[test]
+    fn a_cut_off_report_points_at_the_report_view() {
+        let mut idle = thread("demo-api-1a2b", Group::Idle, 1);
+        let long: Vec<String> = (1..=30).map(|i| format!("Step {i} done.")).collect();
+        idle.last_report = Some(long.join("\n"));
+        let mut app = app_with(vec![idle]);
+        app.on_key(ch('j'));
+        let out = render(&app, 70, 30);
+        assert!(out.contains("↓ more · v reads it all"), "{out}");
+        assert!(out.contains("v report"), "{out}");
+        assert!(!out.contains("Step 30 done."), "{out}");
+        // A short one doesn't.
+        app.threads[0].last_report = Some("Done.".into());
+        let out = render(&app, 70, 30);
+        assert!(
+            out.contains("Done.") && !out.contains("v reads it all"),
+            "{out}"
+        );
     }
 
     #[test]

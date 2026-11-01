@@ -510,8 +510,9 @@ CREATE TABLE events (
   project_slug TEXT NOT NULL,
   hook         TEXT NOT NULL,
   ts           INTEGER NOT NULL,
-  summary      TEXT                       -- short human line; never the whole payload
+  summary      TEXT                       -- short human line, at most 120 chars; never the whole payload (below)
 );
+CREATE INDEX events_by_session ON events(session_name, id);   -- a thread's latest events, for the board's detail, §10 (migration 15)
 
 CREATE TABLE reports (
   id           INTEGER PRIMARY KEY,
@@ -519,6 +520,7 @@ CREATE TABLE reports (
   ts           INTEGER NOT NULL,
   text         TEXT NOT NULL
 );
+CREATE INDEX reports_by_session ON reports(session_name, id); -- a thread's reports, for the board's report view, §10 (migration 15)
 
 CREATE TABLE guard_denials (
   id           INTEGER PRIMARY KEY,
@@ -551,10 +553,16 @@ CREATE TABLE teammates (                  -- a session's subagents in its curren
 );
 ```
 
-Every connection: `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Every hook opens the
+Every connection: `journal_mode=WAL`, a busy handler that retries a locked statement for 5 s of
+real time (`db::BUSY_WAIT`), `foreign_keys=ON`. Not SQLite's `busy_timeout`: it adds up the sleeps
+it asks for, not the time that passes, and with the bundled SQLite on macOS a hook held up by a
+locked database waited about 12 s for its 5000 ms. Every hook opens the
 database, so opening reads `user_version` first and a database at the current version takes no
 write lock. One behind it is migrated in a `BEGIN IMMEDIATE` transaction that reads the version
-again, so processes opening it at once migrate it once.
+again, so processes opening it at once migrate it once. Every other write transaction is
+`db::immediate`'s `BEGIN IMMEDIATE`, which rolls back on an error, a failed `COMMIT` and a panic
+unwinding through it alike: a long-lived connection left in an open transaction (the board's
+refresher starts again after a panic, §10) would keep the write lock every hook waits on.
 
 ### Matching a hook to a session
 
@@ -606,6 +614,14 @@ SubagentStop, SessionEnd, other notification types) are only recorded in `events
 `teammates` and the background work (below): when one changes `subagents_busy` or
 `background_running`, it sets `updated_at` and re-derives the group. Coordinator Stops store
 reports too.
+
+An event's `summary`, whitespace collapsed and cut to 120 chars: for PreToolUse and PostToolUse
+`<tool>: <what it acts on>`, the first of the tool input's `command`, `file_path`,
+`notebook_path`, `pattern`, `url`, `query`, `description`, `to`, `skill`, `name`, `task_id`,
+`path` that is a non-empty string (AskUserQuestion: its first question), a path inside the
+payload's `cwd` given from there, or the tool name alone; for UserPromptSubmit the prompt; for a
+Notification `<notification_type>: <message>`; for Stop the last assistant message; for
+SessionStart the source, SessionEnd the reason, SubagentStart and SubagentStop the agent id.
 
 Subagents (§1, §6 "Subagents"): in the same transaction, a matched session's hook keeps its
 `teammates` rows, under the payload's `session_id` (a subagent's own hooks carry its lead's).
@@ -737,7 +753,7 @@ chief counts them from the hooks, in the same transaction as the rest (§4 `sess
 `background_running`, `stopped_early_at`; `teammates.busy`):
 
 - **Subagents mid-turn.** SubagentStart marks its teammate row `busy` (recording the row first,
-  as above); SubagentStop clears it. A SubagentStop chief missed (its hook hit the busy timeout,
+  as above); SubagentStop clears it. A SubagentStop chief missed (its hook gave up on a locked database,
   say) is caught at the session's own next Stop (no `agent_id`), whose `background_tasks` lists
   every subagent the session still has (§1): an async agent as a `subagent` under its agent id
   until its hand-back, a teammate as a `teammate` under a task id, idle or not. When that list
@@ -1308,7 +1324,9 @@ thread for one nobody shows.
 
 Relay (`src/relay.rs`). attach runs on a pseudo-terminal of its own (`embed::Pty::open`: the
 child leads its own session with the slave as its controlling terminal, keeps the pane's `TERM`
-and `TERM_PROGRAM`, and has SIGTSTP/SIGHUP/SIGINT/SIGTERM at their defaults), of the pane
+and `TERM_PROGRAM`, and has SIGTSTP/SIGHUP/SIGINT/SIGTERM at their defaults; both sides of the
+pty are close-on-exec from the moment they are open, so no other child chief starts can keep
+the terminal open after attach), of the pane
 terminal's size, resized on SIGWINCH. One thread `poll`s stdin and the pty's master
 (non-blocking) in slices of at most 50 ms, looking at the signal flags between them, and copies
 bytes both ways untouched: Claude draws on the user's terminal as if it had it (its scrollback,
@@ -1402,9 +1420,12 @@ board, sharing a screen instead of a multiplexer.
 - Conversation. The pane loop's steps 0 to 6, with the same constants, messages and
   `left_lines` (as for `OnQuit::Layout`), but `claude attach <short_id>` runs on a pseudo-terminal
   of its own (`embed::Pty::spawn`: as for the relay above, but with `TERM=xterm-256color`,
-  `COLORTERM=truecolor` and no `TERM_PROGRAM`, since chief's emulator reads its output, and a
-  reader thread) instead of being relayed. `alacritty_terminal` (Alacritty's terminal emulator,
-  pure Rust, from crates.io) emulates it (`embed::Screen`): it parses attach's output and answers
+  `COLORTERM=truecolor` and no `TERM_PROGRAM`, since chief's emulator reads its output, a
+  reader thread, and a writer thread that the keys, the paste and the emulator's replies are
+  queued for, in order: a child that stops reading its input would otherwise stop the UI thread
+  in a blocking write, Ctrl+Q included) instead of being relayed. `alacritty_terminal`
+  (Alacritty's terminal emulator, pure Rust, from crates.io) emulates it (`embed::Screen`): it
+  parses attach's output and answers
   most of its queries (DA1 as a VT102, DA2, DSR, the size reports, DECRQM, the kitty keyboard
   query; OSC 10/11 and the palette chief answers from a dark default and xterm's colours). A
   second parser over the same bytes answers what alacritty_terminal never sees (XTVERSION
@@ -1418,8 +1439,13 @@ board, sharing a screen instead of a multiplexer.
   so the outer terminal's theme applies; during a synchronized update (mode 2026) vte's processor
   holds the update's bytes, so the last complete frame stays, for at most 500 ms. chief's own lines (`chief · <name> …`,
   the retry and "you left" lines) are written on a fresh emulated screen, or below attach's own
-  output when it failed. Each pass of the loop has a generation number, so output of an attach
-  that was ended, or the result of a wake for an earlier target, is dropped. The wake step
+  output when it failed. attach has ended when its terminal closes (the reader's end of output),
+  or, as in the relay, when it exited with the terminal still held open by something it started
+  (on Linux: macOS revokes a session's terminal when its leader, attach, exits, so the reader sees
+  the end): each tick checks whether it exited, and 500 ms after that it counts as ended, and
+  what holds the terminal is ended with its process group (`Pty::end`). Each pass of the
+  loop has a generation number, so output of an attach
+  that ended or was ended, or the result of a wake for an earlier target, is dropped. The wake step
   (`pane::wake`: `claude agents`, then `claude respawn` and its wait) runs on a worker with its own
   database connection, so the screen stays live. An attach being ended (switch, quit) gets
   SIGTERM, 2 s, then SIGKILL, to its whole process group, on a thread that chief joins before it
@@ -1440,15 +1466,23 @@ board, sharing a screen instead of a multiplexer.
 - Bar. The conversation's last row (when it has two or more) is chief's, and Claude gets the rows
   above: dim `chief · coordinator` or `chief · thread <name>` on the left while that target is
   being woken or attached (else `chief`), and on the right, in the key bar's style, `^Q quit`
-  and `^\ board`, as many as fit, quit first. A click on a hint does what its key
-  does; other clicks on the bar go nowhere.
+  and `^\ board`; before them, while threads wait on the user, `! <n> waiting` in the board's
+  Waiting style. As many as fit, in that order, the waiting count first. A click on a hint does
+  what its key does, and one on the waiting count what the board's `n` does (it shows the next
+  thread waiting, or says the one shown is the only one) and gives the conversation the keys;
+  other clicks on the bar go nowhere.
 - Keys. Ctrl+Q (which Claude Code doesn't bind) quits from either side, attached or not. Ctrl+\
   (which Claude Code doesn't bind either; legacy terminals report it as Ctrl+4) switches
   sides, and a click focuses the side clicked. On the conversation side every other key goes to
-  attach while it runs; otherwise `q` quits (also Ctrl+C in the "you left" wait, whose ⏎ goes
-  back and whose first 300 ms of keys are dropped, as in step 6). On the board side keys are the
-  board's, and its `q` quits. The mouse goes to the side under it: to attach as its mouse
-  reporting asks, else the wheel scrolls the conversation's history, marked `↑ history · a key
+  attach while it runs; while chief's own lines offer `q` (the retry lines, the "you left"
+  wait), `q` quits (also Ctrl+C in the "you left" wait, whose ⏎ goes back and whose first 300 ms
+  of keys are dropped, as in step 6); while a target wakes, keys go nowhere, `q` included. On
+  the board side keys are the board's, and its `q` quits. Whatever the board shows (⏎, `n`, Esc
+  or `c`, a click on the selection) gives the conversation the keys, so the answer to a waiting
+  thread is the next thing typed and a narrow screen shows it at once; a key typed before its
+  attach runs is that answer's start, not a `q` for chief, hence the rule above. The mouse goes
+  to the side under it: to attach as its mouse reporting asks, else the wheel scrolls the
+  conversation's history, marked `↑ history · a key
   returns` at its top right (and no cursor) until a key, a paste or the wheel brings back the live
   screen; paste goes to attach. Focus
   reports follow the side with the keys. chief turns on bracketed paste, focus reports and, where
@@ -1481,8 +1515,10 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   `claude agents --json --all`, sync (§5), read the project's rows, guard denial count and
   `pane_target`. A failing `claude agents` still sends the stored rows, with "refresh failed: …" in
   the status line; a failing database read keeps the last rows. After each action the worker asks
-  for an immediate re-read (database only). Every 30 s (first at start): `pr::refresh_project` with
-  one `Gh` kept for the board's lifetime and `project.toml` re-read each time (§12), which runs
+  for an immediate re-read (database only). With the rows, each working or waiting thread's 12
+  latest events (`db::session_events`, by `events_by_session`), for the detail. Every 30 s
+  (first at start): `pr::refresh_project` with one `Gh` kept for the board's lifetime and
+  `project.toml` re-read each time (§12), which runs
   `gh pr list --head <branch> --state all --json
   url,state,isDraft,reviewDecision,createdAt,isCrossRepository,headRefOid --limit 10` in
   `repo_path` and,
@@ -1495,7 +1531,8 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   and marks, the selection in reverse video across the width. The last line is always the key
   bar: the keys that act on the selection, most useful first (`n next waiting` while a thread
   waits; on a thread `S stop` when it has a process, else `w wake`; on a resolved, uncleaned
-  one `x clean up` and `X clean up all`), each `key what` with the key in
+  one `x clean up` and `X clean up all`; `o PR` with a PR, then `v report` with a report), each
+  `key what` with the key in
   the accent colour, whole hints only, `^Q quit` and `? help` kept at the end when the rest doesn't
   fit (in the built-in layout `^\ conversation` instead of `^Q quit`, which the conversation's
   bar names, §9). Above
@@ -1519,8 +1556,14 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`), `cleanup blocked`, `cleaned up`, then the agp label of the account it runs in (`PB2`; none for a
   thread in the project's account without agp, §7 "Thread account"). Detail panel for the
   selection, titled with the thread's title (name, group and reason or resolved reason,
-  `· <background work> running`, asleep, branch, PR URL, model · effort, `account <label>`, last
-  activity, cleanup state, the last report wrapped), or "Coordinator" (its state, model ·
+  `· <background work> running`, asleep; then, from a working or waiting thread's latest events,
+  what it does or asks: `wants to run <command>` (or `wants to use <tool: what>`) for the call a
+  permission prompt is for, the PreToolUse before the prompt; `asks <question>` while its latest
+  call is an unanswered AskUserQuestion; `now <call> · 12s` while its latest call runs, else
+  `last <call> · 3s ago`; its task on one line; branch, PR URL, model · effort, `account
+  <label>`, last activity, cleanup state; up to three calls before that one under `earlier`, each
+  with its age; the last report wrapped, and when the text runs past the panel its last line
+  says `↓ more · v reads it all`), or "Coordinator" (its state, model ·
   effort, last activity, and what to do next: with no threads, "Tell the coordinator what you want
   done, in the main pane…"): below the list when the body has ≥ 16 lines (the list takes what it
   needs up to 3/5), otherwise Tab swaps the list for it.
@@ -1551,14 +1594,24 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   with a wrong name clears the input; Esc cancels); if it lists nothing or fails (`claude rm`
   refused over work chief can't see), "Cleanup blocked" says `Cleanup blocked: <why>.` and why no
   discard is offered, and any key closes it. A modal that comes while settings is open waits
-  until settings closes (the form's message says so), so it never throws a draft away; R show or
-  hide resolved; Tab detail on
+  until settings closes (the form's message says so), so it never throws a draft away; v the
+  report view (below); R show or hide resolved; Tab detail on
   short terminals; s settings; ? help (the keys, then what each mark and glyph means; any key or
   click closes); q or Ctrl+C quit the board only; Ctrl+Q quits chief, the main pane too, which
   closes the layout (§9, `pane::request_quit`). Wake and cleanup run one at a time on a worker
   thread ("waking …" in the status line). Shows run in order on one worker of their own: picks
   that queue up while one runs are skipped for the newest, so the main pane ends on the last
   pick.
+- Report view (`v` on a thread; `src/board/report.rs`): the board's whole area for one thread's
+  reports, newest first, one at a time: a panel titled `<title> · report <i> of <n>` (just the
+  title for one), the task, then `report · HH:MM · <ago>` and the report, wrapped. It opens at
+  once on the row's `last_report`; a worker reads the thread's 50 latest reports
+  (`db::recent_reports`, by `reports_by_session`) and only that thread's read replaces them.
+  ↑/↓ or j/k scroll a line, PgUp/PgDn, b and space a page (one line kept), g/G or Home/End the
+  top and bottom, the wheel three lines; the scroll never passes the end. ← or h shows the
+  report before, → or l the one after, each from its top. Esc, q or v go back to the board.
+  Its key bar: `↑↓ space scroll` when the text doesn't fit, `← older`, `→ newer` where there is
+  one, `Esc back`.
 - Mouse: a click selects a row (the coordinator or a thread), a click on the selected row is Enter,
   a click on the Resolved header is R, the wheel moves the selection. Each frame records which
   screen row holds what (`App::hits`) for this. In settings a click puts the cursor on a field and
@@ -1611,7 +1664,8 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   `tui::catch`, which turns it into the worker's failure message (`Waking <name> crashed: <panic>
   at <file:line>`, a save's `Not saved: …`, a trust check's failure), so `busy` and `checking…`
   always end. A refresh thread that panics says `refresh crashed: …; trying again` in the status
-  line and starts its loop again after its interval. The terminal is restored on quit and on
+  line and starts its loop again after its interval, on the same connection (a transaction the
+  panic interrupted was rolled back, §4). The terminal is restored on quit and on
   error; the editor gets it through `tui::suspended` (mouse, alternate screen and raw mode off,
   then back). Input is polled every 100 ms, results are drained between frames, and resizes take
   effect on the next frame.

@@ -2,6 +2,7 @@
 //! (on worker threads where they shell out); results come back as `Msg`s through `apply`.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ratatui::crossterm::event::{
@@ -10,11 +11,12 @@ use ratatui::crossterm::event::{
 
 use crate::cleanup::{Inspection, Mode};
 use crate::config::ProjectConfig;
-use crate::db::SessionRow;
+use crate::db::{Event, Report, SessionRow};
 use crate::placement::{PoolTrust, Untrusted};
 use crate::state::{Group, Role};
 use crate::tools;
 
+use super::report::{self, ReportView};
 use super::settings::{self, SettingsForm};
 use super::ui::display_title;
 
@@ -27,6 +29,8 @@ pub enum Action {
     QuitAll,
     /// Show this thread (None: the coordinator) in the main pane.
     Show(Option<String>),
+    /// Read this thread's reports for the report view.
+    Reports(String),
     Wake(String),
     /// Stop this thread's process (`tools::stop_thread`).
     Stop(String),
@@ -75,6 +79,11 @@ pub enum Msg {
         warning: Option<String>,
     },
     SaveFailed(String),
+    /// A thread's reports, newest first, for the report view.
+    Reports {
+        name: String,
+        reports: Vec<Report>,
+    },
     /// The pool's trust check, or why it failed.
     Trust(Result<PoolTrust, String>),
     /// Marking a pair trusted went as `text` says; `check` is the check that followed.
@@ -88,6 +97,8 @@ pub enum Msg {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub sessions: Vec<SessionRow>,
+    /// A working or waiting thread's latest events, newest first, by name.
+    pub activity: HashMap<String, Vec<Event>>,
     pub denials: i64,
     pub pane_target: Option<String>,
     /// `claude agents` failed; the rows are the stored ones.
@@ -123,6 +134,7 @@ pub enum Screen {
         label: String,
     },
     Settings(Box<SettingsForm>),
+    Report(Box<ReportView>),
 }
 
 /// A line of the thread list.
@@ -158,6 +170,8 @@ pub struct App {
     /// Threads in board order.
     pub threads: Vec<SessionRow>,
     pub coordinator: Option<SessionRow>,
+    /// What working and waiting threads do or ask: their latest events, newest first.
+    pub activity: HashMap<String, Vec<Event>>,
     pub denials: i64,
     /// What the main pane shows; None is the coordinator.
     pub pane_target: Option<String>,
@@ -200,6 +214,7 @@ impl App {
             config,
             threads: Vec::new(),
             coordinator: None,
+            activity: HashMap::new(),
             denials: 0,
             pane_target: None,
             selected: None,
@@ -233,6 +248,7 @@ impl App {
                 tools::board_order(&mut threads);
                 self.coordinator = coordinators.into_iter().next();
                 self.threads = threads;
+                self.activity = s.activity;
                 self.denials = s.denials;
                 self.pane_target = s.pane_target;
                 self.refresh_error = s.error;
@@ -301,6 +317,13 @@ impl App {
                 Screen::Settings(form) => form.trust_marked(text, check),
                 _ => self.status = Some(text),
             },
+            Msg::Reports { name, reports } => {
+                if let Screen::Report(view) = &mut self.screen
+                    && view.name == name
+                {
+                    view.loaded(reports);
+                }
+            }
         }
     }
 
@@ -424,6 +447,7 @@ impl App {
         };
         match (&mut self.screen, ev.kind) {
             (Screen::Help, MouseEventKind::Down(_)) => self.screen = Screen::Board,
+            (Screen::Report(view), kind) => view.on_mouse(kind),
             // The text being typed belongs to its field: the cursor stays until Enter or Esc.
             (Screen::Settings(form), _) if form.editing.is_some() => {}
             (Screen::Settings(form), MouseEventKind::ScrollUp) => form.move_cursor(-1),
@@ -481,6 +505,12 @@ impl App {
             }
             Screen::Confirm(_) => self.confirm_key(key),
             Screen::Stop { .. } => self.stop_key(key),
+            Screen::Report(view) => {
+                if let report::Outcome::Close = view.on_key(key) {
+                    self.screen = Screen::Board;
+                }
+                Vec::new()
+            }
             Screen::Settings(form) => match form.on_key(key) {
                 settings::Outcome::Stay => Vec::new(),
                 settings::Outcome::Close => {
@@ -520,6 +550,7 @@ impl App {
             KeyCode::Char('r') => return self.on_thread(|app, row| app.resolve(row)),
             KeyCode::Char('o') => return self.on_thread(|app, row| app.open_pr(row)),
             KeyCode::Char('x') => return self.on_thread(|app, row| app.clean(row)),
+            KeyCode::Char('v') => return self.on_thread(|app, row| app.read_reports(row)),
             _ => {}
         }
         Vec::new()
@@ -582,6 +613,12 @@ impl App {
         vec![Action::Show(Some(row.name))]
     }
 
+    /// The report view, with the row's last report until the worker's read comes back.
+    fn read_reports(&mut self, row: SessionRow) -> Vec<Action> {
+        self.screen = Screen::Report(Box::new(ReportView::new(&row)));
+        vec![Action::Reports(row.name)]
+    }
+
     fn wake(&mut self, row: SessionRow) -> Vec<Action> {
         if row.removed_at.is_some() {
             return self.refuse(crate::guard::removed_message(&row.name));
@@ -598,7 +635,7 @@ impl App {
 
     /// Shows the next thread waiting on the user after the one the main pane shows (wrapping),
     /// and selects it, so answering them in turn needs no looking.
-    fn next_waiting(&mut self) -> Vec<Action> {
+    pub fn next_waiting(&mut self) -> Vec<Action> {
         let waiting: Vec<&SessionRow> = self
             .threads
             .iter()
@@ -808,6 +845,50 @@ pub(crate) mod tests {
             thread("work-2", Group::Working, 4),
             thread("done-1", Group::Resolved, 9),
         ])
+    }
+
+    /// `v` reads a thread's reports: the view opens at once on the row's last report, a worker
+    /// reads them all, and only that thread's read reaches it; Esc goes back. The coordinator
+    /// has no view.
+    #[test]
+    fn v_opens_a_threads_reports() {
+        let mut app = sample();
+        app.on_key(ch('g'));
+        assert_eq!(app.on_key(ch('v')), []);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .starts_with("That key acts on a thread")
+        );
+        app.on_key(ch('j'));
+        let name = app.selected_row().unwrap().name.clone();
+        assert_eq!(app.on_key(ch('v')), [Action::Reports(name.clone())]);
+        let report = |text: &str| Report {
+            session_name: name.clone(),
+            ts: NOW,
+            text: text.into(),
+        };
+        app.apply(Msg::Reports {
+            name: "other".into(),
+            reports: vec![report("not this one")],
+        });
+        app.apply(Msg::Reports {
+            name: name.clone(),
+            reports: vec![report("second"), report("first")],
+        });
+        let Screen::Report(view) = &app.screen else {
+            panic!("no report view: {:?}", app.screen);
+        };
+        assert_eq!(view.reports.len(), 2);
+        assert_eq!(view.reports[0].text, "second");
+        // Its keys are its own: `q` closes it, not the board.
+        assert_eq!(app.on_key(ch('j')), []);
+        assert_eq!(app.on_key(ch('q')), []);
+        assert_eq!(app.screen, Screen::Board);
+        app.on_key(ch('v'));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Board);
     }
 
     /// n shows the waiting threads in turn, after whichever the main pane shows.

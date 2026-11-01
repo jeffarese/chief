@@ -1,9 +1,11 @@
 //! The board TUI (ARCHITECTURE §10). `app` holds the state and turns keys into actions, `ui`
-//! draws it, `refresh` polls in the background, and `jobs` runs actions off the UI thread.
+//! draws it, `refresh` polls in the background, and `jobs` runs actions off the UI thread;
+//! `settings` and `report` are screens of their own.
 
 pub mod app;
 pub mod jobs;
 pub mod refresh;
+pub mod report;
 pub mod settings;
 pub mod ui;
 
