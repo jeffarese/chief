@@ -194,23 +194,36 @@ impl Pty {
     }
 
     /// SIGTERM, a grace period, then SIGKILL, reaping it: never waits unbounded. The child leads
-    /// its own session, so its group is signalled: whatever it started goes with it.
+    /// its own session, so its group is signalled: whatever it started goes with it. The master
+    /// is drained meanwhile: on macOS a child can't finish exiting, even killed, while output it
+    /// wrote sits unread on its terminal, and a relay (`open`) has no reader thread to take it.
     pub fn end(mut self) {
         let group = -(self.child.id() as libc::pid_t);
-        if let Ok(None) = self.child.try_wait() {
+        let fd = self.master.as_raw_fd();
+        // SAFETY: our own descriptor. Non-blocking so a drain never waits; a `spawn` reader
+        // thread that sees it would block just stops, as it would at the child's exit.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let reaped = |pty: &mut Pty| {
+            let mut buf = [0u8; 4096];
+            while matches!(pty.read(&mut buf), Ok(n) if n > 0) {}
+            matches!(pty.child.try_wait(), Ok(Some(_)) | Err(_))
+        };
+        if !reaped(&mut self) {
             // SAFETY: our own child's group; the child is not yet reaped, so the id is still ours.
             unsafe { libc::kill(group, libc::SIGTERM) };
             let deadline = Instant::now() + GRACE;
-            while Instant::now() < deadline {
-                if let Ok(Some(_)) = self.child.try_wait() {
-                    break;
-                }
+            while Instant::now() < deadline && !reaped(&mut self) {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
         // SAFETY: as above; once the leader is reaped a group of that id can only be what it left.
         unsafe { libc::kill(group, libc::SIGKILL) };
-        let _ = self.child.wait();
+        while !reaped(&mut self) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The child's exit status once it has ended, reaping it.
@@ -292,6 +305,25 @@ mod tests {
         }
         assert!(started.elapsed() < Duration::from_secs(1));
         pty.end();
+    }
+
+    #[test]
+    fn a_relayed_child_still_writing_ends() {
+        // Writes until killed, with no one reading: its terminal's buffer fills, and on macOS
+        // its exit then waits for that output to be read.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; while :; do echo spinning; done"]);
+        let pty = Pty::open(cmd, 20, 4).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let (done, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            pty.end();
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(Duration::from_secs(8)).is_ok(),
+            "end waited on a child stuck exiting"
+        );
     }
 
     #[test]

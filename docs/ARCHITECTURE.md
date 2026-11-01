@@ -1345,8 +1345,10 @@ counts as failed), when attach exits with its terminal still held open, or when 
 for a switch, for Ctrl+Q or the board's quit request (the loop then stops as for `q`) or for a
 hangup (SIGHUP or SIGTERM,
 POLLHUP on stdin, a read of 0 or a failed write). chief ends it with SIGTERM to its process
-group, 2 s, then SIGKILL, and reaps it (`Pty::end`); SIGTERM leaves its session running. chief
-keeps the pane's terminal in raw mode the whole time.
+group, 2 s, then SIGKILL, and reaps it (`Pty::end`), reading and dropping its output meanwhile:
+on macOS a process can't finish exiting, even killed, while output it wrote sits unread on its
+terminal, so an attach killed mid-draw would leave the pane waiting forever. SIGTERM leaves its
+session running. chief keeps the pane's terminal in raw mode the whole time.
 
 `q` or Ctrl+Q while chief has the terminal ends the loop, as Ctrl+Q does during a relay; so do
 the board's Ctrl+Q (below), the block being closed and the session killed. With `--layout` a `q` or Ctrl+Q (not a hangup) then closes the layout as `chief down` does
