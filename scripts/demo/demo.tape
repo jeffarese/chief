@@ -84,4 +84,11 @@ Right
 Sleep 300ms
 Escape
 Wait+Screen /up for review/
+Sleep 4s
+
+# Speed up search works through subagents: the detail shows each one and what it runs.
+Type "g"
+Sleep 400ms
+Type "j"
+Wait+Screen /└ bench/
 Sleep 5s

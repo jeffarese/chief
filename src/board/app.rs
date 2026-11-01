@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{
 
 use crate::cleanup::{Inspection, Mode};
 use crate::config::ProjectConfig;
-use crate::db::{Event, Report, SessionRow};
+use crate::db::{BusySubagent, Event, Report, SessionRow};
 use crate::placement::{PoolTrust, Untrusted};
 use crate::state::{Group, Role};
 use crate::tools;
@@ -99,6 +99,8 @@ pub struct Snapshot {
     pub sessions: Vec<SessionRow>,
     /// A working or waiting thread's latest events, newest first, by name.
     pub activity: HashMap<String, Vec<Event>>,
+    /// A working or waiting thread's subagents mid-turn, by name.
+    pub subagents: HashMap<String, Vec<BusySubagent>>,
     pub denials: i64,
     pub pane_target: Option<String>,
     /// `claude agents` failed; the rows are the stored ones.
@@ -172,6 +174,8 @@ pub struct App {
     pub coordinator: Option<SessionRow>,
     /// What working and waiting threads do or ask: their latest events, newest first.
     pub activity: HashMap<String, Vec<Event>>,
+    /// Their subagents mid-turn, each with its latest call.
+    pub subagents: HashMap<String, Vec<BusySubagent>>,
     pub denials: i64,
     /// What the main pane shows; None is the coordinator.
     pub pane_target: Option<String>,
@@ -215,6 +219,7 @@ impl App {
             threads: Vec::new(),
             coordinator: None,
             activity: HashMap::new(),
+            subagents: HashMap::new(),
             denials: 0,
             pane_target: None,
             selected: None,
@@ -249,6 +254,7 @@ impl App {
                 self.coordinator = coordinators.into_iter().next();
                 self.threads = threads;
                 self.activity = s.activity;
+                self.subagents = s.subagents;
                 self.denials = s.denials;
                 self.pane_target = s.pane_target;
                 self.refresh_error = s.error;

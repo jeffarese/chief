@@ -36,9 +36,11 @@ short_named() {
   done
 }
 
-# Opens or approves the pull request of branch `branch` (`gh pr list --head <branch>`).
+# Opens or approves the pull request of branch `branch` (`gh pr list --head <branch>`). Its head
+# is the branch's tip, which chief checks is on the thread's branch.
 pr_set() {
-  local branch=$1 review=$2
-  printf '[{"url":"https://github.com/acme/payments-api/pull/%s","state":"OPEN","isDraft":false,"reviewDecision":"%s","createdAt":"%s","isCrossRepository":false}]' \
-    "$3" "$review" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$WORLD/pr/$branch.json"
+  local branch=$1 review=$2 head
+  head=$(git -C "$HOME/work/payments-api" rev-parse "$branch")
+  printf '[{"url":"https://github.com/acme/payments-api/pull/%s","state":"OPEN","isDraft":false,"reviewDecision":"%s","createdAt":"%s","isCrossRepository":false,"headRefOid":"%s"}]' \
+    "$3" "$review" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$head" > "$WORLD/pr/$branch.json"
 }

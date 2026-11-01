@@ -179,6 +179,7 @@ fn old_events_are_pruned() {
                 hook: "Stop".into(),
                 ts,
                 summary: None,
+                agent_id: None,
             },
         )
         .unwrap();

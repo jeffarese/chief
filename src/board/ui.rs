@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
-use crate::db::{Event, SessionRow};
+use crate::db::{BusySubagent, Event, SessionRow};
 use crate::registry;
 use crate::state::Group;
 use crate::text::{age, ago, one_line};
@@ -394,7 +394,24 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
         state.push_str(" · asleep");
     }
     lines.push(Line::styled(state, style_of(group)));
-    let events = app.activity.get(&row.name).map_or(&[][..], Vec::as_slice);
+    if !row.resolved && registry::background_work(row).is_some() {
+        let subagents = app.subagents.get(&row.name).map_or(&[][..], Vec::as_slice);
+        lines.extend(subagent_tree(subagents, app.now, width));
+    }
+    let all = app.activity.get(&row.name).map_or(&[][..], Vec::as_slice);
+    // A working thread's own calls: its subagents' are in the tree above. A permission prompt
+    // may be for a subagent's call, so a waiting thread's detail reads them all.
+    let own: Vec<Event>;
+    let events = if group == Group::Working && all.iter().any(|e| e.agent_id.is_some()) {
+        own = all
+            .iter()
+            .filter(|e| e.agent_id.is_none())
+            .cloned()
+            .collect();
+        own.as_slice()
+    } else {
+        all
+    };
     let doing = doing(row, group, events, app.now);
     if let Some((label, text, _)) = &doing {
         lines.push(field(label, text.clone()));
@@ -452,6 +469,47 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
         None => lines.push(Line::styled("No report yet.", dim())),
     }
     lines
+}
+
+/// The widest a subagent's label gets in the tree, so its call still shows.
+const SUBAGENT_LABEL: usize = 18;
+
+/// A thread's subagents mid-turn, one line each under its state: its name (else what it was
+/// asked to do, else its id) and the call it runs.
+fn subagent_tree(subagents: &[BusySubagent], now: i64, width: usize) -> Vec<Line<'static>> {
+    let label = |s: &BusySubagent| {
+        let text = s
+            .name
+            .as_deref()
+            .or(s.description.as_deref())
+            .unwrap_or(&s.agent_id);
+        one_line(text, SUBAGENT_LABEL)
+    };
+    let pad = subagents.iter().map(|s| cols(&label(s))).max().unwrap_or(0);
+    subagents
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let branch = if i + 1 == subagents.len() {
+                "└ "
+            } else {
+                "├ "
+            };
+            let name = label(s);
+            let name = format!("{name}{}", " ".repeat(pad - cols(&name)));
+            let call = match &s.call {
+                Some((call, ts)) => format!("{call} · {}", age(now, *ts)),
+                None => "starting".to_string(),
+            };
+            let room = width.saturating_sub(cols(branch) + pad + 2);
+            Line::from(vec![
+                Span::styled(branch, dim()),
+                Span::raw(name),
+                Span::raw("  "),
+                Span::styled(truncate(&one_line(&call, room + 1), room), dim()),
+            ])
+        })
+        .collect()
 }
 
 /// How many of a working or waiting thread's calls before the latest the detail lists.
@@ -1114,6 +1172,7 @@ mod tests {
                 hook: hook.to_string(),
                 ts: NOW - secs * 1000,
                 summary: Some(summary.to_string()),
+                agent_id: None,
             })
             .collect()
     }
@@ -1172,6 +1231,58 @@ mod tests {
 
         let idle = thread("t", Group::Idle, 1);
         assert_eq!(doing(&idle, Group::Idle, &ran, NOW), None);
+    }
+
+    /// A working thread's busy subagents show as a tree under its state, each with its latest
+    /// call; the thread's own line tells of its own calls, not theirs.
+    #[test]
+    fn the_detail_shows_subagents_as_a_tree() {
+        let mut working = thread("demo-api-1a2b", Group::Working, 1);
+        working.subagents_busy = 3;
+        let mut app = app_with(vec![working]);
+        let mut evs = events(&[
+            ("PreToolUse", "Read: src/hook.rs", 2),
+            ("PreToolUse", "Agent: Review the hook", 30),
+        ]);
+        evs[0].agent_id = Some("areviewer-1".into());
+        app.activity.insert("demo-api-1a2b".into(), evs);
+        let sub = |id: &str, name: Option<&str>, desc: Option<&str>, call: Option<(&str, i64)>| {
+            BusySubagent {
+                agent_id: id.into(),
+                name: name.map(Into::into),
+                description: desc.map(Into::into),
+                call: call.map(|(c, secs)| (c.to_string(), NOW - secs * 1000)),
+            }
+        };
+        app.subagents.insert(
+            "demo-api-1a2b".into(),
+            vec![
+                sub(
+                    "areviewer-1",
+                    Some("reviewer"),
+                    None,
+                    Some(("Read: src/hook.rs", 2)),
+                ),
+                sub(
+                    "a2",
+                    None,
+                    Some("Run the tests"),
+                    Some(("Bash: cargo test", 7)),
+                ),
+                sub("ab-886b99f57d4badec", None, None, None),
+            ],
+        );
+        app.on_key(ch('j'));
+        let out = render(&app, 60, 30);
+        for want in [
+            "├ reviewer            Read: src/hook.rs · 2s",
+            "├ Run the tests       Bash: cargo test · 7s",
+            "└ ab-886b99f57d4bad…  starting",
+            "now Agent: Review the hook · 30s",
+        ] {
+            assert!(out.contains(want), "missing {want:?} in\n{out}");
+        }
+        assert_eq!(out.matches("src/hook.rs").count(), 1, "{out}");
     }
 
     /// The detail of a working thread: what it runs under its state, its task on one line, and

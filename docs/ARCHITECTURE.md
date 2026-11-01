@@ -510,9 +510,11 @@ CREATE TABLE events (
   project_slug TEXT NOT NULL,
   hook         TEXT NOT NULL,
   ts           INTEGER NOT NULL,
-  summary      TEXT                       -- short human line, at most 120 chars; never the whole payload (below)
+  summary      TEXT,                      -- short human line, at most 120 chars; never the whole payload (below)
+  agent_id     TEXT                       -- the payload's `agent_id`: the subagent that made the call; NULL for the session itself (migration 16)
 );
 CREATE INDEX events_by_session ON events(session_name, id);   -- a thread's latest events, for the board's detail, §10 (migration 15)
+CREATE INDEX events_by_agent ON events(session_name, agent_id, id); -- a subagent's latest call, for the detail's tree, §10 (migration 16)
 
 CREATE TABLE reports (
   id           INTEGER PRIMARY KEY,
@@ -547,6 +549,7 @@ CREATE TABLE teammates (                  -- a session's subagents in its curren
   session_id   TEXT NOT NULL,             -- the lead's session id that hook carried; a record counts only for it
   agent_id     TEXT NOT NULL,             -- Claude Code's agent id, e.g. 'ahelper-886b99f57d4badec'
   name         TEXT,                      -- the Agent call's `name`; NULL when it had none, or none is known yet
+  description  TEXT,                      -- the Agent call's `description`, for the board's detail (migration 16)
   recorded_at  INTEGER NOT NULL,          -- unix ms of the latest hook that recorded it
   busy         INTEGER NOT NULL DEFAULT 0, -- mid-turn: SubagentStart to SubagentStop, §5 "Background work" (migration 12)
   PRIMARY KEY (session_name, agent_id)
@@ -627,7 +630,7 @@ Subagents (§1, §6 "Subagents"): in the same transaction, a matched session's h
 `teammates` rows, under the payload's `session_id` (a subagent's own hooks carry its lead's).
 SubagentStart records its `agent_id` alone, and keeps a name already recorded (it fires again on
 every resume); `agent_type` is never taken for a name. PostToolUse for `Agent` records
-`tool_response.agentId` (else `agent_id`) with `tool_input.name`; the name is left out when it is
+`tool_response.agentId` (else `agent_id`) with `tool_input.name` and `tool_input.description`; the name is left out when it is
 missing or empty, or when `tool_response.name` differs from it (Claude Code registered another,
 which could reach someone else; the agent id still works). A name goes to the latest agent
 recorded with it (the others keep their ids, without a name), as Claude Code delivers it. A
@@ -1518,7 +1521,8 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   `pane_target`. A failing `claude agents` still sends the stored rows, with "refresh failed: …" in
   the status line; a failing database read keeps the last rows. After each action the worker asks
   for an immediate re-read (database only). With the rows, each working or waiting thread's 12
-  latest events (`db::session_events`, by `events_by_session`), for the detail. Every 30 s
+  latest events (`db::session_events`, by `events_by_session`), and its subagents mid-turn with
+  each one's latest PreToolUse (`db::busy_subagents`, by `events_by_agent`), for the detail. Every 30 s
   (first at start): `pr::refresh_project` with one `Gh` kept for the board's lifetime and
   `project.toml` re-read each time (§12), which runs
   `gh pr list --head <branch> --state all --json
@@ -1558,8 +1562,11 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`), `cleanup blocked`, `cleaned up`, then the agp label of the account it runs in (`PB2`; none for a
   thread in the project's account without agp, §7 "Thread account"). Detail panel for the
   selection, titled with the thread's title (name, group and reason or resolved reason,
-  `· <background work> running`, asleep; then, from a working or waiting thread's latest events,
-  what it does or asks: `wants to run <command>` (or `wants to use <tool: what>`) for the call a
+  `· <background work> running`, asleep; under it a tree of its subagents mid-turn, one line
+  each, `├ <name, else description, else agent id, up to 18 columns>  <latest call> · 12s` (or
+  `starting` before its first call); then, from a working or waiting thread's latest events
+  (a working thread's own, without its subagents' calls; a waiting one's all, as a permission
+  prompt may be for a subagent's call), what it does or asks: `wants to run <command>` (or `wants to use <tool: what>`) for the call a
   permission prompt is for, the PreToolUse before the prompt; `asks <question>` while its latest
   call is an unanswered AskUserQuestion; `now <call> · 12s` while its latest call runs, else
   `last <call> · 3s ago`; its task on one line; branch, PR URL, model · effort, `account

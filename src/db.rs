@@ -160,6 +160,11 @@ CREATE TABLE ui_state (
     // the report view (§10): by session, newest first, without reading every project's rows.
     "CREATE INDEX events_by_session ON events(session_name, id);
      CREATE INDEX reports_by_session ON reports(session_name, id);",
+    // Which subagent made a call, and what each subagent was asked to do, so the board's detail
+    // can show a thread's subagents and what each does (§10).
+    "ALTER TABLE events ADD COLUMN agent_id TEXT;
+     ALTER TABLE teammates ADD COLUMN description TEXT;
+     CREATE INDEX events_by_agent ON events(session_name, agent_id, id);",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -764,19 +769,22 @@ pub struct Event {
     pub hook: String,
     pub ts: i64,
     pub summary: Option<String>,
+    /// The subagent that made the call (the payload's `agent_id`); None for the session itself.
+    pub agent_id: Option<String>,
 }
 
 pub fn insert_event(conn: &Connection, e: &Event) -> Result<()> {
     conn.execute(
-        "INSERT INTO events (session_name, session_id, project_slug, hook, ts, summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO events (session_name, session_id, project_slug, hook, ts, summary, agent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             e.session_name,
             e.session_id,
             e.project_slug,
             e.hook,
             e.ts,
-            e.summary
+            e.summary,
+            e.agent_id
         ],
     )?;
     Ok(())
@@ -791,7 +799,7 @@ pub fn prune_events(conn: &Connection, before: i64) -> Result<usize> {
 /// The project's latest events, newest first.
 pub fn recent_events(conn: &Connection, project_slug: &str, limit: usize) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT session_name, session_id, project_slug, hook, ts, summary FROM events
+        "SELECT session_name, session_id, project_slug, hook, ts, summary, agent_id FROM events
          WHERE project_slug = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
     )?;
     let rows = stmt
@@ -803,7 +811,7 @@ pub fn recent_events(conn: &Connection, project_slug: &str, limit: usize) -> Res
 /// A session's latest events, newest first.
 pub fn session_events(conn: &Connection, session_name: &str, limit: usize) -> Result<Vec<Event>> {
     let mut stmt = conn.prepare(
-        "SELECT session_name, session_id, project_slug, hook, ts, summary FROM events
+        "SELECT session_name, session_id, project_slug, hook, ts, summary, agent_id FROM events
          WHERE session_name = ?1 ORDER BY id DESC LIMIT ?2",
     )?;
     let rows = stmt
@@ -820,6 +828,7 @@ fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
         hook: r.get(3)?,
         ts: r.get(4)?,
         summary: r.get(5)?,
+        agent_id: r.get(6)?,
     })
 }
 
@@ -874,6 +883,7 @@ pub fn record_teammate(
     session_id: &str,
     agent_id: &str,
     name: Option<&str>,
+    description: Option<&str>,
     now: i64,
 ) -> Result<()> {
     if let Some(name) = name {
@@ -884,11 +894,13 @@ pub fn record_teammate(
         )?;
     }
     conn.execute(
-        "INSERT INTO teammates (session_name, session_id, agent_id, name, recorded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO teammates (session_name, session_id, agent_id, name, description, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(session_name, agent_id) DO UPDATE SET session_id = excluded.session_id,
-           name = coalesce(excluded.name, name), recorded_at = excluded.recorded_at",
-        params![session_name, session_id, agent_id, name, now],
+           name = coalesce(excluded.name, name),
+           description = coalesce(excluded.description, description),
+           recorded_at = excluded.recorded_at",
+        params![session_name, session_id, agent_id, name, description, now],
     )?;
     Ok(())
 }
@@ -948,6 +960,48 @@ pub fn teammates(conn: &Connection, session_name: &str, session_id: &str) -> Res
             Ok(Teammate {
                 agent_id: r.get(0)?,
                 name: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// A subagent mid-turn and its latest call, for the board's detail (§10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusySubagent {
+    pub agent_id: String,
+    pub name: Option<String>,
+    /// The Agent call's `description`.
+    pub description: Option<String>,
+    /// Its latest call's summary and when it started.
+    pub call: Option<(String, i64)>,
+}
+
+/// `session_name`'s subagents mid-turn under `session_id`, in the order first recorded, each
+/// with its latest call.
+pub fn busy_subagents(
+    conn: &Connection,
+    session_name: &str,
+    session_id: &str,
+) -> Result<Vec<BusySubagent>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.agent_id, t.name, t.description,
+           (SELECT e.summary FROM events e WHERE e.session_name = t.session_name
+              AND e.agent_id = t.agent_id AND e.hook = 'PreToolUse' ORDER BY e.id DESC LIMIT 1),
+           (SELECT e.ts FROM events e WHERE e.session_name = t.session_name
+              AND e.agent_id = t.agent_id AND e.hook = 'PreToolUse' ORDER BY e.id DESC LIMIT 1)
+         FROM teammates t WHERE t.session_name = ?1 AND t.session_id = ?2 AND t.busy = 1
+         ORDER BY t.rowid",
+    )?;
+    let rows = stmt
+        .query_map(params![session_name, session_id], |r| {
+            let summary: Option<String> = r.get(3)?;
+            let ts: Option<i64> = r.get(4)?;
+            Ok(BusySubagent {
+                agent_id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                call: summary.zip(ts),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1197,7 +1251,7 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 15);
+        assert_eq!(MIGRATIONS.len(), 16);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
@@ -1529,14 +1583,14 @@ mod tests {
 
         // The Agent call's response names it; SubagentStart (again on every resume) knows only
         // the id and keeps the name.
-        record_teammate(&conn, "t", "sid-t", "ahelper-1", Some("helper"), 10).unwrap();
-        record_teammate(&conn, "t", "sid-t", "ahelper-1", None, 11).unwrap();
+        record_teammate(&conn, "t", "sid-t", "ahelper-1", Some("helper"), None, 10).unwrap();
+        record_teammate(&conn, "t", "sid-t", "ahelper-1", None, None, 11).unwrap();
         assert_eq!(of("t", "sid-t"), [mate("ahelper-1", Some("helper"))]);
         // SubagentStart may come first.
-        record_teammate(&conn, "t", "sid-t", "aother-2", None, 12).unwrap();
-        record_teammate(&conn, "t", "sid-t", "aother-2", Some("other"), 13).unwrap();
+        record_teammate(&conn, "t", "sid-t", "aother-2", None, None, 12).unwrap();
+        record_teammate(&conn, "t", "sid-t", "aother-2", Some("other"), None, 13).unwrap();
         // The latest agent given a name has it.
-        record_teammate(&conn, "t", "sid-t", "ahelper-3", Some("helper"), 14).unwrap();
+        record_teammate(&conn, "t", "sid-t", "ahelper-3", Some("helper"), None, 14).unwrap();
         assert_eq!(
             of("t", "sid-t"),
             [
@@ -1547,7 +1601,7 @@ mod tests {
         );
         // Another session's are its own, and a record counts only for the session id it was made
         // under.
-        record_teammate(&conn, "u", "sid-u", "ahelper-9", Some("helper"), 15).unwrap();
+        record_teammate(&conn, "u", "sid-u", "ahelper-9", Some("helper"), None, 15).unwrap();
         assert_eq!(of("u", "sid-u"), [mate("ahelper-9", Some("helper"))]);
         assert!(of("t", "sid-u").is_empty());
         assert_eq!(of("t", "sid-t").len(), 3);
@@ -1559,7 +1613,7 @@ mod tests {
         set_teammate_busy(&conn, "t", "ahelper-1", true).unwrap();
         set_teammate_busy(&conn, "t", "aother-2", true).unwrap();
         set_teammate_busy(&conn, "u", "ahelper-9", true).unwrap();
-        record_teammate(&conn, "t", "sid-t", "ahelper-1", None, 21).unwrap();
+        record_teammate(&conn, "t", "sid-t", "ahelper-1", None, None, 21).unwrap();
         assert_eq!(busy("t", "sid-t"), 2);
         assert_eq!(busy("t", "sid-u"), 0);
         set_teammate_busy(&conn, "t", "aother-2", false).unwrap();
@@ -1585,6 +1639,7 @@ mod tests {
                 hook: "Stop".into(),
                 ts: 1,
                 summary: None,
+                agent_id: None,
             },
         )
         .unwrap();
@@ -1653,6 +1708,7 @@ mod tests {
                     hook: hook.into(),
                     ts,
                     summary: Some(hook.to_lowercase()),
+                    agent_id: None,
                 },
             )
             .unwrap();

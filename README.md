@@ -6,8 +6,8 @@ to the right thread, and reports back. A board beside the conversation parks eve
 status, and you can open any thread's own conversation from it.
 
 ![A new project in chief: you ask the coordinator for three things, it starts a thread for each,
-the board shows the one waiting on you, you answer it there, and a pull request lands in Ready for
-review](docs/demo.gif)
+the board shows the one waiting on you, you answer it there, a pull request lands in Ready for
+review, and the board shows a thread's subagents and what each one runs](docs/demo.gif)
 
 <sub>A scripted run (<a href="docs/demo.mp4">MP4</a>): the launcher, board and pane are chief itself,
 the Claude sessions behind them a replay. <code>scripts/demo/demo.sh</code> records it again.</sub>

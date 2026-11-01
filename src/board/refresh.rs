@@ -189,17 +189,25 @@ pub fn tick(conn: &Connection, claude: &Claude, slug: &str) -> Msg {
 fn read(conn: &Connection, slug: &str, error: Option<String>) -> Result<Msg> {
     let sessions = db::list_sessions(conn, slug, None)?;
     let mut activity = HashMap::new();
+    let mut subagents = HashMap::new();
     for row in &sessions {
         if row.role == Role::Thread.as_str()
             && matches!(group_of(row), Group::Working | Group::Waiting)
         {
             let events = db::session_events(conn, &row.name, ACTIVITY_EVENTS)?;
             activity.insert(row.name.clone(), events);
+            if row.subagents_busy > 0
+                && let Some(sid) = &row.session_id
+            {
+                let busy = db::busy_subagents(conn, &row.name, sid)?;
+                subagents.insert(row.name.clone(), busy);
+            }
         }
     }
     Ok(Msg::Rows(Snapshot {
         sessions,
         activity,
+        subagents,
         denials: db::count_guard_denials(conn, slug)?,
         pane_target: db::get_pane_target(conn, slug)?,
         error: error.map(|e| e.split_whitespace().collect::<Vec<_>>().join(" ")),
@@ -254,6 +262,7 @@ mod tests {
                     hook: "PreToolUse".into(),
                     ts,
                     summary: Some(call.into()),
+                    agent_id: None,
                 };
                 db::insert_event(&conn, &event).unwrap();
             }

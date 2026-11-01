@@ -391,10 +391,59 @@ def ask(s, label, question, options):
     return options[pick].replace(" (Recommended)", "")
 
 
+def hook(short, event, **payload):
+    """A hook as Claude Code would send it for session `short`, through `chief hook`."""
+    payload.update(hook_event_name=event, session_id=f"{short}-0000-4000-8000-000000000000")
+    subprocess.run(["chief", "hook", event, "--project", SLUG, "--role", "thread"],
+                   input=json.dumps(payload), capture_output=True, text=True)
+
+
+# Speed up search splits its profiling between subagents: name, what it was asked, its calls.
+SUBAGENTS = [
+    ("db-profiler", "Profile the search queries", [
+        ("Bash", {"command": "psql < q.sql"}),
+        ("Read", {"file_path": "db/schema.sql"}),
+    ]),
+    ("cache-audit", "Find what search could cache", [
+        ("Grep", {"pattern": "redis.get", "path": "src"}),
+        ("Read", {"file_path": "src/cache.ts"}),
+    ]),
+    ("bench", "Benchmark each fix", [
+        ("Bash", {"command": "npm run bench"}),
+        ("Bash", {"command": "npm test"}),
+    ]),
+]
+
+
+def subagents(short):
+    """Starts Speed up search's subagents, then gives each its next call every few seconds."""
+    for i, (name, task, _) in enumerate(SUBAGENTS):
+        agent_id = f"a{name}-{i}f3c9e1d0b7a2468"
+        hook(short, "SubagentStart", agent_id=agent_id, agent_type="general-purpose")
+        hook(short, "PostToolUse", tool_name="Agent",
+             tool_input={"name": name, "description": task, "prompt": task},
+             tool_response={"agentId": agent_id, "name": name})
+    step = 0
+    while os.path.isdir(WORLD):
+        for i, (name, _, calls) in enumerate(SUBAGENTS):
+            tool, args = calls[(step + i) % len(calls)]
+            hook(short, "PreToolUse", agent_id=f"a{name}-{i}f3c9e1d0b7a2468",
+                 tool_name=tool, tool_input=args)
+            time.sleep(1.3)
+        step += 1
+
+
 def director():
-    """The threads' timeline after they start: the flaky test opens a PR, rate limiting asks."""
+    """The threads' timeline after they start: the flaky test opens a PR, rate limiting asks,
+    and speed up search's subagents work throughout."""
     flaky, rate = short_of("flaky-checkout-test"), short_of("rate-limiting")
+    search = short_of("speed-up-search")
     branch = f"worktree-{agent(flaky)['name']}"
+    if os.fork() == 0:
+        try:
+            subagents(search)
+        finally:
+            os._exit(0)
     time.sleep(4)
     subprocess.run(["bash", "-c", f'. "{DEMO}/lib.sh"; pr_set "{branch}" "" 482'])
     time.sleep(3.5)

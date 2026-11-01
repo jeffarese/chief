@@ -804,6 +804,9 @@ pub fn handle(conn: &Connection, ctx: &Ctx, event: &str, payload: &Value) -> Res
                 hook: event.to_string(),
                 ts: ctx.now,
                 summary: Some(summary(event, payload)),
+                agent_id: str_field("agent_id")
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string),
             },
         )?;
         let Some(r) = row.as_mut() else {
@@ -975,7 +978,7 @@ fn record_teammates(
         // at every turn of the subagent, which runs until its SubagentStop (§5).
         "SubagentStart" => {
             if let Some(agent) = text(Some(payload), "agent_id") {
-                db::record_teammate(conn, session, session_id, agent, None, now)?;
+                db::record_teammate(conn, session, session_id, agent, None, None, now)?;
                 db::set_teammate_busy(conn, session, agent, true)?;
             }
         }
@@ -1009,7 +1012,8 @@ fn record_teammates(
             let registered = response.and_then(|r| r.get("name")).and_then(Value::as_str);
             let name = text(payload.get("tool_input"), "name")
                 .filter(|n| registered.is_none_or(|r| r == *n));
-            db::record_teammate(conn, session, session_id, agent, name, now)?;
+            let description = text(payload.get("tool_input"), "description");
+            db::record_teammate(conn, session, session_id, agent, name, description, now)?;
         }
         _ => {}
     }
@@ -1565,6 +1569,43 @@ mod tests {
             .collect()
     }
 
+    /// A subagent mid-turn keeps what its Agent call asked of it, and its calls are recorded
+    /// under its agent id, so the board can show what each subagent does (§10).
+    #[test]
+    fn a_busy_subagent_shows_its_task_and_latest_call() {
+        let (_dir, conn) = lead_setup();
+        let lines = teammate_fixture();
+        for (i, line) in lines[..=3].iter().enumerate() {
+            replay(&conn, line, i as i64);
+        }
+        let busy = db::busy_subagents(&conn, "spike-main", LEAD).unwrap();
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].agent_id, HELPER);
+        assert_eq!(busy[0].description.as_deref(), Some("Reply with ready"));
+        assert_eq!(busy[0].call, None);
+
+        // One of its own calls; the lead's calls stay its own.
+        let mut call = lines[5].clone();
+        call["agent_id"] = HELPER.into();
+        replay(&conn, &call, 10);
+        replay(&conn, &lines[7], 11);
+        let busy = db::busy_subagents(&conn, "spike-main", LEAD).unwrap();
+        let (summary, ts) = busy[0].call.clone().unwrap();
+        assert!(summary.starts_with("SendMessage"), "{summary}");
+        assert_eq!(ts, 10);
+        let events = db::session_events(&conn, "spike-main", 2).unwrap();
+        assert_eq!(events[0].agent_id, None);
+        assert_eq!(events[1].agent_id.as_deref(), Some(HELPER));
+
+        // Its turn over, it leaves the tree.
+        replay(&conn, &lines[4], 12);
+        assert!(
+            db::busy_subagents(&conn, "spike-main", LEAD)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// F1, F2: the Agent call's PostToolUse gives the agent id and the name, SubagentStart the
     /// id alone; `agent_type` is never taken for a name. F6: a SessionStart other than
     /// `compact` is a new process, without them.
@@ -2058,6 +2099,7 @@ mod tests {
             "o-sid",
             "aresearcher-1",
             Some("researcher"),
+            None,
             1,
         )
         .unwrap();
