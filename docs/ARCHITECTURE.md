@@ -159,8 +159,18 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   `projects/other/project.toml` while `projects/other/memory/note.md` stays writable. A file glob
   works: `Edit(//<abs>/settings*.json)` blocks `settings.json` and `settings.local.json` while
   `other.json` stays writable. So glob characters in a path are read as globs.
+- A command hook with `"asyncRewake": true` runs in the background: the event goes on without it
+  (a Stop ends the turn at once), and when it exits 2 Claude Code wakes the idle session with a
+  user message `<task-notification><summary>{rewakeSummary}</summary></task-notification>` plus a
+  system-reminder `{rewakeMessage} {its stderr, else stdout}`, queued to run next; any other exit
+  wakes nothing. `rewakeSummary` and `rewakeMessage` are optional strings in the hook's entry
+  (defaults "Stop hook feedback" and `Stop hook blocking error from command "<event>":`). The
+  hook's parent is the session's process, and its `timeout` (seconds) is how long it may run.
+  Verified live on 2.1.316 in a `claude --bg` session, on SessionStart and Stop; older versions
+  are untested.
 
-Minimum Claude Code version: 2.1.310. `chief` checks `claude --version` on `init` and `up`.
+Minimum Claude Code version: 2.1.316 (the coordinator's watcher, §5 "Telling the coordinator",
+needs `asyncRewake`). `chief` checks `claude --version` on `init` and `up`.
 
 ## 2. Processes (no daemon)
 
@@ -180,6 +190,7 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session; in Rex it runs as `claude` (§9) |
 | `chief hook <event> --project <slug> --role <coordinator\|thread>` | Claude Code hooks | Record events, derive state, inject context |
 | `chief hook guard --project <slug> --role …` | PreToolUse hook | Message guard |
+| `chief hook watch --project <slug> --role coordinator` | the coordinator's SessionStart and Stop hooks, in the background (`asyncRewake`) | Wake the coordinator when a thread is stuck on the user (§5 "Telling the coordinator") |
 | `chief mcp --project <slug>` | Claude Code (coordinator's MCP config) | Coordinator tools over stdio |
 | `chief status [<slug>]` | you | Print the board as text (debugging, scripting) |
 | `chief gc [<slug>] [--dry-run]` | you | Refresh PRs, then clean up every resolved thread that loses nothing (§12) |
@@ -189,6 +200,8 @@ Hook commands must be fast, must never block a session, and must exit 0. Failure
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision, the coordinator's
 UserPromptSubmit context, and the two outputs of §5 "Background work": the PreToolUse denial of a
 subagent's background command and the Stop decision that asks a thread for its final report. The
+one exception is `chief hook watch`: it runs in the background, so it may take as long as it
+needs and blocks nothing, and it exits 2 with its notice on stderr to wake the coordinator. The
 `claude agents` call inside the guard is bounded at 10 s; inside the coordinator's context, the
 final report's Stop and a Stop chief can't match yet (§4 "Matching a hook to a session") at 5 s.
 
@@ -384,7 +397,11 @@ in every agp pool account but the project's own (§7 "Thread account").
   run (<chief path>); message blocked. Run chief up again." >&2; exit 2; }` (the message is one
   shell-quoted word), so a missing or broken binary (exit 127 or any non-zero exit) blocks the
   call with exit 2, which Claude Code treats as a block and shows to the model. The guard's entry
-  also sets `"timeout": 30` (seconds; the time budget is in §6). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
+  also sets `"timeout": 30` (seconds; the time budget is in §6). The coordinator's SessionStart
+  and Stop entries have a second command, its watcher (§5 "Telling the coordinator"):
+  `{"command": "<chief> hook watch --project <slug> --role coordinator", "asyncRewake": true,
+  "timeout": 86400, "rewakeSummary": "chief: a thread is waiting on you", "rewakeMessage":
+  "Message from chief (not a hook error):"}` (§1). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
   `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
   and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<root>/projects/*/generated/**)`,
   `Edit(//<root>/projects/*/project.toml)`, `Edit(//<dir>/.claude/**)` (its cwd's project
@@ -500,7 +517,9 @@ CREATE TABLE sessions (                   -- coordinator and threads
   background_running INTEGER NOT NULL DEFAULT 0, -- background commands its last Stop listed running (migration 12)
   stopped_early_at INTEGER,               -- a thread's last Stop while background work ran; its final report is due (migration 12)
   reason_before_removed TEXT,             -- the resolved_reason a reopened thread kept when a sync marked it removed; put back if the session is listed again, §5 (migration 13)
-  legacy_cleaned  INTEGER NOT NULL DEFAULT 0 -- 1 = cleaned before migration 13, possibly by a removed verdict from before migration 6, §5 (migration 13)
+  legacy_cleaned  INTEGER NOT NULL DEFAULT 0, -- 1 = cleaned before migration 13, possibly by a removed verdict from before migration 6, §5 (migration 13)
+  blocked_since   INTEGER,                -- when it got stuck on the user (rule 3, §5); NULL while it isn't (migration 17)
+  blocked_told_at INTEGER                 -- when the coordinator's watcher last told of it, §5 "Telling the coordinator" (migration 17)
 );
 
 CREATE TABLE events (
@@ -541,7 +560,8 @@ CREATE TABLE ui_state (
   rex_session  TEXT,                      -- id of the Rex session `chief up` created, §9 (migration 8)
   pane_pid     INTEGER,                   -- the running `chief pane`, which the board signals to switch, §9 (migration 9)
   pane_started TEXT,                      -- that process's start time, proving the pid is still it (migration 9)
-  tmux_window  TEXT                       -- '<window id> <server pid> <socket>' of the tmux window `chief up` opened, §9 (migration 9)
+  tmux_window  TEXT,                      -- '<window id> <server pid> <socket>' of the tmux window `chief up` opened, §9 (migration 9)
+  watcher_pid  INTEGER                    -- the newest coordinator watcher; older ones end, §5 "Telling the coordinator" (migration 17)
 );
 
 CREATE TABLE teammates (                  -- a session's subagents in its current process, §5, §6 "Subagents" (migration 11)
@@ -611,8 +631,8 @@ above (the process works), but never clear `pending_permission` or update `cwd`:
 prompt of the lead's, and the subagent's cwd isn't the lead's. Rule 3 comes before rule 5, so a lead
 waiting on a permission stays **waiting** while its subagents work. A Notification carries no
 `agent_id`, so a subagent's own permission prompt marks its lead's row too; it clears at the lead's
-next own UserPromptSubmit, PreToolUse or PostToolUse, at its Stop, or when the process is gone
-(below), not when the subagent goes on. Other events (SubagentStart,
+next own UserPromptSubmit, PreToolUse or PostToolUse, at its Stop, when a poll sees it answered, or
+when the process is gone (below), not when the subagent goes on. Other events (SubagentStart,
 SubagentStop, SessionEnd, other notification types) are only recorded in `events`, apart from
 `teammates` and the background work (below): when one changes `subagents_busy` or
 `background_running`, it sets `updated_at` and re-derives the group. Coordinator Stops store
@@ -651,6 +671,12 @@ Derivation, first match wins (inputs: the row plus the latest `claude agents` sn
 4. `cc_state = blocked` → **waiting**, reason `question`
 5. `cc_status = busy`, or background work (below) → **working**, unless the process is gone
    (below)
+
+A thread that matches rule 3 (not resolved, not failed) is **stuck on the user**: its turn can't go
+on until they answer. `state::blocked` says so, and every re-derive keeps `blocked_since`: the
+time it got stuck, kept while it stays stuck, NULL once it isn't (migration 17 sets it to
+`updated_at` for rows stuck then). Rule 4, a turn that ended on a question, isn't stuck: the
+coordinator's idle notice carries it.
 
 `cc_state` is Claude Code's judgment of the task (working, blocked, done), not of the process: in M2b
 a thread that had finished its turn stayed `working` / `idle` indefinitely (its job record never
@@ -741,7 +767,16 @@ the row), and the row counts as **process gone** while `pid` is NULL and `gone_a
 `last_hook_at`. A process-gone row never matches rule 5, neither from `cc_state`/`cc_status` nor
 from the provisional working hooks. A permission prompt dies with its process and a respawn doesn't
 bring it back, so the sync that sets `gone_at` also clears `pending_permission`, and rule 3 doesn't
-match a process-gone row either. Rules 1, 2, 4 and 6–8 still apply, so it shows as waiting (a
+match a process-gone row either.
+
+Claude Code fires no hook when the user answers a permission prompt: the next one comes when the
+approved call ends, which can take minutes. Its status changes at once, so a sync clears
+`pending_permission` when a non-stale snapshot finds a row `busy` or `idle` whose stored state is
+fresh (`cc_fresh = 1`, no hook since the poll before) and says `waiting` with `pending_permission =
+1`: both polls came after the prompt's Notification (which set `cc_fresh = 0`), and the earlier
+one saw the session wait on it. The board then shows it working within one poll (2 s, §10). A
+prompt whose status was never seen `waiting` (a subagent's, while its lead runs) keeps waiting until
+the session's own next hook. Rules 1, 2, 4 and 6–8 still apply, so it shows as waiting (a
 blocked question), review/landing (open PR), resolved, failed, or idle/asleep. A newer hook (e.g. a
 respawn starting a turn) makes it count as running again until the next non-stale poll.
 
@@ -800,6 +835,34 @@ chief counts them from the hooks, in the same transaction as the rest (§4 `sess
 A subagent can still stall on some other kind of background work that doesn't wake it (§1 only
 verified Bash). Its lead would then look done at its next Stop. The thread prompt (§8) tells
 threads to have subagents run commands in the foreground.
+
+### Telling the coordinator (`src/waiting.rs`)
+
+A thread stuck on the user (above) can't report: its turn hasn't ended, so its coordinator gets no
+idle notice, and the coordinator, idle itself, reads no board until the user writes to it. So the
+board's Waiting on you was the only sign, and the user, watching the coordinator, saw nothing. The
+coordinator's own hooks fix that with a watcher, `chief hook watch`, that Claude Code runs in the
+background (`asyncRewake`, §1, §3) at each SessionStart and Stop of the coordinator:
+
+- It stores its pid in `ui_state.watcher_pid`; the newest watcher wins, and an older one that finds
+  another pid there ends (exit 0). So one watches per project, the one the latest turn started.
+- Every second it reads the project's threads. A thread is **due** when it isn't resolved, cleaned
+  or removed, its row is stuck now (`state::blocked`, so a `blocked_since` that outlived its block
+  never raises a false alarm), has been stuck for at least 10 s (`blocked_since`; a prompt
+  answered at once, in the pane, needs no word), and wasn't told since it got stuck (`blocked_told_at` NULL or older than
+  `blocked_since`). In one write transaction, looking again, it sets `blocked_told_at` on every due
+  thread, then prints a notice to stderr and exits 2, which wakes the coordinator with it. A thread
+  is told once per time it gets stuck.
+- The notice is `<chief-waiting>`, a line per thread, `</chief-waiting>`, and what to do: `- <name>
+  "<title>" · <permission|question> since HH:MM · wants to run <command>` (or `wants to use
+  <call>`, or `asks <question>`, read from its events as the board's detail does, §10). The
+  coordinator prompt (§8) says to tell the user at once which thread and what it wants, and that
+  they answer it by opening the thread on the board.
+- It ends (exit 0, nothing told) when its parent, the coordinator's process, is gone, or a minute
+  before its hook `timeout` (a day). A coordinator idle longer than that hears of the next stuck
+  thread at its next SessionStart or Stop.
+- It reads the database only. A prompt is seen at once (its Notification), a question (rule 3's
+  `cc_status = waiting`) at the next board poll. Its errors go to the hook error log.
 
 ## 6. Message guard
 
@@ -1141,7 +1204,10 @@ a pid. Otherwise it is left alone.
   work"). Removing worktrees and branches is the user's call (board `x`, `chief clean`,
   `chief gc`), so it never offers to; it names no branch in a thread's brief unless the user did
   (threads create their own). One line says it can message its own subagents by the name or agent
-  id the Agent tool gave them, and that they report to it (§6 "Subagents").
+  id the Agent tool gave them, and that they report to it (§6 "Subagents"). A `<chief-waiting>`
+  message from its watcher (§5 "Telling the coordinator") means to tell the user at once, a line
+  per thread, which thread and what it wants, and that they answer it by opening the thread on the
+  board; it can't answer for them and doesn't message the thread.
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch; of other sessions message only the coordinator,
   by its exact name (the report needs no message), or, for a thread spawned in another account

@@ -71,6 +71,15 @@ or `effort` only when the user asks or a task is clearly small.
   can't approve prompts.
 - Resolve a thread only when the user agrees, or its pull request merged.
 
+## When chief says a thread is waiting on you
+
+A message from chief with a `<chief-waiting>` list means those threads are stuck in the middle of
+their work until the user answers them: a permission prompt, or a question asked in the thread.
+Nothing else tells the user, so tell them right away, one line per thread: which thread, what it
+wants (the command, the tool or the question), and that they answer it by opening the thread on
+the board. You can't approve or answer it for them, and the thread can't hear you while it waits,
+so don't message it. Say nothing else unless there is news.
+
 ## Memory
 
 Memory lives in `{{project_dir}}/memory/`. `MEMORY.md` is the index, one line per file. Save

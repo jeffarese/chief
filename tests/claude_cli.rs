@@ -221,13 +221,13 @@ fn find_started_looks_for_a_new_background_session_by_exact_name() {
 #[test]
 fn version_check() {
     let fake = Fake::new();
-    fake.set("version.stdout", "2.1.310 (Claude Code)\n");
+    fake.set("version.stdout", "2.1.316 (Claude Code)\n");
     fake.claude().check_version().unwrap();
     fake.set("version.stdout", "2.2.0 (Claude Code)\n");
     fake.claude().check_version().unwrap();
-    fake.set("version.stdout", "2.1.309 (Claude Code)\n");
+    fake.set("version.stdout", "2.1.315 (Claude Code)\n");
     let msg = fake.claude().check_version().unwrap_err().to_string();
-    assert!(msg.contains("2.1.309") && msg.contains("2.1.310"), "{msg}");
+    assert!(msg.contains("2.1.315") && msg.contains("2.1.316"), "{msg}");
     fake.set("version.stdout", "garbage\n");
     assert!(fake.claude().check_version().is_err());
     assert_eq!(fake.calls()[0], ["--version"]);

@@ -51,6 +51,14 @@ const GUARD_MATCHER: &str = "SendMessage|ListAgents|Agent";
 pub const GUARD_HOOK_TIMEOUT_SECS: u64 = 30;
 /// Permission rule for every tool of the `chief` MCP server.
 const MCP_TOOLS_RULE: &str = "mcp__chief";
+/// The coordinator's events that start its waiting watcher (§5 "Telling the coordinator"): its
+/// process starting, and each of its turns ending.
+const WATCH_EVENTS: [&str; 2] = ["SessionStart", "Stop"];
+/// What the user sees in the coordinator's session when the watcher wakes it.
+const WATCH_SUMMARY: &str = "chief: a thread is waiting on you";
+/// What comes before the watcher's notice, in place of Claude Code's "Stop hook blocking error
+/// from command …".
+const WATCH_PREFIX: &str = "Message from chief (not a hook error):";
 
 pub fn coordinator_settings_path(dir: &Path) -> PathBuf {
     dir.join("generated/coordinator-settings.json")
@@ -238,6 +246,12 @@ pub fn hook_settings(exe: &Path, slug: &str, role: Role, env: &[(String, String)
     let mut hooks = serde_json::Map::new();
     for (event, matcher) in EVENTS {
         let mut entry = json!({"hooks": [command(event)]});
+        if role == Role::Coordinator && WATCH_EVENTS.contains(&event) {
+            entry["hooks"]
+                .as_array_mut()
+                .expect("an array")
+                .push(watch_hook(exe, slug, env));
+        }
         if let Some(m) = matcher {
             entry["matcher"] = json!(m);
         }
@@ -259,6 +273,20 @@ pub fn hook_settings(exe: &Path, slug: &str, role: Role, env: &[(String, String)
         settings["permissions"] = json!({"allow": [MCP_TOOLS_RULE]});
     }
     settings
+}
+
+/// The coordinator's waiting watcher, `chief hook watch` (§5 "Telling the coordinator"). With
+/// `asyncRewake` Claude Code runs it in the background, ends the turn without it, and wakes the
+/// session with its stderr when it exits 2 (§1). Its `timeout` is how long it may watch.
+fn watch_hook(exe: &Path, slug: &str, env: &[(String, String)]) -> Value {
+    json!({
+        "type": "command",
+        "command": hook_command(exe, slug, Role::Coordinator, "watch", env),
+        "asyncRewake": true,
+        "timeout": crate::waiting::WATCH_HOOK_TIMEOUT_SECS,
+        "rewakeSummary": WATCH_SUMMARY,
+        "rewakeMessage": WATCH_PREFIX,
+    })
 }
 
 /// `[K='v' …] '<exe>' hook <event> --project <slug> --role <role>`, every word shell-quoted.
@@ -410,6 +438,47 @@ mod tests {
             "CHIEF_HOME='/tmp/chief home' CHIEF_NO_NOTIFY=1 /bin/chief hook UserPromptSubmit \
              --project demo --role coordinator"
         );
+    }
+
+    /// §5 "Telling the coordinator": the coordinator's SessionStart and Stop also start the
+    /// waiting watcher in the background; nothing else does, and threads have none.
+    #[test]
+    fn the_coordinator_starts_its_watcher_in_the_background() {
+        let v = hook_settings(Path::new("/bin/chief"), "demo", Role::Coordinator, &[]);
+        let hooks = v["hooks"].as_object().unwrap();
+        for event in ["SessionStart", "Stop"] {
+            let entry = &hooks[event][0]["hooks"];
+            assert_eq!(entry.as_array().unwrap().len(), 2, "{event}");
+            assert_eq!(
+                entry[0]["command"],
+                format!("/bin/chief hook {event} --project demo --role coordinator")
+            );
+            assert_eq!(
+                entry[1],
+                json!({
+                    "type": "command",
+                    "command": "/bin/chief hook watch --project demo --role coordinator",
+                    "asyncRewake": true,
+                    "timeout": crate::waiting::WATCH_HOOK_TIMEOUT_SECS,
+                    "rewakeSummary": "chief: a thread is waiting on you",
+                    "rewakeMessage": "Message from chief (not a hook error):",
+                }),
+                "{event}"
+            );
+        }
+        let watchers = |v: &Value| {
+            v["hooks"]
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|entries| entries.as_array().unwrap())
+                .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                .filter(|h| h["command"].as_str().unwrap().contains(" hook watch "))
+                .count()
+        };
+        assert_eq!(watchers(&v), 2);
+        let thread = hook_settings(Path::new("/bin/chief"), "demo", Role::Thread, &[]);
+        assert_eq!(watchers(&thread), 0);
     }
 
     #[test]

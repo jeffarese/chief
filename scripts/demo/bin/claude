@@ -4,7 +4,7 @@
 . "$(dirname "$0")/../lib.sh"
 
 case "$1" in
-  --version) echo "2.1.310 (Claude Code)" ;;
+  --version) echo "2.1.316 (Claude Code)" ;;
   agents)
     rows=("$WORLD"/agents/*.json)
     if [ -e "${rows[0]}" ]; then jq -cs . "${rows[@]}"; else echo '[]'; fi

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-pub const MIN_VERSION: (u32, u32, u32) = (2, 1, 310);
+/// 2.1.316: the coordinator's waiting watcher needs `asyncRewake` hooks, verified there (§1). A
+/// version that ran it as an ordinary hook would hold the coordinator's every Stop for a day.
+pub const MIN_VERSION: (u32, u32, u32) = (2, 1, 316);
 
 /// One row of `claude agents --json --all`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -982,7 +984,8 @@ mod tests {
         assert_eq!(parse_version("10.0.1"), Some((10, 0, 1)));
         assert_eq!(parse_version("2.1 (Claude Code)"), None);
         assert_eq!(parse_version("Claude Code"), None);
-        assert!((2, 1, 309) < MIN_VERSION);
+        assert!((2, 1, 315) < MIN_VERSION);
+        assert!((2, 1, 316) >= MIN_VERSION);
         assert!((2, 2, 0) > MIN_VERSION);
     }
 

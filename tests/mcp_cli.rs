@@ -76,7 +76,7 @@ fn connect(child: &mut Child) -> Client {
 fn tools_run_in_the_projects_account() {
     let home = Home::new();
     home.fake
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
         .set("agents.stdout", "[]");
     let carlos = common::account(home.path(), "claude-carlos");
     let mut init = home.command(&["init", "Demo"]);
@@ -102,7 +102,7 @@ fn tools_run_in_the_projects_account() {
 fn serves_the_tools_over_stdio() {
     let home = Home::new();
     home.fake
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
         .set("agents.stdout", "[]");
     assert!(home.run(&["init", "Demo"], "").status.success());
 
@@ -166,7 +166,7 @@ fn serves_the_tools_over_stdio() {
 fn a_cancelled_start_thread_spawns_nothing() {
     let home = Home::new();
     home.fake
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
         .set("agents.stdout", "[]")
         .set("bg.stdout", "backgrounded · abc123 · x\n");
     assert!(home.run(&["init", "Demo"], "").status.success());

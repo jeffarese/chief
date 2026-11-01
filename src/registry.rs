@@ -67,9 +67,12 @@ pub fn background_work(row: &SessionRow) -> Option<String> {
     crate::text::background_work(row.subagents_busy, row.background_running)
 }
 
-/// Recomputes `group_name` and `waiting_reason` from the row.
-pub fn rederive(row: &mut SessionRow) {
-    let d = state::derive(&facts(row));
+/// Recomputes `group_name` and `waiting_reason` from the row, and `blocked_since`: kept while the
+/// thread stays stuck on the user, `now` when it starts to be, None when it isn't.
+pub fn rederive(row: &mut SessionRow, now: i64) {
+    let facts = facts(row);
+    let d = state::derive(&facts);
+    let blocked = state::blocked(&facts);
     row.group_name = d.group.as_str().to_string();
     row.waiting_reason = d.reason.map(|r| {
         match r {
@@ -78,6 +81,10 @@ pub fn rederive(row: &mut SessionRow) {
         }
         .to_string()
     });
+    row.blocked_since = match row.blocked_since {
+        Some(since) if blocked => Some(since),
+        _ => blocked.then_some(now),
+    };
 }
 
 /// §5 auto-resolve for threads: a merged PR, or 7 days without activity while not working or
@@ -101,7 +108,7 @@ pub fn auto_resolve(row: &mut SessionRow, now: i64) {
     };
     row.resolved = true;
     row.resolved_reason = Some(reason.to_string());
-    rederive(row);
+    rederive(row, now);
 }
 
 /// Applies one `claude agents` snapshot to a row. Returns whether the row changed, apart from its
@@ -145,6 +152,9 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
             restore_legacy_cleaned(row, taken_at);
             row.pid = a.pid;
             if !stale {
+                if prompt_answered(&before, a) {
+                    row.pending_permission = false;
+                }
                 row.cc_state = a.state.clone();
                 row.cc_status = a.status.clone();
                 row.cc_fresh = true;
@@ -179,13 +189,26 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
         row.gone_at = Some(taken_at);
         row.pending_permission = false;
     }
-    rederive(row);
+    rederive(row, now);
     auto_resolve(row, now);
     let changed = *row != before;
     if changed {
         row.updated_at = now;
     }
     changed
+}
+
+/// Claude Code fires no hook when the user answers a permission prompt; the next one comes when
+/// the approved call ends, which can take minutes. Its status says it at once: a snapshot that
+/// finds the session `busy` or `idle` right after one (no hook between, `cc_fresh`) found it
+/// `waiting` on the prompt means the prompt was answered. Both snapshots are newer than the
+/// prompt's Notification, which set `cc_fresh = 0`. A prompt whose status never showed `waiting`
+/// stays until the session's own next hook clears it, as before.
+fn prompt_answered(before: &SessionRow, now: &AgentRow) -> bool {
+    before.pending_permission
+        && before.cc_fresh
+        && before.cc_status.as_deref() == Some("waiting")
+        && matches!(now.status.as_deref(), Some("busy" | "idle"))
 }
 
 /// A stopped session stays listed in `claude agents --all`; only `claude rm` (here, or from
@@ -384,7 +407,7 @@ pub fn set_resolved(
             row.last_activity_at = now;
         }
         row.updated_at = now;
-        rederive(&mut row);
+        rederive(&mut row, now);
         db::update_session(conn, &row)?;
         Ok(row)
     })
@@ -409,7 +432,7 @@ pub fn set_pr(conn: &Connection, name: &str, pr: Option<&PrInfo>, now: i64) -> R
         row.pr_state = pr.map(|p| p.state.clone());
         row.pr_draft = pr.map(|p| p.draft);
         row.pr_review = pr.and_then(|p| p.review.clone()).filter(|r| !r.is_empty());
-        rederive(&mut row);
+        rederive(&mut row, now);
         auto_resolve(&mut row, now);
         if row != before {
             row.updated_at = now;
@@ -1142,7 +1165,7 @@ mod tests {
         row.last_hook_at = Some(100);
         row.pid = Some(4242);
         row.cc_state = Some("done".into());
-        rederive(&mut row);
+        rederive(&mut row, 0);
         assert_eq!(row.group_name, "working");
 
         let mut stale = row.clone();
@@ -1189,7 +1212,7 @@ mod tests {
         row.pid = Some(7);
         row.last_hook = Some("PreToolUse".into());
         row.last_hook_at = Some(100);
-        rederive(&mut row);
+        rederive(&mut row, 0);
         assert_eq!(row.group_name, "working");
         db::insert_session(&conn, &row).unwrap();
         let get = || db::get_session(&conn, "t").unwrap().unwrap();
@@ -1224,7 +1247,7 @@ mod tests {
         let mut r = get();
         r.last_hook_at = Some(300);
         r.cc_fresh = false;
-        rederive(&mut r);
+        rederive(&mut r, 0);
         assert_eq!(r.group_name, "working");
         db::update_session(&conn, &r).unwrap();
         sync(&conn, "demo", &[], 250, 310).unwrap();
@@ -1239,7 +1262,7 @@ mod tests {
         r.last_hook_at = Some(400);
         r.pending_permission = true;
         r.pid = Some(8);
-        rederive(&mut r);
+        rederive(&mut r, 0);
         assert_eq!(r.waiting_reason.as_deref(), Some("permission"));
         db::update_session(&conn, &r).unwrap();
         sync(&conn, "demo", &[], 390, 395).unwrap();
@@ -1259,8 +1282,57 @@ mod tests {
         r.cc_state = Some("done".into());
         r.pr_state = Some("OPEN".into());
         r.pr_draft = Some(false);
-        rederive(&mut r);
+        rederive(&mut r, 0);
         assert_eq!(r.group_name, "review");
+    }
+
+    /// Claude Code fires no hook when the user answers a prompt. The poll after one that found
+    /// the session `waiting` on it clears it as soon as the status moves on; a status that never
+    /// showed `waiting` (a subagent's prompt, say), or a hook in between, proves nothing.
+    #[test]
+    fn an_answered_prompt_clears_at_the_next_poll() {
+        let (_dir, conn) = setup();
+        let mut row = thread("t", Some("x"), Some("sid-x"), 0);
+        row.pid = Some(7);
+        row.last_hook = Some("Notification:permission_prompt".into());
+        row.last_hook_at = Some(100);
+        row.pending_permission = true;
+        rederive(&mut row, 100);
+        assert_eq!(row.blocked_since, Some(100));
+        db::insert_session(&conn, &row).unwrap();
+        let get = || db::get_session(&conn, "t").unwrap().unwrap();
+        let listed = |status: &str| {
+            let mut a = snapshot()[3].clone();
+            a.session_id = "sid-x".into();
+            a.state = Some("working".into());
+            a.status = Some(status.into());
+            a.pid = Some(7);
+            vec![a]
+        };
+        let state = || {
+            let r = get();
+            (r.pending_permission, r.group_name, r.blocked_since)
+        };
+        let waiting = (true, "waiting".to_string(), Some(100));
+
+        sync(&conn, "demo", &listed("busy"), 110, 115).unwrap();
+        assert_eq!(state(), waiting, "never seen waiting");
+        sync(&conn, "demo", &listed("waiting"), 120, 125).unwrap();
+        assert_eq!(state(), waiting);
+        // A subagent's tool call: its lead's prompt still waits.
+        let mut r = get();
+        r.last_hook = Some("PostToolUse".into());
+        r.last_hook_at = Some(127);
+        r.cc_fresh = false;
+        db::update_session(&conn, &r).unwrap();
+        sync(&conn, "demo", &listed("busy"), 130, 135).unwrap();
+        assert_eq!(state(), waiting, "a hook came between");
+
+        sync(&conn, "demo", &listed("waiting"), 140, 145).unwrap();
+        assert_eq!(state(), waiting);
+        sync(&conn, "demo", &listed("busy"), 150, 155).unwrap();
+        assert_eq!(state(), (false, "working".to_string(), None), "answered");
+        assert_eq!(get().waiting_reason, None);
     }
 
     #[test]
@@ -1270,7 +1342,7 @@ mod tests {
         row.pid = Some(3);
         row.last_hook = Some("Stop".into());
         row.last_hook_at = Some(100);
-        rederive(&mut row);
+        rederive(&mut row, 0);
 
         // An empty list proves nothing, nor does a snapshot older than the last hook.
         let mut empty = row.clone();
@@ -1375,7 +1447,7 @@ mod tests {
             ),
         ];
         for (name, mut row, want) in cases {
-            rederive(&mut row);
+            rederive(&mut row, 0);
             auto_resolve(&mut row, now);
             assert_eq!(row.resolved_reason.as_deref(), want, "{name}");
             assert_eq!(row.resolved, want.is_some(), "{name}");

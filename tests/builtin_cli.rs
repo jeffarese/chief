@@ -54,7 +54,7 @@ fn project() -> Home {
         db::insert_session(&conn, &row).unwrap();
     }
     home.fake
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
         .set(
             "agents.stdout",
             &json!([

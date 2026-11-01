@@ -1,6 +1,7 @@
 //! `chief hook` as Claude Code runs it: payload on stdin, exit 0, errors logged; stdout only for
 //! the guard's decision, the coordinator's context, the denial of a subagent's background command
-//! and the Stop decision that asks a thread for its final report.
+//! and the Stop decision that asks a thread for its final report. The coordinator's background
+//! watcher is the one exception: it exits 2, with its notice on stderr, to wake the coordinator.
 
 mod common;
 
@@ -242,6 +243,51 @@ fn a_stop_after_clear_keeps_its_report() {
         ),
         (None, Some("stranger-sid"))
     );
+}
+
+/// §5 "Telling the coordinator": the coordinator's background watcher exits 2 with its notice on
+/// stderr, which Claude Code wakes the coordinator with, once a thread has been stuck past the
+/// grace, and marks it told. A thread's watcher does nothing.
+#[test]
+fn the_watcher_wakes_the_coordinator_for_a_stuck_thread() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(&home.path().join("chief.db")).unwrap();
+    db::register_project(&conn, "demo", &home.path().join("projects/demo"), 0).unwrap();
+    let mut t = SessionRow::new("demo-a-1a2b", "demo", Role::Thread, 0);
+    t.title = Some("Commit the design".into());
+    t.group_name = "waiting".into();
+    t.waiting_reason = Some("permission".into());
+    t.pending_permission = true;
+    t.blocked_since = Some(db::now_ms() - 60_000);
+    db::insert_session(&conn, &t).unwrap();
+
+    let watch = |role: &str| {
+        hook(
+            home.path(),
+            &["watch", "--project", "demo", "--role", role],
+            "{\"hook_event_name\":\"Stop\"}",
+        )
+    };
+    assert_silent_success(&watch("thread"));
+    assert_eq!(db::get_watcher(&conn, "demo").unwrap(), None);
+
+    let out = watch("coordinator");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let notice = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        notice.starts_with(
+            "<chief-waiting>\n- demo-a-1a2b \"Commit the design\" · permission since "
+        ),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("opening the thread on the board"),
+        "{notice}"
+    );
+    let row = db::get_session(&conn, "demo-a-1a2b").unwrap().unwrap();
+    assert!(row.blocked_told_at.is_some());
+    assert_eq!(error_log(home.path()), "");
 }
 
 #[test]

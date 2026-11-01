@@ -165,6 +165,15 @@ CREATE TABLE ui_state (
     "ALTER TABLE events ADD COLUMN agent_id TEXT;
      ALTER TABLE teammates ADD COLUMN description TEXT;
      CREATE INDEX events_by_agent ON events(session_name, agent_id, id);",
+    // A thread stuck on the user mid-turn wakes its coordinator (§5 "Telling the coordinator"):
+    // since when it is stuck, when the coordinator was last told, and which watcher process
+    // tells it. Rows stuck now count from their last update.
+    "ALTER TABLE sessions ADD COLUMN blocked_since INTEGER;
+     ALTER TABLE sessions ADD COLUMN blocked_told_at INTEGER;
+     ALTER TABLE ui_state ADD COLUMN watcher_pid INTEGER;
+     UPDATE sessions SET blocked_since = updated_at
+       WHERE group_name = 'waiting' AND waiting_reason IS NOT NULL
+         AND (pending_permission = 1 OR (cc_fresh = 1 AND cc_status = 'waiting'));",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -325,6 +334,11 @@ pub struct SessionRow {
     /// migration 6 that left no `removed_at` (§5): a snapshot taken after `cleaned_at` that lists
     /// the session again clears `cleaned_at`.
     pub legacy_cleaned: bool,
+    /// Since when its live process has been stuck on the user mid-turn (rule 3, §5); None when
+    /// it isn't.
+    pub blocked_since: Option<i64>,
+    /// When the coordinator was last told it was stuck (§5 "Telling the coordinator").
+    pub blocked_told_at: Option<i64>,
 }
 
 impl SessionRow {
@@ -367,7 +381,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
     last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked, synced_at, ids_at, \
     removed_at, account_id, account_label, account_dir, subagents_busy, background_running, \
-    stopped_early_at, reason_before_removed, legacy_cleaned";
+    stopped_early_at, reason_before_removed, legacy_cleaned, blocked_since, blocked_told_at";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -418,6 +432,8 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         stopped_early_at: r.get(44)?,
         reason_before_removed: r.get(45)?,
         legacy_cleaned: r.get(46)?,
+        blocked_since: r.get(47)?,
+        blocked_told_at: r.get(48)?,
     })
 }
 
@@ -482,7 +498,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
          ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
-         ?47)"
+         ?47, ?48, ?49)"
     );
     let has_ids = s.short_id.is_some() || s.session_id.is_some();
     let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
@@ -536,6 +552,8 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.stopped_early_at,
             s.reason_before_removed,
             s.legacy_cleaned,
+            s.blocked_since,
+            s.blocked_told_at,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -561,7 +579,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                          ELSE ?31 END,
            removed_at = ?39, account_id = ?40, account_label = ?41, account_dir = ?42,
            subagents_busy = ?43, background_running = ?44, stopped_early_at = ?45,
-           reason_before_removed = ?46, legacy_cleaned = ?47
+           reason_before_removed = ?46, legacy_cleaned = ?47, blocked_since = ?48,
+           blocked_told_at = ?49
          WHERE name = ?1",
             params![
                 s.name,
@@ -611,6 +630,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.stopped_early_at,
                 s.reason_before_removed,
                 s.legacy_cleaned,
+                s.blocked_since,
+                s.blocked_told_at,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -1063,6 +1084,29 @@ pub fn set_pane_target(conn: &Connection, project_slug: &str, target: Option<&st
     Ok(())
 }
 
+/// Makes `pid` the project's waiting watcher (§5 "Telling the coordinator"): an older watcher
+/// finds it isn't the watcher any more and ends.
+pub fn set_watcher(conn: &Connection, project_slug: &str, pid: u32) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ui_state (project_slug, watcher_pid) VALUES (?1, ?2)
+         ON CONFLICT(project_slug) DO UPDATE SET watcher_pid = excluded.watcher_pid",
+        params![project_slug, pid],
+    )?;
+    Ok(())
+}
+
+/// The pid of the project's current waiting watcher, if one ever started.
+pub fn get_watcher(conn: &Connection, project_slug: &str) -> Result<Option<u32>> {
+    Ok(conn
+        .query_row(
+            "SELECT watcher_pid FROM ui_state WHERE project_slug = ?1",
+            [project_slug],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Clears `pane_target` only while it still names `name`, so a target the board just wrote
 /// isn't lost.
 pub fn clear_pane_target_if(conn: &Connection, project_slug: &str, name: &str) -> Result<()> {
@@ -1251,7 +1295,7 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 16);
+        assert_eq!(MIGRATIONS.len(), 17);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();
@@ -1346,6 +1390,46 @@ mod tests {
         assert_eq!(backfilled("unspawned"), (None, None, false));
         assert_eq!(row("kept-reason").resolved_reason.as_deref(), Some("user"));
         assert_eq!(row("removed").reason_before_removed, None);
+    }
+
+    /// Migration 17: a thread stuck on the user now counts as stuck since its last update, so
+    /// the first watcher tells the coordinator; a turn that ended asking, or a stale waiting
+    /// status, doesn't. The watcher record starts empty and keeps the newest pid.
+    #[test]
+    fn upgrades_a_v16_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chief.db");
+        let old = at_version(&path, 16);
+        old.execute_batch(
+            "INSERT INTO projects VALUES ('p', '/p', 1, NULL);
+             INSERT INTO sessions (name, project_slug, role, pending_permission, cc_fresh,
+                 cc_status, group_name, waiting_reason, created_at, updated_at, last_activity_at)
+               VALUES
+               ('prompt', 'p', 'thread', 1, 0, NULL, 'waiting', 'permission', 1, 40, 1),
+               ('dialog', 'p', 'thread', 0, 1, 'waiting', 'waiting', 'question', 1, 50, 1),
+               ('asked', 'p', 'thread', 0, 1, 'idle', 'waiting', 'question', 1, 60, 1),
+               ('stale', 'p', 'thread', 0, 0, 'waiting', 'working', NULL, 1, 70, 1);
+             INSERT INTO ui_state (project_slug, pane_target) VALUES ('p', NULL);",
+        )
+        .unwrap();
+        drop(old);
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len());
+        let stuck = |name: &str| {
+            let r = get_session(&conn, name).unwrap().unwrap();
+            (r.blocked_since, r.blocked_told_at)
+        };
+        assert_eq!(stuck("prompt"), (Some(40), None));
+        assert_eq!(stuck("dialog"), (Some(50), None));
+        assert_eq!(stuck("asked"), (None, None));
+        assert_eq!(stuck("stale"), (None, None));
+        assert_eq!(get_watcher(&conn, "p").unwrap(), None);
+        assert_eq!(get_watcher(&conn, "q").unwrap(), None);
+        set_watcher(&conn, "p", 41).unwrap();
+        set_watcher(&conn, "p", 42).unwrap();
+        set_watcher(&conn, "q", 7).unwrap();
+        assert_eq!(get_watcher(&conn, "p").unwrap(), Some(42));
+        assert_eq!(get_watcher(&conn, "q").unwrap(), Some(7));
     }
 
     /// Migration 12 gives existing teammates and sessions no background work, and migration 13

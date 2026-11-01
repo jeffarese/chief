@@ -74,7 +74,7 @@ I review and test each milestone before the next starts. Local git only; nothing
 
 ## Risks
 
-- Relies on recent Claude Code features; `chief` checks for 2.1.310 or later at start.
+- Relies on recent Claude Code features; `chief` checks for 2.1.316 or later at start (the coordinator's waiting watcher needs `asyncRewake`).
 - Each thread is a full session on your plan; default threads to a smaller model in `project.toml`.
 - A thread's process is ended after about an hour unattached once finished; `wake_thread` respawns it.
 

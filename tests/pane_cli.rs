@@ -212,7 +212,7 @@ fn up_in_a_rex_block_shows_the_conversation_there() {
             "agents.stdout",
             &json!([agent("c0", "c0-sid", COORD, "done", Some(4001))]).to_string(),
         )
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
         .set("attach.sleep", "1.2");
     home.rex
         .set("list.exit", "0")
@@ -292,7 +292,7 @@ fn up_in_a_rex_block_shows_the_conversation_there() {
 fn ctrl_q_quits_while_claude_has_the_keys() {
     let home = coordinator_home(&[
         ("attach.sleep", "30"),
-        ("version.stdout", "2.1.310 (Claude Code)\n"),
+        ("version.stdout", "2.1.316 (Claude Code)\n"),
     ]);
     let conn = home.db();
     home.rex
@@ -359,7 +359,7 @@ fn ctrl_q_quits_while_claude_has_the_keys() {
 fn the_boards_ctrl_q_quits_the_pane() {
     let home = coordinator_home(&[
         ("attach.sleep", "30"),
-        ("version.stdout", "2.1.310 (Claude Code)\n"),
+        ("version.stdout", "2.1.316 (Claude Code)\n"),
     ]);
     let conn = home.db();
     home.rex

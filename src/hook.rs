@@ -37,10 +37,16 @@ static ANSWERED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// UserPromptSubmit context, and for §5 "Background work" the denial of a subagent's background
 /// command and the Stop decision that asks a thread for its final report. The guard fails
 /// closed: any error or panic in it denies, and so does running past its deadline; everything
-/// else fails open.
+/// else fails open. `watch` is the one hook that exits non-zero: 2, with its notice on stderr,
+/// to wake the coordinator (§5 "Telling the coordinator").
 pub fn run(event: &str, project: &str, role: Role) {
     // The default panic hook writes to stderr, which Claude Code may show in the session.
     std::panic::set_hook(Box::new(|_| {}));
+    // Runs in the background and wakes the coordinator by exiting 2 (§5 "Telling the
+    // coordinator"); it records no event.
+    if event == "watch" {
+        return crate::waiting::run_hook(project, role);
+    }
     if event == "guard" {
         start_guard_watchdog(project, guard_deadline());
     }
@@ -836,7 +842,7 @@ pub fn handle(conn: &Connection, ctx: &Ctx, event: &str, payload: &Value) -> Res
         // SubagentStart and SubagentStop change only the background work.
         if kind.is_none() && (r.subagents_busy, r.background_running) != before {
             r.updated_at = ctx.now;
-            registry::rederive(r);
+            registry::rederive(r, ctx.now);
         }
         db::update_session(conn, r)?;
         Ok((row, final_report))
@@ -1057,7 +1063,7 @@ fn apply(row: &mut SessionRow, kind: HookKind, payload: &Value, now: i64) -> Opt
         row.last_report_at = Some(now);
         report = Some(text.to_string());
     }
-    registry::rederive(row);
+    registry::rederive(row, now);
     report
 }
 
@@ -1959,7 +1965,7 @@ mod tests {
         polled.cc_status = Some("busy".into());
         polled.cc_state = Some("working".into());
         polled.cc_fresh = true;
-        registry::rederive(&mut polled);
+        registry::rederive(&mut polled, 0);
         assert_eq!(polled.waiting_reason.as_deref(), Some("permission"));
 
         // The lead's own next call (10, no agent_id) ends the prompt.
@@ -2308,7 +2314,7 @@ mod tests {
         row.cc_state = Some("done".into());
         row.cc_status = Some("idle".into());
         row.cc_fresh = true;
-        registry::rederive(&mut row);
+        registry::rederive(&mut row, 0);
         db::update_session(&conn, &row).unwrap();
         assert_eq!(get(&conn, "spike-thread-a").group_name, "idle");
 

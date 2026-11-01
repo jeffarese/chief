@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 const SLUG: &str = "payments-latency";
 
 fn version_ok(home: &Home) {
-    home.fake.set("version.stdout", "2.1.310 (Claude Code)\n");
+    home.fake.set("version.stdout", "2.1.316 (Claude Code)\n");
 }
 
 fn project_dir(home: &Home) -> PathBuf {

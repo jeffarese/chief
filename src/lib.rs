@@ -33,3 +33,4 @@ pub mod text;
 pub mod tools;
 pub mod trust;
 pub mod tui;
+pub mod waiting;

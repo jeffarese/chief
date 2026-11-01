@@ -199,15 +199,8 @@ pub fn derive(facts: &Facts) -> Derived {
     if facts.cc_state == Some("failed") {
         return Derived::group(Group::Failed);
     }
-    // A permission prompt dies with its process and doesn't come back on respawn.
-    if !facts.process_gone {
-        if facts.pending_permission {
-            return Derived::waiting(WaitingReason::Permission);
-        }
-        // A live process waiting on the user that no hook told us about.
-        if facts.cc_status == Some("waiting") {
-            return Derived::waiting(WaitingReason::Question);
-        }
+    if let Some(reason) = stuck_on(facts) {
+        return Derived::waiting(reason);
     }
     if facts.cc_state == Some("blocked") {
         return Derived::waiting(WaitingReason::Question);
@@ -233,6 +226,26 @@ pub fn derive(facts: &Facts) -> Derived {
         }
     }
     Derived::group(Group::Idle)
+}
+
+/// Rule 3: the live process waits on the user in the middle of a turn, and nothing goes on until
+/// the user answers. A permission prompt dies with its process and doesn't come back on respawn.
+fn stuck_on(facts: &Facts) -> Option<WaitingReason> {
+    if facts.process_gone {
+        return None;
+    }
+    if facts.pending_permission {
+        return Some(WaitingReason::Permission);
+    }
+    // A live process waiting on the user that no hook told us about.
+    (facts.cc_status == Some("waiting")).then_some(WaitingReason::Question)
+}
+
+/// Rule 3 is the one that decides the group: the thread is stuck on the user right now (§5
+/// "Telling the coordinator"). A turn that ended with a question (rule 4) isn't: the thread's
+/// Stop already sent its coordinator the idle notice.
+pub fn blocked(facts: &Facts) -> bool {
+    !facts.resolved && facts.cc_state != Some("failed") && stuck_on(facts).is_some()
 }
 
 #[cfg(test)]
@@ -645,6 +658,74 @@ mod tests {
             ..base()
         };
         assert_eq!(derive(&facts).group, Review);
+    }
+
+    /// Stuck now only when rule 3 decides the group: a live prompt or waiting status, not a
+    /// turn that ended asking, a dead process, a failed or a resolved thread.
+    #[test]
+    fn blocked_is_rule_3() {
+        let cases: Vec<(&str, Facts, bool)> = vec![
+            ("idle", base(), false),
+            (
+                "permission prompt",
+                Facts {
+                    pending_permission: true,
+                    ..base()
+                },
+                true,
+            ),
+            (
+                "waiting status",
+                Facts {
+                    cc_status: Some("waiting"),
+                    cc_state: Some("blocked"),
+                    ..base()
+                },
+                true,
+            ),
+            (
+                "turn ended with a question",
+                Facts {
+                    cc_status: Some("idle"),
+                    cc_state: Some("blocked"),
+                    ..base()
+                },
+                false,
+            ),
+            (
+                "process gone",
+                Facts {
+                    pending_permission: true,
+                    process_gone: true,
+                    ..base()
+                },
+                false,
+            ),
+            (
+                "failed",
+                Facts {
+                    pending_permission: true,
+                    cc_state: Some("failed"),
+                    ..base()
+                },
+                false,
+            ),
+            (
+                "resolved",
+                Facts {
+                    resolved: true,
+                    cc_status: Some("waiting"),
+                    ..base()
+                },
+                false,
+            ),
+        ];
+        for (case, facts, want) in cases {
+            assert_eq!(blocked(&facts), want, "{case}");
+            if want {
+                assert_eq!(derive(&facts).group, Waiting, "{case}");
+            }
+        }
     }
 
     #[test]

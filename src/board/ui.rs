@@ -515,10 +515,10 @@ fn subagent_tree(subagents: &[BusySubagent], now: i64, width: usize) -> Vec<Line
 /// How many of a working or waiting thread's calls before the latest the detail lists.
 const EARLIER_CALLS: usize = 3;
 
-/// What a working or waiting thread does or asks, from its latest events (newest first): the
-/// call a permission prompt is for (PreToolUse comes before the permission check), the question
-/// it asks, or the call it runs, else the one it ran last. The label, the text, and where the
-/// events before that call start.
+/// What a working or waiting thread does or asks, from its latest events (newest first): what a
+/// waiting one asks (`waiting::asks`, shared with the coordinator's notice), or the call a
+/// working one runs, else the one it ran last. The label, the text, and where the events before
+/// that call start.
 fn doing(
     row: &SessionRow,
     group: Group,
@@ -533,25 +533,7 @@ fn doing(
         Some((&events[at], at + 1))
     };
     match group {
-        Group::Waiting if row.waiting_reason.as_deref() == Some("permission") => {
-            let prompt = events.iter().position(|e| {
-                e.hook == "Notification" && text(e).starts_with("permission_prompt")
-            })?;
-            let (call, rest) = started(prompt)?;
-            let call = text(call);
-            Some(match call.strip_prefix("Bash: ") {
-                Some(command) => ("wants to run", command.to_string(), rest),
-                None => ("wants to use", call, rest),
-            })
-        }
-        Group::Waiting => {
-            // A question still open: the latest call asks it and hasn't ended.
-            let latest = events.iter().position(is_call)?;
-            let call = text(&events[latest]);
-            let question = call.strip_prefix("AskUserQuestion: ")?;
-            (events[latest].hook == "PreToolUse")
-                .then(|| ("asks", question.to_string(), latest + 1))
-        }
+        Group::Waiting => crate::waiting::asks(row, events),
         Group::Working => {
             let latest = events.iter().position(is_call)?;
             let e = &events[latest];

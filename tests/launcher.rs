@@ -47,7 +47,7 @@ fn the_wizard_creates_trusts_and_opens_the_project() {
     common::trust_file(&home.trust, &[&api]);
     let name = "chief-checkout";
     home.fake
-        .set("version.stdout", "2.1.310 (Claude Code)\n")
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
         .set("agents.stdout.1", "[]")
         .set("bg.stdout", &format!("backgrounded · c0ffee · {name}\n"))
         .set(
