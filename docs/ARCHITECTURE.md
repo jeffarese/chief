@@ -169,6 +169,34 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   Verified live on 2.1.316 in a `claude --bg` session, on SessionStart and Stop; older versions
   are untested.
 
+- Usage limits and moving a session between accounts, verified live on 2.1.316 (§5 "Limits and
+  moves"):
+  - A turn stopped by a usage limit leaves the session's process alive and idle, and its job state
+    `state: "blocked"`, `needs: "rate limited — wait and retry · <detail>"`, `detail: "You've hit
+    your 5-hour limit · resets 6:10am (Europe/Madrid)"`. It doesn't retry by itself. `claude
+    agents` shows only `state: blocked, status: idle`, the same as a question.
+  - `claude --bg --resume <session id> <flags> "<prompt>"`, run in another account (whose
+    supervisor has no job for that session, and which sees the transcript through a shared
+    `projects/`) with the old process stopped, resumes the same session: the same session id and
+    short id, back inside its worktree, with its whole conversation. The new job has
+    `worktreePath: null` and `cwd` = the folder the command ran in; the job in the first account
+    still names the worktree.
+  - In an account that already has a job for the session, the same command with any flag starts a
+    copy under a new session id ("keeps its own saved options, so the flags you passed started a
+    copy"), and so does one while its process runs ("already running … started a copy"). Without
+    flags, on a stopped job, it wakes the session with its saved options and runs the prompt.
+  - `claude rm` in the new account removes only its job: it names no worktree. In the first
+    account it deletes the worktree and branch, as always. Neither deletes the transcript.
+  - agp watches background sessions it starts (`agp [opts] -- --bg …`) or is given (`agp bg
+    watch`), and moves one to another account when its own hits a limit, in that way. `agp bg
+    --json` lists them: `session_id`, `short_id`, `profile`, `label`, `config_dir` (null: the
+    default account), `state` (`watching`, `limited`, `waiting`, `moving`, `ended`, `dormant`),
+    `limit`, `moves[]` (`at` in unix seconds, `from`/`to` with labels and folders, `reason`:
+    "5-hour limit", "weekly limit", "model limit", "limit", "manual move"). It writes `moving`
+    before it stops a session and keeps it until the session runs again. An older agp has no
+    `bg`, and reads `agp bg …` as `claude` arguments: chief asks `agp --help` for a line starting
+    `agp bg` first.
+
 Minimum Claude Code version: 2.1.316 (the coordinator's watcher, §5 "Telling the coordinator",
 needs `asyncRewake`). `chief` checks `claude --version` on `init` and `up`.
 
@@ -450,6 +478,11 @@ accounts = ["auto"]                # agp accounts new threads may run in (§7 "T
                                    # profile ids; [] = always the project's account
 max_usage = 80                     # optional: a pool account at or over this % (5-hour or
                                    # weekly) takes no new thread
+runner = "agp"                     # agp (default) | claude: who starts threads (§7 "Thread
+                                   # spawn"); with agp, agp watches each one for usage limits
+on_limit = "switch"                # switch (default) | wait | stay: what agp does when a thread's
+                                   # account hits a limit (§5 "Limits and moves"); with
+                                   # accounts = [] a switch is a wait
 
 [[repos]]
 name = "payments-api"
@@ -519,7 +552,16 @@ CREATE TABLE sessions (                   -- coordinator and threads
   reason_before_removed TEXT,             -- the resolved_reason a reopened thread kept when a sync marked it removed; put back if the session is listed again, §5 (migration 13)
   legacy_cleaned  INTEGER NOT NULL DEFAULT 0, -- 1 = cleaned before migration 13, possibly by a removed verdict from before migration 6, §5 (migration 13)
   blocked_since   INTEGER,                -- when it got stuck on the user (rule 3, §5); NULL while it isn't (migration 17)
-  blocked_told_at INTEGER                 -- when the coordinator's watcher last told of it, §5 "Telling the coordinator" (migration 17)
+  blocked_told_at INTEGER,                -- when the coordinator's watcher last told of it, §5 "Telling the coordinator" (migration 17)
+  runner          TEXT,                   -- 'agp' once agp watches the session for limits (it started it, or `agp bg watch` took it); NULL = plain claude, §5 "Limits and moves" (migration 18)
+  prior_accounts  TEXT,                   -- JSON [{id, label, dir}]: the accounts agp moved it out of, oldest first; the first holds the job that owns its worktree, §12 (migration 18)
+  moved_at        INTEGER,                -- when agp last moved it (unix ms) (migration 18)
+  move_note       TEXT,                   -- 'moved from PB2 to PB4 after the 5-hour limit' (migration 18)
+  moved_told_at   INTEGER,                -- when the coordinator's watcher told of that move (migration 18)
+  limit_note      TEXT,                   -- the limit its job state says stopped it ('You've hit your 5-hour limit · resets …'); NULL when none (migration 18)
+  limited_since   INTEGER,                -- when a sync first saw that limit (migration 18)
+  limit_told_at   INTEGER,                -- when the coordinator's watcher told of it (migration 18)
+  agp_state       TEXT                    -- agp's state for it (`agp bg --json`): watching, limited, waiting, moving, ended, dormant (migration 18)
 );
 
 CREATE TABLE events (
@@ -668,6 +710,9 @@ Derivation, first match wins (inputs: the row plus the latest `claude agents` sn
 2. `cc_state = failed` → **failed**
 3. `pending_permission = 1` → **waiting**, reason `permission`; else `cc_status = waiting` →
    **waiting**, reason `question`; both unless the process is gone (below)
+3a. `limit_note` set and no hook since `limited_since` (`registry::limited`) → **limited**: a
+   usage limit stopped its turn (§5 "Limits and moves"). Claude Code blocks it too, but it waits
+   on the clock or another account, not on the user, so it comes before rule 4.
 4. `cc_state = blocked` → **waiting**, reason `question`
 5. `cc_status = busy`, or background work (below) → **working**, unless the process is gone
    (below)
@@ -711,7 +756,13 @@ get `pid = NULL` and `cc_fresh = 0` and keep their last `cc_state`. A thread's `
 state's `worktreeBranch` (§1) when that names a `worktreePath`, NULL when the job state names no
 worktree (the checkout's branch isn't the thread's), and kept when there is no job state to read;
 never anything read at the hooks' `cwd`, which follows the thread's shell into the checkout or
-another thread's worktree. Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
+another thread's worktree. For a thread agp moved, whose job in its current account names no
+worktree, the job that does is in an account it ran in before (`prior_accounts`, newest first,
+`claude::prior_job_state`). Its `limit_note` comes from its job state in the account it runs in now
+(an older account's job stays limited): `job_limit` (state `blocked`, `needs` starting "rate
+limited", the text its `detail`), with `limited_since` = taken-at when first seen, or seen again
+after a later hook (a turn that hit it again); both NULL once the job state says nothing of a
+limit. Rows with neither id (not spawned yet) are left alone. Then re-derive and apply auto-resolve. Each row keeps a watermark,
 `synced_at` = taken-at of the newest snapshot applied to it: a snapshot older than that is ignored
 for the row (polls from the board, hooks and the CLI run in separate processes and may commit out
 of order). A poll that changes nothing else moves only the watermark (`updated_at` stays).
@@ -780,7 +831,8 @@ the session's own next hook. Rules 1, 2, 4 and 6–8 still apply, so it shows as
 blocked question), review/landing (open PR), resolved, failed, or idle/asleep. A newer hook (e.g. a
 respawn starting a turn) makes it count as running again until the next non-stale poll.
 
-Board group order: Waiting on you, Working, Ready for review, Landing, Idle, Failed, Resolved.
+Board group order: Waiting on you, Working, Limited, Ready for review, Landing, Idle, Failed,
+Resolved.
 
 ### Background work
 
@@ -836,6 +888,47 @@ A subagent can still stall on some other kind of background work that doesn't wa
 verified Bash). Its lead would then look done at its next Stop. The thread prompt (§8) tells
 threads to have subagents run commands in the foreground.
 
+### Limits and moves (`src/moves.rs`)
+
+A thread whose account hits a usage limit stops mid-turn and sits blocked (§1); it doesn't go on by
+itself. So threads run through agp (`[threads] runner = "agp"`, the default), which watches each
+one (§7 "Thread spawn"). When its account hits a limit, agp acts per `on_limit`: `switch` stops it
+and resumes the same conversation, in the same worktree and under the same ids, in the pool
+account with the most room that shares `projects/` and trusts its folder (or waits for the reset
+when none can take it); `wait` wakes it on the same account at the reset; `stay` does nothing. Its
+first prompt there says it moved and that its background tasks and subagents stopped. A thread
+whose account hits a limit shows **limited** (rule 3a) until agp moves it, it is woken after the
+reset, or a sync finds its job going on.
+
+chief follows a move from `agp bg --json` (`moves::refresh`, which asks only while the project
+has a live thread with `runner = 'agp'`, and only an agp whose help lists `agp bg`). It runs first
+in every refresh (`accounts::refresh`, and `refresh_row` for an agp thread), so the listings that
+follow are of the right accounts, and in the coordinator's watcher (below). For each thread agp
+lists (`follow`), it stores `agp_state`; once a move is done (never while agp says `moving`: the
+new account may not list it yet) it points the row at the account it runs in now (no account of
+its own when that is the project's, §3), appends the accounts before to `prior_accounts`, takes the
+short id agp gives, and sets `moved_at` (from agp), `move_note` ("moved from PB2 to PB4 after the
+5-hour limit"; "on request" for a manual move), `pid = NULL`, `cc_fresh = 0`, `ids_at` = now (a
+listing of the new account from before the move can't judge it removed) and clears the limit. Each
+move is recorded as a `Moved` event.
+
+A respawn while agp moves a thread would start it again where agp just stopped it, next to the
+copy agp resumes. So before chief revives a session agp watches (`wake_thread`, the pane, `chief
+up`, `move_thread`) it settles (`moves::settle`): while `agp bg --json` says `moving` it waits (1 s
+polls, up to 90 s, then an error), then follows the move. A thread that runs again after the move
+isn't respawned at all. agp itself checks for a live process right before it resumes, and gives
+up the move when one appeared. After `generated::rewrite` and before `claude respawn`, chief runs
+`agp bg watch` for the session (`moves::rearm`): agp writes again the settings it merged with
+chief's (the respawned session reads them) and brings back a watcher that ended. Its failure is
+only logged.
+
+The coordinator is watched with `on_limit = wait`, always (`moves::coordinator_run`): its threads
+reach it by name, which only its own account carries (§1), so it is woken after the reset, never
+moved. Its row gets `runner = 'agp'` but never moves (`follow` applies to threads only).
+
+`move_thread` (§7) moves one now through `agp bg move`. Cleanup of a moved thread runs `claude rm`
+in every account it ran in (§12).
+
 ### Telling the coordinator (`src/waiting.rs`)
 
 A thread stuck on the user (above) can't report: its turn hasn't ended, so its coordinator gets no
@@ -853,16 +946,30 @@ background (`asyncRewake`, §1, §3) at each SessionStart and Stop of the coordi
   `blocked_since`). In one write transaction, looking again, it sets `blocked_told_at` on every due
   thread, then prints a notice to stderr and exits 2, which wakes the coordinator with it. A thread
   is told once per time it gets stuck.
-- The notice is `<chief-waiting>`, a line per thread, `</chief-waiting>`, and what to do: `- <name>
-  "<title>" · <permission|question> since HH:MM · wants to run <command>` (or `wants to use
-  <call>`, or `asks <question>`, read from its events as the board's detail does, §10). The
-  coordinator prompt (§8) says to tell the user at once which thread and what it wants, and that
-  they answer it by opening the thread on the board.
+- Two more kinds are due the same way, and one notice tells every due thread of every kind,
+  marking each in that transaction. **Moved**: agp moved it since the coordinator was told
+  (`moved_at` set, `moved_told_at` NULL or older); the coordinator's subscription named the old
+  process, so it must subscribe again at the new address. **Limited**: rule 3a for at least 2
+  minutes (`limited_since`; agp, when it watches the thread, has moved it well within that) and not
+  told since (`limit_told_at`).
+- The notice is a section per kind, separated by a blank line. `<chief-waiting>`, a line per
+  thread, `</chief-waiting>`, and what to do: `- <name> "<title>" · <permission|question> since
+  HH:MM · wants to run <command>` (or `wants to use <call>`, or `asks <question>`, read from its
+  events as the board's detail does, §10). `<chief-moved>`: `- <name> "<title>" · moved from PB2
+  to PB4 after the 5-hour limit at HH:MM`, then: call `list_threads` for each one's address and
+  subscribe again. `<chief-limited>`: `- <name> "<title>" · limited since HH:MM · <the limit> ·
+  <what happens next>` (agp found no account with room and resumes it at the reset; agp is still
+  moving it; agp isn't watching it, or it doesn't run through agp, so it waits until messaged),
+  then: tell the user, offer `move_thread`. The coordinator prompt (§8) says what to do with each.
 - It ends (exit 0, nothing told) when its parent, the coordinator's process, is gone, or a minute
   before its hook `timeout` (a day). A coordinator idle longer than that hears of the next stuck
   thread at its next SessionStart or Stop.
-- It reads the database only. A prompt is seen at once (its Notification), a question (rule 3's
-  `cc_status = waiting`) at the next board poll. Its errors go to the hook error log.
+- Each look reads the database only. A prompt is seen at once (its Notification), a question (rule
+  3's `cc_status = waiting`) at the next board poll. No hook reports a limit or a move, so every
+  10 s, while the project has a live thread, it syncs them itself (`Watch::sync`): agp's moves
+  (`moves::refresh`), then every live thread's limit from its job state alone
+  (`registry::refresh_limits`: files, no `claude agents`), writing only rows that changed. Its
+  errors go to the hook error log.
 
 ## 6. Message guard
 
@@ -1023,11 +1130,12 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 
 | Tool | Input | Does |
 | --- | --- | --- |
-| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?`, `account?` (an agp id or label from the pool, only when the user asks) | Picks the thread's account (below), which also checks trust of the repo path there, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread in that account, resolves its ids. Returns `{name, short_id, repo, model, effort, account, address, next}` (`account` the agp label, null for the project's account), plus `account_note` when the choice skipped accounts or fell back, and `warning` when it kept a session whose spawn reported a failure (adopted from a listing, or already attached by its hooks: `short_id` null then) or couldn't store the started session's ids |
-| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` in every account the project uses (stored rows plus a `warning` naming what failed), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, running, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`, `account`, `address`; `running` is its background work (§5), e.g. `"1 subagent"`, or null. Resolved and cleaned threads are left out unless `include_resolved` |
+| `start_thread` | `title` (string), `task` (string), `repo?` (repos[].name or absolute path), `model?`, `effort?`, `account?` (an agp id or label from the pool, only when the user asks) | Picks the thread's account (below), which also checks trust of the repo path there, picks a unique name, rewrites `generated/*`, inserts the row, spawns the thread in that account, resolves its ids. Returns `{name, short_id, repo, model, effort, account, runner, address, next}` (`account` the agp label, null for the project's account; `runner` `agp` when agp watches it for limits, else `claude`), plus `account_note` when the choice skipped accounts or fell back, and `warning` when it kept a session whose spawn reported a failure (adopted from a listing, or already attached by its hooks: `short_id` null then) or couldn't store the started session's ids |
+| `list_threads` | `include_resolved?` (bool, default false) | Refreshes from `claude agents` in every account the project uses (stored rows plus a `warning` naming what failed), returns `{threads: [...]}` in board order: `name, title, group, waiting_reason, asleep, running, branch, pr_url, last_report_preview (≤300 chars), last_activity` ("5m ago"), `cleaned`, `account`, `address`, and when set `limit` (the limit it waits on, group `limited`) and `moved` (its `move_note`); `running` is its background work (§5), e.g. `"1 subagent"`, or null. Resolved and cleaned threads are left out unless `include_resolved` |
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text; with background work (§5) also `running` and a `note` that the thread isn't finished and reports when it is |
-| `wake_thread` | `name` | Refreshes from its own account; if no live pid: `claude respawn <short_id>` there, poll its account's `claude agents` up to 20 s for a pid (each poll bounded by the time left, so a hanging listing ends the wait at 20 s; database busy waits are bounded only per statement, §4). Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there). A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
+| `wake_thread` | `name` | Refreshes from its own account; if no live pid, settles a thread agp watches (§5 "Limits and moves": waits while agp moves it, then follows the move) and, when it moved and runs already, returns it without a respawn; else `agp bg watch` for an agp thread, then `claude respawn <short_id>` in its account, poll its account's `claude agents` up to 20 s for a pid (each poll bounded by the time left, so a hanging listing ends the wait at 20 s; database busy waits are bounded only per statement, §4). Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there); a thread that moved also gets `moved` (its note), `account` and `next`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
+| `move_thread` | `name`, `account?` (an agp id or label from the pool) | Needs an agp with `bg`. Settles the thread (§5 "Limits and moves"); a named account must be in the pool, trust its repo (placement's pinned rules, §7 "Thread account") and not be the one it runs in. Then `agp bg move <session id> [--to <id>] --json` (bounded, 120 s): agp stops it and resumes it there (or in the other pool account with the most room). chief follows the move from `agp bg --json`, else from the move's answer, asks agp to watch it (`runner = "agp"`), refreshes its new account and returns `{name, alive, address, moved, account, next}` (subscribe again). The prompt (§8) says agp moves limited threads itself: only when the user asks, or for a limited thread agp didn't move |
 | `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. The prompt (§8) says to use it only when the user asks or a thread is off track and a message didn't help |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
@@ -1125,6 +1233,19 @@ claude --bg --name <name> --model <m> --effort <e> --permission-mode <threads.pe
        "<task>"
 ```
 
+With `[threads] runner = "agp"` (the default), an agp whose `agp --help` lists `agp bg` (asked
+once per binary and process, stdin closed, 5 s), and a pool account chosen (§7 "Thread account"),
+agp starts it instead: `agp --as <id> --on-limit <on_limit> [--accounts a,b] [--max-usage n] --
+--bg …` with the same `claude` arguments and cwd, and without `CLAUDE_CONFIG_DIR` (agp sets the
+account's). agp passes claude's output through, starts its watcher detached (its own session,
+stdio on /dev/null, so the timeout below isn't held up) and exits with claude's code; it merges
+its own settings into `--settings` (an overlay, the shared memory folder) and writes them again on
+every `agp bg watch`. A thread in the project's account (no pool account chosen) is started by
+`claude` and then handed to agp with `agp bg watch <short id> --on-limit …` (best effort). Either
+way the row gets `runner = 'agp'` once agp has it, and its brief (§8) says it may move. With
+`accounts = []` there is nowhere to switch to, so `switch` is passed as `wait`. Without such an
+agp, or `runner = "claude"`, threads start as before and nothing watches them for limits.
+
 Parse `backgrounded · <short-id>` from stdout (error if missing, include stderr). Resolve
 `sessionId` from `claude agents --json --all` (retry up to 5 s). List flags (`--add-dir`,
 `--disallowedTools`) are repeated once per value, and empty optionals are left out. The command runs
@@ -1188,6 +1309,11 @@ session with the name in another folder (another chief home's coordinator, or th
 never adopted: the name counts as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
 a pid. Otherwise it is left alone.
 
+With `[threads] runner = "agp"` and an agp that has `bg`, a coordinator just started, respawned,
+or found running without `runner = 'agp'` is handed to agp with `agp bg watch <short id>
+--on-limit wait` (best effort, §5 "Limits and moves"): after a limit it is woken on its own account
+at the reset, never moved.
+
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)
 
 - `coordinator.md`: role (route, never do the work), its tools (§7: read the repos, edit only
@@ -1207,7 +1333,13 @@ a pid. Otherwise it is left alone.
   id the Agent tool gave them, and that they report to it (§6 "Subagents"). A `<chief-waiting>`
   message from its watcher (§5 "Telling the coordinator") means to tell the user at once, a line
   per thread, which thread and what it wants, and that they answer it by opening the thread on the
-  board; it can't answer for them and doesn't message the thread.
+  board; it can't answer for them and doesn't message the thread. A `<chief-moved>` message means
+  agp moved those threads to another account: call `list_threads` for their new addresses and
+  subscribe again, mentioning it to the user in passing at most. A `<chief-limited>` message means
+  those threads stopped on a usage limit and agp didn't move them: tell the user in a line each
+  (the limit, when it resets, what happens next), offer `move_thread` when the pool may have room,
+  and message a thread agp doesn't resume after the reset. `move_thread` only when the user asks,
+  or for such a thread (agp moves limited threads itself).
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch; of other sessions message only the coordinator,
   by its exact name (the report needs no message), or, for a thread spawned in another account
@@ -1221,7 +1353,10 @@ a pid. Otherwise it is left alone.
 
 Placeholders (`{{name}}` replaced verbatim): coordinator `name`, `goal_line` (` Goal: …` or empty),
 `project_dir`, `max_parallel`; thread `name`, `coordinator_name`, `project_dir`, `messaging` (the
-by-name line, or the by-address line for a thread in another account, chosen at spawn). Both get
+by-name line, the by-address line for a thread in another account, or, for a thread agp may move
+(`runner` agp with `on_limit = "switch"`), a line that holds in either account: it needn't message
+the coordinator to report, and it answers a message by replying to the exact `from` address in its
+header (`chief-<slug>` or `uds:…`); chosen at spawn, which a move keeps). Both get
 `instructions.md` appended under `## Project instructions` when it isn't empty.
 
 The coordinator's UserPromptSubmit hook runs `claude agents` (≤5 s; stored rows if it fails, logged),
@@ -1230,7 +1365,7 @@ syncs, and returns as `additionalContext`:
 ```
 <chief-board as-of="HH:MM">
 Waiting on you:
-- <name> "<title>" · waiting: permission · 1 subagent running · asleep · branch <b> · PR <url>
+- <name> "<title>" · waiting: permission · 1 subagent running · limited: <limit> · asleep · branch <b> · PR <url>
   report: <≤200-char one-line preview>
 …groups in board order; resolved threads left out; "No open threads." when empty
 </chief-board>
@@ -1660,14 +1795,16 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   permission prompt is for, the PreToolUse before the prompt; `asks <question>` while its latest
   call is an unanswered AskUserQuestion; `now <call> · 12s` while its latest call runs, else
   `last <call> · 3s ago`; its task on one line; branch, PR URL, model · effort, `account
-  <label>`, last activity, cleanup state; up to three calls before that one under `earlier`, each
+  <label>`, `moved <move_note> <ago>` for a thread agp moved, `limit <limit_note>` while limited
+  (with ` · agp resumes it at the reset` when agp waits, ` · agp is moving it` while it does), last
+  activity, cleanup state; up to three calls before that one under `earlier`, each
   with its age; the last report wrapped, and when the text runs past the panel its last line
   says `↓ more · v reads it all`), or "Coordinator" (its state, model ·
   effort, last activity, and what to do next: with no threads, "Tell the coordinator what you want
   done, in the main pane…"): below the list when the body has ≥ 16 lines (the list takes what it
   needs up to 3/5), otherwise Tab swaps the list for it.
   Colours: a fixed palette that reads on dark and light terminals (Waiting bold red with `!`,
-  Working green `●`, Review blue `◆`, Landing magenta `▲`, Idle default `○`, Failed red `✗`,
+  Working green `●`, Limited yellow `◷`, Review blue `◆`, Landing magenta `▲`, Idle default `○`, Failed red `✗`,
   Resolved dim `✓`). `▸` marks what the main pane shows: a thread's row, or the coordinator's.
 - Keys: ↑/↓ or j/k move over the coordinator's row and the threads (headers skipped; g/G
   first/last). The first threads to show take the selection from a coordinator selected only
@@ -1723,14 +1860,15 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   made by hand while the board ran (the board's name and goal follow them; if it can't be read,
   the form says so and starts from the board's copy), in four sections: Project (goal, the repos, add repo, default
   repo, the two files, notify), Coordinator (model, effort), Threads (model, effort, permission
-  mode, max_parallel, cleanup) and Accounts (the account, thread accounts, max usage, account
-  trust and its untrusted pairs), then Save. Under the form one line says what the field under the
+  mode, max_parallel, cleanup) and Accounts (the account, thread accounts, max usage, threads run
+  through, on a usage limit, account trust and its untrusted pairs), then Save. Under the form one line says what the field under the
   cursor does (`Field::help`), unless a message replaces it; Ctrl+S saves from any field (in a
   text field being edited, it applies the text first; a bad value stays open with why). The
   fields: goal, coordinator model and effort, thread
   model, effort, permission mode, max_parallel, thread accounts (`[threads] accounts`, ids split
   on commas or spaces, empty = `[]`, shown "(none: the project's account)"), max usage (a percent
-  1–100, empty = none), default repo, cleanup (merged/manual),
+  1–100, empty = none), threads run through (`[threads] runner`, agp/claude), on a usage limit
+  (`[threads] on_limit`, switch/wait/stay), default repo, cleanup (merged/manual),
   `ui.notify`, and the repos (add by path, named after its folder with `-2`, `-3` … on a clash, as
   in `init`; `d` removes one, moving the default repo to the first remaining). It also shows the
   project's Claude Code account (`claude_config_dir`, or `default (~/.claude)`) read-only: Enter
@@ -1742,7 +1880,7 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   (`untrusted  <label> · <repo>`); on it the message says what Enter does, and Enter marks that
   repo trusted in that account (§3 "Trust") on a worker, then checks again (`Msg::Trusted`).
   While a check runs, the last check's pairs stay listed and the cursor stays where it was;
-  Enter on a pair or on "Account trust" then says to wait. Efforts, modes,
+  Enter on a pair or on "Account trust" then says to wait. Efforts, modes, runner, on_limit,
   default repo, cleanup and notify cycle with ←/→ (Enter too); models, goal, max_parallel, thread
   accounts and max usage are free text (Enter edits, Enter applies, Esc cancels; the edit
   belongs to the field it was opened on, which Enter writes whatever the cursor is on). Save validates (`ProjectConfig::validate`,
@@ -1893,7 +2031,10 @@ The worktree is the one `claude rm` itself deletes: the session's job state,
 `<claude dir>/jobs/<short_id>/state.json` → `worktreePath`, where `<claude dir>` is the
 thread's account folder (§3: its own account's, else the project's `claude_config_dir`, or for
 the default account `$CHIEF_CLAUDE_DIR` in tests, else `~/.claude`); its refresh (step 1) and
-its `claude rm` run in that account too. It counts only as a `<repo>/.claude/worktrees/<name>` folder
+its `claude rm` run in that account too. A thread agp moved (§5 "Limits and moves") runs under a
+job that resumed in the worktree and names none; the job that does is in an account it ran in
+before (`prior_accounts`, newest first: `claude::prior_job_state`), and `cleanup::own_job` returns
+that one, with its account. It counts only as a `<repo>/.claude/worktrees/<name>` folder
 (the innermost such match, so a repository that itself lies under one still works), and while it exists
 `git -C <wt> rev-parse --show-toplevel` must be that folder (a leftover plain folder would make git
 answer for the checkout around it). Never the hooks' `cwd`, which follows the thread's shell
@@ -1941,7 +2082,8 @@ still exists there, and the head is the branch's sha.
    record itself) counts.
 3. Never spawned (no `short_id`): mark cleaned without `claude rm`.
 4. Either mode: when the job state of another session registered in this chief home (read in
-   that session's own account folder: its own account's, else its project's) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
+   that session's own account folder: its own account's, else its project's; for a moved one, its
+   earlier accounts' too) names the same worktree, store `<wt> is also the worktree of <other>; chief won't remove or reset it` in
    `cleanup_blocked` and stop without calling `claude rm` (it would delete the worktree and its
    branch under that session). Another session's job state that can't be read may name it, so it
    blocks the same way: `<wt> is possibly also the worktree of <other>, whose job state can't be
@@ -1960,7 +2102,14 @@ still exists there, and the head is the branch's sha.
 5. Steps 1 and 2 again, with a fresh `claude agents`, right before anything is reset or
    stopped (the thread may have got a message, or the pane attached to it, meanwhile); then the
    `Discard` reset from step 4.
-6. `claude rm <short_id>` (120 s: it deletes the worktree before it answers). `Discard` retries an unpushed refusal once with
+6. A thread agp moved has a job in every account it ran in (`cleanup::gather`). The row moves
+   back to the account whose job names the worktree (the current one when none does; no account
+   of its own when that is the project's), `prior_accounts` cleared, in one transaction first; then
+   `claude rm <short_id>` runs in each other account that still has a job for it (those name no
+   worktree, so only the job goes, and its process stops). A refusal there stops cleanup with
+   `claude rm of its old job in <label>: …` in `cleanup_blocked`; the row already names the job
+   that stays, so a later cleanup goes on from there.
+   Then `claude rm <short_id>` in the row's account (120 s: it deletes the worktree before it answers). `Discard` retries an unpushed refusal once with
    `--discard-unpushed <token>` only when the confirmed inspection itself listed unpushed commits
    and the token's head sha (`<sha>@<worktree-id>`) equals the head it saw (`git rev-parse HEAD`
    in the worktree, else the branch's sha). Otherwise `claude rm` counts work nobody was shown,

@@ -29,6 +29,18 @@ pub struct AgentRow {
     pub pid: Option<u32>,
 }
 
+/// What starts a background session (§3 "Threads through agp").
+pub enum Via<'a> {
+    /// `claude --bg` in the `Claude`'s account.
+    Claude,
+    /// `agp --as <id> … -- --bg …`: agp starts it in account `id` and watches it for limits.
+    Agp {
+        agp: &'a crate::agp::Agp,
+        id: &'a str,
+        run: &'a crate::agp::RunOptions,
+    },
+}
+
 /// Arguments for a background session.
 #[derive(Debug, Clone)]
 pub struct BgSpawn {
@@ -202,7 +214,28 @@ impl Claude {
 
     /// Starts a background session and returns its short id.
     pub fn spawn_bg(&self, spec: &BgSpawn) -> Result<String> {
-        let out = self.run(&bg_args(spec), Some(&spec.cwd), SPAWN_TIMEOUT)?;
+        self.spawn_bg_via(spec, &Via::Claude)
+    }
+
+    /// `spawn_bg`, through agp when `via` says so (§7 "Thread spawn"): the same `claude --bg`
+    /// arguments after agp's own, and the same output.
+    pub fn spawn_bg_via(&self, spec: &BgSpawn, via: &Via) -> Result<String> {
+        let args = bg_args(spec);
+        let (mut cmd, shown) = match via {
+            Via::Claude => {
+                let mut cmd = self.command();
+                cmd.args(&args);
+                (cmd, "claude --bg".to_string())
+            }
+            Via::Agp { agp, id, run } => (
+                agp.launch(id, run, &args),
+                format!("agp --as {id} … -- --bg"),
+            ),
+        };
+        cmd.current_dir(&spec.cwd);
+        let out = crate::proc::output_with_timeout(&mut cmd, SPAWN_TIMEOUT)
+            .with_context(|| format!("running `{shown}`"))?
+            .with_context(|| format!("`{shown}` took longer than {}s", SPAWN_TIMEOUT.as_secs()))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stdout.contains("Workspace not trusted") || stderr.contains("Workspace not trusted") {
@@ -211,7 +244,7 @@ impl Claude {
         match parse_bg_short_id(&stdout) {
             Some(id) => Ok(id),
             None => bail!(
-                "`claude --bg` for {} printed no session id ({}).\nstdout: {}\nstderr: {}",
+                "`{shown}` for {} printed no session id ({}).\nstdout: {}\nstderr: {}",
                 spec.name,
                 out.status,
                 stdout.trim(),
@@ -603,6 +636,9 @@ pub struct JobState {
     pub worktree: Option<PathBuf>,
     /// `worktreeBranch`.
     pub branch: Option<String>,
+    /// The limit that stopped its turn, while it waits on it (§1): `blocked` with `needs`
+    /// "rate limited …"; the text is `detail` ("You've hit your 5-hour limit · resets 6:10am").
+    pub limit: Option<String>,
 }
 
 /// `<config_dir>/jobs/<short_id>/state.json`. Ok(None) only when the file doesn't exist: the
@@ -634,7 +670,44 @@ pub fn read_job_state(config_dir: &Path, short_id: &str) -> Result<Option<JobSta
     Ok(Some(JobState {
         worktree: text("worktreePath").map(PathBuf::from),
         branch: text("worktreeBranch"),
+        limit: job_limit(&json),
     }))
+}
+
+/// A job state's limit (`JobState::limit`). Claude Code maps a `rate_limit` stop to `blocked`
+/// with `needs` "rate limited — wait and retry · <detail>"; any other block (a question) isn't
+/// one.
+pub fn job_limit(json: &serde_json::Value) -> Option<String> {
+    let needs = json["needs"].as_str()?;
+    if json["state"].as_str() != Some("blocked") || !needs.starts_with("rate limited") {
+        return None;
+    }
+    let detail = json["detail"]
+        .as_str()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    let text = detail.unwrap_or_else(|| needs.split_once(" · ").map_or(needs, |(_, rest)| rest));
+    Some(text.trim().to_string())
+}
+
+/// The job state that names the worktree of a thread agp moved to another account (§12): its
+/// new job resumed in the worktree its first job made, so only a job in an account it ran in
+/// before names it. Searched newest first; Ok(None) when none does. A job state that can't be
+/// read is an error, as in `read_job_state`: chief can't tell.
+pub fn prior_job_state(
+    priors: &[crate::db::PriorAccount],
+    short_id: &str,
+) -> Result<Option<(Option<PathBuf>, JobState)>> {
+    for prior in priors.iter().rev() {
+        let account = prior.dir.as_deref().map(PathBuf::from);
+        let dir = claude_dir(account.as_deref());
+        let job = read_job_state(&dir, short_id)
+            .with_context(|| format!("reading its job state in {}", prior.label))?;
+        if let Some(job) = job.filter(|j| j.worktree.is_some()) {
+            return Ok(Some((account, job)));
+        }
+    }
+    Ok(None)
 }
 
 /// `read_job_state` with every failure as None, for the sync's display of a thread's branch and
@@ -1368,5 +1441,75 @@ mod tests {
 
         std::fs::write(&config, "{").unwrap();
         assert!(is_trusted_in(&config, &repo).is_err());
+    }
+
+    #[test]
+    fn a_rate_limited_job_names_its_limit() {
+        let limited = serde_json::json!({
+            "state": "blocked",
+            "needs": "rate limited — wait and retry · You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)",
+            "detail": "You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)",
+        });
+        assert_eq!(
+            job_limit(&limited).as_deref(),
+            Some("You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)")
+        );
+        // No detail: what `needs` says after the first separator.
+        let bare = serde_json::json!({
+            "state": "blocked",
+            "needs": "rate limited — wait and retry · weekly limit",
+        });
+        assert_eq!(job_limit(&bare).as_deref(), Some("weekly limit"));
+        // A question blocks too, and a job that went on keeps its old `needs`.
+        let question = serde_json::json!({"state": "blocked", "needs": "answer a question"});
+        assert_eq!(job_limit(&question), None);
+        let working = serde_json::json!({"state": "working", "needs": "rate limited — wait"});
+        assert_eq!(job_limit(&working), None);
+    }
+
+    #[test]
+    fn a_moved_threads_worktree_is_named_by_an_earlier_accounts_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("cpb");
+        let second = tmp.path().join("laura");
+        let write = |dir: &Path, state: serde_json::Value| {
+            let jobs = dir.join("jobs/abc12345");
+            std::fs::create_dir_all(&jobs).unwrap();
+            std::fs::write(jobs.join("state.json"), state.to_string()).unwrap();
+        };
+        write(
+            &first,
+            serde_json::json!({"state": "done", "worktreePath": "/r/.claude/worktrees/fix", "worktreeBranch": "worktree-fix"}),
+        );
+        write(
+            &second,
+            serde_json::json!({"state": "working", "cwd": "/r"}),
+        );
+        let prior = |dir: &Path, id: &str| crate::db::PriorAccount {
+            id: id.into(),
+            label: id.to_uppercase(),
+            dir: Some(dir.to_string_lossy().into_owned()),
+        };
+        let (account, job) =
+            prior_job_state(&[prior(&first, "cpb"), prior(&second, "laura")], "abc12345")
+                .unwrap()
+                .unwrap();
+        assert_eq!(account.as_deref(), Some(first.as_path()));
+        assert_eq!(
+            job.worktree.as_deref(),
+            Some(Path::new("/r/.claude/worktrees/fix"))
+        );
+        assert_eq!(job.branch.as_deref(), Some("worktree-fix"));
+        // None names a worktree, or no job anywhere.
+        assert!(
+            prior_job_state(&[prior(&second, "laura")], "abc12345")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prior_job_state(&[prior(&first, "cpb")], "ffff0000")
+                .unwrap()
+                .is_none()
+        );
     }
 }

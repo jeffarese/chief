@@ -547,7 +547,7 @@ fn transcript_in(transcript: &Path, account: Option<&Path>) -> bool {
 /// `claude` in the project's account (project.toml → `claude_config_dir`), whatever account the
 /// hook's environment names. When project.toml can't say, the account the generated hook
 /// command set (§3), which is the project's unless project.toml was edited by hand since.
-fn project_claude(project: &str) -> Claude {
+pub(crate) fn project_claude(project: &str) -> Claude {
     let account = crate::project::account_of(project).unwrap_or_else(|_| claude::env_account());
     Claude::for_account(account)
 }

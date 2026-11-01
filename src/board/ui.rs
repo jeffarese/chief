@@ -43,6 +43,7 @@ pub const HELP: &[(&str, &str)] = &[
 const LEGEND: &[(Group, &str)] = &[
     (Group::Waiting, "waiting on you"),
     (Group::Working, "working"),
+    (Group::Limited, "limited"),
     (Group::Review, "ready for review"),
     (Group::Landing, "landing"),
     (Group::Idle, "idle"),
@@ -55,6 +56,7 @@ pub fn style_of(group: Group) -> Style {
     match group {
         Group::Waiting => s.fg(Color::Red).add_modifier(Modifier::BOLD),
         Group::Working => s.fg(Color::Green),
+        Group::Limited => s.fg(Color::Yellow),
         Group::Review => s.fg(Color::Blue),
         Group::Landing => s.fg(Color::Magenta),
         Group::Idle => s,
@@ -67,6 +69,7 @@ pub fn glyph(group: Group) -> &'static str {
     match group {
         Group::Waiting => "!",
         Group::Working => "●",
+        Group::Limited => "◷",
         Group::Review => "◆",
         Group::Landing => "▲",
         Group::Idle => "○",
@@ -437,6 +440,23 @@ fn detail(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     if let Some(account) = row.account_shown() {
         lines.push(field("account", account.to_string()));
+    }
+    if let Some(note) = &row.move_note {
+        let when = row.moved_at.map(|at| format!(" {}", ago(app.now, at)));
+        lines.push(field(
+            "moved",
+            format!("{note}{}", when.unwrap_or_default()),
+        ));
+    }
+    if registry::limited(row)
+        && let Some(limit) = &row.limit_note
+    {
+        let next = match (row.via_agp(), row.agp_state.as_deref()) {
+            (true, Some("waiting")) => " · agp resumes it at the reset",
+            (true, Some("limited" | "moving")) => " · agp is moving it",
+            _ => "",
+        };
+        lines.push(field("limit", format!("{limit}{next}")));
     }
     lines.push(field("active", ago(app.now, row.last_activity_at)));
     if row.cleaned_at.is_some() {

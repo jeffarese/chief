@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use crate::state::Role;
 
@@ -174,6 +175,19 @@ CREATE TABLE ui_state (
      UPDATE sessions SET blocked_since = updated_at
        WHERE group_name = 'waiting' AND waiting_reason IS NOT NULL
          AND (pending_permission = 1 OR (cc_fresh = 1 AND cc_status = 'waiting'));",
+    // Threads started through agp, which moves one to another account when its account hits a
+    // limit (§3 "Threads through agp", §5 "Limits and moves"): which runner started it, the
+    // accounts it ran in before (JSON), its last move, the limit its job state reports, agp's
+    // view of it, and when the coordinator was told of each.
+    "ALTER TABLE sessions ADD COLUMN runner TEXT;
+     ALTER TABLE sessions ADD COLUMN prior_accounts TEXT;
+     ALTER TABLE sessions ADD COLUMN moved_at INTEGER;
+     ALTER TABLE sessions ADD COLUMN move_note TEXT;
+     ALTER TABLE sessions ADD COLUMN moved_told_at INTEGER;
+     ALTER TABLE sessions ADD COLUMN limit_note TEXT;
+     ALTER TABLE sessions ADD COLUMN limited_since INTEGER;
+     ALTER TABLE sessions ADD COLUMN limit_told_at INTEGER;
+     ALTER TABLE sessions ADD COLUMN agp_state TEXT;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -339,6 +353,38 @@ pub struct SessionRow {
     pub blocked_since: Option<i64>,
     /// When the coordinator was last told it was stuck (§5 "Telling the coordinator").
     pub blocked_told_at: Option<i64>,
+    /// `agp` when agp started it or watches it for limits (§3 "Threads through agp"); None:
+    /// plain `claude --bg`.
+    pub runner: Option<String>,
+    /// The accounts it ran in before agp moved it, oldest first (JSON, `PriorAccount`): the
+    /// first holds the job that owns its worktree (§12).
+    pub prior_accounts: Option<String>,
+    /// When agp last moved it to another account, and what to say about it.
+    pub moved_at: Option<i64>,
+    pub move_note: Option<String>,
+    /// When the coordinator was last told it moved.
+    pub moved_told_at: Option<i64>,
+    /// The limit its account hit, as its job state says it (`You've hit your 5-hour limit ·
+    /// resets 6:10am`), while it is limited; and since when.
+    pub limit_note: Option<String>,
+    pub limited_since: Option<i64>,
+    /// When the coordinator was last told it was limited.
+    pub limit_told_at: Option<i64>,
+    /// agp's state for it (`agp bg --json` → `state`: watching, limited, waiting, moving, …).
+    pub agp_state: Option<String>,
+}
+
+/// `sessions.runner` of a thread agp started or watches.
+pub const RUNNER_AGP: &str = "agp";
+
+/// One account a thread ran in before a move (`SessionRow::prior_accounts`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorAccount {
+    /// The agp profile id.
+    pub id: String,
+    pub label: String,
+    /// Its config folder; None is the default account.
+    pub dir: Option<String>,
 }
 
 impl SessionRow {
@@ -358,6 +404,28 @@ impl SessionRow {
             .as_deref()
             .filter(|l| !l.trim().is_empty())
             .or(self.account_id.as_deref())
+    }
+
+    /// The accounts it ran in before agp moved it, oldest first; empty for one never moved (or a
+    /// value that doesn't parse, which nothing writes).
+    pub fn prior_accounts(&self) -> Vec<PriorAccount> {
+        self.prior_accounts
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_prior_accounts(&mut self, accounts: &[PriorAccount]) {
+        self.prior_accounts = if accounts.is_empty() {
+            None
+        } else {
+            serde_json::to_string(accounts).ok()
+        };
+    }
+
+    /// agp started it or watches it (§3 "Threads through agp").
+    pub fn via_agp(&self) -> bool {
+        self.runner.as_deref() == Some(RUNNER_AGP)
     }
 
     /// A row for a session that hasn't been spawned yet.
@@ -381,7 +449,9 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     pr_state, pr_draft, pr_review, last_report, last_report_at, created_at, updated_at, \
     last_activity_at, last_hook_at, gone_at, cleaned_at, cleanup_blocked, synced_at, ids_at, \
     removed_at, account_id, account_label, account_dir, subagents_busy, background_running, \
-    stopped_early_at, reason_before_removed, legacy_cleaned, blocked_since, blocked_told_at";
+    stopped_early_at, reason_before_removed, legacy_cleaned, blocked_since, blocked_told_at, runner, \
+    prior_accounts, moved_at, move_note, moved_told_at, limit_note, limited_since, limit_told_at, \
+    agp_state";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -434,6 +504,15 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         legacy_cleaned: r.get(46)?,
         blocked_since: r.get(47)?,
         blocked_told_at: r.get(48)?,
+        runner: r.get(49)?,
+        prior_accounts: r.get(50)?,
+        moved_at: r.get(51)?,
+        move_note: r.get(52)?,
+        moved_told_at: r.get(53)?,
+        limit_note: r.get(54)?,
+        limited_since: r.get(55)?,
+        limit_told_at: r.get(56)?,
+        agp_state: r.get(57)?,
     })
 }
 
@@ -498,7 +577,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
          ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
-         ?47, ?48, ?49)"
+         ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58)"
     );
     let has_ids = s.short_id.is_some() || s.session_id.is_some();
     let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
@@ -554,6 +633,15 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.legacy_cleaned,
             s.blocked_since,
             s.blocked_told_at,
+            s.runner,
+            s.prior_accounts,
+            s.moved_at,
+            s.move_note,
+            s.moved_told_at,
+            s.limit_note,
+            s.limited_since,
+            s.limit_told_at,
+            s.agp_state,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -580,7 +668,9 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            removed_at = ?39, account_id = ?40, account_label = ?41, account_dir = ?42,
            subagents_busy = ?43, background_running = ?44, stopped_early_at = ?45,
            reason_before_removed = ?46, legacy_cleaned = ?47, blocked_since = ?48,
-           blocked_told_at = ?49
+           blocked_told_at = ?49, runner = ?50, prior_accounts = ?51, moved_at = ?52,
+           move_note = ?53, moved_told_at = ?54, limit_note = ?55, limited_since = ?56,
+           limit_told_at = ?57, agp_state = ?58
          WHERE name = ?1",
             params![
                 s.name,
@@ -632,6 +722,15 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.legacy_cleaned,
                 s.blocked_since,
                 s.blocked_told_at,
+                s.runner,
+                s.prior_accounts,
+                s.moved_at,
+                s.move_note,
+                s.moved_told_at,
+                s.limit_note,
+                s.limited_since,
+                s.limit_told_at,
+                s.agp_state,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -1295,7 +1394,7 @@ mod tests {
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 17);
+        assert_eq!(MIGRATIONS.len(), 18);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();

@@ -146,7 +146,15 @@ starts in the account of agp's pool with the most room (`agp status`), skipping 
 `[threads] accounts` in `project.toml` narrows the pool (`["auto"]`, the default, is the whole
 pool; `[]` keeps threads on the project's account) and `max_usage` skips accounts at or over a
 5-hour or weekly percentage. Ask the coordinator for a specific account and it pins the thread
-there. A thread stays in the account it started in; the board tags it with the account's label.
+there. The board tags each thread with its account's label.
+
+agp also starts each thread and watches it (`[threads] runner = "agp"`, the default; needs an agp
+with `agp bg`). When a thread's account hits a usage limit, agp moves it to another pool account
+with room, with its conversation and worktree, and it goes on there (`on_limit = "switch"`; `wait`
+resumes it on the same account at the reset, `stay` leaves it). The board shows a limited thread
+under Limited and a moved one with where it came from, and the coordinator hears of both. Ask the
+coordinator to move a thread and it does. The coordinator itself is woken after its own limit
+resets, never moved.
 
 Each account trusts folders separately, so `chief init`, the new-project wizard and the settings
 screen ("Account trust") check every repo in every pool account and offer to trust it there. A

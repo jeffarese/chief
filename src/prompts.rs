@@ -28,24 +28,43 @@ pub fn coordinator(config: &ProjectConfig, project_dir: &Path, instructions: &st
 
 /// A thread's `--append-system-prompt`. `elsewhere`: it runs in another Claude account than its
 /// coordinator, where the coordinator's name doesn't reach (§1, §6).
+/// Where a thread runs, for how its prompt says it reaches its coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The project's account, for good: the coordinator's name reaches it.
+    Same,
+    /// Another account, for good: only a reply to the coordinator's address does.
+    Elsewhere,
+    /// Through agp, which may move it to another account (§5 "Limits and moves"). The prompt
+    /// is given once, at the start, and a move keeps it, so it must hold in either account.
+    MayMove,
+}
+
 pub fn thread(
     config: &ProjectConfig,
     coordinator_name: &str,
     project_dir: &Path,
     instructions: &str,
-    elsewhere: bool,
+    reach: Reach,
 ) -> String {
-    let messaging = if elsewhere {
-        "You run in another Claude account than your coordinator, so its name doesn't reach it, \
-         and you don't need to message it to report. To answer a message from it, reply with \
-         SendMessage to the exact `from=\"uds:…\"` address in that message's header."
-            .to_string()
-    } else {
-        format!(
+    let messaging = match reach {
+        Reach::Elsewhere => "You run in another Claude account than your coordinator, so its \
+             name doesn't reach it, and you don't need to message it to report. To answer a \
+             message from it, reply with SendMessage to the exact `from=\"uds:…\"` address in \
+             that message's header."
+            .to_string(),
+        Reach::Same => format!(
             "Of other sessions, you can message only your coordinator, by its exact name \
              `{coordinator_name}`; you \
              don't need to message it to report."
-        )
+        ),
+        Reach::MayMove => format!(
+            "Of other sessions, you can message only your coordinator, and you don't need to \
+             message it to report. You may be moved to another Claude account when yours hits a \
+             usage limit, and then its name `{coordinator_name}` doesn't reach it: to answer a \
+             message from it, reply with SendMessage to the exact `from` address in that \
+             message's header (`{coordinator_name}` or `uds:…`)."
+        ),
     };
     let prompt = render(
         THREAD,
@@ -147,7 +166,7 @@ mod tests {
             "chief-payments-latency",
             Path::new("/d"),
             "",
-            false,
+            Reach::Same,
         );
         assert!(!p.contains("{{"), "{p}");
         assert!(p.contains("`chief-payments-latency`"));
@@ -165,7 +184,7 @@ mod tests {
             "chief-payments-latency",
             Path::new("/d"),
             "",
-            true,
+            Reach::Elsewhere,
         );
         assert!(!p.contains("{{"), "{p}");
         assert!(
@@ -175,6 +194,22 @@ mod tests {
         assert!(p.contains("`from=\"uds:…\"` address"), "{p}");
         assert!(!p.contains("by its exact name"), "{p}");
         assert!(p.contains(subagents), "{p}");
+
+        // Through agp, which may move it: holds in either account.
+        let p = thread(
+            &config(None),
+            "chief-payments-latency",
+            Path::new("/d"),
+            "",
+            Reach::MayMove,
+        );
+        assert!(!p.contains("{{"), "{p}");
+        assert!(
+            p.contains("You may be moved to another Claude account"),
+            "{p}"
+        );
+        assert!(p.contains("(`chief-payments-latency` or `uds:…`)"), "{p}");
+        assert!(p.contains(subagents), "{p}");
     }
 
     #[test]
@@ -182,14 +217,15 @@ mod tests {
         let c = config(None);
         let template = "<!-- Standing brief.\nWrite here. -->\n\n";
         assert!(
-            !thread(&c, "x", Path::new("/d"), template, false).contains("## Project instructions")
+            !thread(&c, "x", Path::new("/d"), template, Reach::Same)
+                .contains("## Project instructions")
         );
         let p = thread(
             &c,
             "x",
             Path::new("/d"),
             "<!-- hint -->\nUse pnpm.\n",
-            false,
+            Reach::Same,
         );
         assert!(
             p.ends_with("\n\n## Project instructions\n\nUse pnpm.\n"),

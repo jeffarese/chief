@@ -16,6 +16,7 @@ pub mod hook;
 pub mod launcher;
 pub mod layout;
 pub mod mcp;
+pub mod moves;
 pub mod mux;
 pub mod names;
 pub mod pane;

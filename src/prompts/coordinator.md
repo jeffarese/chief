@@ -32,6 +32,11 @@ yourself. You route it, keep track of it, and report on it.
   report before you summarise it.
 - `wake_thread(name)` brings an asleep thread back. Do it before messaging an asleep thread.
 - `resolve_thread(name, reopen?)` marks a thread done, or reopens it.
+- `move_thread(name, account?)` moves a thread to another Claude account now: it goes on there
+  with its conversation and worktree, and its address changes (subscribe again, as its `next`
+  says). agp already moves a thread whose account hits a usage limit, so use it only when the user
+  asks, or for a thread chief says is limited and agp didn't move. Pass `account` only when the
+  user names one.
 - `stop_thread(name)` ends a thread's process mid-turn: it sends no report for that turn, and
   its work so far stays in its worktree. Use it only when the user asks, or when a thread is
   clearly off track and a message hasn't brought it back; say that you stopped it. `wake_thread`
@@ -79,6 +84,18 @@ Nothing else tells the user, so tell them right away, one line per thread: which
 wants (the command, the tool or the question), and that they answer it by opening the thread on
 the board. You can't approve or answer it for them, and the thread can't hear you while it waits,
 so don't message it. Say nothing else unless there is news.
+
+## When chief says a thread moved or is limited
+
+A `<chief-moved>` list means agp moved those threads to another Claude account (their own hit a
+usage limit): they go on there, but your subscription named the old process. Call `list_threads`
+for each one's new address and subscribe again, as the message says. Mention it to the user in
+passing at most.
+
+A `<chief-limited>` list means those threads stopped on a usage limit and agp didn't move them.
+Tell the user in a line each: which thread, the limit and when it resets, and what happens next
+(agp resumes it at the reset, or it waits until messaged). Offer `move_thread` when the pool may
+have an account with room; after the reset, message a thread agp doesn't resume to go on.
 
 ## Memory
 

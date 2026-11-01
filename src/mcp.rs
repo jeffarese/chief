@@ -15,7 +15,8 @@ use serde_json::Value;
 use crate::claude::{Claude, RESOLVE_TIMEOUT};
 use crate::config::ProjectConfig;
 use crate::tools::{
-    self, ListThreadsArgs, NameArgs, ReadReportArgs, ResolveThreadArgs, StartThreadArgs, ToolCtx,
+    self, ListThreadsArgs, MoveThreadArgs, NameArgs, ReadReportArgs, ResolveThreadArgs,
+    StartThreadArgs, ToolCtx,
 };
 use crate::{db, paths};
 
@@ -96,6 +97,13 @@ impl ChiefMcp {
     )]
     async fn stop_thread(&self, Parameters(args): Parameters<NameArgs>) -> CallToolResult {
         self.call(move |ctx| tools::stop_thread(ctx, &args)).await
+    }
+
+    #[tool(
+        description = "Move a thread to another Claude account now: agp stops it and resumes the same conversation in the same worktree there, starting a new turn that says it moved. agp does this by itself when a thread's account hits a usage limit; use this only when the user asks, or when list_threads shows a thread limited that agp didn't move. Returns its account and the address to subscribe to again."
+    )]
+    async fn move_thread(&self, Parameters(args): Parameters<MoveThreadArgs>) -> CallToolResult {
+        self.call(move |ctx| tools::move_thread(ctx, &args)).await
     }
 
     #[tool(

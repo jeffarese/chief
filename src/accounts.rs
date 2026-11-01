@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 
+use crate::agp::Agp;
 use crate::claude::{self, AgentRow, Claude};
 use crate::db::{self, SessionRow};
 use crate::registry;
@@ -40,6 +41,8 @@ pub struct Listings {
     /// The project's account.
     pub project: Option<PathBuf>,
     pub all: Vec<Listing>,
+    /// Why agp's moves couldn't be followed before listing (§5 "Limits and moves").
+    pub moves_error: Option<String>,
 }
 
 impl Listings {
@@ -62,7 +65,7 @@ impl Listings {
     /// Every failed listing, one each; the project's account's without naming it, as when it
     /// was the only one.
     pub fn error(&self) -> Option<String> {
-        let lines: Vec<String> = self
+        let mut lines: Vec<String> = self
             .all
             .iter()
             .filter_map(|l| {
@@ -76,6 +79,9 @@ impl Listings {
                 )
             })
             .collect();
+        if let Some(e) = &self.moves_error {
+            lines.push(format!("following agp's moves: {e}"));
+        }
         (!lines.is_empty()).then(|| lines.join("; "))
     }
 }
@@ -128,7 +134,21 @@ pub fn list(
     Listings {
         project: project.account.clone(),
         all,
+        moves_error: None,
     }
+}
+
+/// Points the project's threads that agp moved at the accounts they run in now
+/// (`moves::refresh`), so the listings that follow are of the right accounts.
+fn follow_moves(
+    conn: &Connection,
+    slug: &str,
+    project: &Claude,
+    agp: &Agp,
+    now: fn() -> i64,
+) -> Result<()> {
+    crate::moves::refresh(conn, agp, slug, project.account.as_deref(), now())?;
+    Ok(())
 }
 
 /// Writes each listing that was taken into its account's rows of the project.
@@ -163,9 +183,26 @@ pub fn refresh(
     timeout: Duration,
     now: fn() -> i64,
 ) -> Result<Listings> {
+    refresh_with(conn, slug, project, &Agp::from_env(), timeout, now)
+}
+
+/// `refresh` with this agp following the moves.
+pub fn refresh_with(
+    conn: &Connection,
+    slug: &str,
+    project: &Claude,
+    agp: &Agp,
+    timeout: Duration,
+    now: fn() -> i64,
+) -> Result<Listings> {
+    let moves_error = follow_moves(conn, slug, project, agp, now)
+        .err()
+        .map(|e| format!("{e:#}"));
     let rows = db::list_sessions(conn, slug, None)?;
     let accounts = in_use(project.account.as_deref(), &rows);
-    refresh_accounts(conn, slug, project, &accounts, timeout, now)
+    let mut listings = refresh_accounts(conn, slug, project, &accounts, timeout, now)?;
+    listings.moves_error = moves_error;
+    Ok(listings)
 }
 
 /// `refresh` for these accounts only.
@@ -182,7 +219,8 @@ pub fn refresh_accounts(
     Ok(listings)
 }
 
-/// Lists and syncs only the account `row` runs in; its listing's error is the error.
+/// Lists and syncs only the account `row` runs in (now: agp may have moved it, which this
+/// follows first); its listing's error is the error. A failing agp leaves the row where it was.
 pub fn refresh_row(
     conn: &Connection,
     project: &Claude,
@@ -190,6 +228,25 @@ pub fn refresh_row(
     timeout: Duration,
     now: fn() -> i64,
 ) -> Result<Listing> {
+    refresh_row_with(conn, project, &Agp::from_env(), row, timeout, now)
+}
+
+/// `refresh_row` with this agp following the moves.
+pub fn refresh_row_with(
+    conn: &Connection,
+    project: &Claude,
+    agp: &Agp,
+    row: &SessionRow,
+    timeout: Duration,
+    now: fn() -> i64,
+) -> Result<Listing> {
+    let moved;
+    let row = if row.via_agp() && follow_moves(conn, &row.project_slug, project, agp, now).is_ok() {
+        moved = db::get_session(conn, &row.name)?.unwrap_or_else(|| row.clone());
+        &moved
+    } else {
+        row
+    };
     let account = row.account(project.account.as_deref());
     let listings = refresh_accounts(conn, &row.project_slug, project, &[account], timeout, now)?;
     let listing = listings.all.into_iter().next().expect("one account listed");
@@ -249,6 +306,7 @@ mod tests {
                 listing(None, Ok(vec![])),
                 listing(Some("/a/cpb"), Ok(vec![])),
             ],
+            moves_error: None,
         };
         assert_eq!(ok.error(), None);
         let failed = Listings {
@@ -257,10 +315,11 @@ mod tests {
                 listing(Some("/a/cpb"), Err("timeout".into())),
                 listing(None, Err("boom".into())),
             ],
+            moves_error: Some("agp bg failed".into()),
         };
         assert_eq!(
             failed.error().as_deref(),
-            Some("in the account /a/cpb: timeout; boom")
+            Some("in the account /a/cpb: timeout; boom; following agp's moves: agp bg failed")
         );
         let row = thread("b", Some(("cpb", Some("/a/cpb"))));
         assert_eq!(

@@ -51,6 +51,56 @@ pub struct ThreadSettings {
     /// thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_usage: Option<u32>,
+    /// What starts a thread (§3 "Threads through agp"): `agp` (the default) starts it through
+    /// agp when agp is installed, which then watches it for limits; `claude` starts it with
+    /// plain `claude --bg`, as before.
+    #[serde(default)]
+    pub runner: Runner,
+    /// What agp does when a thread's account hits a limit: `switch` (the default) moves it to
+    /// the pool account with the most room, `wait` goes on in the same account after the reset,
+    /// `stay` only reports it.
+    #[serde(default)]
+    pub on_limit: OnLimit,
+}
+
+/// `threads.runner`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Runner {
+    #[default]
+    Agp,
+    Claude,
+}
+
+/// `threads.on_limit`, passed to agp as `--on-limit`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OnLimit {
+    #[default]
+    Switch,
+    Wait,
+    Stay,
+}
+
+impl OnLimit {
+    pub const ALL: [OnLimit; 3] = [OnLimit::Switch, OnLimit::Wait, OnLimit::Stay];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnLimit::Switch => "switch",
+            OnLimit::Wait => "wait",
+            OnLimit::Stay => "stay",
+        }
+    }
+}
+
+impl Runner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Runner::Agp => "agp",
+            Runner::Claude => "claude",
+        }
+    }
 }
 
 fn auto_accounts() -> Vec<String> {
@@ -113,6 +163,8 @@ impl ProjectConfig {
                 cleanup: Cleanup::Merged,
                 accounts: auto_accounts(),
                 max_usage: None,
+                runner: Runner::Agp,
+                on_limit: OnLimit::Switch,
             },
             repos,
             ui: UiSettings::default(),
@@ -318,6 +370,10 @@ mod tests {
         assert_eq!(c.threads.default_repo.as_deref(), Some("payments-api"));
         assert_eq!(c.threads.accounts, ["auto"]);
         assert_eq!(c.threads.max_usage, None);
+        assert_eq!(
+            (c.threads.runner, c.threads.on_limit),
+            (Runner::Agp, OnLimit::Switch)
+        );
         assert!(
             ProjectConfig::new("x", "x", None, vec![])
                 .threads
@@ -381,10 +437,32 @@ notify = true
             PathBuf::from("/Users/me/workspace/payments-api")
         );
         assert!(c.ui.notify);
-        // Files from before `cleanup` and `accounts` existed get the defaults.
+        // Files from before `cleanup`, `accounts`, `runner` and `on_limit` existed get the
+        // defaults.
         assert_eq!(c.threads.cleanup, Cleanup::Merged);
         assert_eq!(c.threads.accounts, ["auto"]);
         assert_eq!(c.threads.max_usage, None);
+        assert_eq!(
+            (c.threads.runner, c.threads.on_limit),
+            (Runner::Agp, OnLimit::Switch)
+        );
+
+        let plain = text.replace(
+            "max_parallel = 3\n",
+            "max_parallel = 3\nrunner = \"claude\"\non_limit = \"wait\"\n",
+        );
+        std::fs::write(&path, plain).unwrap();
+        let c = ProjectConfig::load(&path).unwrap();
+        assert_eq!(
+            (c.threads.runner, c.threads.on_limit),
+            (Runner::Claude, OnLimit::Wait)
+        );
+        let bad = text.replace(
+            "max_parallel = 3\n",
+            "max_parallel = 3\non_limit = \"ask\"\n",
+        );
+        std::fs::write(&path, bad).unwrap();
+        assert!(ProjectConfig::load(&path).is_err());
 
         let pooled = text.replace(
             "max_parallel = 3\n",

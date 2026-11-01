@@ -1,6 +1,7 @@
-//! A thread stuck on the user, told to its coordinator (ARCHITECTURE §5 "Telling the
-//! coordinator"): what the thread asks, which threads are due, and the watcher the coordinator's
-//! hooks start in the background, which wakes the coordinator by exiting 2.
+//! A thread stuck on the user, moved to another account, or stopped on a usage limit, told to
+//! its coordinator (ARCHITECTURE §5 "Telling the coordinator"): what the thread asks, which
+//! threads are due, and the watcher the coordinator's hooks start in the background, which wakes
+//! the coordinator by exiting 2.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -23,6 +24,12 @@ pub const WATCH_HOOK_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const WATCH_MARGIN_MS: i64 = 60_000;
 /// How often the watcher looks: one read of the threads, no write lock.
 const TICK: Duration = Duration::from_secs(1);
+/// How often it reads job states and agp's moves itself (`Watch::sync`), so a limit or a move
+/// is told with no board open.
+pub const SYNC_EVERY_MS: i64 = 10_000;
+/// How long a thread waits on a usage limit before its coordinator hears of it: agp, when it
+/// watches the thread, has moved it to another account well within that.
+pub const LIMIT_TELL_AFTER_MS: i64 = 120_000;
 /// Events read per stuck thread for what it asks: the prompt and the call before it are among
 /// the latest few, whatever its subagents do meanwhile.
 const EVENTS_READ: usize = 50;
@@ -78,12 +85,87 @@ pub fn due(threads: &[SessionRow], now: i64) -> Vec<&SessionRow> {
         .collect()
 }
 
-/// `- <name> "<title>" · permission since 03:39 · wants to run <command>`.
-pub fn line(t: &SessionRow, asks: Option<(&str, String)>) -> String {
-    let mut parts = vec![match t.title.as_deref() {
+/// Threads agp moved to another account since the coordinator last heard (§5 "Limits and
+/// moves"): its subscription named the old process.
+pub fn moved_due(threads: &[SessionRow]) -> Vec<&SessionRow> {
+    threads
+        .iter()
+        .filter(|t| {
+            live(t)
+                && t.moved_at
+                    .is_some_and(|at| t.moved_told_at.is_none_or(|told| told < at))
+        })
+        .collect()
+}
+
+/// Threads stopped on a usage limit for `LIMIT_TELL_AFTER_MS` that the coordinator wasn't told
+/// of since: agp didn't move them (it waits for the reset, or doesn't watch them).
+pub fn limited_due(threads: &[SessionRow], now: i64) -> Vec<&SessionRow> {
+    threads
+        .iter()
+        .filter(|t| {
+            live(t)
+                && registry::limited(t)
+                && t.limited_since.is_some_and(|since| {
+                    now - since >= LIMIT_TELL_AFTER_MS
+                        && t.limit_told_at.is_none_or(|told| told < since)
+                })
+        })
+        .collect()
+}
+
+fn live(t: &SessionRow) -> bool {
+    t.role == Role::Thread.as_str()
+        && !t.resolved
+        && t.cleaned_at.is_none()
+        && t.removed_at.is_none()
+}
+
+/// `- <name> "<title>" · moved from PB2 to PB4 after the 5-hour limit at 03:39`.
+pub fn moved_line(t: &SessionRow) -> String {
+    let mut line = format!(
+        "{} · {}",
+        lead(t),
+        t.move_note.as_deref().unwrap_or("moved to another account")
+    );
+    if let Some(at) = t.moved_at {
+        line.push_str(&format!(" at {}", local_hhmm(at)));
+    }
+    line
+}
+
+/// `- <name> "<title>" · limited since 03:39 · You've hit your 5-hour limit · resets 6:10am ·
+/// agp waits for the reset`.
+pub fn limited_line(t: &SessionRow) -> String {
+    let mut parts = vec![lead(t)];
+    if let Some(since) = t.limited_since {
+        parts.push(format!("limited since {}", local_hhmm(since)));
+    }
+    if let Some(note) = &t.limit_note {
+        parts.push(one_line(note, 200));
+    }
+    parts.push(
+        match (t.via_agp(), t.agp_state.as_deref()) {
+            (true, Some("waiting")) => "agp found no account with room and resumes it at the reset",
+            (true, Some("limited" | "moving")) => "agp is still moving it",
+            (true, _) => "agp isn't watching it, so it waits until messaged",
+            (false, _) => "it doesn't run through agp, so it waits until messaged",
+        }
+        .to_string(),
+    );
+    parts.join(" · ")
+}
+
+fn lead(t: &SessionRow) -> String {
+    match t.title.as_deref() {
         Some(title) => format!("- {} \"{}\"", t.name, one_line(title, 80)),
         None => format!("- {}", t.name),
-    }];
+    }
+}
+
+/// `- <name> "<title>" · permission since 03:39 · wants to run <command>`.
+pub fn line(t: &SessionRow, asks: Option<(&str, String)>) -> String {
+    let mut parts = vec![lead(t)];
     let reason = t.waiting_reason.as_deref().unwrap_or("question");
     match t.blocked_since {
         Some(since) => parts.push(format!("{reason} since {}", local_hhmm(since))),
@@ -102,6 +184,29 @@ pub fn notice(lines: &[String]) -> String {
          them, in the thread itself. Tell the user now, a line each: which thread, what it \
          wants, and that they answer it by opening the thread on the board. You can't answer \
          it for them.",
+        lines.join("\n")
+    )
+}
+
+/// The text for threads agp moved.
+pub fn moved_notice(lines: &[String]) -> String {
+    format!(
+        "<chief-moved>\n{}\n</chief-moved>\nagp moved these threads to another Claude account \
+         (their own hit a usage limit, or one was moved on request); each goes on there with \
+         its conversation and worktree. Your subscription named the old process: call \
+         list_threads for each one's address now, then subscribe again with SendMessage with \
+         exactly {{\"to\": \"<address>\", \"notify_when_idle\": true}} and no message key. \
+         Mention it to the user only in passing.",
+        lines.join("\n")
+    )
+}
+
+/// The text for threads stopped on a usage limit.
+pub fn limited_notice(lines: &[String]) -> String {
+    format!(
+        "<chief-limited>\n{}\n</chief-limited>\nThese threads stopped on a Claude usage limit \
+         and wait. Tell the user in a line each. move_thread moves one to a pool account with \
+         room now; a thread agp doesn't resume goes on only when messaged after the reset.",
         lines.join("\n")
     )
 }
@@ -125,7 +230,12 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
         return Ok(Look::Superseded);
     }
     let threads = db::list_sessions(conn, project, Some(Role::Thread))?;
-    if due(&threads, now).is_empty() {
+    let any = |threads: &[SessionRow]| {
+        !due(threads, now).is_empty()
+            || !moved_due(threads).is_empty()
+            || !limited_due(threads, now).is_empty()
+    };
+    if !any(&threads) {
         return Ok(Look::Nothing);
     }
     db::immediate(conn, |conn| {
@@ -133,19 +243,52 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
             return Ok(Look::Superseded);
         }
         let threads = db::list_sessions(conn, project, Some(Role::Thread))?;
-        let due = due(&threads, now);
-        if due.is_empty() {
+        if !any(&threads) {
             return Ok(Look::Nothing);
         }
+        let mut told: Vec<SessionRow> = Vec::new();
+        let row_of = |t: &SessionRow, told: &mut Vec<SessionRow>| -> usize {
+            match told.iter().position(|r| r.name == t.name) {
+                Some(i) => i,
+                None => {
+                    told.push(t.clone());
+                    told.len() - 1
+                }
+            }
+        };
+        let mut sections = Vec::new();
         let mut lines = Vec::new();
-        for t in due {
+        for t in due(&threads, now) {
             let events = db::session_events(conn, &t.name, EVENTS_READ)?;
             lines.push(line(t, asks(t, &events).map(|(l, text, _)| (l, text))));
-            let mut told = t.clone();
-            told.blocked_told_at = Some(now);
-            db::update_session(conn, &told)?;
+            let i = row_of(t, &mut told);
+            told[i].blocked_told_at = Some(now);
         }
-        Ok(Look::Tell(notice(&lines)))
+        if !lines.is_empty() {
+            sections.push(notice(&lines));
+        }
+        let mut lines = Vec::new();
+        for t in moved_due(&threads) {
+            lines.push(moved_line(t));
+            let i = row_of(t, &mut told);
+            told[i].moved_told_at = Some(now);
+        }
+        if !lines.is_empty() {
+            sections.push(moved_notice(&lines));
+        }
+        let mut lines = Vec::new();
+        for t in limited_due(&threads, now) {
+            lines.push(limited_line(t));
+            let i = row_of(t, &mut told);
+            told[i].limit_told_at = Some(now);
+        }
+        if !lines.is_empty() {
+            sections.push(limited_notice(&lines));
+        }
+        for row in &told {
+            db::update_session(conn, row)?;
+        }
+        Ok(Look::Tell(sections.join("\n\n")))
     })
 }
 
@@ -160,6 +303,9 @@ pub struct Watch<'a> {
     pub tick: Duration,
     /// When it gives up (unix ms).
     pub until: i64,
+    /// Reads what no hook reports, every `SYNC_EVERY_MS`: limits from job states, and agp's
+    /// moves. Its errors are only logged.
+    pub sync: &'a dyn Fn(&Connection, i64) -> Result<()>,
 }
 
 /// Makes this the project's watcher, then looks every tick until some thread is due (the
@@ -167,6 +313,7 @@ pub struct Watch<'a> {
 /// is gone, or `until` passes (None).
 pub fn watch(conn: &Connection, w: &Watch) -> Result<Option<String>> {
     db::set_watcher(conn, w.project, w.pid)?;
+    let mut synced: Option<i64> = None;
     loop {
         if !(w.parent_alive)() {
             return Ok(None);
@@ -175,12 +322,42 @@ pub fn watch(conn: &Connection, w: &Watch) -> Result<Option<String>> {
         if now >= w.until {
             return Ok(None);
         }
+        if synced.is_none_or(|at| now - at >= SYNC_EVERY_MS) {
+            synced = Some(now);
+            if let Err(e) = (w.sync)(conn, now) {
+                hook::log_error(
+                    &paths::hook_error_log(),
+                    "watch",
+                    w.project,
+                    &format!("reading limits and moves: {e:#}"),
+                );
+            }
+        }
         match look(conn, w.project, w.pid, now)? {
             Look::Superseded => return Ok(None),
             Look::Tell(text) => return Ok(Some(text)),
             Look::Nothing => std::thread::sleep(w.tick),
         }
     }
+}
+
+/// The watcher's own sync: agp's moves first (they change the account a job state is read in),
+/// then every live thread's limit. Nothing while the project has no live thread.
+fn sync(
+    conn: &Connection,
+    project: &str,
+    claude: &crate::claude::Claude,
+    agp: &crate::agp::Agp,
+    now: i64,
+) -> Result<()> {
+    let threads = db::list_sessions(conn, project, Some(Role::Thread))?;
+    if !threads.iter().any(live) {
+        return Ok(());
+    }
+    let account = claude.account.as_deref();
+    let moved = crate::moves::refresh(conn, agp, project, account, now);
+    registry::refresh_limits(conn, project, account, now)?;
+    moved.map(|_| ())
 }
 
 /// `chief hook watch` (§2): the coordinator's SessionStart and Stop start it with `asyncRewake`,
@@ -199,6 +376,9 @@ pub fn run_hook(project: &str, role: Role) {
         let conn = db::open(&paths::db())?;
         let start = db::now_ms();
         let until = start + WATCH_HOOK_TIMEOUT_SECS as i64 * 1000 - WATCH_MARGIN_MS;
+        let claude = hook::project_claude(project);
+        let agp = crate::agp::Agp::from_env();
+        let sync = |conn: &Connection, now: i64| sync(conn, project, &claude, &agp, now);
         watch(
             &conn,
             &Watch {
@@ -208,6 +388,7 @@ pub fn run_hook(project: &str, role: Role) {
                 now: &db::now_ms,
                 tick: TICK,
                 until,
+                sync: &sync,
             },
         )
     });
@@ -377,6 +558,7 @@ mod tests {
             now,
             tick: Duration::ZERO,
             until,
+            sync: &|_, _| Ok(()),
         }
     }
 
@@ -440,5 +622,144 @@ mod tests {
         );
         let row = db::get_session(&conn, "p-core-1111").unwrap().unwrap();
         assert!(row.blocked_told_at < row.blocked_since, "still untold");
+    }
+
+    fn moved(name: &str, at: i64) -> SessionRow {
+        let mut r = thread(name);
+        r.runner = Some(db::RUNNER_AGP.into());
+        r.account_id = Some("laura".into());
+        r.account_label = Some("PB4".into());
+        r.moved_at = Some(at);
+        r.move_note = Some("moved from PB2 to PB4 after the 5-hour limit".into());
+        r
+    }
+
+    fn limited(name: &str, since: i64, agp_state: Option<&str>) -> SessionRow {
+        let mut r = thread(name);
+        r.limit_note = Some("You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)".into());
+        r.limited_since = Some(since);
+        r.last_hook_at = Some(since - 1);
+        if let Some(state) = agp_state {
+            r.runner = Some(db::RUNNER_AGP.into());
+            r.agp_state = Some(state.into());
+        }
+        r
+    }
+
+    #[test]
+    fn moved_and_limited_threads_are_due_once() {
+        let now = 1_000_000;
+        let mut told = moved("told", 5_000);
+        told.moved_told_at = Some(6_000);
+        let mut again = moved("again", 9_000);
+        again.moved_told_at = Some(6_000);
+        let mut resolved = moved("resolved", 5_000);
+        resolved.resolved = true;
+        let threads = [moved("new", 5_000), told, again, resolved, thread("never")];
+        let names = |due: Vec<&SessionRow>| due.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(moved_due(&threads)), ["new", "again"]);
+
+        let fresh = limited("fresh", now - LIMIT_TELL_AFTER_MS + 1, None);
+        let old = limited("old", now - LIMIT_TELL_AFTER_MS, Some("waiting"));
+        let mut told = limited("told", 10_000, None);
+        told.limit_told_at = Some(20_000);
+        // A hook since the limit: it went on (a message after the reset).
+        let mut went_on = limited("went-on", 10_000, None);
+        went_on.last_hook_at = Some(10_001);
+        let threads = [fresh, old, told, went_on];
+        assert_eq!(names(limited_due(&threads, now)), ["old"]);
+    }
+
+    #[test]
+    fn moved_and_limited_lines_say_what_happens_next() {
+        let line = moved_line(&moved("p-x-1111", 5_000));
+        assert!(
+            line.starts_with(
+                "- p-x-1111 \"Title of p-x-1111\" · moved from PB2 to PB4 after the 5-hour limit at "
+            ),
+            "{line}"
+        );
+        let line = limited_line(&limited("p-x-1111", 5_000, Some("waiting")));
+        assert!(line.contains("· limited since "), "{line}");
+        assert!(
+            line.contains("· You've hit your 5-hour limit · resets 6:10am (Europe/Madrid) · "),
+            "{line}"
+        );
+        assert!(line.ends_with("agp found no account with room and resumes it at the reset"));
+        let line = limited_line(&limited("p-x-1111", 5_000, None));
+        assert!(line.ends_with("it doesn't run through agp, so it waits until messaged"));
+        let line = limited_line(&limited("p-x-1111", 5_000, Some("dormant")));
+        assert!(line.ends_with("agp isn't watching it, so it waits until messaged"));
+        let text = moved_notice(&["- a".into()]);
+        assert!(
+            text.starts_with("<chief-moved>\n- a\n</chief-moved>\n"),
+            "{text}"
+        );
+        assert!(text.contains("call list_threads"), "{text}");
+        let text = limited_notice(&["- b".into()]);
+        assert!(
+            text.starts_with("<chief-limited>\n- b\n</chief-limited>\n"),
+            "{text}"
+        );
+        assert!(text.contains("move_thread"), "{text}");
+    }
+
+    #[test]
+    fn one_notice_tells_every_kind_and_marks_each() {
+        let (_dir, conn) = setup();
+        let now = 1_000_000;
+        db::insert_session(&conn, &stuck("p-stuck-1111", now - TELL_AFTER_MS)).unwrap();
+        db::insert_session(&conn, &moved("p-moved-2222", now - 5_000)).unwrap();
+        db::insert_session(
+            &conn,
+            &limited("p-limit-3333", now - LIMIT_TELL_AFTER_MS, None),
+        )
+        .unwrap();
+        db::set_watcher(&conn, "p", 7).unwrap();
+        let Look::Tell(text) = look(&conn, "p", 7, now).unwrap() else {
+            panic!("all three are due");
+        };
+        let sections: Vec<_> = text.split("\n\n").collect();
+        assert_eq!(sections.len(), 3, "{text}");
+        assert!(
+            sections[0].starts_with("<chief-waiting>\n- p-stuck-1111"),
+            "{text}"
+        );
+        assert!(
+            sections[1].starts_with("<chief-moved>\n- p-moved-2222"),
+            "{text}"
+        );
+        assert!(
+            sections[2].starts_with("<chief-limited>\n- p-limit-3333"),
+            "{text}"
+        );
+        let get = |name: &str| db::get_session(&conn, name).unwrap().unwrap();
+        assert_eq!(get("p-stuck-1111").blocked_told_at, Some(now));
+        assert_eq!(get("p-moved-2222").moved_told_at, Some(now));
+        assert_eq!(get("p-limit-3333").limit_told_at, Some(now));
+        assert_eq!(look(&conn, "p", 7, now + 1).unwrap(), Look::Nothing);
+    }
+
+    #[test]
+    fn the_watcher_syncs_every_few_seconds() {
+        let (_dir, conn) = setup();
+        let clock = Cell::new(0);
+        let now = || {
+            clock.set(clock.get() + 1_000);
+            clock.get()
+        };
+        let synced = Cell::new(0);
+        let sync = |_: &Connection, _: i64| {
+            synced.set(synced.get() + 1);
+            Ok(())
+        };
+        let alive = || true;
+        let w = Watch {
+            sync: &sync,
+            ..watcher(7, &alive, &now, 25_000)
+        };
+        assert_eq!(watch(&conn, &w).unwrap(), None);
+        // At 1 s, 11 s and 21 s.
+        assert_eq!(synced.get(), 3);
     }
 }

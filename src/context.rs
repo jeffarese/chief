@@ -95,6 +95,11 @@ fn line(t: &SessionRow, preview: usize) -> String {
     if let Some(work) = registry::background_work(t) {
         parts.push(format!("{work} running"));
     }
+    if registry::limited(t)
+        && let Some(limit) = &t.limit_note
+    {
+        parts.push(format!("limited: {}", one_line(limit, 120)));
+    }
     if t.pid.is_none() {
         parts.push("asleep".to_string());
     }

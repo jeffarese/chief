@@ -4,17 +4,26 @@
 //! config folder, which `agp exec <id>` names in `CLAUDE_CONFIG_DIR`. `CHIEF_AGP_BIN` overrides
 //! the binary.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::config::{OnLimit, ThreadSettings};
+
 /// `[threads] accounts` entry meaning every account in agp's pool.
 pub const AUTO: &str = "auto";
 const TIMEOUT: Duration = Duration::from_secs(15);
+/// `agp bg --json` reads a few files; the board runs it with every poll.
+const BG_TIMEOUT: Duration = Duration::from_secs(5);
+/// `agp bg move` stops the session, waits for its process to end and resumes it elsewhere.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One account of `agp status --json` → `views[]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +178,195 @@ pub fn trust_command(id: &str, folder: &Path) -> String {
     )
 }
 
+/// What agp does about a thread's limits (`--on-limit`, `--accounts`, `--max-usage`), from
+/// `[threads]` (§3 "Threads through agp").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOptions {
+    pub on_limit: OnLimit,
+    /// The pool ids `[threads] accounts` lists; empty for `auto`, agp's whole pool.
+    pub accounts: Vec<String>,
+    pub max_usage: Option<u32>,
+}
+
+impl RunOptions {
+    pub fn from_settings(threads: &ThreadSettings) -> Self {
+        let accounts = if threads.accounts.iter().any(|a| a == AUTO) {
+            Vec::new()
+        } else {
+            threads.accounts.clone()
+        };
+        // `accounts = []` keeps threads in the project's account (§3): nowhere to switch to,
+        // so agp waits for the reset there.
+        let on_limit = match threads.on_limit {
+            OnLimit::Switch if threads.accounts.is_empty() => OnLimit::Wait,
+            other => other,
+        };
+        RunOptions {
+            on_limit,
+            accounts,
+            max_usage: threads.max_usage,
+        }
+    }
+
+    /// agp's per-run options for them.
+    pub fn args(&self) -> Vec<String> {
+        let mut args = vec!["--on-limit".to_string(), self.on_limit.as_str().to_string()];
+        if !self.accounts.is_empty() {
+            args.push("--accounts".to_string());
+            args.push(self.accounts.join(","));
+        }
+        if let Some(max) = self.max_usage {
+            args.push("--max-usage".to_string());
+            args.push(max.to_string());
+        }
+        args
+    }
+}
+
+/// `agp --as <id> <run options> --`: what goes before the `claude --bg` arguments for agp to
+/// start the session in account `id` and watch it (§7 "Thread spawn"). The `--` ends agp's
+/// options, so nothing of claude's is read as one of them.
+pub fn launch_args(id: &str, run: &RunOptions) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--as".into(), id.into()];
+    args.extend(run.args().into_iter().map(OsString::from));
+    args.push("--".into());
+    args
+}
+
+/// A background session agp watches (`agp bg --json` → `sessions[]`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct BgSession {
+    pub session_id: String,
+    #[serde(default)]
+    pub short_id: Option<String>,
+    /// The agp profile it runs in now.
+    pub profile: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// That profile's config folder; None is the default account.
+    #[serde(default)]
+    pub config_dir: Option<PathBuf>,
+    /// watching, limited, waiting, moving, ended, dormant.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub limit: Option<BgLimit>,
+    /// Oldest first.
+    #[serde(default)]
+    pub moves: Vec<BgMove>,
+}
+
+impl BgSession {
+    /// agp is stopping it in one account to resume it in another (or after a reset): nothing
+    /// may revive it meanwhile.
+    pub fn moving(&self) -> bool {
+        self.state == "moving"
+    }
+
+    pub fn shown(&self) -> &str {
+        self.label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or(&self.profile)
+    }
+
+    /// Its account as chief stores one: None for the default account.
+    pub fn account(&self) -> Option<PathBuf> {
+        normal_dir(self.config_dir.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct BgLimit {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Unix seconds; None when agp doesn't know.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+/// One move of a background session, as `agp bg --json` lists it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct BgMove {
+    /// Unix seconds.
+    pub at: i64,
+    pub from: String,
+    #[serde(default)]
+    pub from_label: Option<String>,
+    #[serde(default)]
+    pub from_config_dir: Option<PathBuf>,
+    pub to: String,
+    #[serde(default)]
+    pub to_label: Option<String>,
+    #[serde(default)]
+    pub to_config_dir: Option<PathBuf>,
+    /// "5-hour limit", "weekly limit", "manual move", "limit".
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl BgMove {
+    pub fn from_shown(&self) -> &str {
+        self.from_label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or(&self.from)
+    }
+
+    pub fn to_shown(&self) -> &str {
+        self.to_label
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or(&self.to)
+    }
+}
+
+#[derive(Deserialize)]
+struct BgList {
+    #[serde(default)]
+    sessions: Vec<BgSession>,
+}
+
+/// `agp bg --json` → its sessions.
+pub fn parse_bg(json: &str) -> Result<Vec<BgSession>> {
+    let list: BgList = serde_json::from_str(json).context("parsing `agp bg --json`")?;
+    Ok(list.sessions)
+}
+
+/// `agp bg move --json` → where the session went.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Moved {
+    #[serde(default)]
+    pub moved: bool,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub short_id: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub from_label: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub to_label: Option<String>,
+    #[serde(default)]
+    pub to_config_dir: Option<PathBuf>,
+}
+
+/// An account folder as chief stores it: the default account's (`~/.claude`) is None, as agp
+/// and `CLAUDE_CONFIG_DIR` leave it unset.
+pub fn normal_dir(dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir.filter(|d| !d.as_os_str().is_empty())?;
+    let default = dirs::home_dir().map(|h| h.join(".claude"));
+    if default.is_some_and(|d| crate::claude::same_folder(dir, &d)) {
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
 pub struct Agp {
     pub bin: PathBuf,
 }
@@ -184,6 +382,101 @@ impl Agp {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("agp"));
         Agp::new(bin)
+    }
+
+    /// Whether this agp watches background sessions (`agp bg`): an older one reads `agp bg …`
+    /// as a `claude` line and would start a session, so nothing calls `bg` without asking.
+    /// Asked once per binary per process; false when agp isn't installed or doesn't answer.
+    pub fn supports_bg(&self) -> bool {
+        static KNOWN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+        let known = KNOWN.get_or_init(Default::default);
+        if let Some(yes) = known.lock().ok().and_then(|k| k.get(&self.bin).copied()) {
+            return yes;
+        }
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg("--help").stdin(std::process::Stdio::null());
+        let yes = matches!(
+            crate::proc::output_with_timeout(&mut cmd, BG_TIMEOUT),
+            Ok(Some(out)) if help_has_bg(&String::from_utf8_lossy(&out.stdout))
+                || help_has_bg(&String::from_utf8_lossy(&out.stderr))
+        );
+        if let Ok(mut k) = known.lock() {
+            k.insert(self.bin.clone(), yes);
+        }
+        yes
+    }
+
+    /// The command that starts a thread's `claude --bg …` (`claude_args`) through agp in account
+    /// `id`. Without `CLAUDE_CONFIG_DIR`: agp sets the account's (and leaves it unset for the
+    /// default one), so the project's, which the MCP server inherits, must not reach it. Without
+    /// the repository variables too, as for `claude` itself.
+    pub fn launch(&self, id: &str, run: &RunOptions, claude_args: &[OsString]) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        crate::proc::without_repo_env(&mut cmd);
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+        cmd.args(launch_args(id, run)).args(claude_args);
+        cmd
+    }
+
+    /// `agp bg --json`, bounded: the background sessions agp watches. Ok(None) when agp isn't
+    /// installed or has no `bg` (`supports_bg`).
+    pub fn bg(&self) -> Result<Option<Vec<BgSession>>> {
+        if !self.supports_bg() {
+            return Ok(None);
+        }
+        let mut cmd = self.plain();
+        cmd.args(["bg", "--json"]);
+        let Some(out) = self.run_within(&mut cmd, "bg --json", BG_TIMEOUT)? else {
+            return Ok(None);
+        };
+        Ok(Some(parse_bg(&String::from_utf8_lossy(&out.stdout))?))
+    }
+
+    /// `agp bg watch <session> [--as <id>] <run options>`: agp watches an existing background
+    /// session (after `claude respawn`, or one started without agp). It detaches its watcher and
+    /// answers at once.
+    pub fn watch(&self, session: &str, id: Option<&str>, run: &RunOptions) -> Result<()> {
+        if !self.supports_bg() {
+            bail!("this agp has no `agp bg`; update agp");
+        }
+        let mut cmd = self.plain();
+        cmd.args(["bg", "watch", session]);
+        if let Some(id) = id {
+            cmd.args(["--as", id]);
+        }
+        cmd.args(run.args());
+        match self.run_within(&mut cmd, "bg watch", TIMEOUT)? {
+            Some(_) => Ok(()),
+            None => bail!("agp isn't installed"),
+        }
+    }
+
+    /// `agp bg move <session> [--to <id>] --json`: agp moves the session now, to `to` or the
+    /// pool account with the most room.
+    pub fn move_now(&self, session: &str, to: Option<&str>) -> Result<Moved> {
+        if !self.supports_bg() {
+            bail!("this agp has no `agp bg`; update agp");
+        }
+        let mut cmd = self.plain();
+        cmd.args(["bg", "move", session]);
+        if let Some(to) = to {
+            cmd.args(["--to", to]);
+        }
+        cmd.arg("--json");
+        let Some(out) = self.run_within(&mut cmd, "bg move", MOVE_TIMEOUT)? else {
+            bail!("agp isn't installed");
+        };
+        serde_json::from_slice(&out.stdout).context("parsing `agp bg move --json`")
+    }
+
+    /// agp itself, without this process's `CLAUDE_CONFIG_DIR` (agp names accounts itself), the
+    /// repository variables, or a terminal to read.
+    fn plain(&self) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        crate::proc::without_repo_env(&mut cmd);
+        cmd.env_remove("CLAUDE_CONFIG_DIR")
+            .stdin(std::process::Stdio::null());
+        cmd
     }
 
     /// `agp status --json`, bounded. Ok(None) when agp isn't installed.
@@ -219,9 +512,18 @@ impl Agp {
 
     /// Runs agp, bounded; None when the binary isn't there, an error on a timeout or a failure.
     fn run(&self, cmd: &mut Command, shown: &str) -> Result<Option<std::process::Output>> {
-        let out = match crate::proc::output_with_timeout(cmd, TIMEOUT) {
+        self.run_within(cmd, shown, TIMEOUT)
+    }
+
+    fn run_within(
+        &self,
+        cmd: &mut Command,
+        shown: &str,
+        timeout: Duration,
+    ) -> Result<Option<std::process::Output>> {
+        let out = match crate::proc::output_with_timeout(cmd, timeout) {
             Ok(Some(out)) => out,
-            Ok(None) => bail!("`agp {shown}` took longer than {}s", TIMEOUT.as_secs()),
+            Ok(None) => bail!("`agp {shown}` took longer than {}s", timeout.as_secs()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("running {}", self.bin.display())),
         };
@@ -234,6 +536,11 @@ impl Agp {
         }
         Ok(Some(out))
     }
+}
+
+/// `agp --help` lists the `bg` command.
+fn help_has_bg(help: &str) -> bool {
+    help.lines().any(|l| l.trim_start().starts_with("agp bg"))
 }
 
 /// `agp exec`'s `CLAUDE_CONFIG_DIR`: empty is the default account; a path is made absolute and
@@ -389,5 +696,87 @@ mod tests {
         let agp = Agp::new("/nonexistent/agp".into());
         assert_eq!(agp.status().unwrap(), None);
         assert!(agp.config_dir("cpb").is_err());
+    }
+
+    #[test]
+    fn bg_sessions_parse_with_their_moves() {
+        let json = r#"{"sessions": [{"session_id": "f1de9de1-1233-4c43-8a68-fc73f11e1f17",
+            "short_id": "f1de9de1", "name": "demo-x", "profile": "laura", "label": "PB4",
+            "config_dir": "/Users/x/.claude-laura", "cwd": "/r", "on_limit": "switch",
+            "state": "watching", "limit": null,
+            "moves": [{"at": 1793500100, "from": "cpb", "from_label": "PB2",
+                       "from_config_dir": "/Users/x/.claude-cpb", "to": "laura", "to_label": "PB4",
+                       "to_config_dir": "/Users/x/.claude-laura", "reason": "5-hour limit"}],
+            "previous": [{"profile": "cpb", "label": "PB2", "config_dir": "/Users/x/.claude-cpb"}],
+            "watcher_pid": 1234, "watching": true, "updated_at": 1793500100},
+            {"session_id": "s2", "profile": "default", "config_dir": null, "state": "moving",
+             "limit": {"text": "You've hit your 5-hour limit", "since": 1, "resets_at": null}}]}"#;
+        let all = parse_bg(json).unwrap();
+        assert_eq!(all.len(), 2);
+        let s = &all[0];
+        assert_eq!(
+            (s.short_id.as_deref(), s.shown(), s.moving()),
+            (Some("f1de9de1"), "PB4", false)
+        );
+        assert_eq!(s.account(), Some(PathBuf::from("/Users/x/.claude-laura")));
+        assert_eq!(s.moves.len(), 1);
+        assert_eq!(
+            (
+                s.moves[0].from_shown(),
+                s.moves[0].to_shown(),
+                s.moves[0].at
+            ),
+            ("PB2", "PB4", 1793500100)
+        );
+        let t = &all[1];
+        assert!(t.moving());
+        assert_eq!((t.account(), t.shown()), (None, "default"));
+        assert_eq!(
+            t.limit.as_ref().map(|l| (l.text.as_str(), l.resets_at)),
+            Some(("You've hit your 5-hour limit", None))
+        );
+        assert!(parse_bg("{}").unwrap().is_empty());
+        assert!(parse_bg("not json").is_err());
+    }
+
+    #[test]
+    fn only_an_agp_whose_help_lists_bg_has_it() {
+        let new = "Usage:\n  agp [options] [--] [claude args]\n  agp bg [--json]  background sessions\n  agp bg watch <session>\n";
+        assert!(help_has_bg(new));
+        assert!(!help_has_bg("Usage:\n  agp status\nsee also agp bg\n"));
+        assert!(!help_has_bg(""));
+        assert!(!help_has_bg("Usage:\n  agp status [--json]\n"));
+    }
+
+    #[test]
+    fn launch_and_run_options() {
+        let mut threads = crate::config::ProjectConfig::new("Demo", "demo", None, vec![]).threads;
+        threads.accounts = vec![AUTO.to_string()];
+        threads.max_usage = Some(85);
+        let run = RunOptions::from_settings(&threads);
+        assert_eq!(
+            launch_args("cpb", &run),
+            [
+                "--as",
+                "cpb",
+                "--on-limit",
+                "switch",
+                "--max-usage",
+                "85",
+                "--"
+            ]
+            .map(OsString::from)
+        );
+        threads.accounts = vec!["cpb".into(), "laura".into()];
+        threads.on_limit = OnLimit::Stay;
+        threads.max_usage = None;
+        assert_eq!(
+            RunOptions::from_settings(&threads).args(),
+            ["--on-limit", "stay", "--accounts", "cpb,laura"]
+        );
+        // Threads kept in the project's account have nowhere to switch to.
+        threads.accounts = vec![];
+        threads.on_limit = OnLimit::Switch;
+        assert_eq!(RunOptions::from_settings(&threads).on_limit, OnLimit::Wait);
     }
 }

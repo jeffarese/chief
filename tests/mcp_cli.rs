@@ -118,6 +118,7 @@ fn serves_the_tools_over_stdio() {
         names,
         [
             "list_threads",
+            "move_thread",
             "read_report",
             "resolve_thread",
             "start_thread",

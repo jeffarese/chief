@@ -81,6 +81,7 @@ fn short_label(group: Group) -> &'static str {
     match group {
         Group::Waiting => "waiting",
         Group::Working => "working",
+        Group::Limited => "limited",
         Group::Review => "in review",
         Group::Landing => "landing",
         Group::Idle => "idle",

@@ -119,39 +119,68 @@ pub fn active(row: &SessionRow) -> bool {
 /// the hooks' cwd: it follows the thread's shell anywhere, into another thread's worktree too.
 /// An error when the job state can't be read: chief can't tell, so nothing may assume none.
 pub fn worktree_of(claude: &Claude, row: &SessionRow) -> Result<Option<PathBuf>> {
-    Ok(own_job(claude, row)?.map(|(wt, _)| wt))
+    Ok(own_job(claude, row)?.map(|job| job.worktree))
 }
 
 /// The branch the job state names with the thread's own worktree (`worktree_of`): what its PR is
 /// matched on. Never the hooks' cwd, which may sit in the checkout on `main`.
 pub fn branch_of(claude: &Claude, row: &SessionRow) -> Result<Option<String>> {
-    Ok(own_job(claude, row)?.and_then(|(_, branch)| branch))
+    Ok(own_job(claude, row)?.and_then(|job| job.branch))
 }
 
-/// `claude` is the project's account; the job state is in the thread's own (`Claude::for_row`).
-/// Ok(None) for a thread that never started, has no state file, or never moved into a worktree.
-fn own_job(claude: &Claude, row: &SessionRow) -> Result<Option<(PathBuf, Option<String>)>> {
+/// The job that owns a thread's worktree, and where it is.
+pub struct OwnJob {
+    /// `claude` in the account whose job names the worktree: the one whose `claude rm` deletes
+    /// it.
+    pub claude: Claude,
+    pub worktree: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// `claude` is the project's account; the job state is in the thread's own (`Claude::for_row`),
+/// or, for a thread agp moved, in an account it ran in before (`claude::prior_job_state`): its
+/// new job resumed in the worktree and names none. Ok(None) for a thread that never started, has
+/// no state file, or never moved into a worktree.
+pub fn own_job(claude: &Claude, row: &SessionRow) -> Result<Option<OwnJob>> {
     let Some(short) = row.short_id.as_deref() else {
         return Ok(None);
     };
-    let job = claude
-        .for_row(row)
+    let here = claude.for_row(row);
+    let job = here
         .job_state(short)
         .context("reading the thread's job state")?;
-    let Some(claude::JobState {
-        worktree: Some(path),
-        branch,
-    }) = job
-    else {
-        return Ok(None);
+    let (owner, path, branch) = match job {
+        Some(claude::JobState {
+            worktree: Some(path),
+            branch,
+            ..
+        }) => (here, path, branch),
+        _ => match claude::prior_job_state(&row.prior_accounts(), short)? {
+            Some((account, job)) => match job.worktree {
+                Some(path) => (claude.in_account(account.as_deref()), path, job.branch),
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        },
     };
-    Ok((worktree_root(&path).as_deref() == Some(path.as_path())).then_some((path, branch)))
+    Ok(
+        (worktree_root(&path).as_deref() == Some(path.as_path())).then_some(OwnJob {
+            claude: owner,
+            worktree: path,
+            branch,
+        }),
+    )
 }
 
 /// Reads the thread's worktree (`worktree_of`). A thread without one has nothing of its own to
 /// lose; one whose job state can't be read is an error.
 pub fn inspect(claude: &Claude, row: &SessionRow) -> Result<Inspection> {
-    let Some((root, branch)) = own_job(claude, row)? else {
+    let Some(OwnJob {
+        worktree: root,
+        branch,
+        ..
+    }) = own_job(claude, row)?
+    else {
         return Ok(Inspection::default());
     };
     let mut ins = Inspection {
@@ -416,6 +445,14 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
         git(wt, &["reset", "--hard", "-q"])?;
         git(wt, &["clean", "-fdq"])?;
     }
+    // A thread agp moved has a job in every account it ran in.
+    let row = match gather(ctx, row, &short_id)? {
+        Ok(row) => row,
+        Err(why) => {
+            record(ctx, name, Some(&why))?;
+            return Ok(Outcome::Blocked(why));
+        }
+    };
     // In the thread's own account: another account's `claude rm` doesn't know the session.
     let claude = ctx.claude.for_row(&row);
     let mut outcome = claude.rm(&short_id, None)?;
@@ -439,6 +476,89 @@ fn clean_claimed(ctx: &Ctx, name: &str, mode: Mode) -> Result<Outcome> {
     };
     record(ctx, name, Some(&why))?;
     Ok(Outcome::Blocked(why))
+}
+
+/// A thread agp moved (§12): it has a job in each account it ran in, and only one names its
+/// worktree, the job `claude rm` deletes it with. So the row moves back to that account first,
+/// and the other jobs go (their `claude rm` stops the process and removes only the job, as they
+/// name no worktree). Whatever the last `claude rm` then decides, the row names a job that
+/// exists. Err is why cleanup stops (one of those removals failed); a thread never moved is
+/// returned as it is.
+fn gather(ctx: &Ctx, mut row: SessionRow, short: &str) -> Result<Result<SessionRow, String>> {
+    let priors = row.prior_accounts();
+    if priors.is_empty() {
+        return Ok(Ok(row));
+    }
+    let project = ctx.claude.account.as_deref();
+    let current = row.account(project);
+    let owner = own_job(ctx.claude, &row)?.map(|job| job.claude.account);
+    // Every account it ran in but the owner's (or, with no worktree, but the current one).
+    let keep = owner.clone().unwrap_or_else(|| current.clone());
+    let mut others: Vec<Option<PathBuf>> = Vec::new();
+    for account in std::iter::once(current.clone())
+        .chain(priors.iter().map(|p| p.dir.as_deref().map(PathBuf::from)))
+    {
+        if !claude::same_account(account.as_deref(), keep.as_deref())
+            && !others
+                .iter()
+                .any(|o| claude::same_account(o.as_deref(), account.as_deref()))
+        {
+            others.push(account);
+        }
+    }
+    // The row first: if a removal below fails, it already names the job that stays.
+    if !claude::same_account(current.as_deref(), keep.as_deref()) {
+        let back = priors
+            .iter()
+            .rev()
+            .find(|p| claude::same_account(p.dir.as_deref().map(Path::new), keep.as_deref()))
+            .cloned();
+        match back {
+            // The project's account is no account of the row's own (§3).
+            Some(back) if claude::same_account(back.dir.as_deref().map(Path::new), project) => {
+                row.account_id = None;
+                row.account_label = None;
+                row.account_dir = None;
+            }
+            Some(back) => {
+                row.account_id = Some(back.id);
+                row.account_label = Some(back.label);
+                row.account_dir = back.dir;
+            }
+            None => {}
+        }
+    }
+    row.set_prior_accounts(&[]);
+    db::immediate(ctx.conn, |conn| {
+        let Some(mut stored) = db::get_session(conn, &row.name)? else {
+            return Ok(());
+        };
+        stored.account_id = row.account_id.clone();
+        stored.account_label = row.account_label.clone();
+        stored.account_dir = row.account_dir.clone();
+        stored.prior_accounts = None;
+        stored.pid = None;
+        stored.cc_fresh = false;
+        db::update_session(conn, &stored)
+    })?;
+    for account in others {
+        let claude = ctx.claude.in_account(account.as_deref());
+        if claude.job_state(short)?.is_none() {
+            continue;
+        }
+        match claude.rm(short, None)? {
+            RmOutcome::Removed => {}
+            other => {
+                let shown = claude::account_label(account.as_deref());
+                let what = match other {
+                    RmOutcome::Other(text) => one_line(&text, 200),
+                    other => format!("{other:?}"),
+                };
+                return Ok(Err(format!("claude rm of its old job in {shown}: {what}")));
+            }
+        }
+    }
+    Ok(Ok(row))
 }
 
 /// Whether `--discard-unpushed <token>` throws away only what the user confirmed: commits chief
@@ -512,8 +632,16 @@ fn sharing_worktree(ctx: &Ctx, row: &SessionRow, wt: &Path) -> Result<Option<Sha
                 claude
             }
         };
-        let folder = project.for_row(&other).config_dir;
-        match claude::job_worktree(&folder, short) {
+        // Its own job state, or for a thread agp moved, the one before that names its worktree.
+        let theirs =
+            claude::job_worktree(&project.for_row(&other).config_dir, short).and_then(|here| {
+                match here {
+                    Some(wt) => Ok(Some(wt)),
+                    None => Ok(claude::prior_job_state(&other.prior_accounts(), short)?
+                        .and_then(|(_, job)| job.worktree)),
+                }
+            });
+        match theirs {
             Ok(Some(theirs)) if theirs.canonicalize().unwrap_or_else(|_| theirs.clone()) == wt => {
                 return Ok(Some(Sharing::Names(other.name)));
             }

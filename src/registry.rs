@@ -43,10 +43,21 @@ pub fn facts(row: &SessionRow) -> Facts<'_> {
         last_hook: row.last_hook.as_deref().and_then(HookKind::from_stored),
         process_gone: process_gone(row),
         background_work: row.subagents_busy > 0 || row.background_running > 0,
+        limited: limited(row),
         pr_state: row.pr_state.as_deref(),
         pr_draft: row.pr_draft.unwrap_or(false),
         pr_review: row.pr_review.as_deref(),
     }
+}
+
+/// Its job state said a limit stopped it, and no hook since shows it on another turn (a wake
+/// after the reset, a message): the next sync clears the limit then.
+pub fn limited(row: &SessionRow) -> bool {
+    row.limit_note.is_some()
+        && match (row.last_hook_at, row.limited_since) {
+            (Some(hook), Some(since)) => hook <= since,
+            _ => true,
+        }
 }
 
 /// No pid, and a snapshot taken at or after the last hook said so. A newer hook (a respawn
@@ -179,6 +190,7 @@ pub fn sync_row(row: &mut SessionRow, poll: &Poll, now: i64) -> bool {
         }
     }
     refresh_branch(row, poll);
+    refresh_limit(row, poll);
     if row.short_id != before.short_id || row.session_id != before.session_id {
         // What `db::update_session` stamps, so the row in hand agrees.
         row.ids_at = Some(now);
@@ -277,9 +289,23 @@ fn worktree_gone(row: &SessionRow, poll: &Poll) -> bool {
 
 /// The worktree the row's job state names, while it is still on disk.
 fn worktree_on_disk(row: &SessionRow, poll: &Poll) -> Option<PathBuf> {
-    (poll.job)(row.short_id.as_deref()?)?
-        .worktree
-        .filter(|p| p.is_dir())
+    own_job(row, poll)?.worktree.filter(|p| p.is_dir())
+}
+
+/// The job state that names the row's worktree: its own, or for a thread agp moved (whose new job
+/// resumed in a worktree it didn't make, §12) the one before that does. None when one that
+/// matters can't be read: the caller keeps what it has.
+fn own_job(row: &SessionRow, poll: &Poll) -> Option<JobState> {
+    let short = row.short_id.as_deref()?;
+    let here = (poll.job)(short);
+    if here.as_ref().is_some_and(|j| j.worktree.is_some()) || row.prior_accounts.is_none() {
+        return here;
+    }
+    match claude::prior_job_state(&row.prior_accounts(), short) {
+        Ok(Some((_, job))) => Some(job),
+        Ok(None) => here,
+        Err(_) => None,
+    }
 }
 
 /// A thread's branch is the one its job state names with its worktree; one that never entered a
@@ -289,9 +315,85 @@ fn refresh_branch(row: &mut SessionRow, poll: &Poll) {
     if row.role != Role::Thread.as_str() {
         return;
     }
-    if let Some(job) = row.short_id.as_deref().and_then(|s| (poll.job)(s)) {
+    if let Some(job) = own_job(row, poll) {
         row.branch = job.worktree.and(job.branch);
     }
+}
+
+/// The limit its account hit, while its job state says it waits on it (§5 "Limits and moves"),
+/// from its job in the account it runs in now (an older account's job stays limited after agp
+/// moved it). Without a readable job state the stored limit stays.
+fn refresh_limit(row: &mut SessionRow, poll: &Poll) {
+    if row.role != Role::Thread.as_str() {
+        return;
+    }
+    let Some(job) = row.short_id.as_deref().and_then(|s| (poll.job)(s)) else {
+        return;
+    };
+    set_limit(row, job.limit, poll.taken_at);
+}
+
+fn set_limit(row: &mut SessionRow, limit: Option<String>, now: i64) {
+    match limit {
+        Some(text) => {
+            // New, or seen again after a hook since: a later turn hit it again.
+            if !limited(row) {
+                row.limited_since = Some(now);
+            }
+            row.limit_note = Some(text);
+        }
+        None => {
+            row.limit_note = None;
+            row.limited_since = None;
+        }
+    }
+}
+
+/// The limits of the project's live threads, from their job states alone: files, no `claude
+/// agents`, so the coordinator's watcher can afford it every few seconds (§5 "Telling the
+/// coordinator"). Writes only rows whose limit changed.
+pub fn refresh_limits(
+    conn: &Connection,
+    slug: &str,
+    project: Option<&Path>,
+    now: i64,
+) -> Result<()> {
+    let live = |r: &SessionRow| {
+        r.role == Role::Thread.as_str()
+            && !r.resolved
+            && r.cleaned_at.is_none()
+            && r.removed_at.is_none()
+            && r.short_id.is_some()
+    };
+    let mut changed = Vec::new();
+    for row in db::list_sessions(conn, slug, Some(Role::Thread))?
+        .into_iter()
+        .filter(live)
+    {
+        let dir = claude::claude_dir(row.account(project).as_deref());
+        let short = row.short_id.as_deref().unwrap_or_default();
+        let Ok(Some(job)) = claude::read_job_state(&dir, short) else {
+            continue;
+        };
+        if job.limit != row.limit_note {
+            changed.push((row.name, job.limit));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    db::immediate(conn, |conn| {
+        for (name, limit) in &changed {
+            let Some(mut row) = db::get_session(conn, name)? else {
+                continue;
+            };
+            set_limit(&mut row, limit.clone(), now);
+            rederive(&mut row, now);
+            row.updated_at = now;
+            db::update_session(conn, &row)?;
+        }
+        Ok(())
+    })
 }
 
 /// The session is listed again: undo what the removed verdict did, and only that. Every
@@ -813,6 +915,7 @@ mod tests {
             Some(JobState {
                 worktree: Some(fix.clone()),
                 branch: Some("worktree-fix".into()),
+                limit: None,
             })
         };
         let mut t = thread("demo-t-1111", Some("t1"), Some("t-sid"), 0);
@@ -1034,6 +1137,7 @@ mod tests {
             Some(JobState {
                 worktree: Some("/r/.claude/worktrees/fix".into()),
                 branch: Some("worktree-fix".into()),
+                limit: None,
             })
         });
         assert_eq!(t.branch.as_deref(), Some("worktree-fix"));

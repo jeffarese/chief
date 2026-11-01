@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::accounts::{self, Listings};
-use crate::agp::Agp;
-use crate::claude::{AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError, same_account};
-use crate::config::{EFFORTS, ProjectConfig};
+use crate::agp::{Agp, RunOptions};
+use crate::claude::{AGENTS_TIMEOUT, AgentRow, BgSpawn, Claude, ClaudeError, Via, same_account};
+use crate::config::{EFFORTS, OnLimit, ProjectConfig, Runner};
 use crate::db::{self, SessionRow};
 use crate::state::{Group, Role};
 use crate::text::{ago, one_line};
@@ -73,6 +73,16 @@ pub struct StartThreadArgs {
     pub account: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MoveThreadArgs {
+    /// The thread's name.
+    pub name: String,
+    /// The account to move it to, by agp id or label (e.g. "PB4"); it must be in the project's
+    /// pool. Default: the other pool account with the most room now.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ListThreadsArgs {
     /// Also list resolved threads. Default false.
@@ -128,6 +138,14 @@ pub struct ThreadView {
     /// address (it changes when the thread is woken). Null while that thread has no process,
     /// and once it is cleaned up.
     pub address: Option<String>,
+    /// The usage limit it waits on (group `limited`), e.g. "You've hit your 5-hour limit ·
+    /// resets 6:10am (Europe/Madrid)".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// How it last moved account (§5 "Limits and moves"), e.g. "moved from PB2 to PB4 after
+    /// the 5-hour limit".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved: Option<String>,
 }
 
 /// `address` is `tools::address` for the row.
@@ -154,6 +172,8 @@ pub fn thread_view(
         cleaned: row.cleaned_at.is_some(),
         account: row.account_shown().map(str::to_string),
         address,
+        limit: row.limit_note.clone().filter(|_| registry::limited(row)),
+        moved: row.move_note.clone(),
     }
 }
 
@@ -170,7 +190,14 @@ pub fn board_order(rows: &mut [SessionRow]) {
 /// Polls `claude agents` in every account the project uses and writes each into its rows. A
 /// failed account leaves its rows as they were (`Listings::error`).
 pub fn refresh(ctx: &ToolCtx) -> Result<Listings> {
-    accounts::refresh(ctx.conn, ctx.slug(), ctx.claude, AGENTS_TIMEOUT, ctx.now)
+    accounts::refresh_with(
+        ctx.conn,
+        ctx.slug(),
+        ctx.claude,
+        ctx.agp,
+        AGENTS_TIMEOUT,
+        ctx.now,
+    )
 }
 
 pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
@@ -244,6 +271,22 @@ pub fn start_thread_unless(
         row.account_label = Some(c.label.clone());
         row.account_dir = c.dir.as_ref().map(|d| d.to_string_lossy().into_owned());
     }
+    // Through agp, which moves it to another account when its own hits a usage limit (§5
+    // "Limits and moves"): launched by agp in the account placement chose, or, in the project's
+    // account (no agp profile named), launched by claude and handed to agp to watch.
+    let run = RunOptions::from_settings(&ctx.config.threads);
+    let agp_runs = ctx.config.threads.runner == Runner::Agp && ctx.agp.supports_bg();
+    let via = match placed.chosen.as_ref().filter(|_| agp_runs) {
+        Some(c) => Via::Agp {
+            agp: ctx.agp,
+            id: &c.id,
+            run: &run,
+        },
+        None => Via::Claude,
+    };
+    if matches!(via, Via::Agp { .. }) {
+        row.runner = Some(db::RUNNER_AGP.to_string());
+    }
     db::insert_session(ctx.conn, &row)?;
 
     let coordinator = names::coordinator_name(ctx.slug());
@@ -263,7 +306,13 @@ pub fn start_thread_unless(
             &coordinator,
             ctx.project_dir,
             &instructions,
-            !same_account(account.as_deref(), ctx.claude.account.as_deref()),
+            if agp_runs && run.on_limit == OnLimit::Switch {
+                prompts::Reach::MayMove
+            } else if same_account(account.as_deref(), ctx.claude.account.as_deref()) {
+                prompts::Reach::Same
+            } else {
+                prompts::Reach::Elsewhere
+            },
         ),
         prompt: Some(task_prompt(&args.task)),
     };
@@ -275,7 +324,7 @@ pub fn start_thread_unless(
         bail!("start_thread was cancelled before {name} started; nothing was started");
     }
     let mut warnings = Vec::new();
-    let (short_id, adopted) = match claude.spawn_bg(&spec) {
+    let (short_id, adopted) = match claude.spawn_bg_via(&spec, &via) {
         Ok(id) => (Some(id), None),
         Err(e) => {
             let (kept, warning) = after_failed_spawn(ctx, &claude, &name, &live, &spec.cwd, e)?;
@@ -330,6 +379,12 @@ pub fn start_thread_unless(
         }
         (None, _) => None,
     };
+    if agp_runs
+        && matches!(via, Via::Claude)
+        && let Some(id) = &short_id
+    {
+        watch_after_start(ctx, &name, id, &run);
+    }
     if !stored {
         warnings.push(format!(
             "{name} started, but chief couldn't store its session ids (the database was busy or \
@@ -355,6 +410,7 @@ pub fn start_thread_unless(
         "model": model,
         "effort": effort,
         "account": row.account_shown(),
+        "runner": if row.via_agp() { "agp" } else { "claude" },
         "address": address,
         "next": subscribe("Subscribe now", &row, address.as_deref()),
     });
@@ -365,6 +421,26 @@ pub fn start_thread_unless(
         out["warning"] = json!(warnings.join(" "));
     }
     Ok(out)
+}
+
+/// Hands a thread `claude` started in the project's account to agp to watch for limits (§5
+/// "Limits and moves"), and marks it agp's once agp took it. Never fails the start: a thread agp
+/// doesn't watch is one chief tells the coordinator about when it hits a limit.
+fn watch_after_start(ctx: &ToolCtx, name: &str, short_id: &str, run: &RunOptions) {
+    if let Err(e) = ctx.agp.watch(short_id, None, run) {
+        eprintln!("chief mcp: agp couldn't watch {name} for limits: {e:#}");
+        return;
+    }
+    let marked = db::immediate(ctx.conn, |conn| {
+        let Some(mut row) = db::get_session(conn, name)? else {
+            return Ok(());
+        };
+        row.runner = Some(db::RUNNER_AGP.to_string());
+        db::update_session(conn, &row)
+    });
+    if let Err(e) = marked {
+        eprintln!("chief mcp: couldn't mark {name} as watched by agp: {e:#}");
+    }
 }
 
 /// Where the coordinator sends `row`'s messages (§6, §7): its name when it runs in the
@@ -620,11 +696,14 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     if row.cleaned_at.is_some() {
         bail!(crate::guard::cleaned_message(&name));
     }
-    // Its own account's `claude agents` is the one that can see it; Some(row) once it has a
-    // process, with its address from that fresh listing (§7).
+    // Its own account's `claude agents` is the one that can see it (the row read again each
+    // time: agp may have moved it); Some(row) once it has a process, with its address from
+    // that fresh listing (§7).
     let alive =
         |ctx: &ToolCtx, timeout: Duration| -> Result<Option<(SessionRow, Option<String>)>> {
-            let listing = accounts::refresh_row(ctx.conn, ctx.claude, &row, timeout, ctx.now)?;
+            let row = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
+            let listing =
+                accounts::refresh_row_with(ctx.conn, ctx.claude, ctx.agp, &row, timeout, ctx.now)?;
             let now = db::get_session(ctx.conn, &name)?.context("thread row vanished")?;
             if now.pid.is_none() {
                 return Ok(None);
@@ -640,12 +719,38 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     if row.removed_at.is_some() {
         bail!(crate::guard::removed_message(&name));
     }
+    // agp may be moving it to another account (§5 "Limits and moves"): a respawn now would start
+    // it again where agp just stopped it. Once moved, it may run already.
+    let project = ctx.claude.account.as_deref();
+    let settled = crate::moves::settle(
+        ctx.conn,
+        ctx.agp,
+        &row,
+        project,
+        crate::moves::SETTLE_TIMEOUT,
+        ctx.now,
+    )?;
+    let moved = !same_account(
+        settled.account(project).as_deref(),
+        row.account(project).as_deref(),
+    );
+    if moved && let Some((now, address)) = alive(ctx, AGENTS_TIMEOUT)? {
+        let mut out = json!({"name": name, "alive": true, "respawned": false, "address": address});
+        moved_out(&mut out, &now, address.as_deref());
+        return Ok(out);
+    }
+    let row = settled;
     let short_id = row
         .short_id
         .clone()
         .with_context(|| format!("{name} was never started, so there is nothing to wake"))?;
     // A respawned session reads its hooks again.
     generated::rewrite(ctx.project_dir, ctx.config)?;
+    // Before the respawn: agp writes again the settings it merged with ours, which the
+    // respawned session reads, and brings back a watcher that ended (a reboot).
+    if let Err(e) = crate::moves::rearm(ctx.agp, &row, &ctx.config.threads) {
+        eprintln!("chief mcp: agp couldn't watch {name} again: {e:#}");
+    }
     ctx.claude.for_row(&row).respawn(&short_id)?;
     let deadline = Instant::now() + ctx.wake_timeout;
     let left = || deadline.saturating_duration_since(Instant::now());
@@ -662,8 +767,10 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
         if let Some((now, address)) = found {
             let mut out =
                 json!({"name": name, "alive": true, "respawned": true, "address": address});
-            // A socket address names the old process: the subscription must follow.
-            if address.as_deref() != Some(name.as_str()) {
+            if moved {
+                moved_out(&mut out, &now, address.as_deref());
+            } else if address.as_deref() != Some(name.as_str()) {
+                // A socket address names the old process: the subscription must follow.
                 out["next"] = json!(subscribe("Subscribe again", &now, address.as_deref()));
             }
             return Ok(out);
@@ -682,6 +789,16 @@ pub fn wake_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     }
 }
 
+/// What a reply says about a thread agp moved to another account: where it went, and the
+/// subscription at its new address, whatever the old one was.
+fn moved_out(out: &mut Value, row: &SessionRow, address: Option<&str>) {
+    if let Some(note) = &row.move_note {
+        out["moved"] = json!(note);
+    }
+    out["account"] = json!(row.account_shown());
+    out["next"] = json!(subscribe("It moved, so subscribe again", row, address));
+}
+
 /// `claude stop` for a thread: its process ends, and the turn it was in with it. Its
 /// conversation and worktree stay, and `wake_thread` brings it back. The main pane leaves it
 /// first: a pane showing it would respawn it to attach again.
@@ -692,7 +809,7 @@ pub fn stop_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
         bail!(crate::guard::cleaned_message(&name));
     }
     // Its own account's `claude agents` is the one that knows whether it has a process.
-    accounts::refresh_row(ctx.conn, ctx.claude, &row, AGENTS_TIMEOUT, ctx.now)?;
+    accounts::refresh_row_with(ctx.conn, ctx.claude, ctx.agp, &row, AGENTS_TIMEOUT, ctx.now)?;
     let row = project_thread(ctx, &name)?;
     if row.removed_at.is_some() {
         bail!(crate::guard::removed_message(&name));
@@ -706,6 +823,161 @@ pub fn stop_thread(ctx: &ToolCtx, args: &NameArgs) -> Result<Value> {
     }
     ctx.claude.for_row(&row).stop(short_id)?;
     Ok(json!({"name": name, "stopped": true}))
+}
+
+/// Moves a thread to another Claude account now, through agp (§5 "Limits and moves"): agp stops
+/// it and resumes the same conversation, in the same worktree, in `account` or the pool account
+/// with the most room. Its turn restarts there from a note saying it moved.
+pub fn move_thread(ctx: &ToolCtx, args: &MoveThreadArgs) -> Result<Value> {
+    let row = project_thread(ctx, &args.name)?;
+    let name = row.name.clone();
+    if row.cleaned_at.is_some() {
+        bail!(crate::guard::cleaned_message(&name));
+    }
+    if row.removed_at.is_some() {
+        bail!(crate::guard::removed_message(&name));
+    }
+    if !ctx.agp.supports_bg() {
+        bail!(
+            "agp isn't installed, or has no background sessions (`agp bg`): only agp moves a              thread to another account"
+        );
+    }
+    let session = row
+        .session_id
+        .clone()
+        .or_else(|| row.short_id.clone())
+        .with_context(|| format!("{name} was never started, so there is nothing to move"))?;
+    let project = ctx.claude.account.as_deref();
+    let row = crate::moves::settle(
+        ctx.conn,
+        ctx.agp,
+        &row,
+        project,
+        crate::moves::SETTLE_TIMEOUT,
+        ctx.now,
+    )?;
+    // A named account must be in the pool and trust the folder it resumes in.
+    let to = match args
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        Some(pinned) => {
+            let repo = row
+                .repo_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ctx.project_dir.to_path_buf());
+            let inputs = placement::Inputs {
+                threads: &ctx.config.threads,
+                agp: ctx.agp,
+                project: ctx.claude,
+                project_trust: ctx.trust_config,
+            };
+            let chosen = placement::place(&inputs, &repo, Some(pinned))?
+                .chosen
+                .with_context(|| format!("{pinned} is not an agp account"))?;
+            if same_account(chosen.dir.as_deref(), row.account(project).as_deref()) {
+                bail!("{name} runs in {} already", chosen.label);
+            }
+            Some(chosen.id)
+        }
+        None => None,
+    };
+    let moved = ctx.agp.move_now(&session, to.as_deref())?;
+    if !moved.moved {
+        bail!("agp didn't move {name}");
+    }
+    follow_manual_move(ctx, &row, &moved)?;
+    let row = project_thread(ctx, &name)?;
+    if ctx.config.threads.runner == Runner::Agp
+        && let Err(e) = crate::moves::rearm(ctx.agp, &row, &ctx.config.threads)
+    {
+        eprintln!("chief mcp: agp couldn't watch {name} after the move: {e:#}");
+    }
+    let listing =
+        accounts::refresh_row_with(ctx.conn, ctx.claude, ctx.agp, &row, AGENTS_TIMEOUT, ctx.now);
+    let row = project_thread(ctx, &name)?;
+    let agents = listing
+        .as_ref()
+        .ok()
+        .and_then(|l| l.agents.as_deref().ok())
+        .unwrap_or_default();
+    let address = address(ctx, &row, agents);
+    let mut out = json!({"name": name, "alive": row.pid.is_some(), "address": address});
+    moved_out(&mut out, &row, address.as_deref());
+    Ok(out)
+}
+
+/// Points the row at the account `agp bg move` put it in: from agp's record when `agp bg` lists
+/// the session, else from the move's answer.
+fn follow_manual_move(ctx: &ToolCtx, row: &SessionRow, moved: &crate::agp::Moved) -> Result<()> {
+    let project = ctx.claude.account.as_deref();
+    let now = (ctx.now)();
+    let sid = row.session_id.as_deref();
+    let listed = match ctx.agp.bg() {
+        Ok(Some(sessions)) => sessions
+            .into_iter()
+            .find(|s| Some(s.session_id.as_str()) == sid || s.short_id == row.short_id),
+        _ => None,
+    };
+    let bg = match listed.filter(|s| !s.moves.is_empty()) {
+        Some(bg) => bg,
+        None => {
+            let to = moved.to.clone().context("agp's move named no account")?;
+            crate::agp::BgSession {
+                session_id: sid.map(str::to_string).unwrap_or_default(),
+                short_id: moved.short_id.clone().or_else(|| row.short_id.clone()),
+                profile: to.clone(),
+                label: moved.to_label.clone(),
+                config_dir: moved.to_config_dir.clone(),
+                state: "watching".to_string(),
+                limit: None,
+                moves: vec![crate::agp::BgMove {
+                    at: now / 1000,
+                    from: moved
+                        .from
+                        .clone()
+                        .or_else(|| row.account_id.clone())
+                        .unwrap_or_default(),
+                    from_label: moved
+                        .from_label
+                        .clone()
+                        .or_else(|| row.account_shown().map(str::to_string)),
+                    from_config_dir: row.account(project),
+                    to,
+                    to_label: moved.to_label.clone(),
+                    to_config_dir: moved.to_config_dir.clone(),
+                    reason: Some("manual move".to_string()),
+                }],
+            }
+        }
+    };
+    db::immediate(ctx.conn, |conn| {
+        let Some(mut stored) = db::get_session(conn, &row.name)? else {
+            return Ok(());
+        };
+        let before = stored.clone();
+        crate::moves::follow(&mut stored, &bg, project, now);
+        if stored != before {
+            stored.updated_at = now;
+            db::update_session(conn, &stored)?;
+            db::insert_event(
+                conn,
+                &db::Event {
+                    session_name: Some(stored.name.clone()),
+                    session_id: stored.session_id.clone(),
+                    project_slug: stored.project_slug.clone(),
+                    hook: crate::moves::MOVED_EVENT.to_string(),
+                    ts: now,
+                    summary: stored.move_note.clone(),
+                    agent_id: None,
+                },
+            )?;
+        }
+        Ok(())
+    })
 }
 
 pub fn resolve_thread(ctx: &ToolCtx, args: &ResolveThreadArgs) -> Result<Value> {

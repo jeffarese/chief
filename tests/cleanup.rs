@@ -347,6 +347,67 @@ fn a_thread_in_another_account_is_cleaned_there() {
     assert!(env.row().cleaned_at.is_some());
 }
 
+/// A thread agp moved from PB2 to PB4 (§12): its PB4 job resumed in the worktree its PB2 job
+/// made, so the PB2 job names the worktree and its `claude rm` deletes it. Cleanup removes the
+/// PB4 job first (it names no worktree, so only the job goes), then cleans in PB2, and the row
+/// ends up in the account whose job it last removed.
+#[test]
+fn a_moved_thread_is_cleaned_in_every_account_it_ran_in() {
+    let env = Env::new();
+    let cpb = common::account(env._root.path(), "cpb");
+    let laura = common::account(env._root.path(), "laura");
+    env.insert(|r| {
+        common::in_account(r, "laura", "PB4", Some(&laura));
+        r.set_prior_accounts(&[db::PriorAccount {
+            id: "cpb".into(),
+            label: "PB2".into(),
+            dir: Some(cpb.to_string_lossy().into_owned()),
+        }]);
+        r.moved_at = Some(NOW - 10_000);
+        r.move_note = Some("moved from PB2 to PB4 after the 5-hour limit".into());
+    });
+    env.claude.drop_job(SHORT);
+    env.agents(&[agent("c1", "c-sid", "chief-demo", "done", Some(1))]);
+    common::job_in(&cpb, SHORT, Some(&env.worktree), Some("worktree-add-notes"));
+    common::job_in(&laura, SHORT, None, None);
+    common::account_agents(&cpb, &[agent(SHORT, SID, NAME, "done", None)]);
+    common::account_agents(&laura, &[agent(SHORT, SID, NAME, "done", None)]);
+
+    let ins = env.inspect();
+    assert_eq!(
+        ins.worktree.as_deref(),
+        Some(env.worktree.as_path()),
+        "the PB2 job names it"
+    );
+    assert_eq!(
+        cleanup::branch_of(&env.claude.claude(), &env.row())
+            .unwrap()
+            .as_deref(),
+        Some("worktree-add-notes")
+    );
+    assert_eq!(env.clean(Mode::Safe).unwrap(), Outcome::Cleaned);
+    let rms: Vec<_> = env
+        .claude
+        .accounts()
+        .into_iter()
+        .filter(|(first, _)| first == "rm")
+        .map(|(_, account)| account)
+        .collect();
+    assert_eq!(
+        rms,
+        [
+            laura.to_string_lossy().into_owned(),
+            cpb.to_string_lossy().into_owned()
+        ]
+    );
+    let row = env.row();
+    assert!(row.cleaned_at.is_some());
+    assert_eq!(
+        (row.account_id.as_deref(), row.prior_accounts),
+        (Some("cpb"), None)
+    );
+}
+
 #[test]
 fn safe_clean_never_stops_a_thread_it_would_not_remove() {
     let env = Env::new();

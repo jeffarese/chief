@@ -33,6 +33,7 @@ impl Role {
 pub enum Group {
     Waiting,
     Working,
+    Limited,
     Review,
     Landing,
     Idle,
@@ -41,9 +42,10 @@ pub enum Group {
 }
 
 impl Group {
-    pub const ORDER: [Group; 7] = [
+    pub const ORDER: [Group; 8] = [
         Group::Waiting,
         Group::Working,
+        Group::Limited,
         Group::Review,
         Group::Landing,
         Group::Idle,
@@ -55,6 +57,7 @@ impl Group {
         match self {
             Group::Waiting => "Waiting on you",
             Group::Working => "Working",
+            Group::Limited => "Limited",
             Group::Review => "Ready for review",
             Group::Landing => "Landing",
             Group::Idle => "Idle",
@@ -68,6 +71,7 @@ impl Group {
         match self {
             Group::Waiting => "waiting",
             Group::Working => "working",
+            Group::Limited => "limited",
             Group::Review => "review",
             Group::Landing => "landing",
             Group::Idle => "idle",
@@ -163,6 +167,9 @@ pub struct Facts<'a> {
     /// Its subagents or background commands still run (§5 "Background work"), which its own
     /// turn may have ended without.
     pub background_work: bool,
+    /// Its job state says a usage limit stopped its turn and it waits on it (§5 "Limits and
+    /// moves").
+    pub limited: bool,
     pub pr_state: Option<&'a str>,
     pub pr_draft: bool,
     pub pr_review: Option<&'a str>,
@@ -201,6 +208,11 @@ pub fn derive(facts: &Facts) -> Derived {
     }
     if let Some(reason) = stuck_on(facts) {
         return Derived::waiting(reason);
+    }
+    // Claude Code blocks a limited turn too; it waits on the clock or another account, not on
+    // the user.
+    if facts.limited {
+        return Derived::group(Group::Limited);
     }
     if facts.cc_state == Some("blocked") {
         return Derived::waiting(WaitingReason::Question);
@@ -747,6 +759,36 @@ mod tests {
     }
 
     #[test]
+    fn a_limited_turn_is_limited_not_a_question() {
+        let limited = Facts {
+            limited: true,
+            cc_state: Some("blocked"),
+            cc_status: Some("idle"),
+            ..base()
+        };
+        assert_eq!(derive(&limited).group, Group::Limited);
+        assert_eq!(derive(&limited).reason, None);
+        assert!(!blocked(&limited), "nothing for the user to answer");
+        // A permission prompt still comes first, and resolved before everything.
+        let prompt = Facts {
+            pending_permission: true,
+            ..limited.clone()
+        };
+        assert_eq!(derive(&prompt).group, Group::Waiting);
+        let resolved = Facts {
+            resolved: true,
+            ..limited.clone()
+        };
+        assert_eq!(derive(&resolved).group, Group::Resolved);
+        // A blocked turn without a limit is a question, as before.
+        let question = Facts {
+            limited: false,
+            ..limited
+        };
+        assert_eq!(derive(&question).reason, Some(WaitingReason::Question));
+    }
+
+    #[test]
     fn group_order_matches_board() {
         let labels: Vec<_> = Group::ORDER.iter().map(|g| g.label()).collect();
         assert_eq!(
@@ -754,6 +796,7 @@ mod tests {
             [
                 "Waiting on you",
                 "Working",
+                "Limited",
                 "Ready for review",
                 "Landing",
                 "Idle",

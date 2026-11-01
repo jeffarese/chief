@@ -372,3 +372,39 @@ unit tests (`embed::`); the resize call against Rex 0.1 by hand (a probe block g
 of 167 columns). Not verified live yet: Ctrl+Q reaching chief through Rex, Claude's kitty
 keyboard query answered by the user's terminal through the relay, and a real `claude attach` in
 the alacritty_terminal emulator (Shift+Enter, the agent view's mouse and paste).
+
+## Threads through agp: usage limits and moves (built, 2026-11-01)
+
+Problem (from use on mbp-m2max): threads ran on `claude --bg`, so a thread whose account hit its
+5-hour limit sat blocked until someone noticed. The board showed it as Waiting on you · question,
+and the coordinator, stuck in the same account, could do nothing. agp moved sessions between
+accounts only while it was their parent process (its dock, or `-p --on-limit`).
+
+1. **agp `--bg`** (agent-prism, DESIGN §11d): `agp [opts] -- --bg …` starts the session on the
+   account it picks and leaves a detached watcher per session. On a limit the watcher stops the
+   session and resumes the same conversation in another pool account (`switch`), or wakes it at
+   the reset (`wait`). `agp bg --json` lists the sessions, `agp bg watch` takes one over,
+   `agp bg move` moves one now. The resume facts behind it were checked live first (ARCHITECTURE
+   §1): across accounts the same session id comes back in its worktree; in an account that has
+   the job, only the no-flag form avoids a copy.
+2. **chief starts threads through agp** (`[threads] runner = "agp"`, the default; `on_limit =
+   "switch"`; both on the board's settings screen). A thread placed in the project's account is
+   started by `claude` and handed to `agp bg watch`. The coordinator is watched with `wait`,
+   never moved: threads reach it by name.
+3. **Following moves** (`src/moves.rs`): every refresh reads `agp bg --json` first and points a
+   moved row at its new account. It keeps the accounts before in `prior_accounts` (the first one's
+   job owns the worktree) and the note "moved from PB2 to PB4 after the 5-hour limit". Every
+   revive (`wake_thread`, the pane, `chief up`) waits while agp says `moving`, so nothing starts
+   the session again in the account agp just stopped it in, and it hands the session back to
+   `agp bg watch` before `claude respawn`.
+4. **Limited** is a group of its own (rule 3a), from the job state's `rate limited` block, no
+   longer a question. The coordinator's watcher reads limits and moves itself every 10 s and
+   wakes the coordinator with `<chief-moved>` (subscribe again at the new address) and
+   `<chief-limited>` (agp didn't move it: tell the user). `move_thread` moves one on request.
+5. **Cleanup** of a moved thread removes the jobs in its later accounts first, then runs `claude
+   rm` where the worktree's job is.
+
+Tested with the fake `claude` and a fake `agp` (`tests/tools.rs`, `tests/cleanup.rs`) and unit
+tests (`moves::`, `waiting::`, `agp::`, `claude::`); agp's side with its own fake-claude
+integration tests. Not verified live yet: a real limit moving a real thread end to end, and the
+coordinator's `<chief-moved>` turn.

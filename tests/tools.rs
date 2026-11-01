@@ -333,13 +333,14 @@ fn start_thread_runs_in_the_best_pool_account_that_trusts_the_repo() {
         "{listed:?}"
     );
     // agp: its status, then the folders of the accounts tried (never the limited one's).
+    // Then whether it watches background sessions: this one doesn't, so claude starts it.
     let agp: Vec<_> = env
         .agp
         .calls()
         .into_iter()
-        .map(|c| c[..2].join(" "))
+        .map(|c| c.iter().take(2).cloned().collect::<Vec<_>>().join(" "))
         .collect();
-    assert_eq!(agp, ["status --json", "exec cpb", "exec cpe"]);
+    assert_eq!(agp, ["status --json", "exec cpb", "exec cpe", "--help"]);
     let _ = pool.pb5;
 
     // list_threads gives the same address and the account.
@@ -392,12 +393,13 @@ fn start_thread_falls_back_to_the_project_account() {
             .map(str::to_string)
     };
 
-    // `accounts = []`: agp isn't even asked.
+    // `accounts = []`: agp isn't asked for an account, only whether it can watch the thread
+    // for limits (this one can't).
     let mut env = Env::new();
     pool(&env);
     env.config.threads.accounts = vec![];
     assert_eq!(run(&env), None);
-    assert!(env.agp.calls().is_empty());
+    assert_eq!(env.agp.calls(), [vec!["--help".to_string()]]);
 
     // Only accounts outside the pool (or unknown) allowed: silently the project's.
     let mut env = Env::new();
@@ -1474,4 +1476,458 @@ fn cleaned_threads_keep_their_reports_but_nothing_else() {
         })
         .unwrap();
     assert_eq!(out["reports"][0]["text"], "merged it");
+}
+
+/// An agp that watches background sessions: its help lists `agp bg`.
+fn agp_with_bg(env: &Env) {
+    env.agp.set(
+        "help.stdout",
+        "Usage:\n  agp [options] [--] [claude args]\n  agp bg [--json]   background sessions\n  \
+         agp bg watch <session> [--as <id>]\n  agp bg move <session> [--to <id>] [--json]\n",
+    );
+}
+
+/// `agp bg --json` with one session: `profile` (folder `dir`), moved there from `from` unless
+/// `from` is None.
+fn bg_record(
+    state: &str,
+    profile: (&str, &str, &Path),
+    from: Option<(&str, &str, &Path)>,
+    reason: &str,
+) -> String {
+    let moves = from.map_or(json!([]), |(id, label, dir)| {
+        json!([{"at": NOW / 1000 - 30, "from": id, "from_label": label, "from_config_dir": dir,
+                "to": profile.0, "to_label": profile.1, "to_config_dir": profile.2,
+                "reason": reason}])
+    });
+    json!({"sessions": [{"session_id": "sid-abc", "short_id": "abc123", "name": "x",
+        "profile": profile.0, "label": profile.1, "config_dir": profile.2, "cwd": "/r",
+        "on_limit": "switch", "state": state, "limit": null, "moves": moves,
+        "watcher_pid": 1, "watching": true, "updated_at": NOW / 1000}]})
+    .to_string()
+}
+
+/// §5 "Limits and moves": with an agp that watches background sessions, agp starts the thread
+/// in the account placement chose and watches it; chief never runs `claude --bg` itself. When agp
+/// moves it, the next refresh points the row at its new account, and the coordinator gets the new
+/// address.
+#[test]
+fn start_thread_runs_through_agp_and_follows_its_moves() {
+    let env = Env::new();
+    let pool = pool(&env);
+    agp_with_bg(&env);
+    env.agp
+        .set("as.stdout", "backgrounded · abc123 · whatever\n");
+    env.fake.set("agents.stdout", "[]");
+    common::account_agents(
+        &pool.cpe,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-x-xxxx",
+            "working",
+            Some(77),
+        )],
+    );
+    let out = env
+        .with(|ctx| tools::start_thread(ctx, &start_args("Fix login bug", "Fix it")))
+        .unwrap();
+    let name = out["name"].as_str().unwrap().to_string();
+    assert_eq!(
+        (&out["account"], &out["runner"], &out["address"]),
+        (
+            &json!("PB3"),
+            &json!("agp"),
+            &json!("uds:/tmp/cc-socks/77.sock")
+        )
+    );
+    assert!(env.fake.calls_of("--bg").is_empty(), "agp started it");
+    let launch = &env.agp.calls_of("--as")[0];
+    assert_eq!(
+        launch[..6],
+        ["--as", "cpe", "--on-limit", "switch", "--", "--bg"].map(String::from)
+    );
+    assert_eq!(arg_after(launch, "--name"), name);
+    let brief = arg_after(launch, "--append-system-prompt");
+    assert!(
+        brief.contains("You may be moved to another Claude account"),
+        "{brief}"
+    );
+    let n = env.agp.calls().iter().position(|c| c[0] == "--as").unwrap();
+    assert_eq!(env.agp.cwd(n), env.repo, "launched in the repo");
+    let row = env.row(&name).unwrap();
+    assert_eq!(
+        (row.runner.as_deref(), row.account_id.as_deref()),
+        (Some("agp"), Some("cpe"))
+    );
+
+    // agp moved it to PB5 after PB3's limit.
+    env.agp.set(
+        "bg.--json.stdout",
+        &bg_record(
+            "watching",
+            ("pb5", "PB5", &pool.pb5),
+            Some(("cpe", "PB3", &pool.cpe)),
+            "5-hour limit",
+        ),
+    );
+    common::account_agents(
+        &pool.pb5,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-x-xxxx",
+            "working",
+            Some(88),
+        )],
+    );
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    let t = &out["threads"][0];
+    assert_eq!(
+        (&t["account"], &t["address"], &t["moved"]),
+        (
+            &json!("PB5"),
+            &json!("uds:/tmp/cc-socks/88.sock"),
+            &json!("moved from PB3 to PB5 after the 5-hour limit")
+        )
+    );
+    let row = env.row(&name).unwrap();
+    assert_eq!(row.account_dir.as_deref(), Some(pool.pb5.to_str().unwrap()));
+    assert_eq!(
+        row.prior_accounts()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        ["cpe"]
+    );
+    assert_eq!(row.moved_at, Some(NOW - 30_000));
+}
+
+fn agp_thread(env: &Env, name: &str, dir: &Path, pid: Option<u32>) {
+    env.insert(name, |r| {
+        r.short_id = Some("abc123".into());
+        r.session_id = Some("sid-abc".into());
+        r.repo_path = Some(env.repo.to_string_lossy().into_owned());
+        r.runner = Some("agp".into());
+        r.pid = pid;
+        common::in_account(r, "cpe", "PB3", Some(dir));
+    });
+}
+
+/// A revive waits while agp moves the thread (it would start it again in the account agp just
+/// stopped it in), then finds it running in the new one: no respawn at all.
+#[test]
+fn wake_thread_waits_out_a_move_instead_of_reviving_it() {
+    let env = Env::new();
+    let pool = pool(&env);
+    agp_with_bg(&env);
+    agp_thread(&env, "demo-t-1111", &pool.cpe, None);
+    // Stopped in PB3 while agp moves it.
+    common::account_agents(
+        &pool.cpe,
+        &[agent("abc123", "sid-abc", "demo-t-1111", "blocked", None)],
+    );
+    common::account_agents(
+        &pool.pb5,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-t-1111",
+            "working",
+            Some(88),
+        )],
+    );
+    let moving = bg_record(
+        "moving",
+        ("pb5", "PB5", &pool.pb5),
+        Some(("cpe", "PB3", &pool.cpe)),
+        "5-hour limit",
+    );
+    env.agp
+        .set("bg.stdout.1", &moving)
+        .set("bg.stdout.2", &moving)
+        .set(
+            "bg.stdout",
+            &bg_record(
+                "watching",
+                ("pb5", "PB5", &pool.pb5),
+                Some(("cpe", "PB3", &pool.cpe)),
+                "5-hour limit",
+            ),
+        );
+    let out = env
+        .with(|ctx| {
+            tools::wake_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-t-1111".into(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        (&out["alive"], &out["respawned"], &out["address"]),
+        (
+            &json!(true),
+            &json!(false),
+            &json!("uds:/tmp/cc-socks/88.sock")
+        )
+    );
+    assert_eq!(out["moved"], "moved from PB3 to PB5 after the 5-hour limit");
+    assert!(
+        out["next"]
+            .as_str()
+            .unwrap()
+            .starts_with("It moved, so subscribe again: call SendMessage with exactly {\"to\": \"uds:/tmp/cc-socks/88.sock\""),
+        "{out}"
+    );
+    assert!(env.fake.calls_of("respawn").is_empty());
+    assert_eq!(
+        env.row("demo-t-1111").unwrap().account_id.as_deref(),
+        Some("pb5")
+    );
+}
+
+/// A thread agp watches is revived in its own account and handed back to agp's watcher.
+#[test]
+fn wake_thread_rearms_agps_watch() {
+    let env = Env::new();
+    let pool = pool(&env);
+    agp_with_bg(&env);
+    agp_thread(&env, "demo-t-1111", &pool.cpe, None);
+    common::account_agents(
+        &pool.cpe,
+        &[agent("abc123", "sid-abc", "demo-t-1111", "done", None)],
+    );
+    env.agp.set(
+        "bg.--json.stdout",
+        &bg_record("dormant", ("cpe", "PB3", &pool.cpe), None, ""),
+    );
+    // Listed with a pid from the second listing on (after the respawn).
+    std::fs::write(
+        pool.cpe.join("fake-agents.stdout.3"),
+        Value::from(vec![agent(
+            "abc123",
+            "sid-abc",
+            "demo-t-1111",
+            "working",
+            Some(90),
+        )])
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::copy(
+        pool.cpe.join("fake-agents.stdout.3"),
+        pool.cpe.join("fake-agents.stdout.4"),
+    )
+    .unwrap();
+    let out = env
+        .with(|ctx| {
+            tools::wake_thread(
+                ctx,
+                &NameArgs {
+                    name: "demo-t-1111".into(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(out["respawned"], true, "{out}");
+    assert_eq!(env.fake.calls_of("respawn").len(), 1);
+    let watch = &env
+        .agp
+        .calls_of("bg")
+        .into_iter()
+        .find(|c| c.get(1).map(String::as_str) == Some("watch"))
+        .expect("agp bg watch");
+    assert_eq!(
+        watch[..5],
+        ["bg", "watch", "sid-abc", "--as", "cpe"].map(String::from)
+    );
+    assert_eq!(arg_after(watch, "--on-limit"), "switch");
+}
+
+/// `move_thread`: agp moves it now, to the account the coordinator named, and chief follows.
+#[test]
+fn move_thread_moves_it_through_agp() {
+    let env = Env::new();
+    let pool = pool(&env);
+    agp_with_bg(&env);
+    agp_thread(&env, "demo-t-1111", &pool.cpe, Some(77));
+    common::account_agents(
+        &pool.cpe,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-t-1111",
+            "working",
+            Some(77),
+        )],
+    );
+    common::account_agents(
+        &pool.pb5,
+        &[agent(
+            "abc123",
+            "sid-abc",
+            "demo-t-1111",
+            "working",
+            Some(88),
+        )],
+    );
+    env.agp
+        .set(
+            "bg.stdout.1",
+            &bg_record("watching", ("cpe", "PB3", &pool.cpe), None, ""),
+        )
+        .set(
+            "bg.stdout",
+            &bg_record(
+                "watching",
+                ("pb5", "PB5", &pool.pb5),
+                Some(("cpe", "PB3", &pool.cpe)),
+                "manual move",
+            ),
+        )
+        .set(
+            "bg.move.stdout",
+            &json!({"moved": true, "session_id": "sid-abc", "short_id": "abc123",
+                    "from": "cpe", "from_label": "PB3", "to": "pb5", "to_label": "PB5",
+                    "to_config_dir": pool.pb5})
+            .to_string(),
+        );
+    let args = tools::MoveThreadArgs {
+        name: "demo-t-1111".into(),
+        account: Some("PB5".into()),
+    };
+    let out = env.with(|ctx| tools::move_thread(ctx, &args)).unwrap();
+    assert_eq!(
+        (&out["moved"], &out["account"], &out["address"]),
+        (
+            &json!("moved from PB3 to PB5 on request"),
+            &json!("PB5"),
+            &json!("uds:/tmp/cc-socks/88.sock")
+        )
+    );
+    let mv = env
+        .agp
+        .calls_of("bg")
+        .into_iter()
+        .find(|c| c.get(1).map(String::as_str) == Some("move"))
+        .expect("agp bg move");
+    assert_eq!(mv, ["bg", "move", "sid-abc", "--to", "pb5", "--json"]);
+    assert_eq!(
+        env.row("demo-t-1111").unwrap().account_id.as_deref(),
+        Some("pb5")
+    );
+
+    // Where it runs already, or an account outside the pool: refused before agp is asked.
+    let moves = || {
+        env.agp
+            .calls_of("bg")
+            .iter()
+            .filter(|c| c.get(1).map(String::as_str) == Some("move"))
+            .count()
+    };
+    let err = env
+        .with(|ctx| {
+            tools::move_thread(
+                ctx,
+                &tools::MoveThreadArgs {
+                    name: "demo-t-1111".into(),
+                    account: Some("PB5".into()),
+                },
+            )
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("runs in PB5 already"), "{err}");
+    let err = env
+        .with(|ctx| {
+            tools::move_thread(
+                ctx,
+                &tools::MoveThreadArgs {
+                    name: "demo-t-1111".into(),
+                    account: Some("Main".into()),
+                },
+            )
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not an account in this project's pool"),
+        "{err}"
+    );
+    assert_eq!(moves(), 1);
+}
+
+/// A thread whose job state says a usage limit stopped it is `limited`, with the limit, until a
+/// sync finds it going on.
+#[test]
+fn a_rate_limited_thread_is_limited() {
+    let env = Env::new();
+    env.insert("demo-t-1111", |r| {
+        r.short_id = Some("abc123".into());
+        r.session_id = Some("sid-abc".into());
+        r.pid = Some(77);
+    });
+    env.agents(&[agent(
+        "abc123",
+        "sid-abc",
+        "demo-t-1111",
+        "blocked",
+        Some(77),
+    )]);
+    let jobs = env.fake.config_dir().join("jobs/abc123");
+    std::fs::create_dir_all(&jobs).unwrap();
+    let limited = json!({
+        "state": "blocked",
+        "needs": "rate limited — wait and retry · You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)",
+        "detail": "You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)",
+    });
+    std::fs::write(jobs.join("state.json"), limited.to_string()).unwrap();
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    let t = &out["threads"][0];
+    assert_eq!(
+        (&t["group"], &t["limit"], &t["waiting_reason"]),
+        (
+            &json!("limited"),
+            &json!("You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)"),
+            &Value::Null
+        )
+    );
+    let row = env.row("demo-t-1111").unwrap();
+    assert_eq!(row.limited_since, Some(NOW));
+
+    // A message started a turn that hit the limit again: limited again, from that sync.
+    let mut row = env.row("demo-t-1111").unwrap();
+    row.limited_since = Some(NOW - 5_000);
+    row.last_hook_at = Some(NOW - 1_000);
+    db::update_session(&env.conn, &row).unwrap();
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    assert_eq!(out["threads"][0]["group"], "limited");
+    assert_eq!(env.row("demo-t-1111").unwrap().limited_since, Some(NOW));
+
+    // It went on after the reset.
+    std::fs::write(
+        jobs.join("state.json"),
+        json!({"state": "working"}).to_string(),
+    )
+    .unwrap();
+    env.agents(&[agent(
+        "abc123",
+        "sid-abc",
+        "demo-t-1111",
+        "working",
+        Some(77),
+    )]);
+    let out = env
+        .with(|ctx| tools::list_threads(ctx, &ListThreadsArgs::default()))
+        .unwrap();
+    let t = &out["threads"][0];
+    assert_eq!(t["group"], "working");
+    assert!(t.get("limit").is_none(), "{t}");
 }

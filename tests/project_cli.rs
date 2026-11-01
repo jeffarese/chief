@@ -936,6 +936,7 @@ fn respawn_rewrites_the_generated_files_first() {
     let woke = chief::project::respawn(
         &conn,
         &home.fake.claude(),
+        &chief::agp::Agp::new(home.agp.bin()),
         &dir,
         &config,
         &row,
@@ -957,6 +958,7 @@ fn respawn_rewrites_the_generated_files_first() {
     let err = chief::project::respawn(
         &conn,
         &home.fake.claude(),
+        &chief::agp::Agp::new(home.agp.bin()),
         &dir,
         &config,
         &row,

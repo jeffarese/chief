@@ -27,6 +27,8 @@ pub fn report(row: &SessionRow, since: i64) -> Vec<u8> {
     let state = match group {
         Group::Working => "working",
         Group::Waiting => "blocked",
+        // Waits on a usage limit: nothing for the user to answer.
+        Group::Limited => "blocked",
         Group::Idle if asks => "blocked",
         Group::Idle if replied => "done",
         Group::Review | Group::Landing | Group::Resolved => "done",

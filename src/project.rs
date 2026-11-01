@@ -420,8 +420,16 @@ pub fn up_with(slug: &str, choice: LayoutChoice, note: &mut dyn FnMut(Note)) -> 
     }
     let trust_config = claude.trust_config();
     let mut warn = |line: String| note(Note::Warn(line));
-    let (row, action) =
-        ensure_coordinator(&conn, &claude, &config, &dir, &trust_config, &mut warn)?;
+    let agp = crate::agp::Agp::from_env();
+    let (row, action) = ensure_coordinator(
+        &conn,
+        &claude,
+        &agp,
+        &config,
+        &dir,
+        &trust_config,
+        &mut warn,
+    )?;
     let verb = match action {
         CoordinatorAction::Started => "started",
         CoordinatorAction::Respawned => "respawned",
@@ -556,6 +564,7 @@ fn print_manual_layout(slug: &str) {
 pub fn ensure_coordinator(
     conn: &Connection,
     claude: &Claude,
+    agp: &crate::agp::Agp,
     config: &ProjectConfig,
     dir: &Path,
     trust_config: &Path,
@@ -568,9 +577,14 @@ pub fn ensure_coordinator(
         accounts::refresh_row(conn, claude, row, AGENTS_TIMEOUT, db::now_ms)?;
         let row = db::get_session(conn, &row.name)?.context("coordinator row vanished")?;
         if row.pid.is_some() {
+            // One started before agp watched coordinators.
+            let row = match row.via_agp() {
+                true => row,
+                false => watch_coordinator(conn, agp, config, &row).unwrap_or(row),
+            };
             return Ok((row, CoordinatorAction::Running));
         }
-        let row = respawn(conn, claude, dir, config, &row, RESPAWN_WAIT)?;
+        let row = respawn(conn, claude, agp, dir, config, &row, RESPAWN_WAIT)?;
         return Ok((row, CoordinatorAction::Respawned));
     }
 
@@ -594,7 +608,7 @@ pub fn ensure_coordinator(
             agent.id.as_deref().unwrap_or_default()
         ));
         store_ids(conn, &name, agent.id.as_deref(), Some(agent))?;
-        return ensure_coordinator(conn, claude, config, dir, trust_config, warn);
+        return ensure_coordinator(conn, claude, agp, config, dir, trust_config, warn);
     }
     if live
         .iter()
@@ -671,8 +685,43 @@ pub fn ensure_coordinator(
             }
         },
     };
-    let row = store_ids(conn, &name, short_id.as_deref(), agent.as_ref())?;
+    let mut row = store_ids(conn, &name, short_id.as_deref(), agent.as_ref())?;
+    if let Some(watched) = watch_coordinator(conn, agp, config, &row) {
+        row = watched;
+    }
     Ok((row, CoordinatorAction::Started))
+}
+
+/// Hands the coordinator to agp to watch for usage limits (§5 "Limits and moves"), so it goes on
+/// by itself after a reset. Always `wait`, never a move: its threads reach it by name in its
+/// own account. Best effort, like the agp a project may not have; the row marked agp's on
+/// success.
+fn watch_coordinator(
+    conn: &Connection,
+    agp: &crate::agp::Agp,
+    config: &ProjectConfig,
+    row: &SessionRow,
+) -> Option<SessionRow> {
+    if config.threads.runner != crate::config::Runner::Agp {
+        return None;
+    }
+    let short = row.short_id.as_deref()?;
+    if !agp.supports_bg() {
+        return None;
+    }
+    // Quietly: the pane calls this with its terminal in use.
+    agp.watch(short, None, &crate::moves::coordinator_run())
+        .ok()?;
+    db::immediate(conn, |conn| {
+        let Some(mut row) = db::get_session(conn, &row.name)? else {
+            return Ok(None);
+        };
+        row.runner = Some(db::RUNNER_AGP.to_string());
+        db::update_session(conn, &row)?;
+        Ok(Some(row))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Stores a spawned session's short id and, unless the row already has one, its session id and
@@ -706,11 +755,33 @@ fn store_ids(
 pub fn respawn(
     conn: &Connection,
     claude: &Claude,
+    agp: &crate::agp::Agp,
     dir: &Path,
     config: &ProjectConfig,
     row: &SessionRow,
     wait: Duration,
 ) -> Result<SessionRow> {
+    // A thread agp is moving to another account must not be revived where agp just stopped it
+    // (§5 "Limits and moves"); once moved, it may run already.
+    let project = claude.account.as_deref();
+    let settled = crate::moves::settle(
+        conn,
+        agp,
+        row,
+        project,
+        crate::moves::SETTLE_TIMEOUT,
+        db::now_ms,
+    )?;
+    if !claude::same_account(
+        settled.account(project).as_deref(),
+        row.account(project).as_deref(),
+    ) {
+        let now = wait_for_pid(conn, claude, &settled, Duration::ZERO)?;
+        if now.pid.is_some() {
+            return Ok(now);
+        }
+    }
+    let row = &settled;
     let short_id = row.short_id.as_deref().with_context(|| {
         format!(
             "{} was never started, so there is nothing to respawn",
@@ -718,7 +789,17 @@ pub fn respawn(
         )
     })?;
     generated::rewrite(dir, config)?;
+    // Before the respawn, best effort: agp writes again the settings it merged with ours (the
+    // respawned session reads them) and brings back a watcher that ended. A coordinator from
+    // before agp watched coordinators is handed to it after.
+    let coordinator = row.role == Role::Coordinator.as_str();
+    if row.via_agp() {
+        let _ = crate::moves::rearm(agp, row, &config.threads);
+    }
     claude.for_row(row).respawn(short_id)?;
+    if coordinator && !row.via_agp() {
+        watch_coordinator(conn, agp, config, row);
+    }
     wait_for_pid(conn, claude, row, wait)
 }
 
@@ -1120,6 +1201,14 @@ pub fn render_status(
             }
             if let Some(account) = t.account_shown() {
                 parts.push(format!("account {account}"));
+            }
+            if let Some(note) = &t.move_note {
+                parts.push(note.clone());
+            }
+            if crate::registry::limited(t)
+                && let Some(limit) = &t.limit_note
+            {
+                parts.push(format!("limited: {}", one_line(limit, 120)));
             }
             if t.cleaned_at.is_some() {
                 parts.push("cleaned up".to_string());

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::{Cleanup, EFFORTS, ProjectConfig, THREAD_PERMISSION_MODES};
+use crate::config::{Cleanup, EFFORTS, OnLimit, ProjectConfig, Runner, THREAD_PERMISSION_MODES};
 use crate::placement::{PoolTrust, Untrusted};
 
 use super::app::Action;
@@ -31,6 +31,10 @@ pub enum Field {
     /// `[threads] accounts`: the agp accounts threads may run in (§3).
     ThreadAccounts,
     MaxUsage,
+    /// `[threads] runner`: agp, which moves a limited thread to another account, or claude.
+    Runner,
+    /// `[threads] on_limit`: what agp does when a thread's account hits a usage limit.
+    OnLimit,
     DefaultRepo,
     Cleanup,
     Notify,
@@ -58,6 +62,8 @@ impl Field {
             Field::MaxParallel => "Max parallel",
             Field::ThreadAccounts => "Thread accounts",
             Field::MaxUsage => "Max usage",
+            Field::Runner => "Threads run through",
+            Field::OnLimit => "On a usage limit",
             Field::DefaultRepo => "Default repo",
             Field::Cleanup => "Cleanup",
             Field::Notify => "Notifications",
@@ -90,6 +96,8 @@ impl Field {
             Field::Account
             | Field::ThreadAccounts
             | Field::MaxUsage
+            | Field::Runner
+            | Field::OnLimit
             | Field::PoolTrust
             | Field::Untrusted(_) => "Accounts",
             Field::Save => "",
@@ -126,6 +134,13 @@ impl Field {
                 "agp accounts threads may run in: auto = the whole pool, empty = this account only."
             }
             Field::MaxUsage => "A pool account at or over this usage takes no new thread.",
+            Field::Runner => {
+                "agp: agp starts each thread and watches it for usage limits. claude: plain claude."
+            }
+            Field::OnLimit => {
+                "switch: agp moves a limited thread to a pool account with room. wait: it resumes \
+                 it at the reset. stay: nothing."
+            }
             Field::PoolTrust => "Check that every pool account trusts every repo.",
             Field::Untrusted(_) => {
                 "Enter trusts this repo in that account, as Claude's prompt would."
@@ -257,6 +272,8 @@ impl SettingsForm {
             Field::Account,
             Field::ThreadAccounts,
             Field::MaxUsage,
+            Field::Runner,
+            Field::OnLimit,
             Field::PoolTrust,
         ]);
         fields.extend((0..self.untrusted().len()).map(Field::Untrusted));
@@ -335,6 +352,8 @@ impl SettingsForm {
                 Cleanup::Merged => "merged".to_string(),
                 Cleanup::Manual => "manual".to_string(),
             },
+            Field::Runner => c.threads.runner.as_str().to_string(),
+            Field::OnLimit => c.threads.on_limit.as_str().to_string(),
             Field::Notify => if c.ui.notify { "on" } else { "off" }.to_string(),
             Field::Repo(i) => c
                 .repos
@@ -602,6 +621,20 @@ impl SettingsForm {
                 }
             }
             Field::Notify => c.ui.notify = !c.ui.notify,
+            Field::Runner => {
+                c.threads.runner = match c.threads.runner {
+                    Runner::Agp => Runner::Claude,
+                    Runner::Claude => Runner::Agp,
+                }
+            }
+            Field::OnLimit => {
+                let all = OnLimit::ALL.map(OnLimit::as_str);
+                let to = next(&all, c.threads.on_limit.as_str(), step);
+                c.threads.on_limit = OnLimit::ALL
+                    .into_iter()
+                    .find(|o| o.as_str() == to)
+                    .unwrap_or_default();
+            }
             _ => {}
         }
     }
@@ -892,6 +925,20 @@ mod tests {
         assert_eq!(f.draft.threads.effort, "low", "wraps");
         f.on_key(key(KeyCode::Left));
         assert_eq!(f.draft.threads.effort, "max");
+
+        goto(&mut f, Field::Runner);
+        assert_eq!(f.value(Field::Runner), "agp");
+        f.on_key(key(KeyCode::Right));
+        assert_eq!(f.draft.threads.runner, Runner::Claude);
+        f.on_key(key(KeyCode::Right));
+        assert_eq!(f.draft.threads.runner, Runner::Agp);
+        goto(&mut f, Field::OnLimit);
+        assert_eq!(f.value(Field::OnLimit), "switch");
+        f.on_key(key(KeyCode::Right));
+        assert_eq!(f.draft.threads.on_limit, OnLimit::Wait);
+        f.on_key(key(KeyCode::Left));
+        f.on_key(key(KeyCode::Left));
+        assert_eq!(f.draft.threads.on_limit, OnLimit::Stay, "wraps");
 
         goto(&mut f, Field::PermissionMode);
         f.on_key(key(KeyCode::Left));

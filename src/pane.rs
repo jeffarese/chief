@@ -501,7 +501,15 @@ pub(crate) fn wake(
         return Ok(());
     }
     say(&format!("chief · waking {} …", row.name));
-    project::respawn(conn, claude, dir, config, &row, WAKE_WAIT)?;
+    project::respawn(
+        conn,
+        claude,
+        &crate::agp::Agp::from_env(),
+        dir,
+        config,
+        &row,
+        WAKE_WAIT,
+    )?;
     Ok(())
 }
 
