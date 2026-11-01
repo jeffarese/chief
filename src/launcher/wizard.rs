@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::config::EFFORTS;
 
 /// Models offered by ←/→; any other name can be set later in the board's settings.
-pub const MODELS: [&str; 3] = ["opus", "sonnet", "haiku"];
+pub const MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -535,6 +535,9 @@ mod tests {
 
         // 3. ←→ cycle; ↓ moves.
         assert_eq!(w.coordinator_model, "opus");
+        w.on_key(key(KeyCode::Left), &probe);
+        assert_eq!(w.coordinator_model, "fable");
+        w.on_key(key(KeyCode::Right), &probe);
         w.on_key(key(KeyCode::Right), &probe);
         assert_eq!(w.coordinator_model, "sonnet");
         w.on_key(key(KeyCode::Down), &probe);

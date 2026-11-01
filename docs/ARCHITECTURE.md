@@ -1669,8 +1669,8 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
      drops the last folder name, the one before a trailing `/` too; ^U clears) and Enter adds it,
      canonical; a missing folder or one listed already says so. ↑ selects listed folders, d
      removes one. Enter with nothing typed goes on; none is fine.
-  3. Models: coordinator model and effort, thread model and effort (←/→ cycle `opus`, `sonnet`,
-     `haiku` and §3's efforts), defaults from `ProjectConfig::new`, a line on what each does, and
+  3. Models: coordinator model and effort, thread model and effort (←/→ cycle `fable`, `opus`,
+     `sonnet`, `haiku` and §3's efforts), defaults from `ProjectConfig::new`, a line on what each does, and
      a note that the rest is on the board (s).
   4. Review: name and slug, goal, code, models; when the project's account (this process's
      `CLAUDE_CONFIG_DIR`, as for `init`) doesn't trust some repos, lists them with
