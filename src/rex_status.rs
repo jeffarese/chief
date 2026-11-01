@@ -17,20 +17,29 @@ pub fn enabled() -> bool {
 }
 
 /// The report for `row`: its state (a waiting session is `blocked`, with what it waits for), its
-/// title, and its background work as the message.
-pub fn report(row: &SessionRow) -> Vec<u8> {
+/// title, and its background work as the message. An idle session that wrote its last message
+/// after `since` (unix ms; the pane attached it then) ended a turn as the user watched: `done`, as
+/// Claude Code reports a finished turn, or `blocked` on a question when that message asks one.
+pub fn report(row: &SessionRow, since: i64) -> Vec<u8> {
     let group = Group::parse(&row.group_name).unwrap_or(Group::Idle);
+    let replied = group == Group::Idle && row.last_report_at.is_some_and(|at| at > since);
+    let asks = replied && row.last_report.as_deref().is_some_and(asks_a_question);
     let state = match group {
         Group::Working => "working",
         Group::Waiting => "blocked",
+        Group::Idle if asks => "blocked",
+        Group::Idle if replied => "done",
         Group::Review | Group::Landing | Group::Resolved => "done",
         Group::Failed => "error",
         Group::Idle => "idle",
     };
     let mut fields = vec![format!("state={state}"), "app=claude-code".to_string()];
-    if group == Group::Waiting
-        && let Some(kind @ ("permission" | "question")) = row.waiting_reason.as_deref()
-    {
+    let kind = match (group, row.waiting_reason.as_deref()) {
+        (Group::Waiting, Some(kind @ ("permission" | "question"))) => Some(kind),
+        (Group::Idle, _) if asks => Some("question"),
+        _ => None,
+    };
+    if let Some(kind) = kind {
         fields.push(format!("kind={kind}"));
     }
     let title = match row.title.as_deref().filter(|t| !t.trim().is_empty()) {
@@ -43,6 +52,12 @@ pub fn report(row: &SessionRow) -> Vec<u8> {
         fields.push(format!("msg={}", base64(&format!("{work} running"))));
     }
     format!("\x1b]7501;{}\x1b\\", fields.join(":")).into_bytes()
+}
+
+/// A message that ends by asking something, as Claude Code tells one: a question mark at its end.
+fn asks_a_question(text: &str) -> bool {
+    let text = text.trim_end();
+    text.ends_with(['?', '？']) && text.trim_end_matches(['?', '？']).trim_end().len() >= 4
 }
 
 /// Standard base64 with padding, as the protocol carries titles and messages.
@@ -140,6 +155,10 @@ mod tests {
         row
     }
 
+    fn report_now(row: &SessionRow) -> Vec<u8> {
+        report(row, 0)
+    }
+
     fn text(bytes: Vec<u8>) -> String {
         String::from_utf8(bytes).unwrap()
     }
@@ -158,21 +177,21 @@ mod tests {
     #[test]
     fn a_report_tells_the_shown_sessions_state() {
         assert_eq!(
-            text(report(&row(Group::Working, None))),
+            text(report_now(&row(Group::Working, None))),
             "\x1b]7501;state=working:app=claude-code:title=UmF0ZSBsaW1pdHM=\x1b\\"
         );
         assert_eq!(
-            text(report(&row(Group::Waiting, Some("permission")))),
+            text(report_now(&row(Group::Waiting, Some("permission")))),
             "\x1b]7501;state=blocked:app=claude-code:kind=permission:title=UmF0ZSBsaW1pdHM=\x1b\\"
         );
-        assert!(text(report(&row(Group::Review, None))).contains("state=done"));
-        assert!(text(report(&row(Group::Failed, None))).contains("state=error"));
-        assert!(text(report(&row(Group::Idle, None))).contains("state=idle"));
+        assert!(text(report_now(&row(Group::Review, None))).contains("state=done"));
+        assert!(text(report_now(&row(Group::Failed, None))).contains("state=error"));
+        assert!(text(report_now(&row(Group::Idle, None))).contains("state=idle"));
 
         let mut busy = row(Group::Working, None);
         busy.subagents_busy = 2;
         busy.title = None;
-        let out = text(report(&busy));
+        let out = text(report(&busy, 0));
         assert!(
             out.contains(&format!("title={}", base64("demo-api-1a2b"))),
             "{out}"
@@ -181,6 +200,34 @@ mod tests {
             out.contains(&format!("msg={}", base64("2 subagents running"))),
             "{out}"
         );
+    }
+
+    /// A turn that ended while the pane showed it is `done`, or `blocked` on a question when its
+    /// last message asks one; an idle session last heard from before that is just idle.
+    #[test]
+    fn a_turn_that_ended_on_screen_is_done_or_asks() {
+        let mut idle = row(Group::Idle, None);
+        idle.last_report = Some("Opened PR #482 for the flaky test.".into());
+        idle.last_report_at = Some(2_000);
+        assert!(text(report(&idle, 1_000)).contains("state=done:"));
+        assert!(
+            text(report(&idle, 3_000)).contains("state=idle:"),
+            "before the attach"
+        );
+
+        idle.last_report = Some("Should rate limits be per key or per plan? ".into());
+        let out = text(report(&idle, 1_000));
+        assert!(
+            out.contains("state=blocked:app=claude-code:kind=question:"),
+            "{out}"
+        );
+        assert!(text(report(&idle, 3_000)).contains("state=idle:"));
+
+        let mut working = row(Group::Working, None);
+        working.last_report = idle.last_report.clone();
+        working.last_report_at = Some(2_000);
+        assert!(text(report(&working, 1_000)).contains("state=working:"));
+        assert!(!asks_a_question("Ok?"), "too short to be a question");
     }
 
     #[test]

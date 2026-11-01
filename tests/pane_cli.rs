@@ -705,6 +705,15 @@ fn in_rex_the_pane_reports_the_sessions_state() {
         "the colour stayed whole: {out:?}"
     );
     assert!(out.find(blocked) > out.find("m after"), "{out:?}");
+    // Its turn ends with a message while the pane shows it: done, as Claude Code reports it.
+    row.group_name = "idle".into();
+    row.waiting_reason = None;
+    row.last_report = Some("The limit is 100 a minute now.".into());
+    row.last_report_at = Some(db::now_ms());
+    db::update_session(&conn, &row).unwrap();
+    wait_for("done", || {
+        pane.says("\x1b]7501;state=done:app=claude-code:title=Q29vcmRpbmF0b3I=\x1b\\")
+    });
 
     // SAFETY: our own child.
     unsafe { libc::kill(pane.pid(), libc::SIGTERM) };

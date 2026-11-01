@@ -1302,7 +1302,10 @@ While it relays an attach there, it also reports the shown session's state as Cl
 (`rex_status`, OSC 7501 `state=…:app=claude-code[:kind=…]:title=<base64>[:msg=<base64>]`): from
 the session's row, read again every second and sent when it changes; working → `working`,
 waiting → `blocked` with `kind=permission|question`, review, landing and resolved → `done`,
-failed → `error`, idle → `idle`; the title is the thread's title (`Coordinator` for the
+failed → `error`, idle → `idle`, unless its last message (`last_report_at`) came after the pane
+attached it: a turn that ended on screen is `done`, as Claude Code reports one, or `blocked` with
+`kind=question` when that message ends with a question mark (Claude Code's own simplest rule); the
+title is the thread's title (`Coordinator` for the
 coordinator), the message its background work (`3 subagents running`). The relay writes a report
 only between Claude's escape sequences and UTF-8 characters (`rex_status::Boundary`); when the
 attach ends, an ST and `state=clear` end the record. Outside Rex the pane neither renames itself

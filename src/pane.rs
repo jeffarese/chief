@@ -520,6 +520,8 @@ fn attach(
     let mut cmd = claude.command();
     cmd.args(["attach", short_id]);
     let rex = rex_status::enabled();
+    // A turn that ends from now on, as the user watches, is reported finished.
+    let attached_at = db::now_ms();
     let sent: RefCell<Option<Vec<u8>>> = RefCell::new(None);
     let looked: Cell<Option<Instant>> = Cell::new(None);
     // The row as the hooks and the board's sync keep it, read again every STATUS_EVERY.
@@ -529,7 +531,7 @@ fn attach(
         }
         looked.set(Some(Instant::now()));
         let now = db::get_session(conn, &row.name).ok().flatten()?;
-        let report = rex_status::report(&now);
+        let report = rex_status::report(&now, attached_at);
         if sent.borrow().as_ref() == Some(&report) {
             return None;
         }
