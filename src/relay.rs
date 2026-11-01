@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::terminal;
 
 use crate::embed::Pty;
+use crate::rex_status;
 
 /// How long one wait for bytes lasts; a signal (a switch, a hangup, a resize) cuts it short.
 const TICK: Duration = Duration::from_millis(50);
@@ -46,6 +47,9 @@ pub struct Signals<'a> {
     pub switch: &'a dyn Fn() -> bool,
     /// The terminal changed size (SIGWINCH) since the last look.
     pub resized: &'a dyn Fn() -> bool,
+    /// Bytes for the pane's terminal itself, a program status report (`rex_status`): written
+    /// between Claude's escape sequences and characters, never inside one.
+    pub status: &'a dyn Fn() -> Option<Vec<u8>>,
 }
 
 /// Runs `cmd` on a pseudo-terminal of the pane's terminal's size and relays until it ends. The
@@ -60,7 +64,19 @@ pub fn relay(cmd: Command, signals: &Signals) -> io::Result<Ended> {
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 1 << 16];
     let mut out = io::stdout();
+    let mut boundary = rex_status::Boundary::default();
+    let mut report: Option<Vec<u8>> = None;
     loop {
+        if let Some(r) = (signals.status)() {
+            report = Some(r);
+        }
+        if boundary.safe()
+            && let Some(r) = report.take()
+            && out.write_all(&r).and_then(|()| out.flush()).is_err()
+        {
+            pty.end();
+            return Ok(Ended::HungUp);
+        }
         if (signals.hung_up)() {
             pty.end();
             return Ok(Ended::HungUp);
@@ -115,6 +131,7 @@ pub fn relay(cmd: Command, signals: &Signals) -> io::Result<Ended> {
             match pty.read(&mut buf) {
                 Ok(0) => return Ok(Ended::Exited(finish(pty))),
                 Ok(n) => {
+                    boundary.feed(&buf[..n]);
                     if out.write_all(&buf[..n]).and_then(|()| out.flush()).is_err() {
                         pty.end();
                         return Ok(Ended::HungUp);

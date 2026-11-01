@@ -66,6 +66,9 @@ enum Command {
         /// Run as the `main` block of chief's layout: quitting closes the layout
         #[arg(long, hide = true)]
         layout: bool,
+        /// Run beside this Rex block's board, which quitting closes (`chief up` in a Rex block)
+        #[arg(long, hide = true, conflicts_with = "layout")]
+        board: Option<String>,
     },
     /// Hook entry point for Claude Code (reads the payload on stdin)
     Hook {
@@ -221,11 +224,15 @@ fn main() -> Result<()> {
         Command::Archive { slug } => chief::project::archive(&slug),
         Command::Unarchive { slug } => chief::project::unarchive(&slug),
         Command::Board { project } => chief::board::run(&project),
-        Command::Pane { project, layout } => {
-            let on_quit = if layout {
-                chief::pane::OnQuit::Layout
-            } else {
-                chief::pane::OnQuit::Nothing
+        Command::Pane {
+            project,
+            layout,
+            board,
+        } => {
+            let on_quit = match board {
+                Some(board) => chief::pane::OnQuit::Board(chief::mux::BlockRef(board)),
+                None if layout => chief::pane::OnQuit::Layout,
+                None => chief::pane::OnQuit::Nothing,
             };
             chief::pane::run(&project, on_quit)
         }

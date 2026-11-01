@@ -257,6 +257,12 @@ fn up_in_a_rex_block_shows_the_conversation_there() {
     );
     assert!(run.ends_with("board --project demo"), "{run}");
     assert!(home.rex.calls_of("new").is_empty(), "no session of its own");
+    // Rex shows the Claude icon for a process named claude: `up` became that pane, still
+    // knowing the board it closes.
+    assert_eq!(
+        args_of(pane.pid()),
+        "claude pane --project demo --board block:board"
+    );
 
     wait_for("left", || pane.says("close chief and its board"));
     std::thread::sleep(Duration::from_millis(400));
@@ -660,4 +666,70 @@ fn an_older_pane_leaves_the_newest_ones_showing_alone() {
         Some(THREAD)
     );
     assert!(recorded(&newer));
+}
+
+/// In Rex the pane reports the shown session's state as Claude Code would (OSC 7501,
+/// `app=claude-code`), again when it changes, never inside a sequence of Claude's, and clears
+/// it when it shows the session no more. Elsewhere it reports nothing.
+#[test]
+fn in_rex_the_pane_reports_the_sessions_state() {
+    // Stops halfway through a colour, then finishes it.
+    let attach =
+        "printf 'before \\033[38;2;1'; sleep 2; printf 'm after'; while :; do sleep 0.05; done\n";
+    let home = coordinator_home(&[("attach.sh", attach)]);
+    let conn = home.db();
+    let mut pane = Pane::spawn(
+        &home,
+        &["pane", "--project", "demo"],
+        &[("REX_BLOCK", "block:test")],
+    );
+    // The listing says its turn is done.
+    let idle = "\x1b]7501;state=idle:app=claude-code:title=Q29vcmRpbmF0b3I=\x1b\\";
+    wait_for("the first report", || pane.says(idle));
+    wait_for("the cut colour", || pane.says("before \x1b[38;2;1"));
+    assert_eq!(args_of(pane.pid()), "claude pane --project demo");
+    let mut row = db::get_session(&conn, COORD).unwrap().unwrap();
+    row.group_name = "waiting".into();
+    row.waiting_reason = Some("question".into());
+    db::update_session(&conn, &row).unwrap();
+    let blocked =
+        "\x1b]7501;state=blocked:app=claude-code:kind=question:title=Q29vcmRpbmF0b3I=\x1b\\";
+    wait_for("the second report", || pane.says(blocked));
+    let out = String::from_utf8_lossy(&pane.output()).into_owned();
+    assert!(
+        out.contains("before \x1b[38;2;1m after"),
+        "the colour stayed whole: {out:?}"
+    );
+    assert!(out.find(blocked) > out.find("m after"), "{out:?}");
+
+    // SAFETY: our own child.
+    unsafe { libc::kill(pane.pid(), libc::SIGTERM) };
+    assert!(pane.exited().expect("ended").success());
+    let out = String::from_utf8_lossy(&pane.output()).into_owned();
+    assert!(
+        out.contains("\x1b]7501;state=clear\x1b\\"),
+        "cleared: {out:?}"
+    );
+
+    let home = coordinator_home(&[("attach.sh", attach)]);
+    let mut pane = Pane::start(&home);
+    wait_for("attach", || pane.says("m after"));
+    assert!(
+        args_of(pane.pid()).ends_with("chief pane --project demo"),
+        "keeps its name outside Rex: {}",
+        args_of(pane.pid())
+    );
+    // SAFETY: our own child.
+    unsafe { libc::kill(pane.pid(), libc::SIGTERM) };
+    assert!(pane.exited().expect("ended").success());
+    assert!(!pane.says("7501"), "no report outside Rex");
+}
+
+/// A process's arguments as `ps` shows them, argv0 first.
+fn args_of(pid: i32) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }

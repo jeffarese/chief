@@ -177,7 +177,7 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief archive <slug>` | you | `chief down <slug> --stop-threads`, then put the project away (hidden from the launcher's list and `chief status`); nothing is deleted |
 | `chief unarchive <slug>` | you | Bring an archived project back; starts nothing |
 | `chief board --project <slug>` | `chief up` | The board TUI (right pane) |
-| `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session |
+| `chief pane --project <slug>` | `chief up` | Left pane loop: attaches to the current target session; in Rex it runs as `claude` (§9) |
 | `chief hook <event> --project <slug> --role <coordinator\|thread>` | Claude Code hooks | Record events, derive state, inject context |
 | `chief hook guard --project <slug> --role …` | PreToolUse hook | Message guard |
 | `chief mcp --project <slug>` | Claude Code (coordinator's MCP config) | Coordinator tools over stdio |
@@ -1285,7 +1285,22 @@ when several apps are connected, and failing there would lose the id of a sessio
 the next `up` would make another. When Rex's `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
 
-`chief pane` loop (`src/pane.rs`). On start it catches its signals (below), then records its pid
+`chief pane` loop (`src/pane.rs`). In a Rex block (`REX_BLOCK` set) it first starts itself again
+(exec, the same pid) as `chief pane --project <slug>` with `--layout`, or `--board <block id>` for
+`OnQuit::Board` (a hidden flag), under argv0 `claude`, unless it already runs so: Rex picks a
+block's agent icon from its foreground process's argv0 (verified live: a block whose process was
+`claude` got the Claude icon, one sending `app=claude-code` reports didn't), and the pane's own
+`claude attach` runs on chief's pty, out of Rex's sight. Every caller runs the pane last, so
+nothing after it is skipped; a failed exec leaves the pane running as it is, without the icon.
+While it relays an attach there, it also reports the shown session's state as Claude Code would
+(`rex_status`, OSC 7501 `state=…:app=claude-code[:kind=…]:title=<base64>[:msg=<base64>]`): from
+the session's row, read again every second and sent when it changes; working → `working`,
+waiting → `blocked` with `kind=permission|question`, review, landing and resolved → `done`,
+failed → `error`, idle → `idle`; the title is the thread's title (`Coordinator` for the
+coordinator), the message its background work (`3 subagents running`). The relay writes a report
+only between Claude's escape sequences and UTF-8 characters (`rex_status::Boundary`); when the
+attach ends, an ST and `state=clear` end the record. Outside Rex the pane neither renames itself
+nor reports. On start it then catches its signals (below), then records its pid
 and start time in `ui_state.pane_pid` / `pane_started` (`proc::start_time`: `proc_pidinfo` on
 macOS, `/proc/<pid>/stat` on Linux); on exit it clears them, with `pane_showing`, only while they
 are still its own. It writes and clears `pane_showing` only while `pane_pid` is its own pid (or

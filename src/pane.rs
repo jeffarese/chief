@@ -14,6 +14,7 @@
 //! view. The pane then says so and waits for ⏎, a board selection or `q`, rather than attaching
 //! again, which would put the user straight back in with no way out.
 
+use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +34,7 @@ use crate::mux::rex::Rex;
 use crate::mux::{BlockRef, Mux};
 use crate::relay::{self, Ended};
 use crate::state::Role;
-use crate::{accounts, names, paths, proc, project};
+use crate::{accounts, names, paths, proc, project, rex_status};
 
 /// How often a failed attach is retried.
 pub(crate) const RETRY: Duration = Duration::from_millis(500);
@@ -48,6 +49,8 @@ pub(crate) const SHORT_ATTACH: Duration = Duration::from_secs(1);
 /// until then), then leave or turn off each, reset attributes, clear.
 const TERMINAL_RESET: &str = "\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\
                               \x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[>4m\x1b[0m\x1b[2J\x1b[H";
+/// How often the pane reads the shown session's row again for its Rex status.
+const STATUS_EVERY: Duration = Duration::from_secs(1);
 /// How often an unusable project.toml is read again.
 pub(crate) const CONFIG_RETRY: Duration = Duration::from_secs(5);
 /// After the user leaves a session, keys this soon are still the ones that closed Claude (a
@@ -156,6 +159,7 @@ pub enum OnQuit {
 }
 
 pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
+    run_as_claude(project, &on_quit);
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, project)?.is_none() {
         bail!("no chief project {project:?}");
@@ -203,6 +207,37 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
         _ => {}
     }
     result
+}
+
+/// The name the pane runs under in Rex, which shows a block's agent icon by its foreground
+/// process's argv0: the pane stands for the Claude session it relays, whose own process runs on
+/// chief's pty, out of Rex's sight.
+pub const REX_ARGV0: &str = "claude";
+
+/// In Rex, starts this process again as `chief pane` under `REX_ARGV0` (the same pid, so nothing
+/// that knows it is lost); it returns only when it already runs so, isn't in Rex, or can't.
+/// Every caller runs the pane last, so nothing after it is skipped.
+fn run_as_claude(project: &str, on_quit: &OnQuit) {
+    use std::os::unix::process::CommandExt;
+    if !rex_status::enabled() || std::env::args_os().next().is_some_and(|a| a == REX_ARGV0) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg0(REX_ARGV0).args(["pane", "--project", project]);
+    match on_quit {
+        OnQuit::Nothing => {}
+        OnQuit::Layout => {
+            cmd.arg("--layout");
+        }
+        OnQuit::Board(board) => {
+            cmd.args(["--board", &board.0]);
+        }
+    }
+    // Returns only on failure: the pane then runs as it is, without the icon.
+    let _ = cmd.exec();
 }
 
 /// What the pane shows once the user left `name` by hand.
@@ -339,7 +374,7 @@ fn pane_loop(
                     .unwrap_or(true)
         };
         // In the session's own account: no other account's supervisor knows it.
-        let attached = attach(&claude.for_row(&row), &short_id, &switch);
+        let attached = attach(conn, &claude.for_row(&row), &row, &switch);
         let failed = match attached {
             Ok(Ended::HungUp) => {
                 // The relay may have seen the hangup on the terminal itself, before any signal.
@@ -414,21 +449,55 @@ pub(crate) fn wake(
     Ok(())
 }
 
-/// Relays `claude attach <short_id>` between a pseudo-terminal of its own and this one until it
+/// Relays `claude attach` for `row` between a pseudo-terminal of its own and this one until it
 /// exits, the board wants another target (`switch`), the user presses Ctrl+Q or the terminal
 /// hangs up; chief ends it in all but the first (SIGTERM, a grace period, then SIGKILL), which
-/// leaves its session running.
-fn attach(claude: &Claude, short_id: &str, switch: &dyn Fn() -> bool) -> Result<Ended> {
+/// leaves its session running. In Rex it reports the session's state meanwhile (`rex_status`),
+/// and clears the report once it shows the session no more.
+fn attach(
+    conn: &Connection,
+    claude: &Claude,
+    row: &SessionRow,
+    switch: &dyn Fn() -> bool,
+) -> Result<Ended> {
+    let short_id = row.short_id.as_deref().context("target has no short id")?;
     let mut cmd = claude.command();
     cmd.args(["attach", short_id]);
+    let rex = rex_status::enabled();
+    let sent: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+    let looked: Cell<Option<Instant>> = Cell::new(None);
+    // The row as the hooks and the board's sync keep it, read again every STATUS_EVERY.
+    let status = || {
+        if !rex || looked.get().is_some_and(|at| at.elapsed() < STATUS_EVERY) {
+            return None;
+        }
+        looked.set(Some(Instant::now()));
+        let now = db::get_session(conn, &row.name).ok().flatten()?;
+        let report = rex_status::report(&now);
+        if sent.borrow().as_ref() == Some(&report) {
+            return None;
+        }
+        sent.replace(Some(report.clone()));
+        Some(report)
+    };
     let signals = relay::Signals {
         hung_up: &|| HUNG_UP.load(Ordering::SeqCst),
         quit: &quit_requested,
         switch,
         resized: &|| RESIZED.swap(false, Ordering::SeqCst),
+        status: &status,
     };
-    relay::relay(cmd, &signals)
-        .with_context(|| format!("running {} attach {short_id}", claude.bin.display()))
+    let ended = relay::relay(cmd, &signals)
+        .with_context(|| format!("running {} attach {short_id}", claude.bin.display()));
+    if rex {
+        // An ST first ends whatever string attach was cut off in. The terminal may be gone.
+        let mut out = std::io::stdout();
+        let _ = out
+            .write_all(b"\x1b\\")
+            .and_then(|()| out.write_all(rex_status::CLEAR))
+            .and_then(|()| out.flush());
+    }
+    ended
 }
 
 #[derive(Debug, PartialEq)]
