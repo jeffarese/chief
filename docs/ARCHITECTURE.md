@@ -1285,13 +1285,19 @@ when several apps are connected, and failing there would lose the id of a sessio
 the next `up` would make another. When Rex's `show` returns false, `up` prints
 `rex -C <app> do session.select session_id=<id>` and says to pick the session in the app.
 
-`chief pane` loop (`src/pane.rs`). In a Rex block (`REX_BLOCK` set) it first starts itself again
-(exec, the same pid) as `chief pane --project <slug>` with `--layout`, or `--board <block id>` for
-`OnQuit::Board` (a hidden flag), under argv0 `claude`, unless it already runs so: Rex picks a
-block's agent icon from its foreground process's argv0 (verified live: a block whose process was
-`claude` got the Claude icon, one sending `app=claude-code` reports didn't), and the pane's own
-`claude attach` runs on chief's pty, out of Rex's sight. Every caller runs the pane last, so
-nothing after it is skipped; a failed exec leaves the pane running as it is, without the icon.
+`chief pane` loop (`src/pane.rs`). In a Rex block (`REX_BLOCK` set, stdin a terminal) it first
+runs the pane as a new process, `chief pane --project <slug>` with `--layout`, or `--board <block
+id>` for `OnQuit::Board` (a hidden flag), under argv0 `claude`, unless it already runs so: Rex
+picks a block's agent icon from its foreground process's argv0, and settles it once per process.
+Verified live: a block whose process was `claude` from the start got the Claude icon; one that
+renamed itself in place (exec, same pid and executable) didn't, nor did one sending
+`app=claude-code` reports. The pane's own `claude attach` runs on chief's pty, out of Rex's sight.
+As a shell runs a command, the new process gets a process group of its own and becomes the
+terminal's foreground (both it, before exec, and this process set it, SIGTTOU ignored, so it
+never reads the terminal from the background); this process waits for it, passes SIGTERM, SIGHUP
+and SIGINT on, takes the terminal back for its own group and exits with its code. Every caller
+runs the pane last, so nothing after it is skipped; when it can't start, the pane runs in this
+process, without the icon.
 While it relays an attach there, it also reports the shown session's state as Claude Code would
 (`rex_status`, OSC 7501 `state=…:app=claude-code[:kind=…]:title=<base64>[:msg=<base64>]`): from
 the session's row, read again every second and sent when it changes; working → `working`,

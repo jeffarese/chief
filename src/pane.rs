@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -159,7 +159,9 @@ pub enum OnQuit {
 }
 
 pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
-    run_as_claude(project, &on_quit);
+    if let Some(code) = run_as_claude(project, &on_quit) {
+        std::process::exit(code);
+    }
     let conn = db::open(&paths::db())?;
     if db::project_dir(&conn, project)?.is_none() {
         bail!("no chief project {project:?}");
@@ -214,17 +216,28 @@ pub fn run(project: &str, on_quit: OnQuit) -> Result<()> {
 /// chief's pty, out of Rex's sight.
 pub const REX_ARGV0: &str = "claude";
 
-/// In Rex, starts this process again as `chief pane` under `REX_ARGV0` (the same pid, so nothing
-/// that knows it is lost); it returns only when it already runs so, isn't in Rex, or can't.
-/// Every caller runs the pane last, so nothing after it is skipped.
-fn run_as_claude(project: &str, on_quit: &OnQuit) {
+/// A signal for the pane `run_as_claude` waits on, to pass on to it.
+static FORWARD: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_forward(sig: libc::c_int) {
+    FORWARD.store(sig, Ordering::SeqCst);
+}
+
+/// In Rex, runs the pane as a new process, `chief pane` under `REX_ARGV0` in a process group of
+/// its own that it makes the terminal's foreground, as a shell runs a command, and waits for it:
+/// its exit code, to exit with. Rex settles a block's icon once per process, so renaming this
+/// one in place (exec) wouldn't show. None when it already is that pane, isn't in Rex, has no
+/// terminal, or can't start it: the pane then runs here, without the icon. Every caller runs the
+/// pane last, so nothing after it is skipped.
+fn run_as_claude(project: &str, on_quit: &OnQuit) -> Option<i32> {
     use std::os::unix::process::CommandExt;
-    if !rex_status::enabled() || std::env::args_os().next().is_some_and(|a| a == REX_ARGV0) {
-        return;
+    // SAFETY: isatty only reads the descriptor's state.
+    let tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    if !rex_status::enabled() || !tty || std::env::args_os().next().is_some_and(|a| a == REX_ARGV0)
+    {
+        return None;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
+    let exe = std::env::current_exe().ok()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg0(REX_ARGV0).args(["pane", "--project", project]);
     match on_quit {
@@ -236,8 +249,51 @@ fn run_as_claude(project: &str, on_quit: &OnQuit) {
             cmd.args(["--board", &board.0]);
         }
     }
-    // Returns only on failure: the pane then runs as it is, without the icon.
-    let _ = cmd.exec();
+    // SAFETY: between fork and exec, only async-signal-safe calls on the child's own group and
+    // its terminal. It takes the terminal itself too, so it never reads it from the background
+    // (and stops) before this process hands it over; SIGTTOU is ignored only while it does.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid());
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    // SIGTERM or SIGHUP for this process goes on to the pane; the terminal's own signals reach
+    // the foreground pane directly.
+    catch(&[libc::SIGTERM, libc::SIGHUP, libc::SIGINT], on_forward);
+    let child = cmd.spawn().ok()?;
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    // SAFETY: our own child's group and our terminal, as above; waitpid on our own child, which
+    // nothing else reaps (the Child is never waited on).
+    unsafe {
+        libc::setpgid(pid, pid);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(libc::STDIN_FILENO, pid);
+        loop {
+            if libc::waitpid(pid, &mut status, 0) == pid {
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                status = 0;
+                break;
+            }
+            let sig = FORWARD.swap(0, Ordering::SeqCst);
+            if sig != 0 {
+                libc::kill(pid, sig);
+            }
+        }
+        // The terminal back to this process's group, for the shell it returns to.
+        libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
+    }
+    Some(if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    })
 }
 
 /// What the pane shows once the user left `name` by hand.

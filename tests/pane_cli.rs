@@ -259,8 +259,9 @@ fn up_in_a_rex_block_shows_the_conversation_there() {
     assert!(home.rex.calls_of("new").is_empty(), "no session of its own");
     // Rex shows the Claude icon for a process named claude: `up` became that pane, still
     // knowing the board it closes.
+    let shown = foreground_of(pane.pid());
     assert_eq!(
-        args_of(pane.pid()),
+        args_of(shown),
         "claude pane --project demo --board block:board"
     );
 
@@ -687,7 +688,10 @@ fn in_rex_the_pane_reports_the_sessions_state() {
     let idle = "\x1b]7501;state=idle:app=claude-code:title=Q29vcmRpbmF0b3I=\x1b\\";
     wait_for("the first report", || pane.says(idle));
     wait_for("the cut colour", || pane.says("before \x1b[38;2;1"));
-    assert_eq!(args_of(pane.pid()), "claude pane --project demo");
+    // A new process, which Rex sees in the block's foreground, not chief renamed in place.
+    let shown = foreground_of(pane.pid());
+    assert_ne!(shown, pane.pid());
+    assert_eq!(args_of(shown), "claude pane --project demo");
     let mut row = db::get_session(&conn, COORD).unwrap().unwrap();
     row.group_name = "waiting".into();
     row.waiting_reason = Some("question".into());
@@ -715,7 +719,8 @@ fn in_rex_the_pane_reports_the_sessions_state() {
     let mut pane = Pane::start(&home);
     wait_for("attach", || pane.says("m after"));
     assert!(
-        args_of(pane.pid()).ends_with("chief pane --project demo"),
+        foreground_of(pane.pid()) == pane.pid()
+            && args_of(pane.pid()).ends_with("chief pane --project demo"),
         "keeps its name outside Rex: {}",
         args_of(pane.pid())
     );
@@ -732,4 +737,13 @@ fn args_of(pid: i32) -> String {
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The process group in the foreground of `pid`'s terminal, as Rex finds a block's program.
+fn foreground_of(pid: i32) -> i32 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "tpgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
