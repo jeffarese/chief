@@ -106,14 +106,22 @@ pub fn board(ctx: &ToolCtx, refresh: bool) -> Result<Value> {
         .filter(|r| r.role == Role::Thread.as_str())
         .collect();
     tools::board_order(&mut threads);
+    // What each routine's run said it came to rides on its thread.
+    let verdicts = routines::verdicts(ctx.conn, slug)?;
     let threads = threads
         .iter()
-        .map(|t| session(ctx.conn, t))
+        .map(|t| {
+            let mut out = session(ctx.conn, t)?;
+            if let Some(finding) = verdicts.get(&t.name) {
+                out["finding"] = finding.to_json();
+            }
+            Ok(out)
+        })
         .collect::<Result<Vec<_>>>()?;
-    let routines: Vec<Value> = routines::list(ctx.conn, slug)?
+    let routines = routines::list(ctx.conn, slug)?
         .iter()
-        .map(routines::view)
-        .collect();
+        .map(|r| routines::view(ctx.conn, r))
+        .collect::<Result<Vec<Value>>>()?;
     Ok(json!({
         "project": {
             "slug": slug,

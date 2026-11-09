@@ -234,11 +234,49 @@ pub fn start_thread(ctx: &ToolCtx, args: &StartThreadArgs) -> Result<Value> {
     start_thread_unless(ctx, args, &|| false)
 }
 
+/// What makes a thread a routine's run (§13 "A run"): its row names the routine from the
+/// start, it can read and write the routine's folder, and it gets the run tools
+/// (`record_value`, `report_outcome`) with the settings that allow them.
+#[derive(Debug, Clone)]
+pub struct RunOf {
+    pub routine: String,
+    /// The routine's own folder, with its notes.
+    pub folder: PathBuf,
+}
+
+/// The folder threads work in when the project has no repositories: a project that isn't
+/// about code (§3 "Workspace"). Made on first use.
+pub fn workspace(project_dir: &Path) -> PathBuf {
+    project_dir.join("workspace")
+}
+
+/// `resolve_repo`, or the project's workspace when it has no repositories and none is named.
+pub fn resolve_place(ctx: &ToolCtx, repo: Option<&str>) -> Result<(String, PathBuf)> {
+    let named = repo.map(str::trim).is_some_and(|r| !r.is_empty());
+    if named || !ctx.config.repos.is_empty() {
+        return resolve_repo(ctx.config, repo);
+    }
+    let dir = workspace(ctx.project_dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dir = dir.canonicalize().unwrap_or(dir);
+    Ok(("workspace".to_string(), dir))
+}
+
 /// `start_thread` that starts nothing once `cancelled()` is true: the client gave up the call
 /// (§7), so nobody would get the thread's address or its `next`.
 pub fn start_thread_unless(
     ctx: &ToolCtx,
     args: &StartThreadArgs,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value> {
+    start_thread_as(ctx, args, None, cancelled)
+}
+
+/// `start_thread_unless`, for a plain thread (`run` None) or a routine's run.
+pub fn start_thread_as(
+    ctx: &ToolCtx,
+    args: &StartThreadArgs,
+    run_of: Option<&RunOf>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Value> {
     let title = args.title.trim();
@@ -248,7 +286,7 @@ pub fn start_thread_unless(
     if args.task.trim().is_empty() {
         bail!("task is empty: it is the thread's whole brief");
     }
-    let (repo_name, repo_path) = resolve_repo(ctx.config, args.repo.as_deref())?;
+    let (repo_name, repo_path) = resolve_place(ctx, args.repo.as_deref())?;
     let model = pick(args.model.as_deref(), &ctx.config.threads.model);
     let effort = pick(args.effort.as_deref(), &ctx.config.threads.effort);
     if !EFFORTS.contains(&effort.as_str()) {
@@ -296,6 +334,7 @@ pub fn start_thread_unless(
     row.cwd = row.repo_path.clone();
     row.model = Some(model.clone());
     row.effort = Some(effort.clone());
+    row.routine = run_of.map(|r| r.routine.clone());
     if let Some(c) = &placed.chosen {
         row.account_id = Some(c.id.clone());
         row.account_label = Some(c.label.clone());
@@ -327,9 +366,21 @@ pub fn start_thread_unless(
         model: model.clone(),
         effort: effort.clone(),
         permission_mode: ctx.config.threads.permission_mode.clone(),
-        settings: generated::thread_settings_path(ctx.project_dir),
-        mcp_config: None,
-        add_dirs: vec![ctx.project_dir.join("memory")],
+        settings: match run_of {
+            Some(_) => generated::run_settings_path(ctx.project_dir),
+            None => generated::thread_settings_path(ctx.project_dir),
+        },
+        mcp_config: match run_of {
+            Some(of) => Some(generated::write_run_mcp(
+                ctx.project_dir,
+                ctx.config,
+                &of.routine,
+            )?),
+            None => None,
+        },
+        add_dirs: std::iter::once(ctx.project_dir.join("memory"))
+            .chain(run_of.map(|r| r.folder.clone()))
+            .collect(),
         disallowed_tools: vec![],
         append_system_prompt: prompts::thread(
             ctx.config,

@@ -83,6 +83,9 @@ enum Command {
     Mcp {
         #[arg(long)]
         project: String,
+        /// Serve the tools of this routine's runs instead
+        #[arg(long)]
+        routine: Option<String>,
     },
     /// Print a project's board as text
     Status { slug: Option<String> },
@@ -329,7 +332,7 @@ fn main() -> Result<()> {
             chief::hook::run(&event, &project, role.into());
             Ok(())
         }
-        Command::Mcp { project } => chief::mcp::run(&project),
+        Command::Mcp { project, routine } => chief::mcp::run(&project, routine.as_deref()),
         Command::Status { slug } => chief::project::status(slug.as_deref()),
         Command::Gc { slug, dry_run } => chief::cleanup::run_gc(slug.as_deref(), dry_run),
         Command::Clean {

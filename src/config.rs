@@ -26,6 +26,46 @@ pub struct ProjectConfig {
     /// The web dashboard (§14). Left out of the file while it is off.
     #[serde(default, skip_serializing_if = "DashboardSettings::is_off")]
     pub dashboard: DashboardSettings,
+    /// Where chief reaches the user when they aren't looking (§13 "Reaching the user"). Left
+    /// out of the file while no command is set.
+    #[serde(default, skip_serializing_if = "PushSettings::is_unset")]
+    pub push: PushSettings,
+}
+
+/// `[push]`: a command of the user's that carries a message to their phone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PushSettings {
+    /// Run through `sh -c` with `CHIEF_TITLE`, `CHIEF_BODY`, `CHIEF_KIND`, `CHIEF_PROJECT` and
+    /// `CHIEF_URL` in its environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// What is pushed: `attention` (the default) is what needs the user (a run that says so, a
+    /// thread stuck on a permission prompt); `updates` adds a run's news that can wait.
+    #[serde(default)]
+    pub on: PushOn,
+}
+
+/// `push.on`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PushOn {
+    #[default]
+    Attention,
+    Updates,
+}
+
+impl PushSettings {
+    fn is_unset(&self) -> bool {
+        self.command.as_deref().is_none_or(|c| c.trim().is_empty())
+    }
+
+    /// The command, when one is set.
+    pub fn command(&self) -> Option<&str> {
+        self.command
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
 }
 
 /// `[dashboard]`: whether `chief serve` shows this project in the browser.
@@ -185,6 +225,7 @@ impl ProjectConfig {
             repos,
             ui: UiSettings::default(),
             dashboard: DashboardSettings::default(),
+            push: PushSettings::default(),
         }
     }
 

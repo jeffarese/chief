@@ -398,6 +398,47 @@ fn the_api_shows_the_board_and_runs_its_actions() {
 
     let files = server.page("GET", "/api/p/demo/files", None).json();
     assert_eq!(files["instructions"], Value::Null);
+
+    // A routine with what its run found and what it tracks: on the board in brief, on its own
+    // page in full.
+    let made = server.page(
+        "POST",
+        "/api/p/demo/routines",
+        Some(&json!({"name": "nightly", "title": "Nightly", "prompt": "Check.", "schedule": "@daily"})),
+    );
+    assert_eq!(made.status, 200, "{}", made.body);
+    let notes = home.path().join("projects/demo/routines/nightly/NOTES.md");
+    assert!(
+        std::fs::read_to_string(&notes)
+            .unwrap()
+            .starts_with("# Nightly")
+    );
+    std::fs::write(&notes, "# Nightly\nWatching the build.\n").unwrap();
+    conn.execute_batch(
+        "INSERT INTO routine_outcomes (project_slug, routine, thread, ts, outcome, headline)
+           VALUES ('demo', 'nightly', 'demo-fix-it-1a2b', 5, 'attention', 'The build broke');
+         INSERT INTO routine_points (project_slug, routine, series, ts, value, unit)
+           VALUES ('demo', 'nightly', 'Build minutes', 4, 12.5, 'min'),
+                  ('demo', 'nightly', 'Build minutes', 5, 14, 'min');",
+    )
+    .unwrap();
+    let board = server.page("GET", "/api/p/demo/board", None).json();
+    let routine = &board["routines"][0];
+    assert_eq!(routine["last_finding"]["outcome"], "attention");
+    assert_eq!(routine["last_finding"]["headline"], "The build broke");
+    assert_eq!(routine["series"][0]["latest"], 14.0);
+    assert_eq!(routine["series"][0]["previous"], 12.5);
+    assert_eq!(board["threads"][0]["finding"]["outcome"], "attention");
+    let page = server
+        .page("GET", "/api/p/demo/routines/nightly", None)
+        .json();
+    assert_eq!(page["notes"], "# Nightly\nWatching the build.\n");
+    assert_eq!(page["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(page["series"][0]["points"], json!([[4, 12.5], [5, 14.0]]));
+    assert_eq!(
+        server.page("GET", "/api/p/demo/routines/nope", None).status,
+        400
+    );
 }
 
 /// A server-to-client WebSocket frame: its opcode and payload.
@@ -553,8 +594,9 @@ fn a_due_routine_fires_while_the_server_runs() {
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(home.fake.calls_of("--bg").len(), 1);
 
-    // The run finishes while the coordinator sleeps: the server wakes it, once per report, and
-    // its own start-up hook's watcher then tells it (§13 "Telling the coordinator").
+    // The run finishes while the coordinator sleeps: the server wakes it for a run that needs
+    // the user, once per report, and its own start-up hook's watcher then tells it (§13 "Who
+    // hears of a run").
     let mut coordinator = SessionRow::new("chief-demo", "demo", Role::Coordinator, db::now_ms());
     coordinator.short_id = Some("c1".into());
     coordinator.session_id = Some("sid-c1".into());
@@ -568,6 +610,22 @@ fn a_due_routine_fires_while_the_server_runs() {
         run.last_report_at = Some(db::now_ms() - 60_000);
         db::update_session(conn, &run)
     })
+    .unwrap();
+    // News that can wait wakes nobody: the coordinator hears on its next turn.
+    conn.execute(
+        "INSERT INTO routine_outcomes (project_slug, routine, thread, ts, outcome, headline)
+         VALUES ('demo', 'nightly-check', ?1, 1, 'update', 'One thing changed')",
+        [&thread],
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(home.fake.calls_of("respawn").is_empty());
+    // A run that needs the user does.
+    conn.execute(
+        "INSERT INTO routine_outcomes (project_slug, routine, thread, ts, outcome, headline)
+         VALUES ('demo', 'nightly-check', ?1, 2, 'attention', 'Two things need you')",
+        [&thread],
+    )
     .unwrap();
     wait_for("the coordinator's respawn", || {
         (!home.fake.calls_of("respawn").is_empty()).then_some(())

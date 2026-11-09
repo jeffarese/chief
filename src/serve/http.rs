@@ -15,7 +15,7 @@ use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -380,7 +380,9 @@ async fn api_create_routine(
     let project = slug.clone();
     let made = blocking(move || {
         in_project(&slug, |ctx| {
-            routines::create(ctx.conn, ctx.config, &draft, (ctx.now)()).map(|r| routines::view(&r))
+            let made = routines::create(ctx.conn, ctx.config, &draft, (ctx.now)())?;
+            routines::ensure_folder(ctx.project_dir, &made)?;
+            routines::view(ctx.conn, &made)
         })
     })
     .await?;
@@ -397,7 +399,7 @@ async fn api_update_routine(
     let saved = blocking(move || {
         in_project(&slug, |ctx| {
             routines::update(ctx.conn, ctx.config, &name, &changes, (ctx.now)())
-                .map(|r| routines::view(&r))
+                .and_then(|r| routines::view(ctx.conn, &r))
         })
     })
     .await?;
@@ -435,6 +437,14 @@ async fn api_run_routine(
     .await;
     app.kick(&project);
     Ok(Json(ran?))
+}
+
+/// One routine in full, for its page: all its notes, its findings and its series.
+async fn api_routine(Path((slug, name)): Path<(String, String)>) -> Api {
+    let routine =
+        blocking(move || in_project(&slug, |ctx| routines::read(ctx, &name, 256 * 1024, 40, 400)))
+            .await?;
+    Ok(Json(routine))
 }
 
 /// The project's standing brief and memory index, to read.
@@ -610,7 +620,9 @@ pub fn router(token: String) -> Router {
         .route("/api/p/{slug}/routines", post(api_create_routine))
         .route(
             "/api/p/{slug}/routines/{name}",
-            patch(api_update_routine).delete(api_delete_routine),
+            get(api_routine)
+                .patch(api_update_routine)
+                .delete(api_delete_routine),
         )
         .route("/api/p/{slug}/routines/{name}/run", post(api_run_routine))
         .layer(middleware::from_fn_with_state(app.clone(), guard))

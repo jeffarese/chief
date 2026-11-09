@@ -266,16 +266,20 @@
     function readHash() {
       const [, kind, name, tab] = location.hash.split('/').map(decodeURIComponent);
       if (kind === 't' && name) return { sel: { kind: 'thread', name }, tab: tab || null, picked: true };
-      if (kind === 'r' && name) return { sel: { kind: 'routine', name }, tab: null, picked: true };
+      if (kind === 'r' && name) return { sel: { kind: 'routine', name }, tab: tab || null, picked: true };
+      if (kind === 'o') return { sel: { kind: 'overview' }, tab: null, picked: true };
       if (kind === 'new-routine') return { sel: { kind: 'new-routine' }, tab: null, picked: true };
       if (kind === 'c') return { sel: { kind: 'coordinator' }, tab: name || null, picked: true };
-      return { sel: { kind: 'coordinator' }, tab: null, picked: false };
+      // With nothing picked: what the project follows, when it follows anything.
+      const home = S.board && S.board.routines.length ? 'overview' : 'coordinator';
+      return { sel: { kind: home }, tab: null, picked: false };
     }
 
     function hashFor(sel, tab) {
       if (sel.kind === 'thread') return `#/t/${encodeURIComponent(sel.name)}/${tab}`;
-      if (sel.kind === 'routine') return `#/r/${encodeURIComponent(sel.name)}`;
+      if (sel.kind === 'routine') return `#/r/${encodeURIComponent(sel.name)}/${tab}`;
       if (sel.kind === 'new-routine') return '#/new-routine';
+      if (sel.kind === 'overview') return '#/o';
       return `#/c/${tab}`;
     }
 
@@ -310,6 +314,12 @@
     const attachable = (s) => !s || (!s.cleaned && !s.removed);
 
     function defaultTab(sel) {
+      if (sel.kind === 'overview') return 'overview';
+      if (sel.kind === 'new-routine') return 'settings';
+      if (sel.kind === 'routine') {
+        const r = routine(sel.name);
+        return r && (r.last_run_at || r.last_finding) ? 'status' : 'settings';
+      }
       if (sel.kind !== 'thread') return 'conversation';
       const t = thread(sel.name);
       return attachable(t) ? 'conversation' : 'reports';
@@ -376,6 +386,7 @@
           : ['PR open', 'blue'];
         out.push(h('span', { class: `chip ${colour}` }, label));
       }
+      if (t.finding && t.finding.outcome === 'attention') out.push(h('span', { class: 'chip red', title: t.finding.headline }, 'needs you'));
       if (t.routine) out.push(h('span', { class: 'chip', title: `A run of the routine ${t.routine}` }, `↻ ${t.routine}`));
       if (t.cleaned) out.push(h('span', { class: 'chip' }, 'cleaned up'));
       else if (t.removed) out.push(h('span', { class: 'chip' }, 'removed'));
@@ -431,6 +442,25 @@
         );
       }
       if (b.error) kids.push(h('div', { class: 'notice' }, `Showing the last known state: ${b.error}`));
+
+      if (b.routines.length) {
+        const oSel = { kind: 'overview' };
+        const flagged = b.routines.filter((r) => r.last_finding && r.last_finding.outcome === 'attention').length;
+        kids.push(
+          h(
+            'button',
+            {
+              class: 'row',
+              'aria-current': S.view === 'detail' || wide() ? String(sameSel(S.sel, oSel)) : 'false',
+              onclick: () => select(oSel),
+            },
+            h('span', { class: 'glyph g-idle', 'aria-hidden': 'true' }, '▦'),
+            h('span', { class: 'title' }, 'Overview'),
+            h('span', { class: 'when' }, ''),
+            h('span', { class: 'sub' }, h('span', { class: 'text' }, `${b.routines.length} routine${b.routines.length === 1 ? '' : 's'}`), flagged > 0 && h('span', { class: 'chip red' }, `${flagged} need${flagged === 1 ? 's' : ''} you`)),
+          ),
+        );
+      }
 
       const [cState, cGroup] = sessionState(b.coordinator);
       const cSel = { kind: 'coordinator' };
@@ -504,14 +534,23 @@
               'aria-current': S.view === 'detail' || wide() ? String(sameSel(S.sel, sel)) : 'false',
               onclick: () => select(sel),
             },
-            h('span', { class: 'glyph g-idle', 'aria-hidden': 'true' }, r.enabled ? '↻' : '‖'),
+            h(
+              'span',
+              { class: 'glyph ' + (r.last_finding && r.last_finding.outcome === 'attention' ? 'g-waiting' : 'g-idle'), 'aria-hidden': 'true' },
+              !r.enabled ? '‖' : r.last_finding && r.last_finding.outcome === 'attention' ? '!' : '↻',
+            ),
             h('span', { class: 'title' }, r.title),
             h(
               'span',
               { class: 'when', title: r.next_run_at ? stamp(r.next_run_at) : '' },
               !r.enabled ? 'paused' : r.next_run_at ? until(r.next_run_at) : 'never due',
             ),
-            h('span', { class: 'sub' }, h('span', { class: 'text' }, r.schedule_text), r.last_note && h('span', { class: 'chip amber', title: r.last_note }, 'see note')),
+            h(
+              'span',
+              { class: 'sub' },
+              h('span', { class: 'text' }, r.last_finding ? r.last_finding.headline : r.schedule_text),
+              r.last_note && h('span', { class: 'chip amber', title: r.last_note }, 'see note'),
+            ),
           ),
         );
       }
@@ -614,6 +653,16 @@
     function renderHead() {
       const b = S.board;
       const back = h('button', { class: 'back', 'aria-label': 'Back to the board', onclick: showBoard }, '‹');
+      if (S.sel.kind === 'overview') {
+        fill(
+          $.head,
+          h('div', { class: 'head-line' }, back, h('h1', null, 'Overview')),
+          h('div', { class: 'meta' }, h('span', null, 'What this project follows, and what needs you.')),
+          h('div', { style: 'height:12px' }),
+        );
+        fill($.callouts);
+        return;
+      }
       if (S.sel.kind === 'routine' || S.sel.kind === 'new-routine') {
         const r = S.sel.kind === 'routine' ? routine(S.sel.name) : null;
         fill($.head, 
@@ -635,7 +684,15 @@
                 ]
               : h('span', null, 'A prompt chief runs on a schedule. Each run is a fresh thread.'),
           ),
-          h('div', { style: 'height:12px' }),
+          r
+            ? h(
+                'div',
+                { class: 'tabs', role: 'tablist' },
+                [['status', 'Status'], ['settings', 'Settings']].map(([key, label]) =>
+                  h('button', { class: 'tab', role: 'tab', 'aria-selected': String(S.tab === key), onclick: () => select(S.sel, key) }, label),
+                ),
+              )
+            : h('div', { style: 'height:12px' }),
         );
         fill($.callouts, 
           ...(r && r.last_note ? [h('div', { class: 'callout amber' }, h('div', { class: 'what' }, h('b', null, 'Last occurrence'), r.last_note))] : []),
@@ -1165,6 +1222,318 @@
       );
     }
 
+    // -- Routines as things followed over time: verdicts, values, charts --
+
+    const VERDICT = {
+      attention: { label: 'Needs you', mark: '!', cls: 'v-attention' },
+      update: { label: 'Update', mark: '•', cls: 'v-update' },
+      nothing: { label: 'Nothing new', mark: '✓', cls: 'v-nothing' },
+    };
+
+    /** A verdict as an icon and a word, never colour alone. */
+    function verdictBadge(finding) {
+      const v = finding && VERDICT[finding.outcome];
+      if (!v) return h('span', { class: 'verdict v-none' }, h('i', { 'aria-hidden': 'true' }, '–'), 'No run yet');
+      return h('span', { class: `verdict ${v.cls}` }, h('i', { 'aria-hidden': 'true' }, v.mark), v.label);
+    }
+
+    /** 1,284 · 12.9K · 3.45 · with its unit. */
+    function fmtNum(value, unit) {
+      if (value === null || value === undefined) return '–';
+      const abs = Math.abs(value);
+      const text =
+        abs >= 100000
+          ? new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(value)
+          : new Intl.NumberFormat(undefined, { maximumFractionDigits: abs >= 100 ? 1 : 2 }).format(value);
+      if (!unit) return text;
+      return unit === '%' ? `${text}%` : `${text} ${unit}`;
+    }
+
+    function delta(series) {
+      if (series.previous === null || series.previous === undefined || series.latest === null) return null;
+      const d = series.latest - series.previous;
+      if (d === 0) return h('span', { class: 'delta' }, 'no change');
+      // Whether up is good depends on the thing, which chief doesn't know: neutral ink.
+      return h('span', { class: 'delta' }, `${d > 0 ? '▲' : '▼'} ${fmtNum(Math.abs(d), series.unit)} since the run before`);
+    }
+
+    const SVG = 'http://www.w3.org/2000/svg';
+    function svg(tag, attrs, ...kids) {
+      const el = document.createElementNS(SVG, tag);
+      for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+      for (const kid of kids.flat()) if (kid) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+      return el;
+    }
+
+    /** A tile's trend: the line in the quiet hue, the latest point in the series colour. */
+    function sparkline(points) {
+      const w = 120;
+      const ht = 32;
+      if (points.length < 2) return null;
+      const values = points.map((p) => p[1]);
+      const min = Math.min(...values);
+      const span = Math.max(...values) - min || 1;
+      const x = (i) => 3 + (i * (w - 6)) / (points.length - 1);
+      const y = (v) => ht - 4 - ((v - min) / span) * (ht - 8);
+      const path = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(p[1]).toFixed(1)}`).join('');
+      return svg(
+        'svg',
+        { class: 'spark', viewBox: `0 0 ${w} ${ht}`, width: w, height: ht, role: 'img', 'aria-label': `Trend over ${points.length} runs` },
+        svg('path', { d: path, class: 'spark-line' }),
+        svg('circle', { cx: x(points.length - 1), cy: y(values[values.length - 1]), r: 3, class: 'spark-dot' }),
+      );
+    }
+
+    /** One series over time: a 2px line, a quiet grid, and a crosshair that reads the nearest run. */
+    function lineChart(series) {
+      const points = series.points;
+      const wrap = h('div', { class: 'chart' });
+      const draw = () => {
+        const w = Math.max(280, wrap.clientWidth || 600);
+        const ht = 180;
+        const pad = { l: 52, r: 14, t: 10, b: 24 };
+        const values = points.map((p) => p[1]);
+        let min = Math.min(...values);
+        let max = Math.max(...values);
+        if (min === max) {
+          min -= Math.abs(min) * 0.05 || 1;
+          max += Math.abs(max) * 0.05 || 1;
+        }
+        const room = (max - min) * 0.12;
+        min -= room;
+        max += room;
+        const t0 = points[0][0];
+        const t1 = points[points.length - 1][0];
+        const x = (t) => (t1 === t0 ? (pad.l + w - pad.r) / 2 : pad.l + ((t - t0) / (t1 - t0)) * (w - pad.l - pad.r));
+        const y = (v) => ht - pad.b - ((v - min) / (max - min)) * (ht - pad.t - pad.b);
+        // Round numbers inside the range: 700, 800, 900 rather than 684, 795.5, 907.
+        const rough = (max - min) / 3;
+        const mag = 10 ** Math.floor(Math.log10(rough));
+        const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((m) => m >= rough) || rough;
+        const ticks = [];
+        for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-9; v += step) ticks.push(Number(v.toPrecision(12)));
+        const day = (ms) => new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' });
+        const hair = svg('line', { class: 'hair', y1: pad.t, y2: ht - pad.b, x1: 0, x2: 0, visibility: 'hidden' });
+        const focus = svg('circle', { class: 'chart-dot', r: 4.5, cx: 0, cy: 0, visibility: 'hidden' });
+        const last = points[points.length - 1];
+        const plot = svg(
+          'svg',
+          { viewBox: `0 0 ${w} ${ht}`, width: w, height: ht, role: 'img', 'aria-label': `${series.name}: ${points.length} values, latest ${fmtNum(series.latest, series.unit)}` },
+          ticks.map((v) => svg('line', { class: 'grid', x1: pad.l, x2: w - pad.r, y1: y(v), y2: y(v) })),
+          ticks.map((v) => svg('text', { class: 'tick', x: pad.l - 8, y: y(v) + 4, 'text-anchor': 'end' }, fmtNum(v))),
+          svg('text', { class: 'tick', x: pad.l, y: ht - 6 }, day(t0)),
+          t1 !== t0 && svg('text', { class: 'tick', x: w - pad.r, y: ht - 6, 'text-anchor': 'end' }, day(t1)),
+          points.length > 1 && svg('path', { class: 'chart-line', d: points.map((p, i) => `${i ? 'L' : 'M'}${x(p[0]).toFixed(1)} ${y(p[1]).toFixed(1)}`).join('') }),
+          svg('circle', { class: 'chart-dot', r: 4.5, cx: x(last[0]), cy: y(last[1]) }),
+          hair,
+          focus,
+        );
+        const tip = h('div', { class: 'tip', hidden: true });
+        const show = (event) => {
+          const box = plot.getBoundingClientRect();
+          const px = ((event.clientX - box.left) / box.width) * w;
+          let near = points[0];
+          for (const p of points) if (Math.abs(x(p[0]) - px) < Math.abs(x(near[0]) - px)) near = p;
+          const cx = x(near[0]);
+          hair.setAttribute('x1', cx);
+          hair.setAttribute('x2', cx);
+          hair.setAttribute('visibility', 'visible');
+          focus.setAttribute('cx', cx);
+          focus.setAttribute('cy', y(near[1]));
+          focus.setAttribute('visibility', 'visible');
+          fill(tip, h('b', null, fmtNum(near[1], series.unit)), h('span', null, stamp(near[0])));
+          tip.hidden = false;
+          const left = (cx / w) * box.width;
+          tip.style.left = `${Math.min(Math.max(left, 70), box.width - 70)}px`;
+          tip.style.top = `${(y(near[1]) / ht) * box.height}px`;
+        };
+        const hide = () => {
+          hair.setAttribute('visibility', 'hidden');
+          focus.setAttribute('visibility', 'hidden');
+          tip.hidden = true;
+        };
+        plot.addEventListener('pointermove', show);
+        plot.addEventListener('pointerdown', show);
+        plot.addEventListener('pointerleave', hide);
+        fill(wrap, plot, tip);
+      };
+      let drawn = 0;
+      const redraw = () => {
+        const width = wrap.clientWidth;
+        if (!wrap.isConnected || width === drawn) return;
+        drawn = width;
+        draw();
+      };
+      draw();
+      // Drawn at its real width, so text never stretches; again only when that width changes.
+      new ResizeObserver(redraw).observe(wrap);
+      const rows = [...points].reverse();
+      return h(
+        'section',
+        { class: 'series' },
+        h(
+          'div',
+          { class: 'series-head' },
+          h('div', null, h('h3', null, series.name), delta(series)),
+          h('div', { class: 'stat' }, fmtNum(series.latest, series.unit)),
+        ),
+        wrap,
+        h(
+          'details',
+          { class: 'values' },
+          h('summary', null, `All ${points.length} values`),
+          h('table', null, h('tbody', null, rows.map((p) => h('tr', null, h('td', null, stamp(p[0])), h('td', { class: 'num' }, fmtNum(p[1], series.unit)))))),
+        ),
+      );
+    }
+
+    // -- Overview: everything the project follows, at a glance --
+
+    function overviewPane(pane) {
+      const b = S.board;
+      const kids = [];
+      const waiting = b.threads.filter((t) => t.group === 'waiting');
+      const flagged = b.routines.filter((r) => r.last_finding && r.last_finding.outcome === 'attention');
+      if (waiting.length || flagged.length) {
+        kids.push(
+          h('h2', { class: 'ov-title' }, 'Needs you'),
+          h(
+            'div',
+            { class: 'needs' },
+            waiting.map((t) =>
+              h(
+                'button',
+                { class: 'need', onclick: () => select({ kind: 'thread', name: t.name }) },
+                verdictBadge({ outcome: 'attention' }),
+                h('b', null, t.title || t.name),
+                h('span', null, t.asks ? `${t.asks.label} ${t.asks.text}` : t.waiting_reason === 'permission' ? 'asks for permission' : 'asked a question'),
+              ),
+            ),
+            flagged.map((r) =>
+              h(
+                'button',
+                { class: 'need', onclick: () => select({ kind: 'routine', name: r.name }, 'status') },
+                verdictBadge(r.last_finding),
+                h('b', null, r.title),
+                h('span', null, r.last_finding.headline),
+              ),
+            ),
+          ),
+        );
+      }
+      kids.push(h('h2', { class: 'ov-title' }, 'Routines'));
+      const tiles = b.routines.map((r) => {
+        const f = r.last_finding;
+        const main = r.series[0];
+        return h(
+          'button',
+          { class: 'tile' + (r.enabled ? '' : ' off'), onclick: () => select({ kind: 'routine', name: r.name }) },
+          h('div', { class: 'tile-head' }, h('b', null, r.title), verdictBadge(f)),
+          h('p', { class: 'tile-line' }, f ? f.headline : r.enabled ? 'It hasn’t run yet.' : 'Paused.'),
+          main &&
+            h(
+              'div',
+              { class: 'tile-stat' },
+              h('div', null, h('span', { class: 'stat-label' }, main.name), h('span', { class: 'stat' }, fmtNum(main.latest, main.unit))),
+              sparkline(main.points),
+            ),
+          r.series.length > 1 && h('div', { class: 'tile-more' }, r.series.slice(1).map((s) => h('span', null, `${s.name} `, h('b', null, fmtNum(s.latest, s.unit))))),
+          h(
+            'div',
+            { class: 'tile-foot' },
+            h('span', null, r.schedule_text),
+            h('span', null, !r.enabled ? 'paused' : r.next_run_at ? `next ${until(r.next_run_at)}` : ''),
+            f && h('span', { title: stamp(f.at) }, `ran ${ago(f.at) === 'now' ? 'just now' : ago(f.at) + ' ago'}`),
+          ),
+        );
+      });
+      kids.push(
+        tiles.length
+          ? h('div', { class: 'tiles' }, tiles)
+          : h('div', { class: 'blank' }, h('b', null, 'Nothing is followed yet'), 'Ask the coordinator to watch something on a schedule, or add a routine.'),
+      );
+      const working = b.threads.filter((t) => t.group === 'working').length;
+      const open = b.threads.filter((t) => t.group !== 'resolved').length;
+      kids.push(
+        h('h2', { class: 'ov-title' }, 'Threads'),
+        h(
+          'p',
+          { class: 'dim' },
+          open ? `${open} open, ${working} working. ` : 'No open threads. ',
+          h('a', { href: hashFor({ kind: 'coordinator' }, 'conversation') }, 'Talk to the coordinator'),
+          ' to start one.',
+        ),
+      );
+      fill(pane, h('div', { class: 'overview' }, kids));
+    }
+
+    // -- A routine's status: what it found, its values over time, what it remembers --
+
+    async function loadRoutine(force) {
+      const r = routine(S.sel.name);
+      if (!r) return;
+      const key = `${r.name}|${r.last_run_at}|${r.last_finding ? r.last_finding.at : ''}|${r.series.map((s) => s.at).join(',')}`;
+      // Nothing it shows changed: leave the page, and whatever is hovered on it, alone.
+      if (!force && key === S.routineKey && S.routineDetail) return false;
+      S.routineKey = key;
+      try {
+        const detail = await api('GET', `${base}/routines/${encodeURIComponent(r.name)}`);
+        if (S.routineKey === key) S.routineDetail = detail;
+      } catch (e) {
+        if (S.routineKey === key) S.routineDetail = { error: e.message };
+      }
+      return true;
+    }
+
+    function drawStatus() {
+      if (S.sel.kind !== 'routine' || S.tab !== 'status' || !$.pane) return;
+      const d = S.routineDetail;
+      if (!d) return fill($.pane, h('div', { class: 'blank' }, 'Loading…'));
+      if (d.error) return fill($.pane, h('div', { class: 'blank' }, d.error));
+      const kids = [];
+      const f = d.last_finding;
+      if (f) {
+        kids.push(
+          h(
+            'section',
+            { class: 'finding ' + (VERDICT[f.outcome] ? VERDICT[f.outcome].cls : '') },
+            h('div', { class: 'finding-head' }, verdictBadge(f), h('span', { class: 'dim', title: stamp(f.at) }, `${stamp(f.at)}`)),
+            h('p', { class: 'finding-line' }, f.headline),
+            f.details && h('div', { class: 'md', html: md(f.details) }),
+            f.thread && h('a', { href: hashFor({ kind: 'thread', name: f.thread }, 'reports') }, 'Read the run’s report →'),
+          ),
+        );
+      } else {
+        kids.push(h('div', { class: 'blank' }, h('b', null, 'No run has reported yet'), d.enabled ? `It runs ${d.next_run_at ? until(d.next_run_at) : 'at its next time'}, or now from Settings.` : 'It is paused.'));
+      }
+      if (d.series.length) kids.push(h('div', { class: 'charts' }, d.series.map(lineChart)));
+      if (d.findings.length > 1) {
+        kids.push(
+          h('h2', { class: 'ov-title' }, 'What its runs found'),
+          h(
+            'ul',
+            { class: 'history' },
+            d.findings.map((x) =>
+              h(
+                'li',
+                null,
+                h('time', { title: stamp(x.at) }, stamp(x.at)),
+                verdictBadge(x),
+                x.thread ? h('a', { href: hashFor({ kind: 'thread', name: x.thread }, 'reports') }, x.headline) : h('span', null, x.headline),
+              ),
+            ),
+          ),
+        );
+      }
+      const notes = String(d.notes || '').replace(/<!--[\s\S]*?-->/g, '').trim();
+      kids.push(
+        h('h2', { class: 'ov-title' }, 'What it remembers'),
+        notes ? h('div', { class: 'notes md', html: md(notes) }) : h('p', { class: 'dim' }, 'Nothing yet: its runs keep their notes here.'),
+        h('p', { class: 'dim small' }, h('code', null, d.notes_file), ' · each run reads this first and rewrites it. You can edit it; so can the coordinator.'),
+      );
+      fill($.pane, h('div', { class: 'inner wide' }, kids));
+    }
+
     // -- Main: putting it together --
 
     /** Draws the main area for the selection and tab: called when either changes. */
@@ -1177,6 +1546,19 @@
       $.pane = h('div', { class: 'pane' });
       fill($.main, $.head, $.callouts, $.pane);
       renderHead();
+      if (S.sel.kind === 'overview') {
+        $.pane.className = 'pane padded';
+        overviewPane($.pane);
+        return;
+      }
+      if (S.sel.kind === 'routine' && S.tab === 'status' && routine(S.sel.name)) {
+        $.pane.className = 'pane padded';
+        S.routineDetail = null;
+        S.routineKey = '';
+        drawStatus();
+        loadRoutine(true).then(drawStatus);
+        return;
+      }
       if (S.sel.kind === 'routine' || S.sel.kind === 'new-routine') {
         $.pane.className = 'pane padded';
         routinePane($.pane);
@@ -1217,8 +1599,19 @@
       }
       // A tab that no longer applies (the thread was cleaned up while it showed).
       const s = current();
-      if (S.sel.kind !== 'routine' && S.sel.kind !== 'new-routine' && !tabsFor(s).some(([k]) => k === S.tab)) {
+      const session = S.sel.kind === 'coordinator' || S.sel.kind === 'thread';
+      if (session && !tabsFor(s).some(([k]) => k === S.tab)) {
         select(S.sel, defaultTab(S.sel));
+        return;
+      }
+      if (S.sel.kind === 'overview') {
+        renderHead();
+        overviewPane($.pane);
+        return;
+      }
+      if (S.sel.kind === 'routine' && S.tab === 'status' && routine(S.sel.name)) {
+        renderHead();
+        loadRoutine(false).then((changed) => changed && drawStatus());
         return;
       }
       // A routine made a moment ago wasn't on the board when its page was drawn.

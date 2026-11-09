@@ -27,6 +27,7 @@ pub mod pr;
 pub mod proc;
 pub mod project;
 pub mod prompts;
+pub mod push;
 pub mod registry;
 pub mod relay;
 pub mod rex_status;

@@ -225,6 +225,7 @@ coordinator's tools work the same with it stopped. One binary:
 | `chief hook guard --project <slug> --role …` | PreToolUse hook | Message guard |
 | `chief hook watch --project <slug> --role coordinator` | the coordinator's SessionStart and Stop hooks, in the background (`asyncRewake`) | Wake the coordinator when a thread is stuck on the user (§5 "Telling the coordinator") |
 | `chief mcp --project <slug>` | Claude Code (coordinator's MCP config) | Coordinator tools over stdio |
+| `chief mcp --project <slug> --routine <name>` | Claude Code (a routine run's MCP config) | That routine's run tools over stdio: `record_value`, `report_outcome` (§13) |
 | `chief status [<slug>]` | you | Print the board as text (debugging, scripting) |
 | `chief gc [<slug>] [--dry-run]` | you | Refresh PRs, then clean up every resolved thread that loses nothing (§12) |
 | `chief clean <slug> <thread> [--discard] [--yes]` | you | Clean up one resolved thread; `--discard` throws away unsaved work after confirming (§12) |
@@ -235,8 +236,9 @@ coordinator's tools work the same with it stopped. One binary:
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision, the coordinator's
-UserPromptSubmit context, and the two outputs of §5 "Background work": the PreToolUse denial of a
-subagent's background command and the Stop decision that asks a thread for its final report. The
+UserPromptSubmit context, the two outputs of §5 "Background work" (the PreToolUse denial of a
+subagent's background command and the Stop decision that asks a thread for its final report), and
+the Stop decision that asks a routine's run for its outcome (§13 "What a run leaves"). The
 one exception is `chief hook watch`: it runs in the background, so it may take as long as it
 needs and blocks nothing, and it exits 2 with its notice on stderr to wake the coordinator. The
 `claude agents` call inside the guard is bounded at 10 s; inside the coordinator's context, the
@@ -349,8 +351,17 @@ An empty variable counts as unset (made absolute, it would be the current folder
   memory/MEMORY.md      memory index; other memory files beside it
   generated/coordinator-settings.json
   generated/thread-settings.json
+  generated/run-settings.json        a routine run's: a thread's hooks, and `mcp__chief` allowed (§13)
   generated/mcp.json
+  generated/run-mcp-<routine>.json   the run tools of one routine, written before each run
+  routines/<routine>/NOTES.md        what that routine's runs remember; other files they keep beside it
+  workspace/                         where threads work when the project has no repositories
 ```
+
+**Workspace.** A project needn't be about code. With no `[[repos]]` and no repo named,
+`start_thread` and a routine's run work in `<dir>/workspace` (`tools::resolve_place`, made on
+first use, repo name `workspace`): a plain folder, so no worktree and no branch. The project
+folder's trust (below) covers it. A project with repositories never uses it.
 
 `generated/*` is rewritten from `project.toml` by `init`, `up` and whenever settings change, and
 right before every spawn and respawn (`start_thread`, `wake_thread`, the pane's respawn, `chief up`):
@@ -512,6 +523,11 @@ notify = true                      # macOS notifications on permission prompts a
 
 [dashboard]                        # left out of the file while it is off
 enabled = true                     # `chief serve` shows the project in the browser (§14)
+
+[push]                             # left out of the file while no command is set
+command = "curl -s -H \"Title: $CHIEF_TITLE\" -d \"$CHIEF_BODY\" ntfy.sh/my-topic"
+                                   # run through `sh -c` to reach the user (§13 "Reaching the user")
+on = "attention"                   # attention (default) | updates: also a run's news that can wait
 ```
 
 Routines are not in project.toml: they live in the database (§4, §13), since the coordinator,
@@ -612,6 +628,31 @@ CREATE TABLE routines (                   -- §13 (migration 19)
   last_note    TEXT,                      -- why the last occurrence started no thread, or what the start warned of
   UNIQUE (project_slug, name)
 );
+
+CREATE TABLE routine_outcomes (           -- what a run said it came to, §13 (migration 20)
+  id           INTEGER PRIMARY KEY,
+  project_slug TEXT NOT NULL,
+  routine      TEXT NOT NULL,             -- routines.name; kept when the routine is deleted
+  thread       TEXT,                      -- the run's sessions.name
+  ts           INTEGER NOT NULL,
+  outcome      TEXT NOT NULL CHECK (outcome IN ('nothing','update','attention')),
+  headline     TEXT NOT NULL,             -- one line for the user, at most 200 chars
+  details      TEXT
+);
+CREATE INDEX routine_outcomes_by_routine ON routine_outcomes(project_slug, routine, id);
+CREATE INDEX routine_outcomes_by_thread ON routine_outcomes(thread, id);
+
+CREATE TABLE routine_points (             -- the values a routine tracks over time, §13 (migration 20)
+  id           INTEGER PRIMARY KEY,
+  project_slug TEXT NOT NULL,
+  routine      TEXT NOT NULL,
+  series       TEXT NOT NULL,             -- what the number is; one line per series
+  ts           INTEGER NOT NULL,
+  value        REAL NOT NULL,
+  unit         TEXT,
+  note         TEXT
+);
+CREATE INDEX routine_points_by_series ON routine_points(project_slug, routine, series, id);
 
 CREATE TABLE events (
   id           INTEGER PRIMARY KEY,
@@ -752,6 +793,9 @@ only ends its turn (below). Deleting a session row (a failed spawn) deletes its 
 
 When `[ui] notify` is true, a thread's `permission_prompt` and a thread's Stop send a macOS
 notification (`osascript`, spawned without waiting; skipped if missing or `CHIEF_NO_NOTIFY=1`).
+Not the Stop of a routine's run: a run says what it came to itself, and only what needs the user
+is sent (§13 "Reaching the user"), so an hourly routine doesn't notify hourly. A
+`permission_prompt` is also pushed with the project's `[push]` command, when one is set.
 
 Derivation, first match wins (inputs: the row plus the latest `claude agents` snapshot if fresh):
 
@@ -1003,13 +1047,16 @@ background (`asyncRewake`, §1, §3) at each SessionStart and Stop of the coordi
   told since (`limit_told_at`).
 - A fourth kind is due the same way. **Routine run finished** (§13, `routine_due`): a thread with
   a `routine` that reported (`last_report_at`) since the coordinator was last told
-  (`routine_told_at`), isn't working, waiting or limited now, has no `stopped_early_at`, and whose
-  routine tells (`notify`). Nobody subscribed to a thread `chief serve` started, so no idle
-  notice carries its report. A run its routine's next run put away (`resolved_reason =
-  'routine'`) still counts; one a person or the coordinator resolved was seen. `<chief-routine>`:
-  `- <name> "<title>" · routine <routine> · finished at HH:MM` and a `report:` preview line (≤200
-  chars), then: read each report with `read_report`, tell the user what it found and what needs
-  them, resolve a run that leaves nothing to do.
+  (`routine_told_at`), isn't working, waiting or limited now, has no `stopped_early_at`, whose
+  routine tells (`notify`), and whose run didn't say `nothing` (§13 "What a run leaves": a run
+  that found nothing new is told to nobody; one that gave no outcome at all is told, since
+  something may be wrong). Nobody subscribed to a thread `chief serve` started, so no idle notice
+  carries its report. A run its routine's next run put away (`resolved_reason = 'routine'`)
+  still counts; one a person or the coordinator resolved was seen. `<chief-routine>`: `- <name>
+  "<title>" · routine <routine> · finished at HH:MM · <outcome>: <headline>` (for a run without
+  an outcome, `· gave no outcome` and a `report:` preview line, ≤200 chars), then: tell the user
+  in a line each, attention first; look closer with `read_routine` or `read_report` for those and
+  for a run without an outcome; resolve a run that leaves nothing to do.
 - The notice is a section per kind, separated by a blank line. `<chief-waiting>`, a line per
   thread, `</chief-waiting>`, and what to do: `- <name> "<title>" · <permission|question> since
   HH:MM · wants to run <command>` (or `wants to use <call>`, or `asks <question>`, read from its
@@ -1195,11 +1242,12 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 | `move_thread` | `name`, `account?` (an agp id or label from the pool) | Needs an agp with `bg`. Settles the thread (§5 "Limits and moves"); a named account must be in the pool, trust its repo (placement's pinned rules, §7 "Thread account") and not be the one it runs in. Then `agp bg move <session id> [--to <id>] --json` (bounded, 120 s): agp stops it and resumes it there (or in the other pool account with the most room). chief follows the move from `agp bg --json`, else from the move's answer, asks agp to watch it (`runner = "agp"`), refreshes its new account and returns `{name, alive, address, moved, account, next}` (subscribe again). The prompt (§8) says agp moves limited threads itself: only when the user asks, or for a limited thread agp didn't move |
 | `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. The prompt (§8) says to use it only when the user asks or a thread is off track and a message didn't help |
-| `list_routines` | none | `{routines: [...]}`, each a routine's row (§4) plus `schedule_text` ("Weekdays at 09:00"), `next_run` and `last_run` (local `YYYY-MM-DD HH:MM`, null when none); and `scheduler`, a line saying `chief serve` isn't running and how the user starts it, whenever it isn't (on every routine tool's answer but `delete_routine`'s and `run_routine`'s) |
+| `list_routines` | none | `{routines: [...]}`, each a routine's row (§4) plus `schedule_text` ("Weekdays at 09:00"), `next_run` and `last_run` (local `YYYY-MM-DD HH:MM`, null when none), `last_finding` (what its last run said: `outcome`, `headline`, `details`, `at`, `when`, `thread`; null before any) and `series` (up to 4 of what it tracks, most recently recorded first: `name`, `unit`, `latest`, `previous`, `at`, and its 30 latest `points`); and `scheduler`, a line saying `chief serve` isn't running and how the user starts it, whenever it isn't (on every routine tool's answer but `delete_routine`'s and `run_routine`'s) |
 | `create_routine` | `title`, `prompt`, `schedule`, `repo?`, `model?`, `effort?`, `notify?` (default true), `enabled?` (default true), `name?` (default: made from the title) | Validates (§13 "A routine") and stores it with its next run. Returns the routine as `list_routines` shows it |
 | `update_routine` | `name`, and any of `title`, `prompt`, `schedule`, `repo`, `model`, `effort` (an empty string goes back to the project's default), `notify`, `enabled` | Changes only what is given; `enabled: false` pauses, `true` resumes from now. Returns the routine |
 | `delete_routine` | `name` | Removes the routine; its runs' threads and reports stay. `{name, deleted: true, note}`. The prompt keeps it for when the user asks |
 | `run_routine` | `name` | A run now, outside the schedule, which doesn't move (§13 "A run"). `{routine, started: true, thread, next}`, or `{routine, started: false, note}` while its last run still works |
+| `read_routine` | `name` | One routine in full, without a thread: what `list_routines` shows, plus `notes` (its `NOTES.md`, the first 8 KB, with `notes_file` and `notes_cut` when it goes on), `findings` (its 10 latest: `outcome`, `headline`, `details`, `at`, `when`, `thread`) and `series` with each one's 60 latest `points` (`[at, value]`) |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
@@ -1408,8 +1456,14 @@ at the reset, never moved.
   wants repeated becomes a routine (`create_routine`), not a thread; its prompt must stand on its
   own, since a run sees neither the conversation nor earlier runs and can't ask anyone; schedules
   are in the user's local time; when a tool says `chief serve` isn't running, tell the user. A
-  `<chief-routine>` message means those runs finished: read each report, tell the user what it
-  found, don't subscribe to a run, resolve one that leaves nothing to do without asking.
+  `<chief-routine>` message means those runs finished, each line with its outcome and
+  headline: tell the user in a line each, attention first, looking closer with `read_routine` or
+  `read_report` for those; don't subscribe to a run, resolve one that leaves nothing to do
+  without asking. The section also says: a routine is how the project follows things over time;
+  chief tells every run how runs work (notes, values, outcome), so the prompt says only the
+  task, what counts as news and when the user wants interrupting; keep runs cheap (`haiku` or
+  `sonnet` at `low` for a lookup, no more often than the thing changes); `read_routine` answers a
+  question about something followed without starting anything; it may edit a routine's notes.
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch; of other sessions message only the coordinator,
   by its exact name (the report needs no message), or, for a thread spawned in another account
@@ -2093,6 +2147,11 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
   routine kind (`waiting::`), and `tests/routines.rs` against the fake (validation, a due run
   starting a tagged thread, the claim, the skip while the last run works, older runs put away, a
   failed start noted and not retried).
+- A run's side: `tests/routines.rs` (the notes folder and brief, values joining one series, the
+  outcome and what it pushes, the Stop hook's request, who is woken, the workspace of a project
+  without repositories), `tests/mcp_cli.rs` (`chief mcp --routine` serves the two run tools over
+  stdio and nothing of the coordinator's) and `push::` (the command gets the message in its
+  environment).
 - `chief serve` runs end to end in `tests/serve_cli.rs`: the binary on port 0 with the fake, driven
   over raw sockets (sign-in, the origin rule, the API and its actions, the board stream, the
   terminal socket carrying a fake `attach`, a due routine firing, one server per home, stop).
@@ -2314,41 +2373,96 @@ occurrences were missed, and its next run is counted from then.
 3. **Put away.** Its earlier runs that sit idle are resolved (`resolved_reason = 'routine'`), so
    one finished run per routine stays on the board. A run with an open pull request (review,
    landing), a failed one, and anything of another routine stay.
-4. **Start.** `tools::start_thread` with the routine's title, repo, model and effort and no
-   account (placement picks, §7 "Thread account"): the thread is a thread like any other, with
-   the same brief, guard, hooks, agp watching and cleanup. Its task is the prompt under one
-   paragraph (`routines::brief`): this is a scheduled run of the routine "<title>" (<schedule in
-   words>), nobody is watching, don't wait for an answer, say what is missing and stop, earlier
-   runs were separate sessions. The row then gets `routine = <name>`, and the routine
+4. **Start.** `tools::start_thread_as` with the routine's title, repo (the project's workspace
+   when it has no repositories, §3), model and effort and no account (placement picks, §7
+   "Thread account"): a thread like any other, with the same guard, hooks, agp watching and
+   cleanup, plus what makes it a run (`tools::RunOf`): its row carries `routine = <name>` from
+   the start; `--add-dir` its routine's folder; `--settings generated/run-settings.json` (a
+   thread's hooks, and `permissions.allow: ["mcp__chief"]`, since nobody watches a run for a
+   prompt on the tools it must call); `--mcp-config generated/run-mcp-<name>.json`, written just
+   before (`chief mcp --project <slug> --routine <name>` as its `chief` server). Its task is the
+   prompt under chief's own brief (`routines::brief`, below). The routine then gets
    `last_run_at`, `last_thread` and `last_note` (a start's `warning`, else NULL). A start that
    fails is the error, with `last_note` = `failed at HH:MM: <why>`.
 
 `max_parallel` is not counted against routine runs: it is a rule the coordinator keeps for the
 threads it starts.
 
-### Telling the coordinator
+### What a run leaves
 
-The coordinator subscribes to the threads it starts; nobody subscribes to a run. So its watcher
-(§5 "Telling the coordinator") tells it when a run of a routine with `notify` reported and is no
-longer working, waiting or limited, once per report, with `<chief-routine>`; the prompt (§8) has
-it read the report and tell the user what it found. A run stuck on the user, moved or limited is
-told by the watcher's other kinds, like any thread.
+Runs are separate sessions: fresh context every time, which is what keeps a routine that runs
+for months as cheap on its hundredth run as on its first. What carries over is what a run
+leaves, and chief's brief tells every run to leave three things, so a routine's own prompt says
+only the task:
 
-The watcher lives in the coordinator's process, which Claude Code ends after about an hour idle
-(§1), so a run at 9am with no terminal open would be heard by nobody. So `chief serve` wakes the
-coordinator for it (`Scheduler::tick`, `routines::unheard`, `wake_coordinator`): each look, a
-project with a run that is due to be told and whose report is at least 30 s old
-(`WAKE_AFTER_MS`: a turn the Stop hook kept going has moved on, and a coordinator that is awake
-has heard) gets its coordinator refreshed and, when it has no process, respawned
-(`project::respawn`, 5 s for a pid). Its SessionStart hook starts the watcher (§3), which finds
-the run due and wakes the coordinator with the notice: its turn reads the report and writes the
-user what it found, there when they next open the conversation. Each report gets one wake (kept
-in the server's memory, so a restart may wake once more): a coordinator that can't be told
-doesn't come back every hour. A coordinator that was never started isn't started for this; it
-reads the board, where a run is tagged `routine <name>`, on its first turn. The thread's own
-Stop already sent the desktop notification (`[ui] notify`, §5).
+- **Notes.** `<dir>/routines/<name>/NOTES.md` (`routines::ensure_folder`, made with the routine
+  and before each run) is the routine's memory. The brief: read it first; before finishing,
+  rewrite it for the next run (the current state, what was checked and when, what to watch),
+  under about 150 lines, replacing what is stale rather than appending; anything else worth
+  keeping goes in that folder. The user and the coordinator may edit it too (the coordinator's
+  deny rules don't cover it): the next run reads what is there. The folder outlives the routine.
+- **Values.** `record_value {series, value, unit?, note?}` stores one point of one series
+  (`routine_points`): a price, a rate, a balance. One series per thing, the same name every run;
+  whitespace is collapsed and a name that differs only in case from one in use takes that one,
+  so a line doesn't split. Returns `{series, recorded, previous}`. An empty or over-long (60
+  chars) series and a value that isn't a finite number are refused.
+- **An outcome.** `report_outcome {outcome, headline, details?}` (`routine_outcomes`, tied to
+  the routine's newest thread, `routines::current_run`): `nothing` (nothing changed that the
+  user would want to hear), `update` (news that can wait) or `attention` (they should look or
+  decide now), with a headline of one line, at most 200 chars, written for a phone. A run's
+  later word replaces its earlier one. Returns `{recorded, pushed, next}`.
 
-A deleted routine's runs keep their tag and their threads.
+The brief also says nobody is watching (don't wait for an answer; say what is missing in the
+outcome and stop) and to be economical.
+
+A run that ends without an outcome is asked for one: the thread's Stop hook
+(`hook::outcome_block`) prints `{"decision":"block","reason":…}` naming the notes file and
+`report_outcome`, when the thread is a run, has no outcome recorded, no subagents or background
+commands still running (that Stop isn't the end of the work), and the Stop isn't itself the end
+of a blocked turn (`stop_hook_active`): once per chain of Stops, after the final-report request
+(§5), which comes first. A failure to decide is logged and blocks nothing.
+
+### Who hears of a run
+
+A run's outcome decides it, so a routine costs a coordinator's turn only when there is news:
+
+| Outcome | Coordinator | User |
+| --- | --- | --- |
+| `nothing` | not told | nothing; the routine's page shows the finding |
+| `update` | told with `<chief-routine>` on its next turn (its watcher, §5); never woken for it | pushed only with `[push] on = "updates"` |
+| `attention` | told, and woken when it sleeps | pushed, and a desktop notification |
+| none (it crashed, or forgot despite being asked) | told on its next turn, with its report's first words | nothing |
+
+- A routine with `notify = false` tells the coordinator of no run; its runs still push.
+- **Waking.** The watcher lives in the coordinator's process, which Claude Code ends after
+  about an hour idle (§1). So `chief serve` wakes it for a run that needs the user
+  (`Scheduler::tick`, `routines::unheard`, `wake_coordinator`): each look, a project with a run
+  that is due to be told, said `attention`, and reported at least 30 s ago (`WAKE_AFTER_MS`: a
+  turn the Stop hook kept going has moved on, and a coordinator that is awake has heard) gets
+  its coordinator refreshed and, when it has no process, respawned (`project::respawn`, 5 s for
+  a pid). Its SessionStart hook starts the watcher (§3), which finds the run due and wakes the
+  coordinator with the notice. Each report gets one wake (kept in the server's memory, so a
+  restart may wake once more). A coordinator that was never started isn't started for this.
+- A run stuck on the user, moved or limited is told by the watcher's other kinds, like any
+  thread.
+
+A deleted routine's runs keep their tag, their threads, their findings and their values.
+
+### Reaching the user (`src/push.rs`)
+
+The coordinator's words wait in its conversation; these reach the user when they aren't
+looking, and never wait on anything (each is spawned and left):
+
+- **The desktop notification** (`push::desktop`, macOS `osascript`, `[ui] notify`): a thread's
+  permission prompt, a plain thread's finished turn (§5), and a run's `attention`.
+- **The push command** (`[push] command`, `push::send`): the user's own one-liner, run through
+  `sh -c` with the message in its environment, never in its command line, so nothing in a
+  headline is read as shell: `CHIEF_TITLE` (`<project name> · <routine title>`, or the
+  notification's title), `CHIEF_BODY` (the headline), `CHIEF_KIND` (`attention`, `update`,
+  `permission`), `CHIEF_PROJECT` (the slug) and `CHIEF_URL` (the dashboard's page for it, when a
+  server runs and the project's dashboard is on; else empty). It runs for a run's `attention`,
+  for a thread's permission prompt, and with `on = "updates"` for a run's `update`. chief ships
+  no service of its own: ntfy, Telegram, mail and the rest are a `curl` away.
 
 ## 14. `chief serve` and the dashboard (`src/serve/`)
 
@@ -2424,6 +2538,7 @@ JSON; a failure is `{"error": "<plain message>"}` with 400 (what the tools refus
 | `GET /api/p/<slug>/sessions/<name>` | One session of the project in full: its board entry plus `task`, `reports` (newest first, 50), `events` (40) and `subagents` mid-turn |
 | `POST /api/p/<slug>/threads/<name>/<action>` | `wake` and `stop` (`tools::wake_thread`, `stop_thread`), `resolve` and `reopen` (`registry::set_resolved`, reason `user`), `clean` (`cleanup::clean(Safe)`). `{ok, message}`. A blocked cleanup is an error that names `x` on the board and `chief clean --discard`: discarding unsaved work needs the loss shown and the name typed (§12), which the dashboard doesn't do. Never the coordinator |
 | `POST /api/p/<slug>/routines`, `PATCH`/`DELETE …/routines/<name>`, `POST …/routines/<name>/run` | `routines::create`, `update`, `delete`, `run(Manual)` (§13) |
+| `GET /api/p/<slug>/routines/<name>` | The routine in full (`routines::read`): as `read_routine`, with all its notes (256 KB), 40 findings and 400 points a series |
 | `GET /api/p/<slug>/files` | `{instructions, memory}`: `instructions.md` and `memory/MEMORY.md`, to read |
 | `GET /api/p/<slug>/term?target=<thread>&cols=&rows=` | The terminal socket (below); no `target` is the coordinator |
 
@@ -2434,7 +2549,7 @@ started) and `threads` in board order, `routines` (as `list_routines`), `guard_d
 `waiting_reason`, `asleep`, `started`, `running` (background work), `branch`, `pr` (`url`,
 `state`, `draft`, `review`), `account`, `routine`, `repo`, `model`, `effort`,
 `last_activity_at`, `last_report_at`, `report_preview`, `resolved_reason`, `cleaned`, `removed`,
-`cleanup_blocked`, `limit`, `moved`; and for a working or waiting thread what it asks (`asks`:
+`cleanup_blocked`, `limit`, `moved`, for a routine's run its `finding` (what it said it came to); and for a working or waiting thread what it asks (`asks`:
 `label`, `text`, from `waiting::asks`) or does (`doing`: its own latest call), as the terminal
 board's detail (§10).
 
@@ -2473,7 +2588,8 @@ permission prompts, questions and slash commands all work, for the coordinator a
 
 - A top bar with the project (a menu when several are served) and its goal, and whether the
   stream is live.
-- The board on the left: a red strip when threads wait on the user (it opens the first), the
+- The board on the left: a red strip when threads wait on the user (it opens the first),
+  Overview when the project has routines, the
   coordinator, the threads by group as on the terminal board (same glyphs and colours, the same
   tags as chips, what a working thread does and a waiting one asks, Resolved folded), then the
   routines with their schedule in words and next run, and `+ New`.
@@ -2482,9 +2598,19 @@ permission prompts, questions and slash commands all work, for the coordinator a
   once more), what it waits on as a callout, and tabs: Conversation (the terminal), Reports (its
   task and every report, as Markdown), and Activity (its latest calls and subagents) for a
   thread or Project (settings in brief, instructions and memory, to read) for the coordinator. A
-  routine: its form (title, prompt, a schedule builder that writes the cron line, repository,
+  routine has two tabs. Status: what its last run found (outcome, headline, details, a link to
+  the run's report), a line chart per series it tracks, the findings before, and its notes.
+  Settings: its form (title, prompt, a schedule builder that writes the cron line, repository,
   model, effort, whether the coordinator is told), Run now, Pause or Resume, Delete, and its
   runs.
+- **Overview**, where a project with routines lands: what needs the user (threads waiting, and
+  routines whose last run said `attention`), then a tile per routine with its outcome as an icon
+  and a word, its headline, the latest value of what it tracks with a sparkline, its schedule
+  and next run.
+- Charts (drawn as SVG, no library): one series a chart, never two scales on one; a 2px line in
+  one validated series colour per theme, round-number gridlines, a crosshair that reads the
+  nearest run's value and time, and every value as a table under the chart. A change since the
+  run before is shown in neutral ink: chief doesn't know whether up is good.
 - The selection lives in the URL's hash, so reload and back work. Below 860 px the board is the
   home and a selection opens over it. Light and dark follow the system; the terminal is always
   a dark screen.

@@ -68,6 +68,16 @@ pub fn thread_settings_path(dir: &Path) -> PathBuf {
     dir.join("generated/thread-settings.json")
 }
 
+/// The settings of a routine's run: a thread's hooks, plus leave for the run tools (§13).
+pub fn run_settings_path(dir: &Path) -> PathBuf {
+    dir.join("generated").join("run-settings.json")
+}
+
+/// The MCP config of the runs of routine `name`.
+pub fn run_mcp_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join("generated").join(format!("run-mcp-{name}.json"))
+}
+
 pub fn mcp_config_path(dir: &Path) -> PathBuf {
     dir.join("generated/mcp.json")
 }
@@ -149,7 +159,33 @@ pub fn write_all(
         &thread_settings_path(dir),
         &hook_settings(exe, slug, Role::Thread, env),
     )?;
+    write_json(&run_settings_path(dir), &run_settings(exe, slug, env))?;
     write_json(&mcp_config_path(dir), &mcp_config(exe, slug, env))
+}
+
+/// A thread's hooks, and `mcp__chief` allowed: nobody watches a run for a prompt on the tools
+/// it must call (`record_value`, `report_outcome`).
+pub fn run_settings(exe: &Path, slug: &str, env: &[(String, String)]) -> Value {
+    let mut settings = hook_settings(exe, slug, Role::Thread, env);
+    settings["permissions"] = json!({"allow": ["mcp__chief"]});
+    settings
+}
+
+/// `chief mcp --project <slug> --routine <name>` as the `chief` server of that routine's runs.
+pub fn run_mcp_config(exe: &Path, slug: &str, name: &str, env: &[(String, String)]) -> Value {
+    let mut config = mcp_config(exe, slug, env);
+    config["mcpServers"]["chief"]["args"] = json!(["mcp", "--project", slug, "--routine", name]);
+    config
+}
+
+/// Writes the MCP config of routine `name`'s runs, right before one starts, and returns its
+/// path.
+pub fn write_run_mcp(dir: &Path, config: &ProjectConfig, name: &str) -> Result<PathBuf> {
+    let exe = chief_exe()?;
+    let env = passthrough_env(config.claude_config_dir.as_deref());
+    let path = run_mcp_path(dir, name);
+    write_json(&path, &run_mcp_config(&exe, &config.slug, name, &env))?;
+    Ok(path)
 }
 
 /// `write_all` with this binary and environment, right before a session starts or respawns:
@@ -604,13 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn write_all_writes_three_files() {
+    fn write_all_writes_four_files() {
         let dir = tempfile::tempdir().unwrap();
         let config = ProjectConfig::new("Demo", "demo", None, vec![]);
         write_all(dir.path(), &config, Path::new("/bin/chief"), &[]).unwrap();
         for p in [
             coordinator_settings_path(dir.path()),
             thread_settings_path(dir.path()),
+            run_settings_path(dir.path()),
             mcp_config_path(dir.path()),
         ] {
             let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -620,6 +657,31 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(names.len(), 3, "no temp files left: {names:?}");
+        assert_eq!(names.len(), 4, "no temp files left: {names:?}");
+    }
+
+    /// A run gets a thread's hooks and may call its own tools without a prompt; its MCP server
+    /// is told which routine it serves.
+    #[test]
+    fn a_runs_settings_and_tools() {
+        let exe = Path::new("/bin/chief");
+        let thread = hook_settings(exe, "demo", Role::Thread, &[]);
+        let run = run_settings(exe, "demo", &[]);
+        assert_eq!(run["hooks"], thread["hooks"]);
+        assert_eq!(run["permissions"], json!({"allow": ["mcp__chief"]}));
+        assert!(thread.get("permissions").is_none());
+
+        let env = vec![("CHIEF_HOME".to_string(), "/h".to_string())];
+        let mcp = run_mcp_config(exe, "demo", "check-flights", &env);
+        let server = &mcp["mcpServers"]["chief"];
+        assert_eq!(
+            server["args"],
+            json!(["mcp", "--project", "demo", "--routine", "check-flights"])
+        );
+        assert_eq!(server["env"]["CHIEF_HOME"], "/h");
+        assert_eq!(
+            run_mcp_path(Path::new("/p"), "check-flights"),
+            Path::new("/p/generated/run-mcp-check-flights.json")
+        );
     }
 }

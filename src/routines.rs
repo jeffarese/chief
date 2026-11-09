@@ -2,6 +2,9 @@
 //! The coordinator's tools, `chief routine` and the dashboard all go through these functions;
 //! `chief serve` fires the due ones.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use schemars::JsonSchema;
@@ -13,8 +16,8 @@ use crate::cron::Schedule;
 use crate::db::{self, SessionRow};
 use crate::state::{Group, Role};
 use crate::text::{local_hhmm, local_stamp};
-use crate::tools::{self, StartThreadArgs, ToolCtx};
-use crate::{names, registry};
+use crate::tools::{self, RunOf, StartThreadArgs, ToolCtx};
+use crate::{names, push, registry};
 
 /// `resolved_reason` of a finished run put away when the routine's next run starts.
 pub const RESOLVED_BY_ROUTINE: &str = "routine";
@@ -235,10 +238,13 @@ fn check(config: &ProjectConfig, r: &Routine) -> Result<Schedule> {
         bail!("effort {effort:?} is not one of {}", EFFORTS.join(", "));
     }
     // A run with nowhere to work fails every time, so say so now. An absolute path is refused:
-    // the coordinator's deny rules and trust are set up for the project's repositories only.
-    let (repo, _) = tools::resolve_repo(config, r.repo.as_deref())?;
-    if r.repo.is_some() && config.repo(&repo).is_none() {
-        bail!("a routine runs in one of the project's repositories, by name");
+    // the coordinator's deny rules and trust are set up for the project's repositories only. A
+    // project without repositories works in its workspace (`tools::resolve_place`).
+    if r.repo.is_some() || !config.repos.is_empty() {
+        let (repo, _) = tools::resolve_repo(config, r.repo.as_deref())?;
+        if r.repo.is_some() && config.repo(&repo).is_none() {
+            bail!("a routine runs in one of the project's repositories, by name");
+        }
     }
     Ok(schedule)
 }
@@ -395,9 +401,15 @@ pub fn delete(conn: &Connection, slug: &str, name: &str) -> Result<Routine> {
     })
 }
 
-/// A routine as the tools and the dashboard show it: its row, its schedule in words and its
-/// times as local text beside the timestamps.
-pub fn view(r: &Routine) -> Value {
+/// How many of a series' latest points ride along wherever routines are listed.
+const SPARK_POINTS: usize = 30;
+/// At most this many series per routine there; `read` gives them all.
+const LISTED_SERIES: usize = 4;
+
+/// A routine as the tools and the dashboard show it: its row, its schedule in words, its times
+/// as local text beside the timestamps, what its last run found, and the latest of what it
+/// tracks.
+pub fn view(conn: &Connection, r: &Routine) -> Result<Value> {
     let mut out = serde_json::to_value(r).unwrap_or_default();
     out["schedule_text"] = json!(
         Schedule::parse(&r.schedule)
@@ -406,7 +418,16 @@ pub fn view(r: &Routine) -> Value {
     );
     out["next_run"] = json!(r.next_run_at.map(local_stamp));
     out["last_run"] = json!(r.last_run_at.map(local_stamp));
-    out
+    out["last_finding"] = match findings(conn, &r.project_slug, &r.name, 1)?.first() {
+        Some(f) => f.to_json(),
+        None => Value::Null,
+    };
+    out["series"] = series(conn, &r.project_slug, &r.name, SPARK_POINTS)?
+        .iter()
+        .take(LISTED_SERIES)
+        .map(Series::to_json)
+        .collect();
+    Ok(out)
 }
 
 /// What asked for a run.
@@ -456,16 +477,59 @@ fn busy(row: &SessionRow) -> bool {
         )
 }
 
-/// The brief of a run: the routine's prompt under a line that says nobody is watching.
-pub fn brief(routine: &Routine) -> String {
+/// The routine's own folder (`<project>/routines/<name>`): its notes and whatever else its
+/// runs keep. It outlives the routine.
+pub fn folder(project_dir: &Path, name: &str) -> PathBuf {
+    project_dir.join("routines").join(name)
+}
+
+pub const NOTES_FILE: &str = "NOTES.md";
+
+/// Makes the routine's folder and, the first time, its notes file. A run's memory is that
+/// file: runs are separate sessions.
+pub fn ensure_folder(project_dir: &Path, routine: &Routine) -> Result<PathBuf> {
+    let dir = folder(project_dir, &routine.name);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let notes = dir.join(NOTES_FILE);
+    if !notes.exists() {
+        let text = format!(
+            "# {}\n\n<!-- What the runs of this routine remember. Each run reads this first and \
+             rewrites it before it ends: the current state, what was checked and when, what to \
+             watch next. Keep it short. You can edit it too: the next run reads what is here. \
+             -->\n",
+            routine.title
+        );
+        std::fs::write(&notes, text).with_context(|| format!("writing {}", notes.display()))?;
+    }
+    Ok(dir.canonicalize().unwrap_or(dir))
+}
+
+/// The brief of a run: how a run works (its notes, the values it records, the verdict it ends
+/// with), then the routine's prompt.
+pub fn brief(routine: &Routine, folder: &Path) -> String {
     let when = Schedule::parse(&routine.schedule)
         .map(|s| s.describe())
         .unwrap_or_else(|_| routine.schedule.clone());
+    let notes = folder.join(NOTES_FILE);
     format!(
-        "This is a scheduled run of the routine \"{}\" ({when}). Nobody is watching it: don't \
-         wait for an answer. If something you need is missing, say exactly what in your report \
-         and stop. Earlier runs were separate sessions; you don't have their conversation.\n\n{}",
-        routine.title, routine.prompt
+        "This is a scheduled run of the routine \"{title}\" ({when}). Nobody is watching it: \
+         don't wait for an answer. If something you need is missing, say exactly what in your \
+         outcome and stop.\n\n\
+         Memory. Earlier runs were separate sessions; what they left for you is {notes}. Read it \
+         first. Before you finish, rewrite it for the next run: the current state, what you \
+         checked and when, what to watch. Keep it under about 150 lines by replacing what is \
+         stale, not appending. Anything else worth keeping goes in {folder} too.\n\n\
+         Values. When a number matters over time (a price, a rate, a balance), record it with \
+         the record_value tool: one series per thing, the same series name every run.\n\n\
+         Outcome. End by calling report_outcome once: \"nothing\" when nothing changed that the \
+         user would want to hear, \"update\" for news that can wait, \"attention\" when they \
+         should look or decide now. Its headline is one line they read on their phone: lead \
+         with the fact, with the number in it.\n\n\
+         Be economical: do what the task asks and no more.\n\n{prompt}",
+        title = routine.title,
+        notes = notes.display(),
+        folder = folder.display(),
+        prompt = routine.prompt,
     )
 }
 
@@ -538,34 +602,32 @@ pub fn run(ctx: &ToolCtx, name: &str, trigger: Trigger) -> Result<Outcome> {
         }
     }
 
+    let failed = |e: anyhow::Error| {
+        note(Some(format!("failed at {}: {e:#}", local_hhmm(now))), None);
+        e.context(format!("starting a run of routine {name}"))
+    };
+    let folder = match ensure_folder(ctx.project_dir, &routine) {
+        Ok(folder) => folder,
+        Err(e) => return Err(failed(e)),
+    };
     let args = StartThreadArgs {
         title: routine.title.clone(),
-        task: brief(&routine),
+        task: brief(&routine, &folder),
         repo: routine.repo.clone(),
         model: routine.model.clone(),
         effort: routine.effort.clone(),
         account: None,
     };
-    let started = match tools::start_thread(ctx, &args) {
+    let of = RunOf {
+        routine: name.to_string(),
+        folder,
+    };
+    let started = match tools::start_thread_as(ctx, &args, Some(&of), &|| false) {
         Ok(started) => started,
-        Err(e) => {
-            note(Some(format!("failed at {}: {e:#}", local_hhmm(now))), None);
-            return Err(e.context(format!("starting a run of routine {name}")));
-        }
+        Err(e) => return Err(failed(e)),
     };
     let thread = started["name"].as_str().unwrap_or_default().to_string();
     let warning = started["warning"].as_str().map(str::to_string);
-    // The row exists since before the spawn; its hooks may be writing it already.
-    let marked = db::immediate(ctx.conn, |conn| {
-        let Some(mut row) = db::get_session(conn, &thread)? else {
-            return Ok(());
-        };
-        row.routine = Some(name.to_string());
-        db::update_session(conn, &row)
-    });
-    if let Err(e) = marked {
-        eprintln!("chief: {thread} started, but couldn't be marked as a run of {name}: {e:#}");
-    }
     note(warning.clone(), Some(&thread));
     Ok(Outcome::Started { thread, warning })
 }
@@ -589,13 +651,17 @@ pub fn run_due(ctx: &ToolCtx) -> Result<Vec<(String, Result<Outcome>)>> {
 pub const WAKE_AFTER_MS: i64 = 30_000;
 const WAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The finished runs the coordinator should hear of and hasn't (`waiting::routine_due`), whose
-/// report is at least `WAKE_AFTER_MS` old: each thread's name and that report's time.
+/// The finished runs worth waking a sleeping coordinator for: due to be told
+/// (`waiting::routine_due`), said to need the user (`Verdict::Attention`), and reported at
+/// least `WAKE_AFTER_MS` ago. Each thread's name and that report's time. News that can wait is
+/// told on the coordinator's next turn, at no turn of its own.
 pub fn unheard(conn: &Connection, slug: &str, now: i64) -> Result<Vec<(String, i64)>> {
     let threads = db::list_sessions(conn, slug, Some(Role::Thread))?;
     let quiet = quiet(conn, slug)?;
-    Ok(crate::waiting::routine_due(&threads, &quiet)
+    let verdicts = verdicts(conn, slug)?;
+    Ok(crate::waiting::routine_due(&threads, &quiet, &verdicts)
         .into_iter()
+        .filter(|t| verdicts.get(&t.name).map(|f| f.verdict) == Some(Verdict::Attention))
         .filter_map(|t| Some((t.name.clone(), t.last_report_at?)))
         .filter(|(_, at)| now - at >= WAKE_AFTER_MS)
         .collect())
@@ -633,6 +699,374 @@ pub fn wake_coordinator(ctx: &ToolCtx) -> Result<bool> {
     Ok(true)
 }
 
+// ---- What a run leaves (§13) --------------------------------------------------------------------
+
+/// What a run says it came to, which decides who hears of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Nothing changed that the user would want to hear: nobody is told.
+    Nothing,
+    /// News that can wait: the coordinator hears on its next turn.
+    Update,
+    /// The user should look or decide now: the coordinator is woken and the user pushed.
+    Attention,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Nothing => "nothing",
+            Verdict::Update => "update",
+            Verdict::Attention => "attention",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Verdict> {
+        match s {
+            "nothing" => Some(Verdict::Nothing),
+            "update" => Some(Verdict::Update),
+            "attention" => Some(Verdict::Attention),
+            _ => None,
+        }
+    }
+}
+
+/// A `routine_outcomes` row: what one run found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finding {
+    pub routine: String,
+    /// The run's thread.
+    pub thread: Option<String>,
+    pub at: i64,
+    pub verdict: Verdict,
+    /// One line for the user.
+    pub headline: String,
+    pub details: Option<String>,
+}
+
+impl Finding {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "outcome": self.verdict.as_str(),
+            "headline": self.headline,
+            "details": self.details,
+            "at": self.at,
+            "when": local_stamp(self.at),
+            "thread": self.thread,
+        })
+    }
+}
+
+fn finding_from_row(r: &Row) -> rusqlite::Result<Finding> {
+    let verdict: String = r.get(3)?;
+    Ok(Finding {
+        routine: r.get(0)?,
+        thread: r.get(1)?,
+        at: r.get(2)?,
+        verdict: Verdict::parse(&verdict).unwrap_or(Verdict::Update),
+        headline: r.get(4)?,
+        details: r.get(5)?,
+    })
+}
+
+const FINDING_COLUMNS: &str = "routine, thread, ts, outcome, headline, details";
+
+/// A routine's latest findings, newest first.
+pub fn findings(
+    conn: &Connection,
+    slug: &str,
+    routine: &str,
+    limit: usize,
+) -> Result<Vec<Finding>> {
+    let sql = format!(
+        "SELECT {FINDING_COLUMNS} FROM routine_outcomes
+         WHERE project_slug = ?1 AND routine = ?2 ORDER BY id DESC LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![slug, routine, limit as i64], finding_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// What each run of the project last said of itself, by thread. A run that said nothing isn't
+/// in it.
+pub fn verdicts(conn: &Connection, slug: &str) -> Result<HashMap<String, Finding>> {
+    let sql = format!(
+        "SELECT {FINDING_COLUMNS} FROM routine_outcomes
+         WHERE project_slug = ?1 AND thread IS NOT NULL ORDER BY id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([slug], finding_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // In id order, so a run's later word replaces its earlier one.
+    Ok(rows
+        .into_iter()
+        .filter_map(|f| Some((f.thread.clone()?, f)))
+        .collect())
+}
+
+/// Whether `thread` has said what it came to.
+pub fn reported(conn: &Connection, thread: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM routine_outcomes WHERE thread = ?1 LIMIT 1",
+            [thread],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The routine's run that is under way, or its latest: the newest thread that carries its name.
+pub fn current_run(conn: &Connection, slug: &str, routine: &str) -> Result<Option<SessionRow>> {
+    Ok(db::list_sessions(conn, slug, Some(Role::Thread))?
+        .into_iter()
+        .filter(|t| t.routine.as_deref() == Some(routine))
+        .max_by_key(|t| t.created_at))
+}
+
+/// One thing a routine tracks over time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Series {
+    pub name: String,
+    /// The unit of its latest point.
+    pub unit: Option<String>,
+    /// Oldest first: when, and the value.
+    pub points: Vec<(i64, f64)>,
+}
+
+impl Series {
+    pub fn to_json(&self) -> Value {
+        let latest = self.points.last();
+        let previous = self.points.iter().rev().nth(1);
+        json!({
+            "name": self.name,
+            "unit": self.unit,
+            "latest": latest.map(|p| p.1),
+            "at": latest.map(|p| p.0),
+            "previous": previous.map(|p| p.1),
+            "points": self.points.iter().map(|(at, v)| json!([at, v])).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The routine's series, most recently recorded first, each with its latest `points` points.
+pub fn series(conn: &Connection, slug: &str, routine: &str, points: usize) -> Result<Vec<Series>> {
+    let mut names = conn.prepare(
+        "SELECT series, max(id) FROM routine_points
+         WHERE project_slug = ?1 AND routine = ?2 GROUP BY series ORDER BY max(id) DESC",
+    )?;
+    let names = names
+        .query_map(params![slug, routine], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut read = conn.prepare(
+        "SELECT ts, value, unit FROM routine_points
+         WHERE project_slug = ?1 AND routine = ?2 AND series = ?3 ORDER BY id DESC LIMIT ?4",
+    )?;
+    let mut out = Vec::new();
+    for name in names {
+        let mut rows = read
+            .query_map(params![slug, routine, name, points as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let unit = rows.first().and_then(|r| r.2.clone());
+        rows.reverse();
+        out.push(Series {
+            name,
+            unit,
+            points: rows.into_iter().map(|(at, v, _)| (at, v)).collect(),
+        });
+    }
+    Ok(out)
+}
+
+const SERIES_MAX: usize = 60;
+const HEADLINE_MAX: usize = 200;
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RecordValueArgs {
+    /// What the number is, e.g. "BCN-NYC lowest fare" or "outstanding principal". Use exactly
+    /// the same name every run: it is how the points join into one line over time.
+    pub series: String,
+    /// The number, without its unit.
+    pub value: f64,
+    /// Its unit, e.g. "EUR", "%", "days".
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// A few words about this point, e.g. the airline or the bank.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReportOutcomeArgs {
+    /// "nothing": nothing changed that the user would want to hear. "update": news that can
+    /// wait until they next look. "attention": they should look or decide now.
+    pub outcome: Verdict,
+    /// One line the user reads on their phone. Lead with the fact and put the number in it:
+    /// "BCN-NYC dropped to 412 EUR on 14 Mar (was 498)".
+    pub headline: String,
+    /// What they need to know beyond the headline, in a few lines. Optional.
+    #[serde(default)]
+    pub details: Option<String>,
+}
+
+/// `record_value`, a run's tool: one point of one series of its routine.
+pub fn record_value_tool(ctx: &ToolCtx, routine: &str, args: &RecordValueArgs) -> Result<Value> {
+    let slug = ctx.config.slug.as_str();
+    let name = args.series.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        bail!("series is empty: name what the number is");
+    }
+    if name.chars().count() > SERIES_MAX {
+        bail!("series is a short name (at most {SERIES_MAX} characters), not a sentence");
+    }
+    if !args.value.is_finite() {
+        bail!("value must be a number");
+    }
+    // The same thing under another case is the same series: take the name already in use.
+    let known = series(ctx.conn, slug, routine, 1)?;
+    let name = known
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(&name))
+        .map(|s| s.name.clone())
+        .unwrap_or(name);
+    ctx.conn.execute(
+        "INSERT INTO routine_points (project_slug, routine, series, ts, value, unit, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            slug,
+            routine,
+            name,
+            (ctx.now)(),
+            args.value,
+            clean(args.unit.as_deref()),
+            clean(args.note.as_deref()),
+        ],
+    )?;
+    let recorded = series(ctx.conn, slug, routine, 2)?
+        .into_iter()
+        .find(|s| s.name == name);
+    let previous = recorded
+        .as_ref()
+        .and_then(|s| s.points.iter().rev().nth(1).map(|p| p.1));
+    Ok(json!({"series": name, "recorded": args.value, "previous": previous}))
+}
+
+/// `report_outcome`, a run's tool: its verdict and a line for the user. What needs the user is
+/// pushed at once (the desktop notification, and the project's push command); the coordinator
+/// hears through its watcher (§13 "Who hears of a run").
+pub fn report_outcome_tool(
+    ctx: &ToolCtx,
+    routine: &str,
+    args: &ReportOutcomeArgs,
+) -> Result<Value> {
+    let slug = ctx.config.slug.as_str();
+    let headline = crate::text::one_line(&args.headline, HEADLINE_MAX);
+    if headline.is_empty() {
+        bail!("headline is empty: say in one line what you found");
+    }
+    let run = current_run(ctx.conn, slug, routine)?;
+    let title = get(ctx.conn, slug, routine)?
+        .map(|r| r.title)
+        .unwrap_or_else(|| routine.to_string());
+    ctx.conn.execute(
+        "INSERT INTO routine_outcomes (project_slug, routine, thread, ts, outcome, headline, details)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            slug,
+            routine,
+            run.as_ref().map(|r| r.name.as_str()),
+            (ctx.now)(),
+            args.outcome.as_str(),
+            headline,
+            clean(args.details.as_deref()),
+        ],
+    )?;
+    let kind = match args.outcome {
+        Verdict::Nothing => None,
+        Verdict::Update => Some(push::Kind::Update),
+        Verdict::Attention => Some(push::Kind::Attention),
+    };
+    let mut pushed = false;
+    if let Some(kind) = kind {
+        let message = push::Message {
+            kind,
+            title: format!("{} · {}", ctx.config.name, title),
+            body: headline.clone(),
+            url: push::dashboard_url(ctx.config, &format!("#/r/{routine}")),
+        };
+        pushed = push::send(ctx.config, &message);
+        if kind == push::Kind::Attention && ctx.config.ui.notify {
+            push::desktop(&message.title, &message.body);
+        }
+    }
+    Ok(json!({
+        "recorded": args.outcome.as_str(),
+        "pushed": pushed,
+        "next": "Make sure your notes file is up to date, then end your turn with a short report.",
+    }))
+}
+
+/// How much of a routine's notes the coordinator is handed.
+const NOTES_READ_BYTES: usize = 8 * 1024;
+const READ_FINDINGS: usize = 10;
+const READ_POINTS: usize = 60;
+
+/// `read_routine`, the coordinator's: everything a routine knows without reading a thread.
+pub fn read_tool(ctx: &ToolCtx, args: &RoutineNameArgs) -> Result<Value> {
+    read(
+        ctx,
+        args.name.trim(),
+        NOTES_READ_BYTES,
+        READ_FINDINGS,
+        READ_POINTS,
+    )
+}
+
+/// A routine in full: its row as listed, its notes (at most `notes_bytes` of them), its latest
+/// findings and every series with its latest points.
+pub fn read(
+    ctx: &ToolCtx,
+    name: &str,
+    notes_bytes: usize,
+    findings_kept: usize,
+    points: usize,
+) -> Result<Value> {
+    let slug = ctx.config.slug.as_str();
+    let routine = must_get(ctx.conn, slug, name)?;
+    let mut out = view(ctx.conn, &routine)?;
+    let notes_path = folder(ctx.project_dir, &routine.name).join(NOTES_FILE);
+    let notes = std::fs::read_to_string(&notes_path).unwrap_or_default();
+    let cut = notes.len() > notes_bytes;
+    let mut end = notes.len().min(notes_bytes);
+    while !notes.is_char_boundary(end) {
+        end -= 1;
+    }
+    out["notes"] = json!(notes[..end]);
+    out["notes_file"] = json!(notes_path.display().to_string());
+    if cut {
+        out["notes_cut"] = json!("the notes go on; read notes_file for the rest");
+    }
+    out["findings"] = findings(ctx.conn, slug, &routine.name, findings_kept)?
+        .iter()
+        .map(Finding::to_json)
+        .collect();
+    out["series"] = series(ctx.conn, slug, &routine.name, points)?
+        .iter()
+        .map(Series::to_json)
+        .collect();
+    Ok(out)
+}
+
 // ---- The coordinator's tools (§7) -------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -661,7 +1095,10 @@ fn scheduler_note(ctx: &ToolCtx, out: &mut Value) {
 }
 
 pub fn list_tool(ctx: &ToolCtx) -> Result<Value> {
-    let routines: Vec<Value> = list(ctx.conn, &ctx.config.slug)?.iter().map(view).collect();
+    let routines = list(ctx.conn, &ctx.config.slug)?
+        .iter()
+        .map(|r| view(ctx.conn, r))
+        .collect::<Result<Vec<Value>>>()?;
     let mut out = json!({ "routines": routines });
     scheduler_note(ctx, &mut out);
     Ok(out)
@@ -669,7 +1106,14 @@ pub fn list_tool(ctx: &ToolCtx) -> Result<Value> {
 
 pub fn create_tool(ctx: &ToolCtx, draft: &Draft) -> Result<Value> {
     let routine = create(ctx.conn, ctx.config, draft, (ctx.now)())?;
-    let mut out = view(&routine);
+    ensure_folder(ctx.project_dir, &routine)?;
+    let mut out = view(ctx.conn, &routine)?;
+    out["notes"] = json!(
+        folder(ctx.project_dir, &routine.name)
+            .join(NOTES_FILE)
+            .display()
+            .to_string()
+    );
     scheduler_note(ctx, &mut out);
     Ok(out)
 }
@@ -682,7 +1126,7 @@ pub fn update_tool(ctx: &ToolCtx, args: &UpdateRoutineArgs) -> Result<Value> {
         &args.changes,
         (ctx.now)(),
     )?;
-    let mut out = view(&routine);
+    let mut out = view(ctx.conn, &routine)?;
     scheduler_note(ctx, &mut out);
     Ok(out)
 }
@@ -790,6 +1234,7 @@ pub fn cli_list(slug: &str) -> Result<()> {
 pub fn cli_add(slug: &str, draft: &Draft) -> Result<()> {
     for_cli(slug, |ctx| {
         let routine = create(ctx.conn, ctx.config, draft, (ctx.now)())?;
+        ensure_folder(ctx.project_dir, &routine)?;
         println!("Added {}", render(&routine));
         cli_scheduler_note(ctx);
         Ok(())

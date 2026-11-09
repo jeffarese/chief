@@ -3,7 +3,6 @@
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -148,13 +147,50 @@ fn dispatch(event: &str, project: &str, role: Role, input: &str) -> Result<Optio
     };
     let held = outcome.held.iter().filter(|_| block.is_none());
     let notices: Vec<_> = outcome.notices.iter().chain(held).collect();
-    if !notices.is_empty() && notify_enabled(project) {
+    if !notices.is_empty() {
+        let config = project_config(project);
         for notice in notices {
-            send_notice(notice);
+            if config.as_ref().is_some_and(|c| c.ui.notify) {
+                send_notice(notice);
+            }
+            if notice.stuck
+                && let Some(config) = &config
+            {
+                crate::push::send(
+                    config,
+                    &crate::push::Message {
+                        kind: crate::push::Kind::Permission,
+                        title: notice.title.clone(),
+                        body: notice.message.clone(),
+                        url: outcome.session.as_deref().and_then(|thread| {
+                            crate::push::dashboard_url(
+                                config,
+                                &format!("#/t/{thread}/conversation"),
+                            )
+                        }),
+                    },
+                );
+            }
         }
     }
     if block.is_some() {
         return Ok(block);
+    }
+    // A routine's run that is done but hasn't said what it came to is asked once (§13).
+    if event == "Stop"
+        && role == Role::Thread
+        && let Some(thread) = outcome.session.as_deref()
+    {
+        match outcome_block(&conn, project, thread, &payload) {
+            Ok(Some(block)) => return Ok(Some(block)),
+            Ok(None) => {}
+            Err(e) => log_error(
+                &paths::hook_error_log(),
+                event,
+                project,
+                &format!("not asking {thread} for its outcome: {e:#}"),
+            ),
+        }
     }
     if event == "PreToolUse"
         && let Some(session) = outcome.session.as_deref()
@@ -792,6 +828,9 @@ pub struct Outcome {
 pub struct Notice {
     pub title: String,
     pub message: String,
+    /// A permission prompt: the thread is stuck until the user answers, so it is also pushed
+    /// (§13 "Reaching the user").
+    pub stuck: bool,
 }
 
 /// Records the event and applies the §5 hook updates to the matched session.
@@ -1075,6 +1114,9 @@ fn notice_for(project: &str, row: &SessionRow, kind: HookKind) -> Option<Notice>
     let label = row.title.as_deref().unwrap_or(&row.name);
     let message = match kind {
         HookKind::PermissionNotification => format!("{label} needs your permission"),
+        // A routine's run says what it came to itself (`report_outcome`), and only what needs
+        // the user is sent: a run every hour mustn't notify every hour.
+        HookKind::Stop if row.routine.is_some() => return None,
         HookKind::Stop => {
             let report = row.last_report.as_deref().unwrap_or("");
             format!("{label} finished: {}", one_line(report, 100))
@@ -1084,6 +1126,7 @@ fn notice_for(project: &str, row: &SessionRow, kind: HookKind) -> Option<Notice>
     Some(Notice {
         title: format!("chief · {project}"),
         message,
+        stuck: kind == HookKind::PermissionNotification,
     })
 }
 
@@ -1154,14 +1197,15 @@ fn tool_call(payload: &Value) -> String {
     format!("{tool}: {what}")
 }
 
-/// `ui.notify` from project.toml. A missing file means no notifications; a broken one is logged.
-fn notify_enabled(project: &str) -> bool {
+/// project.toml, for `ui.notify` and `[push]`. A missing file means no notifications; a broken
+/// one is logged.
+fn project_config(project: &str) -> Option<ProjectConfig> {
     let path = paths::project_dir(project).join("project.toml");
     if !path.exists() {
-        return false;
+        return None;
     }
     match ProjectConfig::load(&path) {
-        Ok(c) => c.ui.notify,
+        Ok(c) => Some(c),
         Err(e) => {
             log_error(
                 &paths::hook_error_log(),
@@ -1169,33 +1213,59 @@ fn notify_enabled(project: &str) -> bool {
                 project,
                 &format!("{e:#}"),
             );
-            false
+            None
         }
     }
 }
 
-/// Fire and forget: the hook must not wait on Notification Center, and the child must not hold
-/// the hook's stdout open. `CHIEF_NO_NOTIFY=1` turns this off (tests).
-fn send_notice(n: &Notice) {
-    if std::env::var_os("CHIEF_NO_NOTIFY").is_some_and(|v| v == "1") {
-        return;
+/// The Stop decision that keeps a routine's run going until it has said what it came to: its
+/// verdict decides who is told (§13 "Who hears of a run"), so a run that forgets it would wake
+/// nobody, or everybody. Asked once per Stop chain (never while `stop_hook_active`), and not
+/// while its subagents or background commands still run: that Stop isn't the end of the work.
+pub fn outcome_block(
+    conn: &Connection,
+    project: &str,
+    thread: &str,
+    payload: &Value,
+) -> Result<Option<String>> {
+    let blocked = payload
+        .get("stop_hook_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if blocked {
+        return Ok(None);
     }
-    // Text goes in as argv so quotes in a title can't break the AppleScript.
-    let _ = Command::new("osascript")
-        .args([
-            "-e",
-            "on run argv",
-            "-e",
-            "display notification (item 2 of argv) with title (item 1 of argv)",
-            "-e",
-            "end run",
-            &n.title,
-            &n.message,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let Some(row) = db::get_session(conn, thread)? else {
+        return Ok(None);
+    };
+    let Some(routine) = row.routine.as_deref() else {
+        return Ok(None);
+    };
+    if background_work(&row) || crate::routines::reported(conn, thread)? {
+        return Ok(None);
+    }
+    let notes = crate::routines::folder(&paths::project_dir(project), routine)
+        .join(crate::routines::NOTES_FILE);
+    Ok(Some(
+        json!({
+            "decision": "block",
+            "reason": format!(
+                "This run of the routine {routine} hasn't said what it came to. Bring your \
+                 notes up to date for the next run ({}), then call the report_outcome tool \
+                 once: \"nothing\" when nothing changed that the user would want to hear, \
+                 \"update\" for news that can wait, \"attention\" when they should look or \
+                 decide now, with a one-line headline. Then end your turn.",
+                notes.display()
+            ),
+        })
+        .to_string(),
+    ))
+}
+
+/// Fire and forget: the hook must not wait on Notification Center, and the child must not hold
+/// the hook's stdout open.
+fn send_notice(n: &Notice) {
+    crate::push::desktop(&n.title, &n.message);
 }
 
 /// Appends one line to the hook error log; errors here are dropped, there is nowhere left to

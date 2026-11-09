@@ -8,9 +8,10 @@ the milestones.
 
 - `docs/ARCHITECTURE.md` wins over code. If the code must differ, update the doc in the same commit.
 - Hook commands (`chief hook …`) must never block or fail a Claude session: exit 0, keep stdout empty
-  except the guard decision, the coordinator's context, and the two background-work outputs
+  except the guard decision, the coordinator's context, the two background-work outputs
   (ARCHITECTURE §5): the denial of a subagent's background command and the Stop decision that asks
-  a thread for its final report. Log errors to `<root>/logs/hook-errors.log`. The one exception is
+  a thread for its final report, and the Stop decision that asks a routine's run for its outcome
+  (§13). Log errors to `<root>/logs/hook-errors.log`. The one exception is
   the coordinator's background watcher, `chief hook watch` (ARCHITECTURE §5 "Telling the
   coordinator"): it exits 2 with its notice on stderr to wake the coordinator.
 - Never call `claude --bg --resume <id>` with extra arguments; revive with `claude respawn <id>`.

@@ -123,6 +123,7 @@ fn serves_the_tools_over_stdio() {
             "list_threads",
             "move_thread",
             "read_report",
+            "read_routine",
             "resolve_thread",
             "run_routine",
             "start_thread",
@@ -194,6 +195,97 @@ fn serves_the_tools_over_stdio() {
     assert!(
         status.success(),
         "chief mcp exits cleanly when stdin closes: {status}"
+    );
+}
+
+/// `chief mcp --routine <name>` serves a run's two tools and nothing of the coordinator's: a
+/// run can record its values and its outcome, not start or steer threads.
+#[test]
+fn a_routines_runs_get_their_own_tools() {
+    let home = Home::new();
+    home.fake
+        .set("version.stdout", "2.1.316 (Claude Code)\n")
+        .set("agents.stdout", "[]");
+    assert!(home.run(&["init", "Home"], "").status.success());
+    let added = home.run(
+        &[
+            "routine",
+            "add",
+            "home",
+            "--title",
+            "Flights",
+            "--schedule",
+            "@daily",
+            "--prompt",
+            "Check fares.",
+        ],
+        "",
+    );
+    assert!(added.status.success(), "{}", common::stderr(&added));
+
+    let mut child = home
+        .command(&["mcp", "--project", "home", "--routine", "flights"])
+        .spawn()
+        .unwrap();
+    let mut client = connect(&mut child);
+    client.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let list = client.response(2);
+    let mut names: Vec<_> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["record_value", "report_outcome"]);
+
+    let text = |result: &Value| -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let first = client.call(
+        3,
+        "record_value",
+        json!({"series": "BCN-NYC lowest fare", "value": 498, "unit": "EUR"}),
+    );
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(text(&first)["previous"], Value::Null);
+    // The same series under another case and spacing is the same line.
+    let second = client.call(
+        4,
+        "record_value",
+        json!({"series": "bcn-nyc  lowest fare", "value": 412.5}),
+    );
+    assert_eq!(
+        text(&second),
+        json!({"series": "BCN-NYC lowest fare", "recorded": 412.5, "previous": 498.0})
+    );
+    let bad = client.call(
+        5,
+        "report_outcome",
+        json!({"outcome": "maybe", "headline": "x"}),
+    );
+    assert_eq!(bad["isError"], true, "{bad}");
+    let said = client.call(
+        6,
+        "report_outcome",
+        json!({"outcome": "attention", "headline": "BCN-NYC dropped to 412 EUR (was 498)"}),
+    );
+    assert_eq!(said["isError"], false, "{said}");
+    assert_eq!(text(&said)["recorded"], "attention");
+    assert_eq!(text(&said)["pushed"], false);
+
+    drop(client);
+    assert!(child.wait().unwrap().success());
+    let conn = home.db();
+    let found = chief::routines::findings(&conn, "home", "flights", 5).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].headline, "BCN-NYC dropped to 412 EUR (was 498)");
+    let series = chief::routines::series(&conn, "home", "flights", 10).unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].unit, None);
+    assert_eq!(
+        series[0].points.iter().map(|p| p.1).collect::<Vec<_>>(),
+        [498.0, 412.5]
     );
 }
 

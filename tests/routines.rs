@@ -304,9 +304,47 @@ fn a_due_routine_starts_a_thread_of_its_own() {
         "This is a scheduled run of the routine \"Triage new issues\" (Every 30 minutes)."
     ));
     assert!(task.ends_with("Look at new issues and label them."));
+    // The brief names the run's memory and how it ends.
+    let folder = env
+        .dir
+        .join("routines/triage-new-issues")
+        .canonicalize()
+        .unwrap();
+    let notes = folder.join("NOTES.md");
+    assert!(task.contains(&format!("what they left for you is {}", notes.display())));
+    assert!(task.contains("record_value") && task.contains("report_outcome"));
+    assert!(
+        std::fs::read_to_string(&notes)
+            .unwrap()
+            .starts_with("# Triage new issues\n")
+    );
 
+    // It starts as a thread does, plus its own folder, its tools and the settings that allow
+    // them.
     let spawn = &env.fake.calls_of("--bg")[0];
     assert!(spawn.contains(&"haiku".to_string()) && spawn.contains(&"low".to_string()));
+    let after = |flag: &str| -> Vec<String> {
+        spawn
+            .windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .collect()
+    };
+    assert_eq!(
+        after("--settings"),
+        [env.dir
+            .join("generated/run-settings.json")
+            .display()
+            .to_string()]
+    );
+    let mcp = env.dir.join("generated/run-mcp-triage-new-issues.json");
+    assert_eq!(after("--mcp-config"), [mcp.display().to_string()]);
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["chief"]["args"],
+        serde_json::json!(["mcp", "--project", "demo", "--routine", "triage-new-issues"])
+    );
+    assert!(after("--add-dir").contains(&folder.display().to_string()));
 
     // The occurrence is claimed: the next run counts from now, and it isn't due again.
     let r = env.routine("triage-new-issues");
@@ -435,6 +473,14 @@ fn the_tools_speak_json_and_say_when_nothing_fires() {
         .with(|ctx| routines::create_tool(ctx, &draft("Weekday triage", "0 9 * * 1-5")))
         .unwrap();
     assert_eq!(made["name"], "weekday-triage");
+    assert_eq!(made["last_finding"], Value::Null);
+    assert_eq!(made["series"], serde_json::json!([]));
+    assert!(
+        made["notes"]
+            .as_str()
+            .unwrap()
+            .ends_with("routines/weekday-triage/NOTES.md")
+    );
     assert_eq!(made["schedule_text"], "Weekdays at 09:00");
     assert!(made["next_run"].as_str().unwrap().ends_with("09:00"));
     // No `chief serve` runs for this test's home.
@@ -497,4 +543,261 @@ fn the_tools_speak_json_and_say_when_nothing_fires() {
     let thread = ran["thread"].as_str().unwrap();
     assert_eq!(env.row(thread).routine.as_deref(), Some("weekday-triage"));
     let _ = agent;
+}
+
+fn finish(env: &Env, thread: &str, at: i64) {
+    db::immediate(&env.conn, |conn| {
+        let mut row = db::get_session(conn, thread)?.unwrap();
+        row.group_name = "idle".into();
+        row.last_hook = Some("Stop".into());
+        row.last_report = Some("Done.".into());
+        row.last_report_at = Some(at);
+        db::update_session(conn, &row)
+    })
+    .unwrap();
+}
+
+/// What a run leaves: values that join into a line across runs, a verdict that decides who
+/// hears, and notes the coordinator can read without opening a thread.
+#[test]
+fn a_run_records_values_and_says_what_it_came_to() {
+    let mut env = Env::new();
+    let pushed = env.dir.join("pushed");
+    env.config.push.command = Some(format!(
+        "printf '%s|%s|%s' \"$CHIEF_KIND\" \"$CHIEF_TITLE\" \"$CHIEF_BODY\" >> '{}'",
+        pushed.display()
+    ));
+    env.create(&draft("Flights", "@daily")).unwrap();
+    env.will_start("r1");
+    let thread = started(
+        env.with(|ctx| routines::run(ctx, "flights", Trigger::Manual))
+            .unwrap(),
+    );
+
+    let record = |series: &str, value: f64, unit: Option<&str>| {
+        env.with(|ctx| {
+            routines::record_value_tool(
+                ctx,
+                "flights",
+                &routines::RecordValueArgs {
+                    series: series.into(),
+                    value,
+                    unit: unit.map(str::to_string),
+                    note: None,
+                },
+            )
+        })
+    };
+    let first = record("BCN-NYC lowest fare", 498.0, Some("EUR")).unwrap();
+    assert_eq!(first["previous"], Value::Null);
+    // The same thing under another case and spacing is the same line.
+    let second = record(" bcn-nyc  LOWEST fare ", 412.0, Some("EUR")).unwrap();
+    assert_eq!(second["previous"], 498.0);
+    record("BCN-TYO lowest fare", 820.0, Some("EUR")).unwrap();
+    let long = "long ".repeat(20);
+    for (series, value) in [("", 1.0), ("x", f64::NAN), (long.as_str(), 1.0)] {
+        assert!(record(series, value, None).is_err(), "{series:?} {value}");
+    }
+    let series = routines::series(&env.conn, "demo", "flights", 10).unwrap();
+    // Most recently recorded first.
+    let names: Vec<&str> = series.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["BCN-TYO lowest fare", "BCN-NYC lowest fare"]);
+    let values: Vec<f64> = series[1].points.iter().map(|p| p.1).collect();
+    assert_eq!(values, [498.0, 412.0]);
+    assert_eq!(series[1].unit.as_deref(), Some("EUR"));
+
+    let say = |outcome: routines::Verdict, headline: &str| {
+        env.with(|ctx| {
+            routines::report_outcome_tool(
+                ctx,
+                "flights",
+                &routines::ReportOutcomeArgs {
+                    outcome,
+                    headline: headline.into(),
+                    details: Some("Vueling, 14 Mar.".into()),
+                },
+            )
+        })
+    };
+    assert!(!routines::reported(&env.conn, &thread).unwrap());
+    assert!(say(routines::Verdict::Update, "  ").is_err());
+    // News that can wait isn't pushed unless the settings ask for updates; nothing never is.
+    let nothing = say(routines::Verdict::Nothing, "No change").unwrap();
+    assert_eq!(nothing["pushed"], false);
+    let update = say(routines::Verdict::Update, "BCN-TYO is at 820 EUR").unwrap();
+    assert_eq!(update["pushed"], false);
+    assert!(routines::reported(&env.conn, &thread).unwrap());
+    let said = say(
+        routines::Verdict::Attention,
+        "BCN-NYC dropped to 412 EUR\n(was 498)",
+    )
+    .unwrap();
+    assert_eq!(said["pushed"], true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let want = "attention|Demo · Flights|BCN-NYC dropped to 412 EUR (was 498)";
+    while std::fs::read_to_string(&pushed).ok().as_deref() != Some(want) {
+        assert!(std::time::Instant::now() < deadline, "the push never ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A run's later word replaces its earlier one, and belongs to its thread.
+    let verdicts = routines::verdicts(&env.conn, "demo").unwrap();
+    assert_eq!(verdicts[&thread].verdict, routines::Verdict::Attention);
+    assert_eq!(
+        verdicts[&thread].details.as_deref(),
+        Some("Vueling, 14 Mar.")
+    );
+
+    // The coordinator reads it all without a thread.
+    std::fs::write(
+        env.dir.join("routines/flights/NOTES.md"),
+        "# Flights\nWatching BCN-NYC under 450.\n",
+    )
+    .unwrap();
+    let read = env
+        .with(|ctx| {
+            routines::read_tool(
+                ctx,
+                &routines::RoutineNameArgs {
+                    name: "flights".into(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(read["notes"], "# Flights\nWatching BCN-NYC under 450.\n");
+    assert_eq!(read["last_finding"]["outcome"], "attention");
+    assert_eq!(read["findings"].as_array().unwrap().len(), 3);
+    assert_eq!(read["series"][1]["latest"], 412.0);
+    assert_eq!(read["series"][1]["previous"], 498.0);
+    assert_eq!(read["series"][1]["points"].as_array().unwrap().len(), 2);
+}
+
+/// Only a run that needs the user is worth a coordinator's wake; the rest wait for its next
+/// turn, and one that found nothing is told to nobody.
+#[test]
+fn only_a_run_that_needs_the_user_wakes_the_coordinator() {
+    let env = Env::new();
+    env.create(&draft("Flights", "@daily")).unwrap();
+    env.will_start("r1");
+    let thread = started(
+        env.with(|ctx| routines::run(ctx, "flights", Trigger::Manual))
+            .unwrap(),
+    );
+    let old = NOW - routines::WAKE_AFTER_MS;
+    finish(&env, &thread, old);
+    let unheard = || routines::unheard(&env.conn, "demo", NOW).unwrap();
+    let due = || {
+        let threads = db::list_sessions(&env.conn, "demo", Some(Role::Thread)).unwrap();
+        let verdicts = routines::verdicts(&env.conn, "demo").unwrap();
+        chief::waiting::routine_due(&threads, &[], &verdicts).len()
+    };
+    let say = |outcome| {
+        env.with(|ctx| {
+            routines::report_outcome_tool(
+                ctx,
+                "flights",
+                &routines::ReportOutcomeArgs {
+                    outcome,
+                    headline: "h".into(),
+                    details: None,
+                },
+            )
+        })
+        .unwrap()
+    };
+    // No verdict at all (it crashed, or forgot): told on the next turn, no wake.
+    assert_eq!((due(), unheard().len()), (1, 0));
+    say(routines::Verdict::Nothing);
+    assert_eq!((due(), unheard().len()), (0, 0));
+    say(routines::Verdict::Update);
+    assert_eq!((due(), unheard().len()), (1, 0));
+    say(routines::Verdict::Attention);
+    assert_eq!((due(), unheard()), (1, vec![(thread.clone(), old)]));
+    // Too fresh: the Stop hook may still be keeping its turn going.
+    finish(&env, &thread, NOW - 1_000);
+    assert!(unheard().is_empty());
+}
+
+/// A project that isn't about code has no repositories: its threads and runs work in its own
+/// workspace folder.
+#[test]
+fn a_project_without_repositories_works_in_its_workspace() {
+    let mut env = Env::new();
+    env.config.repos.clear();
+    env.config.threads.default_repo = None;
+    // The project folder is trusted (chief made it), which covers the workspace under it.
+    trust_file(&env.trust, &[&env.dir]);
+    env.create(&draft("Mortgage", "@weekly")).unwrap();
+    env.will_start("r1");
+    let thread = started(
+        env.with(|ctx| routines::run(ctx, "mortgage", Trigger::Manual))
+            .unwrap(),
+    );
+    let row = env.row(&thread);
+    let workspace = env.dir.join("workspace").canonicalize().unwrap();
+    assert_eq!(row.repo_name.as_deref(), Some("workspace"));
+    assert_eq!(row.repo_path.as_deref(), Some(workspace.to_str().unwrap()));
+    // A named repository that the project doesn't have is still refused.
+    let named = env.create(&Draft {
+        repo: Some("nope".into()),
+        ..draft("Other", "@daily")
+    });
+    assert!(named.is_err());
+}
+
+/// A run that is done but hasn't said what it came to is kept going once, by the Stop hook.
+#[test]
+fn a_run_that_ends_without_a_verdict_is_asked_for_one() {
+    let env = Env::new();
+    env.create(&draft("Flights", "@daily")).unwrap();
+    env.will_start("r1");
+    let thread = started(
+        env.with(|ctx| routines::run(ctx, "flights", Trigger::Manual))
+            .unwrap(),
+    );
+    let stop = serde_json::json!({"hook_event_name": "Stop"});
+    let ask = |payload: &Value| chief::hook::outcome_block(&env.conn, "demo", &thread, payload);
+
+    let block: Value = serde_json::from_str(&ask(&stop).unwrap().unwrap()).unwrap();
+    assert_eq!(block["decision"], "block");
+    let reason = block["reason"].as_str().unwrap();
+    assert!(reason.contains("report_outcome") && reason.contains("routines/flights/NOTES.md"));
+    // Once per chain of Stops: the Stop that ends the turn the block started isn't blocked.
+    let again = serde_json::json!({"hook_event_name": "Stop", "stop_hook_active": true});
+    assert_eq!(ask(&again).unwrap(), None);
+
+    // Not while its subagents still work: that Stop isn't the end of the run.
+    db::immediate(&env.conn, |conn| {
+        let mut row = db::get_session(conn, &thread)?.unwrap();
+        row.subagents_busy = 1;
+        db::update_session(conn, &row)
+    })
+    .unwrap();
+    assert_eq!(ask(&stop).unwrap(), None);
+    db::immediate(&env.conn, |conn| {
+        let mut row = db::get_session(conn, &thread)?.unwrap();
+        row.subagents_busy = 0;
+        db::update_session(conn, &row)
+    })
+    .unwrap();
+
+    // A plain thread is never asked, and a run that said its piece isn't asked again.
+    let mut plain = SessionRow::new("demo-plain-1a2b", "demo", Role::Thread, NOW);
+    plain.short_id = Some("p1".into());
+    db::insert_session(&env.conn, &plain).unwrap();
+    let other = chief::hook::outcome_block(&env.conn, "demo", "demo-plain-1a2b", &stop);
+    assert_eq!(other.unwrap(), None);
+    env.with(|ctx| {
+        routines::report_outcome_tool(
+            ctx,
+            "flights",
+            &routines::ReportOutcomeArgs {
+                outcome: routines::Verdict::Nothing,
+                headline: "No change".into(),
+                details: None,
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(ask(&stop).unwrap(), None);
 }

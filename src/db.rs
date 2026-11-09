@@ -215,6 +215,31 @@ CREATE TABLE ui_state (
      ALTER TABLE sessions ADD COLUMN routine TEXT;
      ALTER TABLE sessions ADD COLUMN routine_told_at INTEGER;
      CREATE INDEX sessions_by_routine ON sessions(project_slug, routine);",
+    // What a routine's run says of itself (§13 "What a run leaves"): a verdict with a line for
+    // the user, which decides who is told, and the values it tracks over time.
+    "CREATE TABLE routine_outcomes (
+       id           INTEGER PRIMARY KEY,
+       project_slug TEXT NOT NULL,
+       routine      TEXT NOT NULL,
+       thread       TEXT,
+       ts           INTEGER NOT NULL,
+       outcome      TEXT NOT NULL CHECK (outcome IN ('nothing','update','attention')),
+       headline     TEXT NOT NULL,
+       details      TEXT
+     );
+     CREATE INDEX routine_outcomes_by_routine ON routine_outcomes(project_slug, routine, id);
+     CREATE INDEX routine_outcomes_by_thread ON routine_outcomes(thread, id);
+     CREATE TABLE routine_points (
+       id           INTEGER PRIMARY KEY,
+       project_slug TEXT NOT NULL,
+       routine      TEXT NOT NULL,
+       series       TEXT NOT NULL,
+       ts           INTEGER NOT NULL,
+       value        REAL NOT NULL,
+       unit         TEXT,
+       note         TEXT
+     );
+     CREATE INDEX routine_points_by_series ON routine_points(project_slug, routine, series, id);",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -1426,13 +1451,15 @@ mod tests {
                 "guard_denials",
                 "projects",
                 "reports",
+                "routine_outcomes",
+                "routine_points",
                 "routines",
                 "sessions",
                 "teammates",
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 19);
+        assert_eq!(MIGRATIONS.len(), 20);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();

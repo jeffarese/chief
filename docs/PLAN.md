@@ -453,6 +453,45 @@ server); a real `claude attach` in xterm.js (its keyboard protocol queries, Shif
 the agent view's mouse), and two attaches to one session at once (the terminal pane and a
 browser tab); the launchd agent (`chief serve install`).
 
+## Routines that follow things: memory, outcomes, values, push (built, 2026-11-10)
+
+Problem (user request): routines should carry the things one tracks and automates outside code
+too (a mortgage, flights), as a single source, and do it properly: efficient, with memory. As
+built the day before, each run started from nothing, every finished run cost a coordinator's
+turn and a notification, the result was text only, nothing reached a phone, and a project
+needed a repository.
+
+1. **Memory** (ARCHITECTURE §13 "What a run leaves"): each routine has a folder with a notes
+   file every run reads first and rewrites. Runs stay fresh sessions, so a routine's hundredth
+   run costs what its first did; the notes are what carries over.
+2. **Outcomes**: every run ends with `report_outcome` (`nothing`, `update`, `attention`, and a
+   headline); the Stop hook asks a run that forgets. The outcome decides who hears (§13 "Who
+   hears of a run"): nothing tells nobody, an update waits for the coordinator's next turn,
+   attention wakes it and reaches the user. The per-run desktop notification is gone.
+3. **Values**: `record_value` stores what a routine tracks as series over time (migration 20).
+4. **Run tools**: a run gets its own MCP server (`chief mcp --routine <name>`) and settings
+   that allow it; the coordinator gets `read_routine` (notes, findings, values) to answer
+   without starting anything, and guidance to keep runs cheap.
+5. **Push** (`[push] command`, `src/push.rs`): the user's own command, with the message in its
+   environment, for a run's attention and a thread's permission prompt.
+6. **Workspace** (§3): a project without repositories works in its own folder.
+7. **Dashboard**: an overview (what needs you, a tile per routine with its outcome, headline,
+   latest value and trend), and a routine's status page (charts, findings, notes).
+
+Tested with the fakes (`tests/routines.rs`, `tests/mcp_cli.rs`, `tests/serve_cli.rs`, `push::`)
+and the page in headless Chrome against a seeded home project.
+
+Not verified live yet: a real run using its tools (that a `--bg` thread started with
+`--mcp-config` and the `mcp__chief` allow rule calls `record_value` and `report_outcome` without
+a prompt, as the coordinator's own tools do); the Stop hook's outcome request on a real run; a
+thread in a folder that isn't a git repository; a real push command. Still open from the review
+below: an unattended run can't reach sites that need a login, and nothing gates a run on a cheap
+check before a session starts (a script that says "nothing changed" for zero tokens).
+
+Found on the way: `hooks_against_a_locked_database_log_and_exit_zero` fails about one run in
+four on the commit before this work too. A hook can wait about 10 s on a locked database, not
+the 5 s §4 says: the busy handler's clock starts again for each lock a statement waits on.
+
 ## Review, 2026-11-09: what would make chief better
 
 From a read-only pass over the docs and code. Not built; ranked by value.

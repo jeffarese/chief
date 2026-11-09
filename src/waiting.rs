@@ -3,6 +3,7 @@
 //! threads are due, and the watcher the coordinator's hooks start in the background, which wakes
 //! the coordinator by exiting 2.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::db::{self, Event, SessionRow};
+use crate::routines::{Finding, Verdict};
 use crate::state::{self, Role};
 use crate::text::{local_hhmm, one_line};
 use crate::{hook, paths, registry};
@@ -118,15 +120,24 @@ pub fn limited_due(threads: &[SessionRow], now: i64) -> Vec<&SessionRow> {
 /// to a thread `chief serve` started, so no idle notice carries its report. Finished is a report
 /// since the last telling with nothing left running: not working, waiting or limited (those are
 /// told, or go on, by themselves). `quiet` names the routines that tell nobody (`notify =
-/// false`). A run put away by its routine's next run still counts; one the user or the
-/// coordinator resolved was seen.
-pub fn routine_due<'a>(threads: &'a [SessionRow], quiet: &[String]) -> Vec<&'a SessionRow> {
+/// false`), and `verdicts` is what each run said of itself (`routines::verdicts`): one that
+/// said `nothing` is news to nobody, and one that said nothing at all (it crashed, or forgot)
+/// is told, since something may be wrong. A run put away by its routine's next run still
+/// counts; one the user or the coordinator resolved was seen.
+pub fn routine_due<'a>(
+    threads: &'a [SessionRow],
+    quiet: &[String],
+    verdicts: &HashMap<String, Finding>,
+) -> Vec<&'a SessionRow> {
     threads
         .iter()
         .filter(|t| {
             let Some(routine) = &t.routine else {
                 return false;
             };
+            if verdicts.get(&t.name).map(|f| f.verdict) == Some(Verdict::Nothing) {
+                return false;
+            }
             let seen = t.resolved
                 && t.resolved_reason.as_deref() != Some(crate::routines::RESOLVED_BY_ROUTINE);
             t.role == Role::Thread.as_str()
@@ -144,8 +155,9 @@ pub fn routine_due<'a>(threads: &'a [SessionRow], quiet: &[String]) -> Vec<&'a S
         .collect()
 }
 
-/// `- <name> "<title>" · routine <routine> · finished at 09:04`, then its report's first words.
-pub fn routine_line(t: &SessionRow) -> String {
+/// `- <name> "<title>" · routine <routine> · finished at 09:04 · attention: <headline>`; for a
+/// run that gave no verdict, its report's first words instead.
+pub fn routine_line(t: &SessionRow, finding: Option<&Finding>) -> String {
     let mut line = format!(
         "- {} \"{}\" · routine {} · finished at {}",
         t.name,
@@ -153,8 +165,14 @@ pub fn routine_line(t: &SessionRow) -> String {
         t.routine.as_deref().unwrap_or("?"),
         local_hhmm(t.last_report_at.unwrap_or(t.updated_at)),
     );
-    if let Some(report) = t.last_report.as_deref().filter(|r| !r.trim().is_empty()) {
-        line.push_str(&format!("\n  report: {}", one_line(report, 200)));
+    match finding {
+        Some(f) => line.push_str(&format!(" · {}: {}", f.verdict.as_str(), f.headline)),
+        None => {
+            line.push_str(" · gave no outcome");
+            if let Some(report) = t.last_report.as_deref().filter(|r| !r.trim().is_empty()) {
+                line.push_str(&format!("\n  report: {}", one_line(report, 200)));
+            }
+        }
     }
     line
 }
@@ -163,9 +181,11 @@ pub fn routine_line(t: &SessionRow) -> String {
 pub fn routine_notice(lines: &[String]) -> String {
     format!(
         "<chief-routine>\n{}\n</chief-routine>\nThese scheduled routine runs finished with \
-         nobody watching. Read each one's full report with read_report, then tell the user \
-         what it found in a line or two, and what, if anything, needs them. Resolve a run that \
-         leaves nothing to do; a follow-up goes to its thread like any other.",
+         nobody watching. Each line carries what the run found. Tell the user in a line each, \
+         the ones marked attention first; for those, and for a run that gave no outcome, read \
+         more with read_routine (its notes, findings and values) or read_report before you \
+         speak. Resolve a run that leaves nothing to do; a follow-up goes to its thread like \
+         any other.",
         lines.join("\n")
     )
 }
@@ -287,11 +307,12 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
     }
     let threads = db::list_sessions(conn, project, Some(Role::Thread))?;
     let quiet = crate::routines::quiet(conn, project)?;
+    let verdicts = crate::routines::verdicts(conn, project)?;
     let any = |threads: &[SessionRow]| {
         !due(threads, now).is_empty()
             || !moved_due(threads).is_empty()
             || !limited_due(threads, now).is_empty()
-            || !routine_due(threads, &quiet).is_empty()
+            || !routine_due(threads, &quiet, &verdicts).is_empty()
     };
     if !any(&threads) {
         return Ok(Look::Nothing);
@@ -344,8 +365,8 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
             sections.push(limited_notice(&lines));
         }
         let mut lines = Vec::new();
-        for t in routine_due(&threads, &quiet) {
-            lines.push(routine_line(t));
+        for t in routine_due(&threads, &quiet, &verdicts) {
+            lines.push(routine_line(t, verdicts.get(&t.name)));
             let i = row_of(t, &mut told);
             told[i].routine_told_at = Some(now);
         }
@@ -555,25 +576,56 @@ mod tests {
             fresh, told, again, working, waiting, early, silent, quiet, plain, put_away, seen,
             removed, review,
         ];
-        let names: Vec<&str> = routine_due(&threads, &["nightly".to_string()])
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect();
-        assert_eq!(names, ["fresh", "again", "put-away", "review"]);
+        let finding = |verdict| Finding {
+            routine: "triage".into(),
+            thread: None,
+            at: 5_000,
+            verdict,
+            headline: "h".into(),
+            details: None,
+        };
+        let none = HashMap::new();
+        let names = |verdicts: &HashMap<String, Finding>| -> Vec<String> {
+            routine_due(&threads, &["nightly".to_string()], verdicts)
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&none), ["fresh", "again", "put-away", "review"]);
+        // A run that said nothing changed is news to nobody; any other verdict is.
+        let said: HashMap<String, Finding> = [
+            ("fresh".to_string(), finding(Verdict::Nothing)),
+            ("again".to_string(), finding(Verdict::Update)),
+            ("review".to_string(), finding(Verdict::Attention)),
+        ]
+        .into();
+        assert_eq!(names(&said), ["again", "put-away", "review"]);
     }
 
     #[test]
     fn the_routine_notice_names_the_run_and_previews_its_report() {
         let run = run_of("p-triage-1a2b", "triage", 0);
-        let line = routine_line(&run);
+        // Without a verdict, the report's first words stand in for it.
+        let line = routine_line(&run, None);
         assert!(line.starts_with(
             "- p-triage-1a2b \"Title of p-triage-1a2b\" · routine triage · finished at "
         ));
-        assert!(line.ends_with("\n  report: 3 new issues. #883 needs you."));
+        assert!(line.ends_with(" · gave no outcome\n  report: 3 new issues. #883 needs you."));
+        let finding = Finding {
+            routine: "triage".into(),
+            thread: Some("p-triage-1a2b".into()),
+            at: 0,
+            verdict: Verdict::Attention,
+            headline: "#883 double-charges after a retry".into(),
+            details: None,
+        };
+        let line = routine_line(&run, Some(&finding));
+        assert!(line.ends_with(" · attention: #883 double-charges after a retry"));
+        assert!(!line.contains("report:"));
         let notice = routine_notice(&[line]);
         assert!(notice.starts_with("<chief-routine>\n- p-triage-1a2b"));
         assert!(notice.contains("</chief-routine>\nThese scheduled routine runs finished"));
-        assert!(notice.contains("read_report"));
+        assert!(notice.contains("read_routine"));
     }
 
     #[test]

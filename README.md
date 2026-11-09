@@ -3,8 +3,10 @@
 Claude Projects, locally. You talk to one coordinator Claude session; it starts background Claude
 Code sessions ("threads") that each own one task on their own git branch, routes your follow-ups
 to the right thread, and reports back. A board beside the conversation parks every thread by
-status, and you can open any thread's own conversation from it. A project can also repeat work
-on a schedule ([routines](#routines)) and be used from a browser ([the dashboard](#the-dashboard)).
+status, and you can open any thread's own conversation from it. A project can also follow
+things over time on a schedule ([routines](#routines)) and be used from a browser
+([the dashboard](#the-dashboard)), and it needn't be about code: a project for the household's
+money and plans works the same way.
 
 ![A new project in chief: you ask the coordinator for three things, it starts a thread for each,
 the board shows the one waiting on you, you answer it there, a pull request lands in Ready for
@@ -126,32 +128,59 @@ running in the background either way; `chief` or `chief up <slug>` opens the lay
 
 ## Routines
 
-A routine is work the project repeats: a prompt chief runs on a schedule, each run a fresh thread
-that nobody has to watch. Ask the coordinator in plain words ("every weekday at 9, triage the
-new issues and tell me which need me") and it creates one; it can list, change, pause, run and
-delete them too. Or from a shell:
+A routine is something the project does or watches on a schedule: a prompt chief runs by
+itself, each run a fresh thread that nobody has to watch. It is how a project follows things
+over time: a fare, a mortgage rate, a nightly build, an inbox of issues. Ask the coordinator in
+plain words ("every morning, check flights to Tokyo for 10-24 April and tell me if one drops
+under 700") and it creates one; it can list, read, change, pause, run and delete them too. Or
+from a shell:
 
 ```sh
-chief routine add payments-latency --title "Triage new issues" \
-  --schedule "0 9 * * 1-5" --prompt "Label the issues opened since the last run, close duplicates, report the ones that need a person."
-chief routine list payments-latency
-chief routine run payments-latency triage-new-issues    # now, outside its schedule
+chief routine add home --title "Flights to Tokyo" --schedule "0 8 * * *" --model haiku \
+  --prompt "Find the lowest return fare BCN-TYO for 10-24 April. Record it. Attention only under 700 EUR."
+chief routine list home
+chief routine run home flights-to-tokyo    # now, outside its schedule
 ```
 
 - **Schedules** are in your local time: five cron fields (`0 9 * * 1-5`), `@hourly`, `@daily`,
   `@weekly`, `@monthly`, or `every 30m` / `every 2h`. At most every 5 minutes, since every run is
   a whole session.
-- **A run** is a thread like any other, tagged `routine <name>` on the board, with the project's
-  thread model and effort unless the routine names its own. A run is skipped while the
-  routine's last one still works, and the next run puts the last finished one away (resolved),
-  so runs don't pile up.
-- **Hearing about it.** When a run finishes, the coordinator reads its report and tells you what
-  it found, even if it was asleep: it is woken for it. `--quiet` (or the checkbox in the
-  dashboard) turns that off for runs you only want on the board.
+- **Memory.** Runs are separate sessions, so the hundredth run costs what the first did. What
+  carries over is the routine's notes file (`routines/<name>/NOTES.md` in the project folder):
+  every run reads it first and rewrites it before it ends. You can edit it, and so can the
+  coordinator ("our mortgage is at 2.9% now").
+- **Values.** A run records the numbers it tracks (a price, a rate, a balance), which join into
+  a line over time on the dashboard.
+- **An outcome.** Every run ends by saying what it came to, with a one-line headline: `nothing`
+  (nothing new), `update` (news that can wait) or `attention` (you should look now). chief asks
+  a run that forgets.
+- **Who hears.** That outcome decides it, so a routine costs you and the coordinator nothing
+  when nothing happened. `nothing` tells nobody. `update` is told by the coordinator when you
+  next talk to it. `attention` wakes the coordinator, sends a desktop notification, and is
+  pushed to your phone if you set a push command (below).
+- **A run** is otherwise a thread like any other, tagged `routine <name>` on the board. A run is
+  skipped while the routine's last one still works, and the next run puts the last finished one
+  away (resolved), so runs don't pile up.
 - **Routines fire while `chief serve` runs**, the one background process chief has. `chief up`
   starts it for a project with routines; `chief serve install` keeps it running across logins
-  (macOS), so a 9am routine runs with no terminal open. A routine that came due while it was
+  (macOS), so an 8am routine runs with no terminal open. A routine that came due while it was
   down runs once when it is back.
+
+**Push.** To hear about what needs you away from the machine, give the project a command in
+`project.toml`. chief runs it with the message in `CHIEF_TITLE`, `CHIEF_BODY`, `CHIEF_KIND`
+(`attention`, `update` or `permission`) and `CHIEF_URL` (the dashboard page, when it is on):
+
+```toml
+[push]
+command = 'curl -s -H "Title: $CHIEF_TITLE" -H "Click: $CHIEF_URL" -d "$CHIEF_BODY" ntfy.sh/your-secret-topic'
+# Telegram: 'curl -s "https://api.telegram.org/bot$TOKEN/sendMessage" -d chat_id=$CHAT --data-urlencode "text=$CHIEF_TITLE: $CHIEF_BODY"'
+on = "attention"   # or "updates" to also get news that can wait
+```
+
+It fires when a run says `attention` and when a thread is stuck on a permission prompt.
+
+**Not only code.** A project with no repositories works in its own `workspace/` folder, so a
+project like `home` needs no setup: `chief init Home --goal "…"`, then talk to it.
 
 ## The dashboard
 
@@ -162,11 +191,17 @@ chief dashboard payments-latency
 turns the project's web dashboard on, starts `chief serve` and opens a link that signs your
 browser in.
 
-![The dashboard: the board on the left with a thread waiting on you, and a thread's report
-rendered on the right](docs/dashboard.png)
+![The dashboard's overview of a home project: one routine needs you because a fare dropped, and
+each routine's tile shows what its last run found, its latest value and its trend](docs/dashboard-overview.png)
 
-<sub>Seeded demo data, not a real project.</sub>
+![The dashboard for a code project: the board on the left with a thread waiting on you, and a
+thread's report rendered on the right](docs/dashboard.png)
 
+<sub>Seeded demo data, not real projects.</sub>
+
+- **Overview**: what needs you, then a tile per routine with what its last run found, the
+  latest value of what it tracks and its trend. A routine's own page charts every value it
+  tracks, lists what each run found, and shows its notes.
 - **The board, live**: the same groups, tags and colours as the terminal board, what each
   working thread does and what a waiting one asks, and a red strip that takes you to the next
   thread that needs you.
@@ -292,7 +327,8 @@ except `chief serve` when you use routines or the dashboard.
 
 - The coordinator is a background Claude Code session with chief's MCP tools (`start_thread`,
   `list_threads`, `read_report`, `wake_thread`, `stop_thread`, `move_thread`, `resolve_thread`,
-  and the routine tools) and no shell. It reaches threads
+  and the routine tools) and no shell. A routine's run gets two tools of its own, `record_value`
+  and `report_outcome`. It reaches threads
   with Claude Code's built-in `SendMessage` and hears back through idle notices.
 - Threads are ordinary background sessions (`claude --bg`), revived with `claude respawn` when their
   process has ended.
