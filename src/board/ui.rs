@@ -110,6 +110,10 @@ pub fn tags(row: &SessionRow) -> Vec<String> {
     } else if row.cleanup_blocked.is_some() {
         tags.push("cleanup blocked".to_string());
     }
+    // A run of a routine (§13).
+    if let Some(routine) = &row.routine {
+        tags.push(format!("routine {routine}"));
+    }
     // The agp account it runs in (§3), last: the least urgent.
     if let Some(account) = row.account_shown() {
         tags.push(account.to_string());

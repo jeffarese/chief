@@ -188,6 +188,33 @@ CREATE TABLE ui_state (
      ALTER TABLE sessions ADD COLUMN limited_since INTEGER;
      ALTER TABLE sessions ADD COLUMN limit_told_at INTEGER;
      ALTER TABLE sessions ADD COLUMN agp_state TEXT;",
+    // Routines (§13): a prompt a project runs on a schedule, each run a fresh thread. The
+    // definition and its schedule state live here, not in project.toml: the coordinator, the
+    // CLI and the dashboard all write them, and `chief serve` stamps each run. A thread that is
+    // a run names its routine, and when the coordinator was told it finished.
+    "CREATE TABLE routines (
+       id           INTEGER PRIMARY KEY,
+       project_slug TEXT NOT NULL REFERENCES projects(slug),
+       name         TEXT NOT NULL,
+       title        TEXT NOT NULL,
+       prompt       TEXT NOT NULL,
+       schedule     TEXT NOT NULL,
+       repo         TEXT,
+       model        TEXT,
+       effort       TEXT,
+       enabled      INTEGER NOT NULL DEFAULT 1,
+       notify       INTEGER NOT NULL DEFAULT 1,
+       created_at   INTEGER NOT NULL,
+       updated_at   INTEGER NOT NULL,
+       next_run_at  INTEGER,
+       last_run_at  INTEGER,
+       last_thread  TEXT,
+       last_note    TEXT,
+       UNIQUE (project_slug, name)
+     );
+     ALTER TABLE sessions ADD COLUMN routine TEXT;
+     ALTER TABLE sessions ADD COLUMN routine_told_at INTEGER;
+     CREATE INDEX sessions_by_routine ON sessions(project_slug, routine);",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -372,6 +399,10 @@ pub struct SessionRow {
     pub limit_told_at: Option<i64>,
     /// agp's state for it (`agp bg --json` → `state`: watching, limited, waiting, moving, …).
     pub agp_state: Option<String>,
+    /// The routine this thread is a run of (`routines.name`, §13); None for any other thread.
+    pub routine: Option<String>,
+    /// When the coordinator was last told this run finished (§13 "Telling the coordinator").
+    pub routine_told_at: Option<i64>,
 }
 
 /// `sessions.runner` of a thread agp started or watches.
@@ -451,7 +482,7 @@ const SESSION_COLUMNS: &str = "name, project_slug, role, short_id, session_id, t
     removed_at, account_id, account_label, account_dir, subagents_busy, background_running, \
     stopped_early_at, reason_before_removed, legacy_cleaned, blocked_since, blocked_told_at, runner, \
     prior_accounts, moved_at, move_note, moved_told_at, limit_note, limited_since, limit_told_at, \
-    agp_state";
+    agp_state, routine, routine_told_at";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -513,6 +544,8 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         limited_since: r.get(55)?,
         limit_told_at: r.get(56)?,
         agp_state: r.get(57)?,
+        routine: r.get(58)?,
+        routine_told_at: r.get(59)?,
     })
 }
 
@@ -577,7 +610,7 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
         "INSERT INTO sessions ({SESSION_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
          ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
-         ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58)"
+         ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60)"
     );
     let has_ids = s.short_id.is_some() || s.session_id.is_some();
     let ids_at = s.ids_at.or(has_ids.then_some(s.updated_at));
@@ -642,6 +675,8 @@ pub fn insert_session(conn: &Connection, s: &SessionRow) -> Result<()> {
             s.limited_since,
             s.limit_told_at,
             s.agp_state,
+            s.routine,
+            s.routine_told_at,
         ],
     )
     .with_context(|| format!("inserting session {}", s.name))?;
@@ -670,7 +705,7 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
            reason_before_removed = ?46, legacy_cleaned = ?47, blocked_since = ?48,
            blocked_told_at = ?49, runner = ?50, prior_accounts = ?51, moved_at = ?52,
            move_note = ?53, moved_told_at = ?54, limit_note = ?55, limited_since = ?56,
-           limit_told_at = ?57, agp_state = ?58
+           limit_told_at = ?57, agp_state = ?58, routine = ?59, routine_told_at = ?60
          WHERE name = ?1",
             params![
                 s.name,
@@ -731,6 +766,8 @@ pub fn update_session(conn: &Connection, s: &SessionRow) -> Result<()> {
                 s.limited_since,
                 s.limit_told_at,
                 s.agp_state,
+                s.routine,
+                s.routine_told_at,
             ],
         )
         .with_context(|| format!("updating session {}", s.name))?;
@@ -1389,12 +1426,13 @@ mod tests {
                 "guard_denials",
                 "projects",
                 "reports",
+                "routines",
                 "sessions",
                 "teammates",
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 18);
+        assert_eq!(MIGRATIONS.len(), 19);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();

@@ -114,6 +114,62 @@ pub fn limited_due(threads: &[SessionRow], now: i64) -> Vec<&SessionRow> {
         .collect()
 }
 
+/// Routine runs (§13) that finished and that the coordinator wasn't told of: nobody subscribed
+/// to a thread `chief serve` started, so no idle notice carries its report. Finished is a report
+/// since the last telling with nothing left running: not working, waiting or limited (those are
+/// told, or go on, by themselves). `quiet` names the routines that tell nobody (`notify =
+/// false`). A run put away by its routine's next run still counts; one the user or the
+/// coordinator resolved was seen.
+pub fn routine_due<'a>(threads: &'a [SessionRow], quiet: &[String]) -> Vec<&'a SessionRow> {
+    threads
+        .iter()
+        .filter(|t| {
+            let Some(routine) = &t.routine else {
+                return false;
+            };
+            let seen = t.resolved
+                && t.resolved_reason.as_deref() != Some(crate::routines::RESOLVED_BY_ROUTINE);
+            t.role == Role::Thread.as_str()
+                && !quiet.contains(routine)
+                && !seen
+                && t.removed_at.is_none()
+                && t.stopped_early_at.is_none()
+                && !matches!(
+                    state::Group::parse(&t.group_name),
+                    Some(state::Group::Working | state::Group::Waiting | state::Group::Limited)
+                )
+                && t.last_report_at
+                    .is_some_and(|at| t.routine_told_at.is_none_or(|told| told < at))
+        })
+        .collect()
+}
+
+/// `- <name> "<title>" · routine <routine> · finished at 09:04`, then its report's first words.
+pub fn routine_line(t: &SessionRow) -> String {
+    let mut line = format!(
+        "- {} \"{}\" · routine {} · finished at {}",
+        t.name,
+        t.title.as_deref().unwrap_or(&t.name),
+        t.routine.as_deref().unwrap_or("?"),
+        local_hhmm(t.last_report_at.unwrap_or(t.updated_at)),
+    );
+    if let Some(report) = t.last_report.as_deref().filter(|r| !r.trim().is_empty()) {
+        line.push_str(&format!("\n  report: {}", one_line(report, 200)));
+    }
+    line
+}
+
+/// The text for routine runs that finished.
+pub fn routine_notice(lines: &[String]) -> String {
+    format!(
+        "<chief-routine>\n{}\n</chief-routine>\nThese scheduled routine runs finished with \
+         nobody watching. Read each one's full report with read_report, then tell the user \
+         what it found in a line or two, and what, if anything, needs them. Resolve a run that \
+         leaves nothing to do; a follow-up goes to its thread like any other.",
+        lines.join("\n")
+    )
+}
+
 fn live(t: &SessionRow) -> bool {
     t.role == Role::Thread.as_str()
         && !t.resolved
@@ -230,10 +286,12 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
         return Ok(Look::Superseded);
     }
     let threads = db::list_sessions(conn, project, Some(Role::Thread))?;
+    let quiet = crate::routines::quiet(conn, project)?;
     let any = |threads: &[SessionRow]| {
         !due(threads, now).is_empty()
             || !moved_due(threads).is_empty()
             || !limited_due(threads, now).is_empty()
+            || !routine_due(threads, &quiet).is_empty()
     };
     if !any(&threads) {
         return Ok(Look::Nothing);
@@ -284,6 +342,15 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
         }
         if !lines.is_empty() {
             sections.push(limited_notice(&lines));
+        }
+        let mut lines = Vec::new();
+        for t in routine_due(&threads, &quiet) {
+            lines.push(routine_line(t));
+            let i = row_of(t, &mut told);
+            told[i].routine_told_at = Some(now);
+        }
+        if !lines.is_empty() {
+            sections.push(routine_notice(&lines));
         }
         for row in &told {
             db::update_session(conn, row)?;
@@ -441,6 +508,72 @@ mod tests {
             summary: Some(summary.into()),
             agent_id: None,
         }
+    }
+
+    /// A routine's run that ended its turn with a report at `at`.
+    fn run_of(name: &str, routine: &str, at: i64) -> SessionRow {
+        let mut r = thread(name);
+        r.routine = Some(routine.into());
+        r.group_name = "idle".into();
+        r.last_report = Some("3 new issues.\n#883 needs you.".into());
+        r.last_report_at = Some(at);
+        r
+    }
+
+    #[test]
+    fn a_finished_routine_run_is_told_once_per_report() {
+        let fresh = run_of("fresh", "triage", 5_000);
+        let mut told = run_of("told", "triage", 5_000);
+        told.routine_told_at = Some(6_000);
+        // It reported again after the coordinator heard: a follow-up turn.
+        let mut again = run_of("again", "triage", 9_000);
+        again.routine_told_at = Some(6_000);
+        let mut working = run_of("working", "triage", 5_000);
+        working.group_name = "working".into();
+        let mut waiting = run_of("waiting", "triage", 5_000);
+        waiting.group_name = "waiting".into();
+        let mut early = run_of("early", "triage", 5_000);
+        early.stopped_early_at = Some(5_000);
+        let mut silent = run_of("silent", "triage", 5_000);
+        silent.last_report_at = None;
+        let quiet = run_of("quiet", "nightly", 5_000);
+        let mut plain = run_of("plain", "triage", 5_000);
+        plain.routine = None;
+        // Put away by the routine's next run: still news. Resolved by a person: seen.
+        let mut put_away = run_of("put-away", "triage", 5_000);
+        put_away.resolved = true;
+        put_away.resolved_reason = Some("routine".into());
+        let mut seen = run_of("seen", "triage", 5_000);
+        seen.resolved = true;
+        seen.resolved_reason = Some("user".into());
+        let mut removed = run_of("removed", "triage", 5_000);
+        removed.removed_at = Some(1);
+        let mut review = run_of("review", "triage", 5_000);
+        review.group_name = "review".into();
+
+        let threads = [
+            fresh, told, again, working, waiting, early, silent, quiet, plain, put_away, seen,
+            removed, review,
+        ];
+        let names: Vec<&str> = routine_due(&threads, &["nightly".to_string()])
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["fresh", "again", "put-away", "review"]);
+    }
+
+    #[test]
+    fn the_routine_notice_names_the_run_and_previews_its_report() {
+        let run = run_of("p-triage-1a2b", "triage", 0);
+        let line = routine_line(&run);
+        assert!(line.starts_with(
+            "- p-triage-1a2b \"Title of p-triage-1a2b\" · routine triage · finished at "
+        ));
+        assert!(line.ends_with("\n  report: 3 new issues. #883 needs you."));
+        let notice = routine_notice(&[line]);
+        assert!(notice.starts_with("<chief-routine>\n- p-triage-1a2b"));
+        assert!(notice.contains("</chief-routine>\nThese scheduled routine runs finished"));
+        assert!(notice.contains("read_report"));
     }
 
     #[test]

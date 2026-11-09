@@ -1,7 +1,9 @@
 # chief: architecture and contracts
 
 chief recreates Claude Projects locally. You talk to one coordinator Claude session; it starts and
-steers background Claude Code sessions ("threads"); a board parks each thread by status.
+steers background Claude Code sessions ("threads"); a board parks each thread by status. A project
+can also repeat work on a schedule (routines, §13) and show itself in the browser (the dashboard,
+§14); one optional background process, `chief serve`, does both.
 
 This file is the contract. Code follows it; if code needs to differ, change this file in the same
 commit and say why.
@@ -200,9 +202,12 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
 Minimum Claude Code version: 2.1.316 (the coordinator's watcher, §5 "Telling the coordinator",
 needs `asyncRewake`). `chief` checks `claude --version` on `init` and `up`.
 
-## 2. Processes (no daemon)
+## 2. Processes (one optional daemon)
 
-Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. One binary:
+Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. Nothing below
+needs a process of chief's to stay up, with one exception that is opt-in: `chief serve` (§14),
+which fires routines (§13) and serves the dashboard. Hooks, the board, the pane and the
+coordinator's tools work the same with it stopped. One binary:
 
 | Command | Started by | Job |
 | --- | --- | --- |
@@ -223,6 +228,10 @@ Claude Code's supervisor owns every session. SQLite (WAL) is the shared state. O
 | `chief status [<slug>]` | you | Print the board as text (debugging, scripting) |
 | `chief gc [<slug>] [--dry-run]` | you | Refresh PRs, then clean up every resolved thread that loses nothing (§12) |
 | `chief clean <slug> <thread> [--discard] [--yes]` | you | Clean up one resolved thread; `--discard` throws away unsaved work after confirming (§12) |
+| `chief routine list\|add\|run\|pause\|resume\|rm <slug> …` | you | A project's routines (§13) |
+| `chief serve [--bind ADDR] [--port N]` | you, `chief serve start`, launchd | The background server, in the foreground: fires due routines and serves the dashboard (§14) |
+| `chief serve start\|stop\|status\|install\|uninstall` | you; `chief up` and `chief dashboard` run `start` | Start it detached, end it, say what it serves, keep it running across logins (§14) |
+| `chief dashboard <slug> [--off] [--no-open]` | you | Turn the project's dashboard on (or off), start the server, print the sign-in link (§14) |
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision, the coordinator's
@@ -271,6 +280,11 @@ the two commands to run side by side in terminals or splits of the user's own, `
 falls back the same way. `--layout builtin` skips Rex and tmux and opens the built-in layout; it
 fails before anything starts without a terminal or the feature.
 
+After the coordinator step, `up` starts `chief serve` when the project has an enabled routine or
+its dashboard on and none runs (`serve::ensure_for`: `Started chief serve at <url> (routines…).`);
+a server that can't start is a warning, and `up` goes on. `chief down` never stops it: it serves
+every project of the chief home.
+
 `chief down <slug> [--stop-threads]` (`project::down`, which prints what `project::down_with`
 reports: lines on stdout, warnings and failures on stderr) first ends the running pane, wherever
 it runs: one `down` didn't open (in the user's own Rex block, §9 case 0, or run by hand) would otherwise attach again
@@ -309,7 +323,7 @@ accounts and their threads', §3; stored rows if it fails), syncs each project w
 snapshots (§5), and prints
 each project's coordinator and threads grouped in board order. A thread's line joins with ` · `
 its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>`, `account <label>` (the
-agp account it runs in, §7 "Thread account") (each when there is
+agp account it runs in, §7 "Thread account"), `routine <name>` (a routine's run, §13) (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
 it was last active (`5m ago`, `just now`). Without a slug it leaves archived projects out and ends
 with `N archived project(s) not shown; chief status <slug> shows one.` when there are any; with
@@ -324,6 +338,11 @@ An empty variable counts as unset (made absolute, it would be the current folder
 ```
 <root>/chief.db
 <root>/logs/hook-errors.log
+<root>/logs/serve.log   what a detached `chief serve` says (§14)
+<root>/serve.toml       optional: where `chief serve` listens (`bind`, `port`)
+<root>/serve.lock       held by the running `chief serve`
+<root>/serve.json       the running server's pid, address and start time
+<root>/serve-token      the dashboard's secret, mode 0600
 <root>/projects/<slug>/
   project.toml          settings (schema below)
   instructions.md       standing brief sent to the coordinator and every new thread
@@ -490,7 +509,13 @@ path = "/Users/me/workspace/payments-api"
 
 [ui]
 notify = true                      # macOS notifications on permission prompts and finished threads
+
+[dashboard]                        # left out of the file while it is off
+enabled = true                     # `chief serve` shows the project in the browser (§14)
 ```
+
+Routines are not in project.toml: they live in the database (§4, §13), since the coordinator,
+the CLI and the dashboard all write them and `chief serve` stamps each run.
 
 ## 4. SQLite schema (`chief.db`, migrations in `src/db.rs`, `PRAGMA user_version`)
 
@@ -525,7 +550,7 @@ CREATE TABLE sessions (                   -- coordinator and threads
   group_name      TEXT NOT NULL DEFAULT 'working',   -- derived board group, see §5
   waiting_reason  TEXT,                   -- 'permission' | 'question' | NULL
   resolved        INTEGER NOT NULL DEFAULT 0,
-  resolved_reason TEXT,                   -- 'user' | 'coordinator' | 'merged' | 'inactive' | 'removed'
+  resolved_reason TEXT,                   -- 'user' | 'coordinator' | 'merged' | 'inactive' | 'removed' | 'routine' (a finished run put away by its routine's next run, §13)
   pr_url          TEXT,
   pr_state        TEXT,                   -- OPEN | MERGED | CLOSED
   pr_draft        INTEGER,
@@ -561,7 +586,31 @@ CREATE TABLE sessions (                   -- coordinator and threads
   limit_note      TEXT,                   -- the limit its job state says stopped it ('You've hit your 5-hour limit · resets …'); NULL when none (migration 18)
   limited_since   INTEGER,                -- when a sync first saw that limit (migration 18)
   limit_told_at   INTEGER,                -- when the coordinator's watcher told of it (migration 18)
-  agp_state       TEXT                    -- agp's state for it (`agp bg --json`): watching, limited, waiting, moving, ended, dormant (migration 18)
+  agp_state       TEXT,                   -- agp's state for it (`agp bg --json`): watching, limited, waiting, moving, ended, dormant (migration 18)
+  routine         TEXT,                   -- routines.name of the routine this thread is a run of, §13; NULL for any other thread (migration 19)
+  routine_told_at INTEGER                 -- when the coordinator's watcher told of this run's finish, §13 (migration 19)
+);
+CREATE INDEX sessions_by_routine ON sessions(project_slug, routine);   -- (migration 19)
+
+CREATE TABLE routines (                   -- §13 (migration 19)
+  id           INTEGER PRIMARY KEY,
+  project_slug TEXT NOT NULL REFERENCES projects(slug),
+  name         TEXT NOT NULL,             -- its handle, [a-z0-9-], at most 32 chars, never changed
+  title        TEXT NOT NULL,             -- each run's thread carries it
+  prompt       TEXT NOT NULL,             -- what every run does
+  schedule     TEXT NOT NULL,             -- as written: five cron fields, an @shorthand, or `every 30m` (`src/cron.rs`)
+  repo         TEXT,                      -- a repos[].name; NULL = the project's default repo
+  model        TEXT,                      -- NULL = [threads] model
+  effort       TEXT,                      -- NULL = [threads] effort
+  enabled      INTEGER NOT NULL DEFAULT 1, -- 0 = paused
+  notify       INTEGER NOT NULL DEFAULT 1, -- 1 = the coordinator is told when a run finishes
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  next_run_at  INTEGER,                   -- when it next fires (unix ms); NULL while paused, or when no day matches
+  last_run_at  INTEGER,                   -- when its latest run started
+  last_thread  TEXT,                      -- that run's sessions.name
+  last_note    TEXT,                      -- why the last occurrence started no thread, or what the start warned of
+  UNIQUE (project_slug, name)
 );
 
 CREATE TABLE events (
@@ -952,6 +1001,15 @@ background (`asyncRewake`, §1, §3) at each SessionStart and Stop of the coordi
   process, so it must subscribe again at the new address. **Limited**: rule 3a for at least 2
   minutes (`limited_since`; agp, when it watches the thread, has moved it well within that) and not
   told since (`limit_told_at`).
+- A fourth kind is due the same way. **Routine run finished** (§13, `routine_due`): a thread with
+  a `routine` that reported (`last_report_at`) since the coordinator was last told
+  (`routine_told_at`), isn't working, waiting or limited now, has no `stopped_early_at`, and whose
+  routine tells (`notify`). Nobody subscribed to a thread `chief serve` started, so no idle
+  notice carries its report. A run its routine's next run put away (`resolved_reason =
+  'routine'`) still counts; one a person or the coordinator resolved was seen. `<chief-routine>`:
+  `- <name> "<title>" · routine <routine> · finished at HH:MM` and a `report:` preview line (≤200
+  chars), then: read each report with `read_report`, tell the user what it found and what needs
+  them, resolve a run that leaves nothing to do.
 - The notice is a section per kind, separated by a blank line. `<chief-waiting>`, a line per
   thread, `</chief-waiting>`, and what to do: `- <name> "<title>" · <permission|question> since
   HH:MM · wants to run <command>` (or `wants to use <call>`, or `asks <question>`, read from its
@@ -1137,6 +1195,11 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 | `move_thread` | `name`, `account?` (an agp id or label from the pool) | Needs an agp with `bg`. Settles the thread (§5 "Limits and moves"); a named account must be in the pool, trust its repo (placement's pinned rules, §7 "Thread account") and not be the one it runs in. Then `agp bg move <session id> [--to <id>] --json` (bounded, 120 s): agp stops it and resumes it there (or in the other pool account with the most room). chief follows the move from `agp bg --json`, else from the move's answer, asks agp to watch it (`runner = "agp"`), refreshes its new account and returns `{name, alive, address, moved, account, next}` (subscribe again). The prompt (§8) says agp moves limited threads itself: only when the user asks, or for a limited thread agp didn't move |
 | `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. The prompt (§8) says to use it only when the user asks or a thread is off track and a message didn't help |
+| `list_routines` | none | `{routines: [...]}`, each a routine's row (§4) plus `schedule_text` ("Weekdays at 09:00"), `next_run` and `last_run` (local `YYYY-MM-DD HH:MM`, null when none); and `scheduler`, a line saying `chief serve` isn't running and how the user starts it, whenever it isn't (on every routine tool's answer but `delete_routine`'s and `run_routine`'s) |
+| `create_routine` | `title`, `prompt`, `schedule`, `repo?`, `model?`, `effort?`, `notify?` (default true), `enabled?` (default true), `name?` (default: made from the title) | Validates (§13 "A routine") and stores it with its next run. Returns the routine as `list_routines` shows it |
+| `update_routine` | `name`, and any of `title`, `prompt`, `schedule`, `repo`, `model`, `effort` (an empty string goes back to the project's default), `notify`, `enabled` | Changes only what is given; `enabled: false` pauses, `true` resumes from now. Returns the routine |
+| `delete_routine` | `name` | Removes the routine; its runs' threads and reports stay. `{name, deleted: true, note}`. The prompt keeps it for when the user asks |
+| `run_routine` | `name` | A run now, outside the schedule, which doesn't move (§13 "A run"). `{routine, started: true, thread, next}`, or `{routine, started: false, note}` while its last run still works |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
@@ -1215,9 +1278,11 @@ once: a thread whose account later hits a limit waits there and is never moved. 
 (§2) and the board's settings screen (§10) check every pool account's trust of every repo ahead
 of time and offer the fix for each pair, so `start_thread` rarely has to skip one.
 
-The tool logic lives in `src/tools.rs` as plain functions over a context (connection, config,
+The tool logic lives in `src/tools.rs` (the routine tools in `src/routines.rs`) as plain functions
+over a context (connection, config,
 `Claude` in the project's account, `Agp`, project dir, trust file, clock, timeouts; the account
-choice is `src/placement.rs`); `src/mcp.rs` adapts them to `rmcp` and runs
+choice is `src/placement.rs`). `tools::with_project` builds that context for a project as it is
+now, for `chief mcp`, `chief serve` and `chief routine`; `src/mcp.rs` adapts the tools to `rmcp` and runs
 each call on the blocking pool with a freshly loaded `project.toml`. stdout is the protocol; logs go
 to stderr.
 
@@ -1339,7 +1404,12 @@ at the reset, never moved.
   those threads stopped on a usage limit and agp didn't move them: tell the user in a line each
   (the limit, when it resets, what happens next), offer `move_thread` when the pool may have room,
   and message a thread agp doesn't resume after the reset. `move_thread` only when the user asks,
-  or for such a thread (agp moves limited threads itself).
+  or for such a thread (agp moves limited threads itself). A "Routines" section: work the user
+  wants repeated becomes a routine (`create_routine`), not a thread; its prompt must stand on its
+  own, since a run sees neither the conversation nor earlier runs and can't ask anyone; schedules
+  are in the user's local time; when a tool says `chief serve` isn't running, tell the user. A
+  `<chief-routine>` message means those runs finished: read each report, tell the user what it
+  found, don't subscribe to a run, resolve one that leaves nothing to do without asking.
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch; of other sessions message only the coordinator,
   by its exact name (the report needs no message), or, for a thread spawned in another account
@@ -1365,7 +1435,7 @@ syncs, and returns as `additionalContext`:
 ```
 <chief-board as-of="HH:MM">
 Waiting on you:
-- <name> "<title>" · waiting: permission · 1 subagent running · limited: <limit> · asleep · branch <b> · PR <url>
+- <name> "<title>" · routine <routine> · waiting: permission · 1 subagent running · limited: <limit> · asleep · branch <b> · PR <url>
   report: <≤200-char one-line preview>
 …groups in board order; resolved threads left out; "No open threads." when empty
 </chief-board>
@@ -1784,7 +1854,7 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
   `<target mark><glyph> <title or name>  <tags>`, cut to the width with an ellipsis and never
   wrapped; the title gives way first so tags stay readable. Tags:
   waiting reason, background work unless resolved (`1 subagent, 2 background commands`, §5),
-  `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`), `cleanup blocked`, `cleaned up`, then the agp label of the account it runs in (`PB2`; none for a
+  `asleep`, PR state (`PR draft|open|approved|changes|merged|closed`), `cleanup blocked`, `cleaned up`, `routine <name>` for a routine's run (§13), then the agp label of the account it runs in (`PB2`; none for a
   thread in the project's account without agp, §7 "Thread account"). Detail panel for the
   selection, titled with the thread's title (name, group and reason or resolved reason,
   `· <background work> running`, asleep; under it a tree of its subagents mid-turn, one line
@@ -2019,6 +2089,16 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
 - The launcher's wizard and screens are tested without a terminal (a `Probe` answers its slug and
   trust checks); its create step runs end to end against the fake in `tests/launcher.rs`, a test
   binary with one test, since that step reads chief's environment variables in-process.
+- Routines: the schedule (`cron::`, table-driven: next runs, refusals, wording), the watcher's
+  routine kind (`waiting::`), and `tests/routines.rs` against the fake (validation, a due run
+  starting a tagged thread, the claim, the skip while the last run works, older runs put away, a
+  failed start noted and not retried).
+- `chief serve` runs end to end in `tests/serve_cli.rs`: the binary on port 0 with the fake, driven
+  over raw sockets (sign-in, the origin rule, the API and its actions, the board stream, the
+  terminal socket carrying a fake `attach`, a due routine firing, one server per home, stop).
+  `CHIEF_SERVE_TICK_MS` shortens the scheduler's tick for it. The server check reads the chief
+  home a tool's project folder lives in (`serve::home_of`), never `paths::root()`, so in-process
+  tool tests don't touch the developer's own home.
 - `scripts/e2e.sh` runs the live loop with cheap sessions (milestone 2b).
 
 ## 12. Cleanup (`src/cleanup.rs`, `src/pr.rs`)
@@ -2171,3 +2251,242 @@ commit `claude rm` reports.
 A cleaned thread, or one removed outside chief, can't be woken, reopened or messaged (§6, §7); a
 cleaned one is hidden from `list_threads` unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
 user's call (§8).
+
+## 13. Routines (`src/routines.rs`, `src/cron.rs`)
+
+A routine is work a project repeats on a schedule: a prompt chief runs by itself, each run a
+fresh thread that nobody watches. The coordinator makes and manages them with its tools (§7), so
+"every weekday at 9, triage new issues" is said in the conversation; `chief routine` (§2) and the
+dashboard (§14) do the same. They are rows (§4 `routines`), written through the same functions
+by all three.
+
+### A routine
+
+- `name`: its handle, `[a-z0-9-]`, at most 32 characters, unique in the project and never
+  changed. Made from the title when none is given (`-2`, `-3` … on a clash); an explicit name
+  that is taken is refused.
+- `title` and `prompt`, neither empty. The prompt is each run's whole brief.
+- `schedule`, in the machine's local time, one of (`cron::Schedule::parse`):
+  - five cron fields, `minute hour day-of-month month day-of-week`: `*`, numbers, ranges
+    (`1-5`), lists (`0,30`), steps (`*/15`, `5/20`, `1-10/2`), month and weekday names (`jan`,
+    `mon`), 7 as Sunday. When both day fields are restricted, a day that fits either matches,
+    as in cron;
+  - `@hourly`, `@daily` (`@midnight`), `@weekly`, `@monthly`, `@weekdays` (weekdays at 09:00);
+  - `every <n>m|h|d` (also `minutes`, `hours`, `days`): that long after the last run.
+  Each run is a whole session, so a schedule that would fire less than 5 minutes apart is refused
+  (`cron::MIN_GAP_MINUTES`). A time the clocks skip doesn't run that day; one they repeat runs at
+  its first pass. `describe` words a schedule for people ("Weekdays at 09:00", "Every 30
+  minutes"), and shows one it has no words for as `cron <fields>`.
+- `repo`: a repository of the project by name (never a path: trust and the coordinator's deny
+  rules are set up for the project's repositories), else the project's default repo; a routine
+  with neither is refused. `model` and `effort`: overrides of `[threads]`.
+- `enabled`: a paused routine keeps its row and fires nothing (`next_run_at` NULL). Resuming
+  counts from that moment; nothing missed while paused is made up.
+- `notify` (default true): whether the coordinator is told when a run finishes (below).
+
+`next_run_at` is set when the routine is created or resumed and whenever its schedule changes
+(an edit to anything else leaves it, so a new prompt doesn't push an interval routine's next run
+away).
+
+### Firing
+
+Routines fire only while `chief serve` runs (§14): every 15 s (`serve::TICK`) it looks, in every
+project that isn't archived, for enabled routines whose `next_run_at` has passed, refreshes that
+project from `claude agents` (the rows decide whether a routine's last run still works), and
+runs each (`serve::Scheduler::tick`, `routines::run_due`). Without the server nothing fires; every listing
+(`list_routines`, `chief routine list`, a new routine's answer) says so and how to start it, and
+`chief up` starts it for a project that has an enabled routine (§2).
+
+A routine that came due while the server was down fires once when it next looks, however many
+occurrences were missed, and its next run is counted from then.
+
+### A run (`routines::run`)
+
+1. **Claim.** For a scheduled run, in one write transaction: when the routine is enabled and
+   due, `next_run_at` moves to the next time after now. Two processes looking at once start one
+   thread, and a run that then fails or is skipped has still spent its occurrence: a broken
+   routine doesn't start a session every tick. A manual run (`run_routine`, `chief routine run`,
+   the dashboard's Run now) claims nothing, leaves the schedule alone, and works on a paused
+   routine too.
+2. **One at a time.** When a thread of this routine is still working, waiting on the user or
+   limited (not resolved, cleaned or removed), nothing starts: `last_note` says `skipped at
+   HH:MM: its last run (<thread>) is still <group>`.
+3. **Put away.** Its earlier runs that sit idle are resolved (`resolved_reason = 'routine'`), so
+   one finished run per routine stays on the board. A run with an open pull request (review,
+   landing), a failed one, and anything of another routine stay.
+4. **Start.** `tools::start_thread` with the routine's title, repo, model and effort and no
+   account (placement picks, §7 "Thread account"): the thread is a thread like any other, with
+   the same brief, guard, hooks, agp watching and cleanup. Its task is the prompt under one
+   paragraph (`routines::brief`): this is a scheduled run of the routine "<title>" (<schedule in
+   words>), nobody is watching, don't wait for an answer, say what is missing and stop, earlier
+   runs were separate sessions. The row then gets `routine = <name>`, and the routine
+   `last_run_at`, `last_thread` and `last_note` (a start's `warning`, else NULL). A start that
+   fails is the error, with `last_note` = `failed at HH:MM: <why>`.
+
+`max_parallel` is not counted against routine runs: it is a rule the coordinator keeps for the
+threads it starts.
+
+### Telling the coordinator
+
+The coordinator subscribes to the threads it starts; nobody subscribes to a run. So its watcher
+(§5 "Telling the coordinator") tells it when a run of a routine with `notify` reported and is no
+longer working, waiting or limited, once per report, with `<chief-routine>`; the prompt (§8) has
+it read the report and tell the user what it found. A run stuck on the user, moved or limited is
+told by the watcher's other kinds, like any thread.
+
+The watcher lives in the coordinator's process, which Claude Code ends after about an hour idle
+(§1), so a run at 9am with no terminal open would be heard by nobody. So `chief serve` wakes the
+coordinator for it (`Scheduler::tick`, `routines::unheard`, `wake_coordinator`): each look, a
+project with a run that is due to be told and whose report is at least 30 s old
+(`WAKE_AFTER_MS`: a turn the Stop hook kept going has moved on, and a coordinator that is awake
+has heard) gets its coordinator refreshed and, when it has no process, respawned
+(`project::respawn`, 5 s for a pid). Its SessionStart hook starts the watcher (§3), which finds
+the run due and wakes the coordinator with the notice: its turn reads the report and writes the
+user what it found, there when they next open the conversation. Each report gets one wake (kept
+in the server's memory, so a restart may wake once more): a coordinator that can't be told
+doesn't come back every hour. A coordinator that was never started isn't started for this; it
+reads the board, where a run is tagged `routine <name>`, on its first turn. The thread's own
+Stop already sent the desktop notification (`[ui] notify`, §5).
+
+A deleted routine's runs keep their tag and their threads.
+
+## 14. `chief serve` and the dashboard (`src/serve/`)
+
+`chief serve` is the one optional long-lived process of a chief home. It does two things: it
+fires routines (§13 "Firing", `schedule.rs`) and it serves the dashboard, a web page for each
+project that turned it on (`http.rs`, `view.rs`, `term.rs`, and the page itself in
+`src/serve/web/`, compiled into the binary: no build step, nothing fetched at run time).
+
+### The process
+
+- **One per chief home.** It holds an exclusive `flock` on `<root>/serve.lock` for as long as it
+  runs; the kernel releases it however the process ends. "Is it running" is "is the lock held"
+  (`serve::running`), never a pid file a crash left behind. A second `chief serve` fails with
+  `chief serve already runs for this chief home at <url>`.
+- **Where it listens.** `--bind` and `--port`, else `<root>/serve.toml` (`bind`, `port`), else
+  `127.0.0.1:4747`. Once it listens it writes `<root>/serve.json` (`pid`, `bind`, `port`,
+  `started_at`), which it removes when it ends; port 0 takes a free port, recorded there. On an
+  address that isn't loopback it logs that other machines can reach it, over plain HTTP.
+- **Accounts.** It runs in no account: every call for a project is made in that project's
+  account (`tools::with_project`, §3), whatever `CLAUDE_CONFIG_DIR` the server started with.
+- `chief serve start` runs it detached (its own session, stdin closed, output appended to
+  `<root>/logs/serve.log`, `CHIEF_HOME` set to the resolved root) and returns once it listens
+  (10 s, else an error naming the log); already running is fine. `chief up` runs it for a
+  project that needs it and `chief dashboard` always (§2).
+- `chief serve stop` sends SIGTERM and waits up to 5 s for the lock to be free. The server ends
+  on SIGTERM or SIGINT without waiting for open streams and terminals; the `claude attach` of an
+  open terminal ends with it (its pseudo-terminal closes), its session keeps running.
+- `chief serve status` says whether it runs and where, then each live project with a routine or
+  its dashboard on.
+- `chief serve install` (macOS) writes a launchd agent, `~/Library/LaunchAgents/
+  dev.chief.serve.plist`, and loads it: `chief serve` at login, restarted when it ends, with
+  this shell's `PATH` (launchd's has neither `claude` nor `agp`), `CHIEF_HOME` and the variables
+  the generated files carry (§3; never `CLAUDE_CONFIG_DIR`). It stops a running server first, so
+  launchd's doesn't fail on the lock, and refuses a chief binary inside a cargo `target/`.
+  `uninstall` unloads and removes it. Elsewhere `install` says to use the system's own service
+  manager.
+
+### Who may use the dashboard
+
+The dashboard starts and steers sessions that run commands on this machine, so:
+
+- **A token.** `<root>/serve-token` (mode 0600, made on first use, 244 random bits) is the one
+  secret. `chief dashboard <slug>` prints `http://<host>:<port>/login?token=<token>&next=/p/<slug>`
+  and opens it. `GET /login` with the right token sets the cookie `chief_token` (`HttpOnly`,
+  `SameSite=Strict`, a year) and redirects to `next`, only ever a path on this server. Every
+  other path but `/assets/*` needs that cookie or `Authorization: Bearer <token>`; without it an
+  API call is 401 and a page is a note on how to get the link. Tokens are compared in constant
+  time.
+- **Its own origin.** A request that proves itself with the cookie and changes something (any
+  method but GET and HEAD), or opens the terminal socket, must carry an `Origin` that names the
+  host it was sent to, else 403: another site's page can make a browser send its cookie here,
+  but not under this origin. A client that writes the Bearer header itself is exempt.
+- **Opt-in per project.** Only projects with `[dashboard] enabled = true` that aren't archived
+  are served (`http::in_project`); any other slug is 404 with how to turn it on. Slugs are
+  checked against `[a-z0-9-]` before they name a folder.
+- **Localhost by default.** Reaching it from another machine is a choice made in `serve.toml`
+  (`bind = "0.0.0.0"`, or a tailnet address); the token still gates it, but travels in clear
+  over plain HTTP, so that is for a network the user trusts, or behind a TLS proxy.
+- Responses carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+  no-referrer` and a `Content-Security-Policy` that allows only the server's own scripts.
+
+### API (`http.rs` routes to `view.rs`)
+
+JSON; a failure is `{"error": "<plain message>"}` with 400 (what the tools refuse), 401, 403 or
+404. Every handler runs on the blocking pool with `tools::with_project`.
+
+| Route | Does |
+| --- | --- |
+| `GET /`, `GET /p/<slug>` | The page |
+| `GET /api/projects` | `{projects: [{slug, name, goal, waiting, working, open, routines}], version}`: the projects served, from stored rows |
+| `GET /api/p/<slug>/board` | The board (below), from stored rows |
+| `GET /api/p/<slug>/stream` | The board as server-sent events: one `board` event with the board's JSON whenever it changed |
+| `GET /api/p/<slug>/sessions/<name>` | One session of the project in full: its board entry plus `task`, `reports` (newest first, 50), `events` (40) and `subagents` mid-turn |
+| `POST /api/p/<slug>/threads/<name>/<action>` | `wake` and `stop` (`tools::wake_thread`, `stop_thread`), `resolve` and `reopen` (`registry::set_resolved`, reason `user`), `clean` (`cleanup::clean(Safe)`). `{ok, message}`. A blocked cleanup is an error that names `x` on the board and `chief clean --discard`: discarding unsaved work needs the loss shown and the name typed (§12), which the dashboard doesn't do. Never the coordinator |
+| `POST /api/p/<slug>/routines`, `PATCH`/`DELETE …/routines/<name>`, `POST …/routines/<name>/run` | `routines::create`, `update`, `delete`, `run(Manual)` (§13) |
+| `GET /api/p/<slug>/files` | `{instructions, memory}`: `instructions.md` and `memory/MEMORY.md`, to read |
+| `GET /api/p/<slug>/term?target=<thread>&cols=&rows=` | The terminal socket (below); no `target` is the coordinator |
+
+The board (`view::board`): `project` (slug, name, goal, repos, default repo, thread model and
+effort, max_parallel), `groups` (§5 order, key and label), `coordinator` (null before it first
+started) and `threads` in board order, `routines` (as `list_routines`), `guard_denials`, and
+`error` when a listing failed (the stored rows are shown). A session: `name`, `title`, `group`,
+`waiting_reason`, `asleep`, `started`, `running` (background work), `branch`, `pr` (`url`,
+`state`, `draft`, `review`), `account`, `routine`, `repo`, `model`, `effort`,
+`last_activity_at`, `last_report_at`, `report_preview`, `resolved_reason`, `cleaned`, `removed`,
+`cleanup_blocked`, `limit`, `moved`; and for a working or waiting thread what it asks (`asks`:
+`label`, `text`, from `waiting::asks`) or does (`doing`: its own latest call), as the terminal
+board's detail (§10).
+
+**Live.** While anyone watches a project's stream, one refresher per project (`http::refresher`)
+does what the terminal board's refresh does (§10): every 2 s it syncs with `claude agents` in
+every account the project uses and publishes the board when its JSON changed; every 30 s it
+refreshes pull requests (and cleans up merged threads when `cleanup = "merged"`, §12). An action
+makes it read at once. It ends 10 s after its last viewer left, so a project nobody looks at
+costs nothing.
+
+### The conversation (`term.rs`)
+
+Claude Code has no command that sends a prompt into a running background session (§1), so the
+dashboard shows the session itself: `claude attach` on a pseudo-terminal of its own
+(`embed::Pty`), its bytes carried over a WebSocket to a terminal emulator in the page
+(xterm.js). What `chief pane` does for a terminal (§9), for a browser tab: the real prompt,
+permission prompts, questions and slash commands all work, for the coordinator and any thread.
+
+- Before attaching, the session is brought up as the pane does: the coordinator through
+  `generated::rewrite` and `project::ensure_coordinator` (started on first use, respawned when
+  asleep, as `chief up`); a thread through `pane::wake`. A cleaned thread and one removed outside
+  chief are refused with §6's messages.
+- Frames: binary is terminal data, either way. Text is JSON: from the page `{"type": "resize",
+  "cols", "rows"}`; to the page `{"type": "status", "text"}` while the session is brought up,
+  `{"type": "ready", "name"}` once attach runs, `{"type": "exit"}` when attach ended, `{"type":
+  "error", "text"}`.
+- Closing the tab, leaving the Conversation tab or selecting another session closes the socket,
+  which ends that `claude attach` (SIGTERM, a grace period, SIGKILL). The session keeps running.
+- The dashboard's terminals are independent of `ui_state.pane_target`: they don't move the
+  terminal pane, and each browser tab has its own attach.
+
+### The page (`src/serve/web/`)
+
+`index.html`, `app.css`, `app.js` and the vendored xterm.js 5.5.0 with its fit addon
+(`vendor/`, MIT, licence beside them), served from `/assets/`. One page per project:
+
+- A top bar with the project (a menu when several are served) and its goal, and whether the
+  stream is live.
+- The board on the left: a red strip when threads wait on the user (it opens the first), the
+  coordinator, the threads by group as on the terminal board (same glyphs and colours, the same
+  tags as chips, what a working thread does and a waiting one asks, Resolved folded), then the
+  routines with their schedule in words and next run, and `+ New`.
+- The selection on the right. A session: its state, the actions that apply (Open PR, Wake or
+  Stop, Resolve; Reopen and Clean up when resolved; Stop, Clean up and deleting a routine ask
+  once more), what it waits on as a callout, and tabs: Conversation (the terminal), Reports (its
+  task and every report, as Markdown), and Activity (its latest calls and subagents) for a
+  thread or Project (settings in brief, instructions and memory, to read) for the coordinator. A
+  routine: its form (title, prompt, a schedule builder that writes the cron line, repository,
+  model, effort, whether the coordinator is told), Run now, Pause or Resume, Delete, and its
+  runs.
+- The selection lives in the URL's hash, so reload and back work. Below 860 px the board is the
+  home and a selection opens over it. Light and dark follow the system; the terminal is always
+  a dark screen.
+- Everything shown from a session (titles, reports, calls) is inserted as text or through the
+  page's own Markdown renderer, which escapes first and produces only its own tags.

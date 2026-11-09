@@ -94,6 +94,33 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Routines: prompts a project runs on a schedule, each run a fresh thread
+    Routine {
+        #[command(subcommand)]
+        action: RoutineAction,
+    },
+    /// The background server: fires routines and serves the web dashboard
+    Serve {
+        /// What to do; with nothing, runs the server in this terminal
+        #[arg(value_enum, default_value_t = ServeAction::Run)]
+        action: ServeAction,
+        /// The address to listen on (default: serve.toml, else 127.0.0.1)
+        #[arg(long)]
+        bind: Option<std::net::IpAddr>,
+        /// The port to listen on (default: serve.toml, else 4747)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Turn a project's web dashboard on and print the link that opens it
+    Dashboard {
+        slug: String,
+        /// Turn it off instead
+        #[arg(long)]
+        off: bool,
+        /// Don't open the link in the browser
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Clean up one resolved thread: remove its session, worktree and local branch
     Clean {
         slug: String,
@@ -105,6 +132,63 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum RoutineAction {
+    /// List a project's routines
+    List { slug: String },
+    /// Add a routine
+    Add {
+        slug: String,
+        /// A few words for the board
+        #[arg(long)]
+        title: String,
+        /// When it runs, in local time: five cron fields ("0 9 * * 1-5"), @hourly, @daily,
+        /// @weekly, @monthly, or "every 30m" / "every 2h"
+        #[arg(long)]
+        schedule: String,
+        /// What every run does: the thread's whole brief
+        #[arg(long)]
+        prompt: String,
+        /// A repository of the project (default: its default repository)
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        /// Its handle (default: made from the title)
+        #[arg(long)]
+        name: Option<String>,
+        /// Don't tell the coordinator when a run finishes
+        #[arg(long)]
+        quiet: bool,
+        /// Create it paused
+        #[arg(long)]
+        paused: bool,
+    },
+    /// Run a routine now, outside its schedule
+    Run { slug: String, name: String },
+    /// Stop a routine from firing until it is resumed
+    Pause { slug: String, name: String },
+    /// Let a paused routine fire again, from now
+    Resume { slug: String, name: String },
+    /// Delete a routine; its past runs stay
+    Rm { slug: String, name: String },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ServeAction {
+    /// Run in this terminal until interrupted
+    Run,
+    /// Start it in the background
+    Start,
+    Stop,
+    Status,
+    /// Keep it running across logins and restarts (macOS launchd)
+    Install,
+    Uninstall,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -254,5 +338,80 @@ fn main() -> Result<()> {
             discard,
             yes,
         } => chief::cleanup::run_clean(&slug, &thread, discard, yes),
+        Command::Routine { action } => routine(action),
+        Command::Serve { action, bind, port } => match action {
+            ServeAction::Run => chief::serve::run(bind, port),
+            ServeAction::Start => {
+                let info = chief::serve::start()?;
+                println!(
+                    "chief serve is running at {} (pid {}).",
+                    info.url(),
+                    info.pid
+                );
+                Ok(())
+            }
+            ServeAction::Stop => {
+                if chief::serve::stop()? {
+                    println!("Stopped chief serve. No routine fires until it runs again.");
+                } else {
+                    println!("chief serve isn't running.");
+                }
+                Ok(())
+            }
+            ServeAction::Status => chief::serve::status(),
+            ServeAction::Install => chief::serve::install(),
+            ServeAction::Uninstall => chief::serve::uninstall(),
+        },
+        Command::Dashboard { slug, off, no_open } => chief::serve::dashboard(&slug, off, !no_open),
+    }
+}
+
+fn routine(action: RoutineAction) -> Result<()> {
+    use chief::routines::{self, Draft, Patch};
+    match action {
+        RoutineAction::List { slug } => routines::cli_list(&slug),
+        RoutineAction::Add {
+            slug,
+            title,
+            schedule,
+            prompt,
+            repo,
+            model,
+            effort,
+            name,
+            quiet,
+            paused,
+        } => routines::cli_add(
+            &slug,
+            &Draft {
+                title,
+                prompt,
+                schedule,
+                repo,
+                model,
+                effort,
+                notify: Some(!quiet),
+                enabled: Some(!paused),
+                name,
+            },
+        ),
+        RoutineAction::Run { slug, name } => routines::cli_run(&slug, &name),
+        RoutineAction::Pause { slug, name } => routines::cli_update(
+            &slug,
+            &name,
+            &Patch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        ),
+        RoutineAction::Resume { slug, name } => routines::cli_update(
+            &slug,
+            &name,
+            &Patch {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        ),
+        RoutineAction::Rm { slug, name } => routines::cli_rm(&slug, &name),
     }
 }

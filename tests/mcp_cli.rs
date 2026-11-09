@@ -117,15 +117,32 @@ fn serves_the_tools_over_stdio() {
     assert_eq!(
         names,
         [
+            "create_routine",
+            "delete_routine",
+            "list_routines",
             "list_threads",
             "move_thread",
             "read_report",
             "resolve_thread",
+            "run_routine",
             "start_thread",
             "stop_thread",
+            "update_routine",
             "wake_thread"
         ]
     );
+    // update_routine takes the name beside the fields to change, all of them optional.
+    let update = tools
+        .iter()
+        .find(|t| t["name"] == "update_routine")
+        .unwrap();
+    assert_eq!(update["inputSchema"]["required"], json!(["name"]));
+    for field in ["name", "schedule", "prompt", "enabled", "notify"] {
+        assert!(
+            update["inputSchema"]["properties"][field].is_object(),
+            "{field}: {update}"
+        );
+    }
     let start = tools.iter().find(|t| t["name"] == "start_thread").unwrap();
     let mut required: Vec<_> = start["inputSchema"]["required"]
         .as_array()
@@ -152,6 +169,25 @@ fn serves_the_tools_over_stdio() {
             .unwrap()
             .contains("not a thread of this project")
     );
+
+    // Routines over the wire: a bad schedule is a tool error; with no arguments, the list.
+    let result = client.call(
+        5,
+        "create_routine",
+        json!({"title": "Nightly", "prompt": "Check.", "schedule": "* * * * *"}),
+    );
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("less than 5 minutes apart")
+    );
+    let result = client.call(6, "list_routines", Value::Null);
+    assert_eq!(result["isError"], false, "{result}");
+    let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["routines"], json!([]));
+    assert!(text["scheduler"].as_str().unwrap().contains("chief serve"));
 
     drop(client);
     let status = child.wait().unwrap();

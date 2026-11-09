@@ -3,7 +3,8 @@
 Claude Projects, locally. You talk to one coordinator Claude session; it starts background Claude
 Code sessions ("threads") that each own one task on their own git branch, routes your follow-ups
 to the right thread, and reports back. A board beside the conversation parks every thread by
-status, and you can open any thread's own conversation from it.
+status, and you can open any thread's own conversation from it. A project can also repeat work
+on a schedule ([routines](#routines)) and be used from a browser ([the dashboard](#the-dashboard)).
 
 ![A new project in chief: you ask the coordinator for three things, it starts a thread for each,
 the board shows the one waiting on you, you answer it there, a pull request lands in Ready for
@@ -14,7 +15,7 @@ the Claude sessions behind them a replay. <code>scripts/demo/demo.sh</code> reco
 
 ## Requirements
 
-- macOS or Linux, Rust (stable), and Claude Code **2.1.310 or later** (`claude --version`).
+- macOS or Linux, Rust (stable), and Claude Code **2.1.316 or later** (`claude --version`).
 - Any terminal. Rex or tmux are optional: they let `chief up` open the two-pane layout for you
   (see [The layout](#the-layout)).
 - `gh`, signed in, for pull request status on the board (optional).
@@ -46,11 +47,9 @@ your projects (with what needs you) and Enter opens one.
 The same from a script: `chief init "Payments latency" --goal "…" --repo ~/workspace/payments-api`,
 then `chief up payments-latency`.
 
-Then just talk: ask questions, hand over
-tasks, send follow-ups. The coordinator
-answers quick questions itself, starts a thread per piece of work, sends follow-ups to the thread
-that owns the work (waking it first if it's asleep), and posts a short update when a thread
-finishes. A thread that ends its turn while its subagents or background commands still run isn't
+Then just talk: ask questions, hand over tasks, send follow-ups. The coordinator answers quick
+questions itself, starts a thread per piece of work, sends follow-ups to the thread that owns the
+work (waking it first if it's asleep), and posts a short update when a thread finishes. A thread that ends its turn while its subagents or background commands still run isn't
 finished: the board keeps it in Working and shows what runs (`1 subagent`), and the coordinator
 hears from it once they finish.
 
@@ -125,6 +124,68 @@ Ctrl+C out of its agent view) brings you to chief's own screen instead: ⏎ goes
 board shows that instead, and `q` or Ctrl+Q closes the layout. The coordinator and threads keep
 running in the background either way; `chief` or `chief up <slug>` opens the layout again.
 
+## Routines
+
+A routine is work the project repeats: a prompt chief runs on a schedule, each run a fresh thread
+that nobody has to watch. Ask the coordinator in plain words ("every weekday at 9, triage the
+new issues and tell me which need me") and it creates one; it can list, change, pause, run and
+delete them too. Or from a shell:
+
+```sh
+chief routine add payments-latency --title "Triage new issues" \
+  --schedule "0 9 * * 1-5" --prompt "Label the issues opened since the last run, close duplicates, report the ones that need a person."
+chief routine list payments-latency
+chief routine run payments-latency triage-new-issues    # now, outside its schedule
+```
+
+- **Schedules** are in your local time: five cron fields (`0 9 * * 1-5`), `@hourly`, `@daily`,
+  `@weekly`, `@monthly`, or `every 30m` / `every 2h`. At most every 5 minutes, since every run is
+  a whole session.
+- **A run** is a thread like any other, tagged `routine <name>` on the board, with the project's
+  thread model and effort unless the routine names its own. A run is skipped while the
+  routine's last one still works, and the next run puts the last finished one away (resolved),
+  so runs don't pile up.
+- **Hearing about it.** When a run finishes, the coordinator reads its report and tells you what
+  it found, even if it was asleep: it is woken for it. `--quiet` (or the checkbox in the
+  dashboard) turns that off for runs you only want on the board.
+- **Routines fire while `chief serve` runs**, the one background process chief has. `chief up`
+  starts it for a project with routines; `chief serve install` keeps it running across logins
+  (macOS), so a 9am routine runs with no terminal open. A routine that came due while it was
+  down runs once when it is back.
+
+## The dashboard
+
+```sh
+chief dashboard payments-latency
+```
+
+turns the project's web dashboard on, starts `chief serve` and opens a link that signs your
+browser in.
+
+![The dashboard: the board on the left with a thread waiting on you, and a thread's report
+rendered on the right](docs/dashboard.png)
+
+<sub>Seeded demo data, not a real project.</sub>
+
+- **The board, live**: the same groups, tags and colours as the terminal board, what each
+  working thread does and what a waiting one asks, and a red strip that takes you to the next
+  thread that needs you.
+- **The conversation** is the session itself: `claude attach` in a terminal in the page, for the
+  coordinator and any thread. Permission prompts, questions and slash commands work as they do in
+  your terminal. Opening a sleeping session wakes it; leaving the tab detaches and the session
+  keeps running.
+- **Reports** as formatted text, a thread's **activity** (its latest calls and subagents), and
+  the actions: wake, stop, resolve, reopen, clean up (only when nothing would be lost), open the
+  pull request.
+- **Routines**: add and edit them with a schedule builder, run one now, pause it, see its runs.
+- It works on a phone-sized screen, and follows your light or dark setting.
+
+It listens on `127.0.0.1:4747` and every request needs the secret token in that link, so keep the
+link to yourself: whoever has it can run the project's sessions. To reach it from another machine,
+set `bind` (and `port`) in `~/.local/share/chief/serve.toml`, for example to your tailnet address;
+the traffic is plain HTTP, so only on a network you trust or behind a TLS proxy. `chief dashboard
+<slug> --off` turns a project's dashboard off; `chief serve stop` ends the server.
+
 ## Settings
 
 `s` on the board edits `project.toml`, in sections, with a line on what each field does (Ctrl+S
@@ -194,6 +255,9 @@ readable.
   (the wizard's checkbox, `init`'s question, `chief trust <slug>`, Enter in settings), writing
   exactly what accepting Claude's trust prompt writes and keeping the rest of the file. The one
   folder it trusts without asking is the project folder it created itself.
+- **The dashboard** is off until you turn it on for a project, listens on localhost unless you
+  say otherwise, and needs its token on every request; a change must also come from its own
+  page, so another website can't steer it through your browser.
 - Threads run with the permission mode you choose (default `auto`); permission prompts show as
   Waiting on you, and you answer them by opening the thread.
 
@@ -214,23 +278,33 @@ readable.
 | `chief status [<slug>]` | The board as text |
 | `chief clean <slug> <thread> [--discard] [--yes]` | Clean up one resolved thread |
 | `chief gc [<slug>] [--dry-run]` | Clean up every resolved thread that loses nothing |
+| `chief routine list\|add\|run\|pause\|resume\|rm <slug> …` | The project's routines |
+| `chief dashboard <slug> [--off] [--no-open]` | Turn the web dashboard on and print its link |
+| `chief serve [start\|stop\|status\|install\|uninstall]` | The background server: routines and the dashboard |
 
 `chief hook` and `chief mcp` are called by Claude Code's hooks and the coordinator's MCP config.
 
 ## How it works
 
-No daemon: Claude Code's background supervisor owns every session, and a SQLite database
-(`~/.local/share/chief/chief.db`) is the shared state.
+Claude Code's background supervisor owns every session, and a SQLite database
+(`~/.local/share/chief/chief.db`) is the shared state. Nothing of chief's has to stay running,
+except `chief serve` when you use routines or the dashboard.
 
 - The coordinator is a background Claude Code session with chief's MCP tools (`start_thread`,
-  `list_threads`, `read_report`, `wake_thread`, `resolve_thread`) and no shell. It reaches threads
+  `list_threads`, `read_report`, `wake_thread`, `stop_thread`, `move_thread`, `resolve_thread`,
+  and the routine tools) and no shell. It reaches threads
   with Claude Code's built-in `SendMessage` and hears back through idle notices.
 - Threads are ordinary background sessions (`claude --bg`), revived with `claude respawn` when their
   process has ended.
 - Claude Code hooks call `chief hook` on every session start, prompt, tool call, notification and
   stop. They record state and reports, and on each coordinator turn add a compact board snapshot
   and the memory index to its context.
-- The board polls `claude agents` every 2 s and pull request status every 30 s.
+- The board polls `claude agents` every 2 s and pull request status every 30 s; so does the
+  dashboard, while someone has it open.
+- `chief serve` looks for due routines every 15 s and starts each as a thread. The dashboard is
+  served from the same process: an HTTP API over the same functions the board and the
+  coordinator's tools use, the board as server-sent events, and `claude attach` over a WebSocket.
+  The page is plain JavaScript and CSS compiled into the binary.
 
 `docs/ARCHITECTURE.md` is the full contract, including what was verified against Claude Code and
 how; `docs/PLAN.md` has the build plan and the live test results.
@@ -243,9 +317,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Tests never start real Claude sessions: they use fake `claude`, `gh`, `rex` and `tmux` binaries
-(`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`) and a temporary
-`CHIEF_HOME`. The tmux backend is also tested against a real tmux server on a private socket,
+Tests never start real Claude sessions: they use fake `claude`, `gh`, `rex`, `tmux` and `agp`
+binaries (`CHIEF_CLAUDE_BIN`, `CHIEF_GH_BIN`, `CHIEF_REX_BIN`, `CHIEF_TMUX_BIN`, `CHIEF_AGP_BIN`)
+and a temporary `CHIEF_HOME`. `chief serve` is tested as the real binary on a free port. The tmux backend is also tested against a real tmux server on a private socket,
 which the test kills; your own tmux server is never touched.
 
 `scripts/demo/demo.sh` records the demo above (`docs/demo.gif`, `docs/demo.mp4`) with

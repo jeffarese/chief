@@ -408,3 +408,90 @@ Tested with the fake `claude` and a fake `agp` (`tests/tools.rs`, `tests/cleanup
 tests (`moves::`, `waiting::`, `agp::`, `claude::`); agp's side with its own fake-claude
 integration tests. Not verified live yet: a real limit moving a real thread end to end, and the
 coordinator's `<chief-moved>` turn.
+
+## Routines and the web dashboard (built, 2026-11-09)
+
+Problem (user request): a project could only do what someone asked for in the conversation, and
+could only be seen in a terminal. Projects should also repeat work on a schedule, with the
+coordinator in charge of it like the threads, and show themselves in a browser.
+
+Decisions (asked first): one optional `chief serve` fires routines and serves the dashboard,
+rather than OS scheduler entries or firing only while chief is open; a run is a fresh thread,
+not a turn of the coordinator; the conversation in the browser is the real `claude attach` in an
+embedded terminal, since Claude Code has no command to send a prompt into a running session;
+localhost by default, with a token, and another address only by choice.
+
+1. **Routines** (ARCHITECTURE §13; `src/routines.rs`, `src/cron.rs`, migration 19): a prompt on
+   a schedule (five cron fields in local time, `@daily`-style shorthands, `every 30m`; at most
+   every 5 minutes), stored in the database. A due run claims its occurrence, is skipped while
+   the routine's last run still works, puts idle earlier runs away, and starts a thread like any
+   other, tagged `routine <name>`. The coordinator has `list_routines`, `create_routine`,
+   `update_routine`, `delete_routine` and `run_routine`; `chief routine` does the same from a
+   shell.
+2. **Hearing of a run**: nobody subscribes to a thread the scheduler started, so the
+   coordinator's watcher tells it with `<chief-routine>` when a run finishes, and `chief serve`
+   respawns a coordinator that sleeps so that its start-up watcher can (a side-agent note caught
+   that an overnight run would otherwise be heard by nobody until the user next wrote).
+3. **`chief serve`** (§14; `src/serve/`): one per chief home, by a lock; `start`, `stop`,
+   `status`, and `install` for a launchd agent. `chief up` starts it for a project that has a
+   routine or its dashboard on.
+4. **Dashboard** (§14): `chief dashboard <slug>` turns it on and prints the sign-in link. The
+   board live over server-sent events (the terminal board's refresh, while someone watches),
+   reports as Markdown, activity, the thread actions, a routine editor with a schedule builder,
+   and the conversation in xterm.js over a WebSocket. axum; the page is plain JS and CSS compiled
+   into the binary.
+
+Tested with the fake `claude` (`tests/routines.rs`, `tests/serve_cli.rs`: the server on a free
+port over raw sockets, the terminal socket included) and unit tests (`cron::`, `waiting::`,
+`serve::`). The page was checked in headless Chrome against a seeded home: light, dark and phone
+widths, the terminal's round trip, creating and editing a routine.
+
+Not verified live yet: a real routine run end to end (`chief serve` starting a real thread and
+the coordinator's `<chief-routine>` turn); the respawned coordinator's SessionStart watcher
+delivering that notice (§1 verified `asyncRewake` on SessionStart, not after a respawn by the
+server); a real `claude attach` in xterm.js (its keyboard protocol queries, Shift+Enter, paste,
+the agent view's mouse), and two attaches to one session at once (the terminal pane and a
+browser tab); the launchd agent (`chief serve install`).
+
+## Review, 2026-11-09: what would make chief better
+
+From a read-only pass over the docs and code. Not built; ranked by value.
+
+1. **A finished thread nobody subscribed to is silent.** The coordinator hears of a finish only
+   through its own `notify_when_idle` subscription, which dies with its process. The routine
+   notice above covers runs; the same `<chief-finished>` kind for any thread whose report is
+   newer than the last telling would cover a coordinator that was respawned.
+2. **Questions and pull requests are seen only while a board (or now a dashboard) runs.** A
+   thread blocked on `AskUserQuestion` after `chief down` tells nobody: the waiting state comes
+   from a `claude agents` poll. Treat an unanswered PreToolUse `AskUserQuestion` as waiting, and
+   let `chief serve` do the board's periodic sync and PR refresh when it runs.
+3. **`chief doctor`.** One command that checks the Claude Code version against the versions §1's
+   facts were verified on, that `claude agents --json` still carries `status` and `pid` (every
+   `AgentRow` field is optional, so a rename shows everything idle), the job state's shape,
+   `/tmp/cc-socks`, the generated hook paths, agp's `bg`, trust, the database version, and the
+   tail of the hook error log.
+4. **Hook errors are invisible**, and a Stop that loses the database lock loses its report. Show
+   an error count on the board and in `chief status`; spool a failed Stop's payload, or re-read
+   the transcript at the next sync.
+5. **Five renderers of a thread's state** (`board/ui.rs` tags, `context.rs`, `render_status`,
+   `tools::thread_view`, `rex_status`, plus the dashboard's `view::session`) already disagree on
+   "asleep". One typed, serialisable view that every front end renders.
+6. **An older binary runs silently on a newer database** (`db::migrate` returns Ok when the
+   version is ahead): a `target/` build can migrate the real home under the installed hooks.
+   Refuse or warn.
+7. **`chief status` skips agp's moves** (it syncs without `moves::refresh`), so a moved thread
+   can look asleep there.
+8. **Notifications** are macOS-only (`osascript`), fire on every turn end, and say nothing of a
+   question, a limit or a move. Add `notify-send`, de-dupe, and notify a coordinator turn the
+   user didn't start.
+9. **No live smoke script and no CI.** `scripts/e2e.sh` is cited but was never written; the "not
+   verified live" items above and before would be its checklist. Fixtures are frozen at
+   2.1.310/316: a capture script per Claude Code version would show drift.
+10. **ARCHITECTURE.md is written at code level** (about 2,500 lines for 22k of code) and has
+    started to contradict itself (§3 and §7 "Thread account" still say a thread's account never
+    changes; §5 has agp move it). Split it into facts, invariants and schema, and move
+    per-function behaviour into module docs and tests.
+11. **The queue lives in the coordinator's conversation.** `max_parallel` is prompted, not
+    enforced, and a compaction or restart forgets what was queued.
+12. **One inbox across projects.** `chief status --waiting` / `--json`, and the dashboard's
+    project list already shows the counts.

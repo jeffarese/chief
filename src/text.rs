@@ -62,6 +62,17 @@ pub fn local_hhmm(ts: i64) -> String {
     }
 }
 
+/// Local `YYYY-MM-DD HH:MM` for a unix ms timestamp: a routine's next and last run.
+pub fn local_stamp(ts: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ts) {
+        chrono::LocalResult::Single(t) | chrono::LocalResult::Ambiguous(t, _) => {
+            t.format("%Y-%m-%d %H:%M").to_string()
+        }
+        chrono::LocalResult::None => "unknown".to_string(),
+    }
+}
+
 /// Quotes one word for `sh`: safe characters pass through, anything else goes in single quotes.
 pub fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()

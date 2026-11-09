@@ -2,7 +2,6 @@
 //! live in `tools.rs`. stdout carries the protocol, so logs go to stderr.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -12,16 +11,12 @@ use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde_json::Value;
 
-use crate::claude::{Claude, RESOLVE_TIMEOUT};
-use crate::config::ProjectConfig;
+use crate::paths;
+use crate::routines::{self, Draft, RoutineNameArgs, UpdateRoutineArgs};
 use crate::tools::{
     self, ListThreadsArgs, MoveThreadArgs, NameArgs, ReadReportArgs, ResolveThreadArgs,
     StartThreadArgs, ToolCtx,
 };
-use crate::{db, paths};
-
-const WAKE_TIMEOUT: Duration = Duration::from_secs(20);
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub fn run(project: &str) -> Result<()> {
     let dir = paths::project_dir(project);
@@ -116,6 +111,50 @@ impl ChiefMcp {
         self.call(move |ctx| tools::resolve_thread(ctx, &args))
             .await
     }
+
+    #[tool(
+        description = "List this project's routines: prompts that run on a schedule, each run a fresh thread. Shows each one's schedule in words, whether it is paused, when it next runs, and the thread and outcome of its last run."
+    )]
+    async fn list_routines(&self) -> CallToolResult {
+        self.call(routines::list_tool).await
+    }
+
+    #[tool(
+        description = "Create a routine: a prompt chief runs on a schedule, each run a fresh thread that works without anyone watching. Use it when the user wants something done regularly (\"every weekday at 9, triage new issues\"). The prompt is each run's whole brief. Returns the routine with its next run."
+    )]
+    async fn create_routine(&self, Parameters(args): Parameters<Draft>) -> CallToolResult {
+        self.call(move |ctx| routines::create_tool(ctx, &args))
+            .await
+    }
+
+    #[tool(
+        description = "Change a routine: its title, prompt, schedule, repo, model or effort, whether you are told when a run finishes, or pause and resume it with enabled. Only the fields you pass change."
+    )]
+    async fn update_routine(
+        &self,
+        Parameters(args): Parameters<UpdateRoutineArgs>,
+    ) -> CallToolResult {
+        self.call(move |ctx| routines::update_tool(ctx, &args))
+            .await
+    }
+
+    #[tool(
+        description = "Delete a routine, only when the user asks. Its past runs' threads and reports stay. To stop it for a while, pause it with update_routine(enabled=false) instead."
+    )]
+    async fn delete_routine(
+        &self,
+        Parameters(args): Parameters<RoutineNameArgs>,
+    ) -> CallToolResult {
+        self.call(move |ctx| routines::delete_tool(ctx, &args))
+            .await
+    }
+
+    #[tool(
+        description = "Run a routine now, outside its schedule: starts its thread and returns its name. Its schedule doesn't move. Nothing starts while its last run is still working."
+    )]
+    async fn run_routine(&self, Parameters(args): Parameters<RoutineNameArgs>) -> CallToolResult {
+        self.call(move |ctx| routines::run_tool(ctx, &args)).await
+    }
 }
 
 impl ChiefMcp {
@@ -126,7 +165,7 @@ impl ChiefMcp {
         F: FnOnce(&ToolCtx) -> Result<Value> + Send + 'static,
     {
         let project = self.project.clone();
-        let result = tokio::task::spawn_blocking(move || with_ctx(&project, f)).await;
+        let result = tokio::task::spawn_blocking(move || tools::with_project(&project, f)).await;
         let result = match result {
             Ok(r) => r,
             Err(e) => Err(anyhow::anyhow!("the tool crashed: {e}")),
@@ -145,37 +184,15 @@ impl ChiefMcp {
     }
 }
 
-fn with_ctx<T>(project: &str, f: impl FnOnce(&ToolCtx) -> Result<T>) -> Result<T> {
-    let dir = crate::project::project_dir(project);
-    let config = ProjectConfig::load(&dir.join("project.toml"))?;
-    let conn = db::open(&paths::db())?;
-    // The project's account, whatever the server's environment names (§3).
-    let claude = Claude::for_account(config.claude_config_dir.clone());
-    let trust_config = claude.trust_config();
-    let agp = crate::agp::Agp::from_env();
-    let ctx = ToolCtx {
-        conn: &conn,
-        config: &config,
-        claude: &claude,
-        agp: &agp,
-        project_dir: &dir,
-        trust_config: &trust_config,
-        now: db::now_ms,
-        resolve_timeout: RESOLVE_TIMEOUT,
-        wake_timeout: WAKE_TIMEOUT,
-        poll_interval: POLL_INTERVAL,
-    };
-    f(&ctx)
-}
-
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ChiefMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("chief", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Tools for this chief project's threads. Message threads with SendMessage; \
-                 use these to start, list, read, wake and resolve them.",
+                "Tools for this chief project's threads and routines. Message threads with \
+                 SendMessage; use these to start, list, read, wake and resolve them, and to \
+                 schedule work that repeats.",
             )
     }
 }

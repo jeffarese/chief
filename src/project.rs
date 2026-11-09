@@ -437,6 +437,16 @@ pub fn up_with(slug: &str, choice: LayoutChoice, note: &mut dyn FnMut(Note)) -> 
     };
     note(Note::Did(format!("Coordinator {} {verb}.", row.name)));
 
+    // A project with routines or its dashboard on needs the server (§14); nothing else does.
+    match crate::serve::ensure_for(&conn, &config) {
+        Ok(Some(line)) => note(Note::Did(line)),
+        Ok(None) => {}
+        Err(e) => note(Note::Warn(format!(
+            "warning: chief serve didn't start, so this project's routines don't fire and its \
+             dashboard isn't served: {e:#}"
+        ))),
+    }
+
     if choice == LayoutChoice::Builtin {
         return Ok(Where::Builtin);
     }
@@ -1201,6 +1211,9 @@ pub fn render_status(
             }
             if let Some(account) = t.account_shown() {
                 parts.push(format!("account {account}"));
+            }
+            if let Some(routine) = &t.routine {
+                parts.push(format!("routine {routine}"));
             }
             if let Some(note) = &t.move_note {
                 parts.push(note.clone());

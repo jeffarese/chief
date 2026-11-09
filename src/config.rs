@@ -23,6 +23,22 @@ pub struct ProjectConfig {
     pub repos: Vec<Repo>,
     #[serde(default)]
     pub ui: UiSettings,
+    /// The web dashboard (§14). Left out of the file while it is off.
+    #[serde(default, skip_serializing_if = "DashboardSettings::is_off")]
+    pub dashboard: DashboardSettings,
+}
+
+/// `[dashboard]`: whether `chief serve` shows this project in the browser.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DashboardSettings {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl DashboardSettings {
+    fn is_off(&self) -> bool {
+        !self.enabled
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -168,6 +184,7 @@ impl ProjectConfig {
             },
             repos,
             ui: UiSettings::default(),
+            dashboard: DashboardSettings::default(),
         }
     }
 

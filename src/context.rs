@@ -89,6 +89,9 @@ fn line(t: &SessionRow, preview: usize) -> String {
         Some(title) => format!("- {} \"{}\"", t.name, one_line(title, 80)),
         None => format!("- {}", t.name),
     }];
+    if let Some(routine) = &t.routine {
+        parts.push(format!("routine {routine}"));
+    }
     if let Some(reason) = &t.waiting_reason {
         parts.push(format!("waiting: {reason}"));
     }

@@ -49,6 +49,36 @@ impl ToolCtx<'_> {
     }
 }
 
+/// How long `wake_thread` waits for a pid outside tests, and how often it looks.
+pub const WAKE_TIMEOUT: Duration = Duration::from_secs(20);
+pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Runs `f` with the context of a project as it is now: its project.toml read afresh, its own
+/// database connection, `claude` in the project's account whatever this process's environment
+/// names (§3), and agp from the environment. What `chief mcp`, `chief serve` and `chief routine`
+/// give the tools.
+pub fn with_project<T>(project: &str, f: impl FnOnce(&ToolCtx) -> Result<T>) -> Result<T> {
+    let dir = crate::project::project_dir(project);
+    let config = ProjectConfig::load(&dir.join("project.toml"))?;
+    let conn = db::open(&crate::paths::db())?;
+    let claude = Claude::for_account(config.claude_config_dir.clone());
+    let trust_config = claude.trust_config();
+    let agp = Agp::from_env();
+    let ctx = ToolCtx {
+        conn: &conn,
+        config: &config,
+        claude: &claude,
+        agp: &agp,
+        project_dir: &dir,
+        trust_config: &trust_config,
+        now: db::now_ms,
+        resolve_timeout: crate::claude::RESOLVE_TIMEOUT,
+        wake_timeout: WAKE_TIMEOUT,
+        poll_interval: POLL_INTERVAL,
+    };
+    f(&ctx)
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StartThreadArgs {
     /// A few words for the board, e.g. "Fix flaky checkout test". Also used in the thread's name.
