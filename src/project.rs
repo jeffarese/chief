@@ -594,8 +594,24 @@ pub fn ensure_coordinator(
             };
             return Ok((row, CoordinatorAction::Running));
         }
-        let row = respawn(conn, claude, agp, dir, config, &row, RESPAWN_WAIT)?;
-        return Ok((row, CoordinatorAction::Respawned));
+        match respawn(conn, claude, agp, dir, config, &row, RESPAWN_WAIT) {
+            Ok(row) => return Ok((row, CoordinatorAction::Respawned)),
+            // Its session was removed outside chief (`claude rm`, or from `claude agents`):
+            // nothing is left to respawn, so a new one takes its place. Only when a listing
+            // says so; any other failure is the user's to see.
+            Err(e) if session_lost(claude, &row) => {
+                warn(format!(
+                    "warning: {}'s session ({}) no longer exists, so chief starts a new \
+                     coordinator; its conversation is gone, the project's threads, reports and \
+                     memory are not. The failure: {e:#}",
+                    row.name,
+                    row.short_id.as_deref().unwrap_or_default()
+                ));
+                forget_session(conn, &row.name)?;
+                return ensure_coordinator(conn, claude, agp, config, dir, trust_config, warn);
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // chief made this folder, so it marks it trusted itself (§3 "Trust"); projects from before
@@ -700,6 +716,38 @@ pub fn ensure_coordinator(
         row = watched;
     }
     Ok((row, CoordinatorAction::Started))
+}
+
+/// True when a listing of `row`'s own account succeeds and has neither its session id nor its
+/// short id: a stopped session stays listed, so this one was removed.
+fn session_lost(claude: &Claude, row: &SessionRow) -> bool {
+    let Ok(live) = claude.for_row(row).agents() else {
+        return false;
+    };
+    !live.iter().any(|a| {
+        row.session_id.as_deref() == Some(a.session_id.as_str())
+            || (row.short_id.is_some() && row.short_id == a.id)
+    })
+}
+
+/// Clears what `name`'s row holds about a session that no longer exists, so the next spawn
+/// fills it again. Its reports and events stay.
+fn forget_session(conn: &Connection, name: &str) -> Result<()> {
+    db::immediate(conn, |conn| {
+        let mut row = db::get_session(conn, name)?.context("coordinator row vanished")?;
+        row.short_id = None;
+        row.session_id = None;
+        row.pid = None;
+        row.cc_state = None;
+        row.cc_status = None;
+        row.gone_at = None;
+        row.runner = None;
+        row.agp_state = None;
+        row.limit_note = None;
+        row.limited_since = None;
+        row.updated_at = db::now_ms();
+        db::update_session(conn, &row)
+    })
 }
 
 /// Hands the coordinator to agp to watch for usage limits (§5 "Limits and moves"), so it goes on

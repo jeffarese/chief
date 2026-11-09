@@ -1422,6 +1422,13 @@ session with the name in another folder (another chief home's coordinator, or th
 never adopted: the name counts as taken. If it exists but `claude agents` shows no pid, `claude respawn` it and wait up to 10 s for
 a pid. Otherwise it is left alone.
 
+A coordinator whose session was removed outside chief (`claude rm`, or from `claude agents`) has
+nothing to respawn. When the respawn fails and a listing of its account that succeeds has neither
+its `session_id` nor its `short_id`, chief clears the row's session (ids, pid, Claude's state,
+runner, limit) and starts a new coordinator under the same name, with a warning: the conversation
+is gone, while the row's reports and events, the threads and `memory/` stay. Any other respawn
+failure is an error, as before.
+
 With `[threads] runner = "agp"` and an agp that has `bg`, a coordinator just started, respawned,
 or found running without `runner = 'agp'` is handed to agp with `agp bg watch <short id>
 --on-limit wait` (best effort, §5 "Limits and moves"): after a limit it is woken on its own account

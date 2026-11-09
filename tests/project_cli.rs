@@ -911,6 +911,66 @@ fn up_starts_then_leaves_then_respawns_the_coordinator() {
     assert!(!home.run(&["status", "nope"], "").status.success());
 }
 
+/// A coordinator whose session was removed outside chief can't be respawned: `up` starts a new
+/// one under the same name. A respawn that fails while the session is still listed stays an
+/// error.
+#[test]
+fn up_replaces_a_coordinator_whose_session_was_removed() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    assert!(init(&home, &a, &b).status.success());
+    let name = "chief-payments-latency";
+    let old = agent("c0ffee", "coord-sid", name, "done", Some(74112));
+    home.fake
+        .set(&format!("agents.stdout.{}", next_agents_call(&home)), "[]")
+        .set(
+            "bg.stdout",
+            "backgrounded · c0ffee · chief-payments-latency\n",
+        )
+        .set("agents.stdout", &json!([old]).to_string());
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Listed without a process, and the respawn fails: nothing is replaced.
+    let asleep = agent("c0ffee", "coord-sid", name, "done", None);
+    home.fake
+        .set("agents.stdout", &json!([asleep]).to_string())
+        .set("respawn.exit", "1")
+        .set("respawn.stderr", "No job matching 'c0ffee'\n");
+    let out = home.run(&["up", SLUG], "");
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("No job matching"), "{}", stderr(&out));
+    assert_eq!(home.fake.calls_of("--bg").len(), 1);
+
+    // No longer listed: a new session takes the name.
+    let new = agent("d00d00", "new-sid", name, "done", Some(74200));
+    let k = next_agents_call(&home);
+    for call in k..k + 3 {
+        home.fake.set(&format!("agents.stdout.{call}"), "[]");
+    }
+    home.fake
+        .set(
+            "bg.stdout",
+            "backgrounded · d00d00 · chief-payments-latency\n",
+        )
+        .set("agents.stdout", &json!([new]).to_string());
+    let out = home.run(&["up", SLUG], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("started"), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("no longer exists"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(home.fake.calls_of("--bg").len(), 2);
+    let row = db::get_coordinator(&home.db(), SLUG).unwrap().unwrap();
+    assert_eq!(
+        (row.short_id.as_deref(), row.session_id.as_deref(), row.pid),
+        (Some("d00d00"), Some("new-sid"), Some(74200))
+    );
+}
+
 /// The respawn `chief up` and the pane use rewrites `generated/*` from project.toml first: a
 /// respawned session reads its hooks again.
 #[test]
