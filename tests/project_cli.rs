@@ -159,11 +159,17 @@ fn init_creates_the_project() {
             format!("Edit(/{}/.claude/**)", dir.display()),
             format!("Edit(/{}/settings*.json)", user_claude.display()),
             format!("Edit(/{}/chief.db*)", root.display()),
+            // Nor schedule work in Anthropic's cloud: routines run here.
+            "RemoteTrigger".to_string(),
+            "Skill(schedule)".to_string(),
         ])
     );
     let thread = read_json(&dir.join("generated/thread-settings.json"));
     assert!(thread.get("worktree").is_none());
-    assert!(thread.get("permissions").is_none());
+    assert_eq!(
+        thread["permissions"],
+        json!({"deny": ["RemoteTrigger", "Skill(schedule)"]})
+    );
 
     let conn = home.db();
     assert_eq!(
@@ -1010,7 +1016,7 @@ fn respawn_rewrites_the_generated_files_first() {
         v["hooks"]["PreToolUse"][1]["matcher"],
         "SendMessage|ListAgents|Agent"
     );
-    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 7);
+    assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 9);
 
     // Can't rewrite: no respawn.
     std::fs::remove_dir_all(dir.join("generated")).unwrap();

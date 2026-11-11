@@ -51,6 +51,11 @@ const GUARD_MATCHER: &str = "SendMessage|ListAgents|Agent";
 pub const GUARD_HOOK_TIMEOUT_SECS: u64 = 30;
 /// Permission rule for every tool of the `chief` MCP server.
 const MCP_TOOLS_RULE: &str = "mcp__chief";
+/// Deny rules every chief session gets: Claude Code's own cloud scheduling. `RemoteTrigger`
+/// creates scheduled tasks that run in Anthropic's cloud and `/schedule` is the skill that
+/// drives it; a project's repeating work is a routine, which runs on this machine (§13).
+/// Session-scoped loops (`CronCreate`, `/loop`) are local and stay.
+pub const CLOUD_SCHEDULING_DENY: [&str; 2] = ["RemoteTrigger", "Skill(schedule)"];
 /// The coordinator's events that start its waiting watcher (§5 "Telling the coordinator"): its
 /// process starting, and each of its turns ending.
 const WATCH_EVENTS: [&str; 2] = ["SessionStart", "Stop"];
@@ -62,6 +67,24 @@ const WATCH_PREFIX: &str = "Message from chief (not a hook error):";
 
 pub fn coordinator_settings_path(dir: &Path) -> PathBuf {
     dir.join("generated/coordinator-settings.json")
+}
+
+/// The coordinator's prompt as it was when its session was created. A respawn starts the
+/// session again with the options it was created with (§1), so this is the brief it still
+/// works from, however chief or the project's settings have changed since (§8 "A brief that
+/// went stale").
+pub fn coordinator_prompt_path(dir: &Path) -> PathBuf {
+    dir.join("generated/coordinator-prompt.md")
+}
+
+/// Keeps `prompt` as what the coordinator's new session starts with.
+pub fn save_coordinator_prompt(dir: &Path, prompt: &str) -> Result<()> {
+    let path = coordinator_prompt_path(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    crate::config::replace_file(&path, prompt)
 }
 
 pub fn thread_settings_path(dir: &Path) -> PathBuf {
@@ -167,7 +190,7 @@ pub fn write_all(
 /// it must call (`record_value`, `report_outcome`).
 pub fn run_settings(exe: &Path, slug: &str, env: &[(String, String)]) -> Value {
     let mut settings = hook_settings(exe, slug, Role::Thread, env);
-    settings["permissions"] = json!({"allow": ["mcp__chief"]});
+    settings["permissions"]["allow"] = json!(["mcp__chief"]);
     settings
 }
 
@@ -206,6 +229,11 @@ pub fn coordinator_settings(
     deny: &[String],
 ) -> Value {
     let mut settings = hook_settings(exe, slug, Role::Coordinator, env);
+    let deny: Vec<&str> = deny
+        .iter()
+        .map(String::as_str)
+        .chain(CLOUD_SCHEDULING_DENY)
+        .collect();
     settings["permissions"]["deny"] = json!(deny);
     settings
 }
@@ -302,11 +330,11 @@ pub fn hook_settings(exe: &Path, slug: &str, role: Role, env: &[(String, String)
         }
         hooks.insert(event.to_string(), Value::Array(entries));
     }
-    let mut settings = json!({"hooks": hooks});
+    let mut settings = json!({"hooks": hooks, "permissions": {"deny": CLOUD_SCHEDULING_DENY}});
     if role == Role::Coordinator {
         settings["worktree"] = json!({"bgIsolation": "none"});
         // Nobody watches the coordinator's background session for prompts on its own tools.
-        settings["permissions"] = json!({"allow": [MCP_TOOLS_RULE]});
+        settings["permissions"]["allow"] = json!([MCP_TOOLS_RULE]);
     }
     settings
 }
@@ -457,7 +485,7 @@ mod tests {
             v.get("worktree").is_none(),
             "threads keep worktree isolation"
         );
-        assert!(v.get("permissions").is_none());
+        assert_eq!(v["permissions"], json!({"deny": CLOUD_SCHEDULING_DENY}));
     }
 
     #[test]
@@ -468,7 +496,10 @@ mod tests {
         ];
         let v = hook_settings(Path::new("/bin/chief"), "demo", Role::Coordinator, &env);
         assert_eq!(v["worktree"], json!({"bgIsolation": "none"}));
-        assert_eq!(v["permissions"], json!({"allow": ["mcp__chief"]}));
+        assert_eq!(
+            v["permissions"],
+            json!({"allow": ["mcp__chief"], "deny": CLOUD_SCHEDULING_DENY})
+        );
         assert_eq!(
             v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
             "CHIEF_HOME='/tmp/chief home' CHIEF_NO_NOTIFY=1 /bin/chief hook UserPromptSubmit \
@@ -606,6 +637,8 @@ mod tests {
                 format!("Edit(/{}/.claude/**)", dir_c.display()),
                 format!("Edit(/{}/settings*.json)", account.display()),
                 edit_deny_files(&db_glob),
+                "RemoteTrigger".to_string(),
+                "Skill(schedule)".to_string(),
             ])
         };
         assert_eq!(
@@ -624,10 +657,9 @@ mod tests {
         );
         let dir = dir_c;
         assert_eq!(coord["worktree"], json!({"bgIsolation": "none"}));
-        assert!(
-            read(thread_settings_path(&dir))
-                .get("permissions")
-                .is_none()
+        assert_eq!(
+            read(thread_settings_path(&dir))["permissions"],
+            json!({"deny": CLOUD_SCHEDULING_DENY})
         );
         assert_eq!(
             edit_deny_rule(Path::new("/Users/me/repo")),
@@ -668,8 +700,15 @@ mod tests {
         let thread = hook_settings(exe, "demo", Role::Thread, &[]);
         let run = run_settings(exe, "demo", &[]);
         assert_eq!(run["hooks"], thread["hooks"]);
-        assert_eq!(run["permissions"], json!({"allow": ["mcp__chief"]}));
-        assert!(thread.get("permissions").is_none());
+        // No chief session schedules work in the cloud: routines are local (§13).
+        assert_eq!(
+            run["permissions"],
+            json!({"allow": ["mcp__chief"], "deny": ["RemoteTrigger", "Skill(schedule)"]})
+        );
+        assert_eq!(
+            thread["permissions"],
+            json!({"deny": ["RemoteTrigger", "Skill(schedule)"]})
+        );
 
         let env = vec![("CHIEF_HOME".to_string(), "/h".to_string())];
         let mcp = run_mcp_config(exe, "demo", "check-flights", &env);

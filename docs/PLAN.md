@@ -525,6 +525,31 @@ firing a command every minute, and the board in tmux.
 Not verified live yet: a check's session started by real news; the coordinator writing a
 command and the user approving it from the board; a command under launchd's environment.
 
+## A coordinator that routes (built, 2026-11-11)
+
+Problem (seen live): asked about an earlier conversation, the coordinator spent a turn
+searching other accounts' session transcripts itself. Claude Projects' coordinator is a light
+router (its docs: it "sees what threads report back, not every step they take", and even
+read-only exploration is a thread's); chief's prompt said the same, and nothing kept it so.
+
+1. **Its own looking is kept quick** (ARCHITECTURE §6, `src/lookups.rs`): its Read, Grep and
+   Glob stay inside the project's folders, and a turn gets 6 lookups (searches, web calls,
+   reads outside its own folder) before chief denies the next and says to start a thread.
+   Its memory stays free to read.
+2. **Lookup threads**: the brief routes anything that takes finding out to a thread that
+   changes nothing and reports the answer, on a small model; earlier conversations are found
+   that way and saved to memory. A thread with such a task makes no branch.
+3. **A brief that went stale reaches the coordinator** (§8): `claude respawn` keeps the first
+   start's prompt, so chief keeps that brief and sends the current one at SessionStart when
+   they differ. Without it no prompt change ever reached a running project.
+4. **No cloud scheduling**: every chief session is denied `RemoteTrigger` and `/schedule`;
+   routines are the project's repeating work and run on this machine.
+
+Tested through the hook command (`tests/hook_cli.rs`) and `lookups::`. Not verified live yet:
+the denial's wording steering a real coordinator to a lookup thread; the SessionStart context
+on a real respawn; that `Skill(schedule)` in `permissions.deny` stops the skill (from Claude
+Code's docs).
+
 ## Review, 2026-11-09: what would make chief better
 
 From a read-only pass over the docs and code. Not built; ranked by value.

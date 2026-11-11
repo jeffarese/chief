@@ -17,6 +17,7 @@ pub mod guard;
 pub mod hook;
 pub mod launcher;
 pub mod layout;
+pub mod lookups;
 pub mod mcp;
 pub mod moves;
 pub mod mux;

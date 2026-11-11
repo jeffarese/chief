@@ -1,6 +1,7 @@
 //! `chief hook` as Claude Code runs it: payload on stdin, exit 0, errors logged; stdout only for
-//! the guard's decision, the coordinator's context, the denial of a subagent's background command
-//! and the Stop decision that asks a thread for its final report. The coordinator's background
+//! the guard's decision, the coordinator's context (and its brief when that went stale), the
+//! denial of a coordinator's look too far or too many, the denial of a subagent's background
+//! command and the Stop decision that asks a thread for its final report. The coordinator's background
 //! watcher is the one exception: it exits 2, with its notice on stderr, to wake the coordinator.
 
 mod common;
@@ -1222,4 +1223,198 @@ fn a_thread_that_stopped_early_is_asked_for_its_final_report() {
         assert_silent_success(&stop(true));
     }
     assert_eq!(error_log(home.path()), "");
+}
+
+fn coordinator_hook(home: &Home, event: &str, payload: &Value) -> Output {
+    home.run(
+        &["hook", event, "--project", "demo", "--role", "coordinator"],
+        &payload.to_string(),
+    )
+}
+
+/// The coordinator routes work and answers quick questions (§6 "The coordinator's own
+/// looking"): it looks only in the project's folders, and a turn gets only so many lookups
+/// before the rest is a thread's.
+#[test]
+fn the_coordinator_looks_only_so_far_and_so_much() {
+    use chief::config::{ProjectConfig, Repo};
+    let home = guarded_home();
+    let dir = home.path().join("projects/demo");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(dir.join("memory")).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    let config = ProjectConfig::new(
+        "Demo",
+        "demo",
+        None,
+        vec![Repo {
+            name: "repo".into(),
+            path: repo.clone(),
+        }],
+    );
+    config.save(&dir.join("project.toml")).unwrap();
+    let call = |role: &str, sid: &str, tool: &str, input: Value| {
+        home.run(
+            &["hook", "PreToolUse", "--project", "demo", "--role", role],
+            &serde_json::json!({
+                "session_id": sid,
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": input,
+                "cwd": dir,
+            })
+            .to_string(),
+        )
+    };
+    let look =
+        |tool: &str, input: Value| deny_reason(&call("coordinator", "coord-sid", tool, input));
+    let glob = || {
+        look(
+            "Glob",
+            serde_json::json!({"pattern": "**/*.rs", "path": repo}),
+        )
+    };
+
+    // Its own memory is free, as often as it likes; other tools are none of this.
+    for _ in 0..10 {
+        assert_eq!(
+            look("Read", serde_json::json!({"file_path": "memory/MEMORY.md"})),
+            None
+        );
+    }
+    assert_eq!(
+        look("Edit", serde_json::json!({"file_path": "memory/x.md"})),
+        None
+    );
+    // A handful of lookups in the repository, then the rest is a thread's.
+    for n in 1..=chief::lookups::PER_TURN {
+        assert_eq!(glob(), None, "lookup {n}");
+    }
+    let why = glob().expect("one lookup too many");
+    assert!(why.contains("start a thread"), "{why}");
+    assert!(
+        look("WebSearch", serde_json::json!({"query": "fares"})).is_some(),
+        "the web counts too"
+    );
+    assert_eq!(
+        look("Read", serde_json::json!({"file_path": "memory/MEMORY.md"})),
+        None
+    );
+
+    // The user's next message starts a new turn. Nothing outside the project is looked at,
+    // other sessions' transcripts included.
+    let prompt = serde_json::json!({
+        "session_id": "coord-sid",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "it was in an earlier conversation",
+        "cwd": dir,
+    });
+    assert!(
+        coordinator_hook(&home, "UserPromptSubmit", &prompt)
+            .status
+            .success()
+    );
+    assert_eq!(glob(), None);
+    let transcripts = home.path().join("claude/projects");
+    let why = look(
+        "Grep",
+        serde_json::json!({"pattern": "routine", "path": transcripts}),
+    )
+    .expect("outside the project");
+    assert!(why.contains("outside this project's folders"), "{why}");
+    assert!(why.contains("start a thread"), "{why}");
+
+    // A thread looks where and as much as its work needs.
+    for _ in 0..10 {
+        let out = call(
+            "thread",
+            "a-sid",
+            "Grep",
+            serde_json::json!({"pattern": "x", "path": "/"}),
+        );
+        assert_eq!(deny_reason(&out), None);
+    }
+    assert!(
+        error_log(home.path()).is_empty(),
+        "{}",
+        error_log(home.path())
+    );
+}
+
+/// `claude respawn` starts the coordinator again with the brief of its first start, so a
+/// brief that changed since is sent again when its process starts (§8 "A brief that went
+/// stale").
+#[test]
+fn a_coordinator_with_a_stale_brief_gets_the_new_one() {
+    use chief::config::ProjectConfig;
+    let home = guarded_home();
+    let dir = home.path().join("projects/demo");
+    std::fs::create_dir_all(dir.join("generated")).unwrap();
+    let mut config = ProjectConfig::new("Demo", "demo", Some("Ship it"), vec![]);
+    config.save(&dir.join("project.toml")).unwrap();
+    let start = |source: &str| {
+        coordinator_hook(
+            &home,
+            "SessionStart",
+            &serde_json::json!({
+                "session_id": "coord-sid",
+                "hook_event_name": "SessionStart",
+                "source": source,
+                "cwd": dir,
+            }),
+        )
+    };
+    let brief = |out: &Output| -> Option<String> {
+        assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+        if out.stdout.is_empty() {
+            return None;
+        }
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        Some(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    // A session from before chief kept its first brief: it may be anything, so it is sent.
+    let sent = brief(&start("resume")).expect("the brief");
+    assert!(sent.starts_with("chief was updated"), "{sent}");
+    assert!(sent.contains("You are the coordinator of the chief project \"Demo\". Goal: Ship it"));
+    assert!(sent.contains("start a lookup thread"), "{sent}");
+
+    // The brief it was created with is the one it has: nothing to say.
+    let first = chief::prompts::coordinator(&config, &dir, "");
+    chief::generated::save_coordinator_prompt(&dir, &first).unwrap();
+    assert_eq!(brief(&start("resume")), None);
+    assert_eq!(brief(&start("startup")), None);
+
+    // The project changed since: sent again at every start of its process, and after a
+    // compaction dropped it.
+    config.goal = Some("Ship it by Friday".into());
+    config.save(&dir.join("project.toml")).unwrap();
+    for source in ["resume", "compact"] {
+        let sent = brief(&start(source)).expect("the new brief");
+        assert!(sent.contains("Goal: Ship it by Friday"), "{source}: {sent}");
+    }
+    // A thread's start says nothing.
+    let out = home.run(
+        &[
+            "hook",
+            "SessionStart",
+            "--project",
+            "demo",
+            "--role",
+            "thread",
+        ],
+        &serde_json::json!({
+            "session_id": "a-sid",
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "cwd": dir,
+        })
+        .to_string(),
+    );
+    assert!(out.status.success() && out.stdout.is_empty(), "{out:?}");
 }

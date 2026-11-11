@@ -667,6 +667,10 @@ pub fn ensure_coordinator(
         append_system_prompt: prompts::coordinator(config, dir, &prompts::read_instructions(dir)),
         prompt: None,
     };
+    // What this session starts with, so a later start can tell when it went stale (§8).
+    if let Err(e) = generated::save_coordinator_prompt(dir, &spec.append_system_prompt) {
+        warn(format!("warning: {e:#}"));
+    }
     let (short_id, agent) = match claude.spawn_bg(&spec) {
         Ok(short_id) => {
             let resolved = claude.resolve_session(&short_id, RESOLVE_TIMEOUT);

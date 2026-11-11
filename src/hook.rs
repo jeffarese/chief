@@ -14,7 +14,7 @@ use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::state::{HookKind, Role};
 use crate::text::{local_hhmm, one_line};
-use crate::{accounts, context, guard, names, paths, registry, tools};
+use crate::{accounts, context, generated, guard, names, paths, prompts, registry, tools};
 
 /// The guard holds up a tool call and the context a turn; neither may hang on the supervisor.
 pub const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -198,10 +198,58 @@ fn dispatch(event: &str, project: &str, role: Role, input: &str) -> Result<Optio
     {
         return Ok(Some(guard::deny_json(SUBAGENT_BACKGROUND_REASON)));
     }
+    // The coordinator routes; what takes looking is a thread's (§6 "The coordinator's own
+    // looking"). Its subagents' calls are its own.
+    if role == Role::Coordinator
+        && event == "PreToolUse"
+        && crate::lookups::is_lookup(&payload)
+        && let Some(session) = outcome.session.as_deref()
+        && let Some(config) = project_config(project)
+    {
+        let rows = db::list_sessions(&conn, project, None)?;
+        let roots = crate::lookups::roots(&config, &rows);
+        let own = paths::project_dir(project);
+        if let Some(why) = crate::lookups::refusal(&conn, session, &payload, &own, &roots)? {
+            return Ok(Some(guard::deny_json(&why)));
+        }
+    }
     if role == Role::Coordinator && event == "UserPromptSubmit" {
         return coordinator_context(&conn, project).map(Some);
     }
+    if role == Role::Coordinator && event == "SessionStart" {
+        return Ok(stale_brief(
+            &paths::project_dir(project),
+            project_config(project).as_ref(),
+        ));
+    }
     Ok(None)
+}
+
+/// What comes before the coordinator's brief when it is sent again.
+const STALE_BRIEF_NOTE: &str = "chief was updated, or this project's settings or instructions \
+    changed, since this conversation began. Below is your brief as it reads now. It replaces \
+    the one you started with: where they differ, follow this one, and trust your tools' own \
+    descriptions over what you remember of them.";
+
+/// The coordinator's brief as it reads now, as SessionStart context, when it isn't the one
+/// its session was created with (§8 "A brief that went stale"): `claude respawn` keeps the
+/// options of the first start, so without this a coordinator never hears of a new chief. A
+/// session from before chief kept its first brief counts as stale. None when it is current.
+pub fn stale_brief(dir: &Path, config: Option<&ProjectConfig>) -> Option<String> {
+    let now = prompts::coordinator(config?, dir, &prompts::read_instructions(dir));
+    let first = std::fs::read_to_string(generated::coordinator_prompt_path(dir)).ok();
+    if first.as_deref() == Some(now.as_str()) {
+        return None;
+    }
+    Some(
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": format!("{STALE_BRIEF_NOTE}\n\n{now}"),
+            }
+        })
+        .to_string(),
+    )
 }
 
 /// §4 "Matching a hook to a session": after `/clear` a session runs under a new session id,

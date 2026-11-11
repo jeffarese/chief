@@ -50,7 +50,9 @@ The same from a script: `chief init "Payments latency" --goal "…" --repo ~/wor
 then `chief up payments-latency`.
 
 Then just talk: ask questions, hand over tasks, send follow-ups. The coordinator answers quick
-questions itself, starts a thread per piece of work, sends follow-ups to the thread that owns the
+questions itself and hands anything that takes finding out to a lookup thread, so it stays free
+to talk: chief keeps its own looking to the project's folders and to a handful of searches a
+turn. It starts a thread per piece of work, sends follow-ups to the thread that owns the
 work (waking it first if it's asleep), and posts a short update when a thread finishes. A thread that ends its turn while its subagents or background commands still run isn't
 finished: the board keeps it in Working and shows what runs (`1 subagent`), and the coordinator
 hears from it once they finish.
@@ -198,6 +200,9 @@ chief routine show api staging-health      # how it stands, its last runs and ou
   starts it for a project with routines; `chief serve install` keeps it running across logins
   (macOS), so an 8am routine runs with no terminal open. A routine that came due while it was
   down runs once when it is back.
+- **Everything runs on your machine.** Sessions are local Claude Code sessions and commands
+  are local processes. chief's sessions can't use Claude Code's own cloud scheduling
+  (`/schedule`, remote triggers): it is denied in their settings.
 
 **Push.** To hear about what needs you away from the machine, give the project a command in
 `project.toml`. chief runs it with the message in `CHIEF_TITLE`, `CHIEF_BODY`, `CHIEF_KIND`

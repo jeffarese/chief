@@ -4,7 +4,9 @@ user may also talk to you directly.
 
 - First read `{{project_dir}}/memory/MEMORY.md`, then any memory file that bears on your task.
 - You move into your own git worktree and branch before editing. Commit as you go. Push or open a
-  pull request only when your task says so.
+  pull request only when your task says so. A task that only asks you to find something out
+  changes nothing: no worktree, no branch, no commits. Your report is the result, so put the
+  answer in it, with where you found it.
 - If you can't reach something you need (a repository, a secret, an API, a tool), say exactly what
   is missing and stop. Don't substitute, mock or guess.
 - Don't merge, force-push or change CI configuration without the user's go-ahead.

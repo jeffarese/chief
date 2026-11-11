@@ -238,7 +238,9 @@ coordinator's tools work the same with it stopped. One binary:
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision, the coordinator's
-UserPromptSubmit context, the two outputs of §5 "Background work" (the PreToolUse denial of a
+UserPromptSubmit context, its brief at SessionStart when that went stale (§8 "A brief that
+went stale"), the PreToolUse denial of a coordinator's look outside the project or past its
+turn's count (§6 "The coordinator's own looking"), the two outputs of §5 "Background work" (the PreToolUse denial of a
 subagent's background command and the Stop decision that asks a thread for its final report), and
 the Stop decision that asks a routine's run for its outcome (§13 "What a run leaves"). The
 one exception is `chief hook watch`: it runs in the background, so it may take as long as it
@@ -356,6 +358,7 @@ An empty variable counts as unset (made absolute, it would be the current folder
   instructions.md       standing brief sent to the coordinator and every new thread
   memory/MEMORY.md      memory index; other memory files beside it
   generated/coordinator-settings.json
+  generated/coordinator-prompt.md    the brief the coordinator's session was created with (§8 "A brief that went stale")
   generated/thread-settings.json
   generated/run-settings.json        a routine run's: a thread's hooks, and `mcp__chief` allowed (§13)
   generated/mcp.json
@@ -466,7 +469,12 @@ in every agp pool account but the project's own (§7 "Thread account").
   and Stop entries have a second command, its watcher (§5 "Telling the coordinator"):
   `{"command": "<chief> hook watch --project <slug> --role coordinator", "asyncRewake": true,
   "timeout": 86400, "rewakeSummary": "chief: a thread is waiting on you", "rewakeMessage":
-  "Message from chief (not a hook error):"}` (§1). The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
+  "Message from chief (not a hook error):"}` (§1). Every file has `"permissions": {"deny":
+  ["RemoteTrigger", "Skill(schedule)"]}` (`generated::CLOUD_SCHEDULING_DENY`): Claude Code's
+  `RemoteTrigger` tool creates scheduled tasks that run in Anthropic's cloud, and `/schedule`
+  is the skill that drives it (Claude Code's docs; not tried live). A project's repeating work
+  is a routine, which runs on this machine (§13), so no chief session may schedule it
+  elsewhere. Session-scoped loops (`CronCreate`, `/loop`) are local and stay. The coordinator's file adds `"worktree": {"bgIsolation": "none"}` and `"permissions"`:
   `"allow": ["mcp__chief"]` (nobody watches its background session for prompts on its own tools)
   and `"deny"`: `Edit(//<repo path>/**)` for every repo, `Edit(//<root>/projects/*/generated/**)`,
   `Edit(//<root>/projects/*/project.toml)`, `Edit(//<dir>/.claude/**)` (its cwd's project
@@ -1264,6 +1272,37 @@ closed), logs the error, and records the denial if the DB opens, with what the p
 tool, the target and the caller (by `session_id`, when its row can be read); a payload that
 doesn't parse, or has no `tool_name`, is recorded as tool `unknown` with no target.
 
+### The coordinator's own looking (`src/lookups.rs`)
+
+The coordinator routes work and answers quick questions; what takes finding out is a thread's
+(§8). It has Read, Grep and Glob, and web tools, and nothing in Claude Code keeps a "quick
+look" quick, so its PreToolUse hook does (`hook::dispatch`, for `--role coordinator`; its
+subagents' calls are its own). Unlike the message guard this is a rule of the house, not a
+safety check: it fails open (an error is logged and the call goes on), and it records no
+denial.
+
+- **Where.** A Read, Grep or Glob is weighed by where it looks (`lookups::classify`): Read's
+  `file_path`; Grep's and Glob's `path`, else the session's folder; for a Glob whose pattern
+  is an absolute path, the folders before its first wildcard. `~` is the home folder, a
+  relative path starts at the payload's `cwd`, `..` is resolved, and a path that exists is
+  taken where it really is, so a link inside a repository that leads out is out. Inside the
+  coordinator's own folder (`<dir>`): a Read is free, always. Inside the project's other
+  folders (`lookups::roots`: its repositories, and every folder one of its sessions works in,
+  a thread's worktree included), or what Claude Code keeps for this session and sends it to
+  read (`lookups::claude_files`, from the payload's `transcript_path`: the folder beside its
+  own transcript, where a long tool result goes; its folder's auto memory; the account's
+  `skills/` and `plugins/`): allowed, and counted. Anywhere else: denied, with the path
+  and what to do instead (start a thread that names the path, changes nothing and reports
+  what it finds, with a small model and low effort; tell the user it is looking). Other
+  sessions' transcripts are anywhere else.
+- **How much.** A turn gets `lookups::PER_TURN` (6) lookups: every Grep, Glob, WebSearch and
+  WebFetch, and every Read outside its own folder. The count is read from the session's
+  recorded PreToolUse events (`lookups::made`, by their summaries, §4) since its last
+  UserPromptSubmit or Stop; the call being weighed is among them, and so is one that was
+  denied. One past the count is denied: answer with what you have, or start a thread for it.
+  The next turn starts at none.
+- Threads are not limited: looking is their work.
+
 ## 7. Coordinator MCP tools (`chief mcp --project <slug>`)
 
 All tools return JSON text content. Errors are tool errors with a plain message.
@@ -1471,8 +1510,16 @@ at the reset, never moved.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)
 
-- `coordinator.md`: role (route, never do the work), its tools (§7: read the repos, edit only
-  memory and instructions, no shell), routing rules (quick question → answer;
+- `coordinator.md`: role (route, never do the work), its tools (§7: a quick look in its own
+  folder and the repositories, which chief keeps quick, §6 "The coordinator's own looking";
+  edit only memory and instructions, no shell), routing rules (quick question, from the board,
+  the reports, memory or one or two reads → answer; a question that takes finding out → a
+  lookup thread, never itself and never a subagent of its own, since the user can't talk to it
+  while it looks and what it reads fills the conversation: the task says what to find and
+  where, that it changes nothing and that its report is the answer, with `haiku` or `sonnet`
+  at `low`; it answers from the report, saves what is worth keeping to memory and resolves the
+  thread without asking; what was said before → memory first, else a lookup thread over
+  Claude Code's transcripts, which saves what it finds to memory;
   new work → `start_thread`, with `account` only when the user names one; follow-up →
   `SendMessage` to the matching thread with `notify_when_idle`, waking it first if asleep, at its
   exact address with no `[ref]` (its name, or the `uds:…` address of a thread in another account,
@@ -1495,7 +1542,9 @@ at the reset, never moved.
   (the limit, when it resets, what happens next), offer `move_thread` when the pool may have room,
   and message a thread agp doesn't resume after the reset. `move_thread` only when the user asks,
   or for such a thread (agp moves limited threads itself). A "Routines" section: work the user
-  wants repeated becomes a routine (`create_routine`), not a thread; a routine is a prompt
+  wants repeated becomes a routine (`create_routine`), not a thread; routines run on this
+  machine, and Claude Code's own scheduling (the `schedule` skill, remote triggers) is never
+  used for it, being cloud and blocked (§3); a routine is a prompt
   (judgement each run), a command (whatever a script can decide: no session, as often as every
   minute, exit 0 means well) or both (a check that gets a session only for news), chosen by
   what the work needs; a command the coordinator writes or changes waits for the user's
@@ -1513,7 +1562,8 @@ at the reset, never moved.
   `sonnet` at `low` for a lookup, no more often than the thing changes); `read_routine` answers a
   question about something followed without starting anything; it may edit a routine's notes.
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
-  instructions follow; work on your own branch; of other sessions message only the coordinator,
+  instructions follow; work on your own branch, except for a task that only asks to find
+  something out, which changes nothing and whose report is the answer; of other sessions message only the coordinator,
   by its exact name (the report needs no message), or, for a thread spawned in another account
   than the coordinator's (§3), reply only to the `from="uds:…"` address of the coordinator's
   message; you can message your own subagents by the name or agent id the Agent tool gave them,
@@ -1550,6 +1600,27 @@ The whole context stays under 8 KB: previews shrink first (200, 100, 40, none), 
 with a marker, then the board itself. The memory marker (36 bytes) takes the place of `(empty)`
 (7 bytes), so it is used only when the cut context fits; a board that leaves less room than that
 is cut instead, and memory is left out.
+
+### A brief that went stale
+
+`claude respawn` starts a session again with the options of its first start (§1), the
+coordinator's `--append-system-prompt` among them. So a coordinator keeps the brief it was
+created with for as long as its conversation lives: a new chief, a new goal or new
+instructions never reach it that way. Its tools do, since its MCP server starts with its
+process.
+
+- When chief creates a coordinator's session it keeps the brief it gave it in
+  `<dir>/generated/coordinator-prompt.md` (`generated::save_coordinator_prompt`; a respawn
+  doesn't touch it, and the coordinator can't edit `generated/`).
+- At every SessionStart of the coordinator (`hook::stale_brief`: `startup`, `resume`, `clear`,
+  and `compact`, which may have dropped it) chief renders the brief as it reads now. When it
+  isn't the kept one, or none was kept (a session from before this), the hook prints
+  `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": …}}`: a
+  note that chief or the project changed since the conversation began and that what follows
+  replaces the brief it started with, where they differ, then the whole brief. A current
+  brief prints nothing.
+- It is sent again at each start for as long as it differs: the cost is one brief per
+  process start, and a compaction can't lose it for good.
 
 ## 9. Layout (`chief up`: Rex, tmux, chief's own, or the user's own)
 
@@ -2249,6 +2320,11 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
   time and a lost run), and `tests/serve_cli.rs` with the binary (the server running a due
   command detached, the command speaking through `chief routine value` and `outcome`, the
   dashboard's state, Run now and Approve, `chief routine run` and `show`).
+- The coordinator's own looking and its brief: `lookups::` (what is free, counted and outside,
+  a link that leads out, the count per turn) and `tests/hook_cli.rs` through the hook command
+  (memory read freely, a handful of lookups then a denial, a new turn starting over, nothing
+  outside the project, threads unlimited; a stale brief sent at SessionStart and after a
+  compaction, a current one not, a thread's start silent).
 - A run's side: `tests/routines.rs` (the notes folder and brief, values joining one series, the
   outcome and what it pushes, the Stop hook's request, who is woken, the workspace of a project
   without repositories), `tests/mcp_cli.rs` (`chief mcp --routine` serves the two run tools over
@@ -2572,6 +2648,9 @@ A command's run is a `routine_runs` row (§4) and a process, never a session:
   printed. A run whose process is gone without a word (the machine restarted) is `lost` the
   next time the routine is looked at; it says nothing about the command. The 200 latest runs
   of a routine are kept.
+- **Where it runs.** On this machine, as every routine does: `chief serve` fires it and the
+  process is its child. Nothing of a routine runs in Anthropic's cloud, and chief sessions
+  are denied Claude Code's own cloud scheduling (§3, `CLOUD_SCHEDULING_DENY`).
 - **What it says.** Nothing is required: the exit status is the verdict. A command that knows
   more says it with two commands it finds on its `PATH`, which are a session's two run tools:
   `chief routine value <series> <number> [--unit U] [--note N]` (`record_value`) and `chief
