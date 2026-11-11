@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod agp;
 pub mod board;
+pub mod brief;
 pub mod builtin;
 pub mod claude;
 pub mod cleanup;

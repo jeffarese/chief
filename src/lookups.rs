@@ -65,7 +65,7 @@ fn spellings(path: &Path) -> Vec<PathBuf> {
 
 /// The absolute path of `text`, which a tool input gave: `~` is the home folder and a relative
 /// path starts at `cwd`.
-fn absolute(text: &str, cwd: &Path) -> PathBuf {
+pub(crate) fn absolute(text: &str, cwd: &Path) -> PathBuf {
     let path = match text.strip_prefix("~/") {
         Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
         None if text == "~" => dirs::home_dir().unwrap_or_default(),

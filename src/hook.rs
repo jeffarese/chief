@@ -14,7 +14,7 @@ use crate::config::ProjectConfig;
 use crate::db::{self, SessionRow};
 use crate::state::{HookKind, Role};
 use crate::text::{local_hhmm, one_line};
-use crate::{accounts, context, generated, guard, names, paths, prompts, registry, tools};
+use crate::{accounts, context, guard, names, paths, registry, tools};
 
 /// The guard holds up a tool call and the context a turn; neither may hang on the supervisor.
 pub const GUARD_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -216,40 +216,47 @@ fn dispatch(event: &str, project: &str, role: Role, input: &str) -> Result<Optio
     if role == Role::Coordinator && event == "UserPromptSubmit" {
         return coordinator_context(&conn, project).map(Some);
     }
-    if role == Role::Coordinator && event == "SessionStart" {
-        return Ok(stale_brief(
-            &paths::project_dir(project),
-            project_config(project).as_ref(),
-        ));
+    if role == Role::Coordinator {
+        return Ok(keep_current(event, project, &payload));
     }
     Ok(None)
 }
 
-/// What comes before the coordinator's brief when it is sent again.
-const STALE_BRIEF_NOTE: &str = "chief was updated, or this project's settings or instructions \
-    changed, since this conversation began. Below is your brief as it reads now. It replaces \
-    the one you started with: where they differ, follow this one, and trust your tools' own \
-    descriptions over what you remember of them.";
-
-/// The coordinator's brief as it reads now, as SessionStart context, when it isn't the one
-/// its session was created with (§8 "A brief that went stale"): `claude respawn` keeps the
-/// options of the first start, so without this a coordinator never hears of a new chief. A
-/// session from before chief kept its first brief counts as stale. None when it is current.
-pub fn stale_brief(dir: &Path, config: Option<&ProjectConfig>) -> Option<String> {
-    let now = prompts::coordinator(config?, dir, &prompts::read_instructions(dir));
-    let first = std::fs::read_to_string(generated::coordinator_prompt_path(dir)).ok();
-    if first.as_deref() == Some(now.as_str()) {
-        return None;
-    }
-    Some(
-        json!({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": format!("{STALE_BRIEF_NOTE}\n\n{now}"),
+/// Keeps a running coordinator's brief current (§8 "A brief that went stale"): what its own
+/// events say about the brief in its context, and at SessionStart the line that tells it to
+/// read the one chief would give it now.
+fn keep_current(event: &str, project: &str, payload: &Value) -> Option<String> {
+    let field = |k: &str| payload.get(k).and_then(Value::as_str);
+    let dir = paths::project_dir(project);
+    match event {
+        // A subagent's reading isn't the coordinator's.
+        "PostToolUse" if field("agent_id").is_none_or(str::is_empty) => {
+            crate::brief::note_read(&dir, payload);
+            None
+        }
+        // `/clear` empties the context; its SessionStart follows.
+        "SessionEnd" if field("reason") == Some("clear") => {
+            crate::brief::forget_read(&dir);
+            None
+        }
+        "SessionStart" => {
+            // A resumed process still has what it read; anything else starts empty.
+            if field("source") != Some("resume") {
+                crate::brief::forget_read(&dir);
             }
-        })
-        .to_string(),
-    )
+            let notice = crate::brief::notice(&dir, project_config(project).as_ref())?;
+            Some(
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": notice,
+                    }
+                })
+                .to_string(),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// §4 "Matching a hook to a session": after `/clear` a session runs under a new session id,
@@ -848,7 +855,19 @@ fn coordinator_context(conn: &Connection, project: &str) -> Result<String> {
     tools::board_order(&mut threads);
     let memory = std::fs::read_to_string(paths::project_dir(project).join("memory/MEMORY.md"))
         .unwrap_or_default();
-    let text = context::coordinator_context(&threads, &memory, &local_hhmm(db::now_ms()));
+    let mut text = context::coordinator_context(&threads, &memory, &local_hhmm(db::now_ms()));
+    // What a running coordinator must hear until it has acted on it (§8 "A brief that went
+    // stale"): short lines, so the whole stays under what Claude Code lets a hook add.
+    let notices = [
+        crate::brief::notice(
+            &paths::project_dir(project),
+            project_config(project).as_ref(),
+        ),
+        crate::brief::stale_tools(conn, project, crate::brief::installed_ms())?,
+    ];
+    for notice in notices.into_iter().flatten().rev() {
+        text = format!("{notice}\n{text}");
+    }
     Ok(context::hook_output(&text))
 }
 

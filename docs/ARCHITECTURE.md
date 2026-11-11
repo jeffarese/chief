@@ -238,8 +238,8 @@ coordinator's tools work the same with it stopped. One binary:
 
 Hook commands must be fast, must never block a session, and must exit 0. Failures go to
 `<root>/logs/hook-errors.log`. The only non-empty stdout is the guard decision, the coordinator's
-UserPromptSubmit context, its brief at SessionStart when that went stale (§8 "A brief that
-went stale"), the PreToolUse denial of a coordinator's look outside the project or past its
+UserPromptSubmit context, the notice at its SessionStart to read a brief that went stale (§8
+"A brief that went stale"), the PreToolUse denial of a coordinator's look outside the project or past its
 turn's count (§6 "The coordinator's own looking"), the two outputs of §5 "Background work" (the PreToolUse denial of a
 subagent's background command and the Stop decision that asks a thread for its final report), and
 the Stop decision that asks a routine's run for its outcome (§13 "What a run leaves"). The
@@ -359,6 +359,8 @@ An empty variable counts as unset (made absolute, it would be the current folder
   memory/MEMORY.md      memory index; other memory files beside it
   generated/coordinator-settings.json
   generated/coordinator-prompt.md    the brief the coordinator's session was created with (§8 "A brief that went stale")
+  generated/coordinator-brief.md     its brief as it reads now, written when that one went stale, for it to read
+  generated/coordinator-brief.read   what it last read of it, while that is still in its context
   generated/thread-settings.json
   generated/run-settings.json        a routine run's: a thread's hooks, and `mcp__chief` allowed (§13)
   generated/mcp.json
@@ -1608,21 +1610,35 @@ is cut instead, and memory is left out.
 `claude respawn` starts a session again with the options of its first start (§1), the
 coordinator's `--append-system-prompt` among them. So a coordinator keeps the brief it was
 created with for as long as its conversation lives: a new chief, a new goal or new
-instructions never reach it that way. Its tools do, since its MCP server starts with its
-process.
+instructions never reach it that way. Its tools change only when its process restarts,
+since its MCP server starts with it (`src/brief.rs`).
 
 - When chief creates a coordinator's session it keeps the brief it gave it in
   `<dir>/generated/coordinator-prompt.md` (`generated::save_coordinator_prompt`; a respawn
   doesn't touch it, and the coordinator can't edit `generated/`).
-- At every SessionStart of the coordinator (`hook::stale_brief`: `startup`, `resume`, `clear`,
-  and `compact`, which may have dropped it) chief renders the brief as it reads now. When it
-  isn't the kept one, or none was kept (a session from before this), the hook prints
-  `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": …}}`: a
-  note that chief or the project changed since the conversation began and that what follows
-  replaces the brief it started with, where they differ, then the whole brief. A current
-  brief prints nothing.
-- It is sent again at each start for as long as it differs: the cost is one brief per
-  process start, and a compaction can't lose it for good.
+- A hook can't carry the brief: Claude Code cuts what a hook adds to a session's context at
+  about 10,000 characters and leaves a preview with a file path, and a brief with the
+  project's instructions is longer (seen live: the coordinator opened that file one time and
+  not the next). So chief writes the brief as it reads now to
+  `<dir>/generated/coordinator-brief.md` and says to read it (`brief::notice`): `<chief-brief>`,
+  that the brief in its system prompt is out of date, to read that file in full before
+  anything else and before answering the user, and that it replaces the one it started with.
+  Under 1,000 characters.
+- The notice is due while the brief chief would give now is neither the one the session was
+  created with nor the one it last read. It is said at the coordinator's SessionStart
+  (`hook::keep_current`) and before the board in every UserPromptSubmit context, until the
+  coordinator reads the file: the PostToolUse of that Read (its own, not a subagent's) keeps
+  a copy of what it read in `generated/coordinator-brief.read` (`brief::note_read`). What
+  empties its context forgets the reading (`brief::forget_read`): a SessionStart that isn't a
+  `resume`, and a SessionEnd whose reason is `clear`. A session created with the current
+  brief is never told.
+- **Old tools.** A coordinator's `chief mcp` is the chief that was installed when its process
+  started, and `/clear` keeps the process. When the chief binary is newer than the
+  coordinator's last SessionStart with source `startup` or `resume` (`brief::stale_tools`,
+  from the events, §4, and the binary's modification time), every UserPromptSubmit context
+  starts with `<chief-update>`: that its tools are the old version, and to tell the user once
+  that `chief down <slug> && chief up <slug>` restarts it with the new ones and keeps the
+  conversation.
 
 ## 9. Layout (`chief up`: Rex, tmux, chief's own, or the user's own)
 
@@ -2325,8 +2341,9 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
 - The coordinator's own looking and its brief: `lookups::` (what is free, counted and outside,
   a link that leads out, the count per turn) and `tests/hook_cli.rs` through the hook command
   (memory read freely, a handful of lookups then a denial, a new turn starting over, nothing
-  outside the project, threads unlimited; a stale brief sent at SessionStart and after a
-  compaction, a current one not, a thread's start silent).
+  outside the project, threads unlimited; a stale brief's notice at SessionStart and with
+  every prompt until the brief is read, again after `/clear` and a compaction, none for a
+  current one; the old-tools line; a thread's start silent) and `brief::`.
 - A run's side: `tests/routines.rs` (the notes folder and brief, values joining one series, the
   outcome and what it pushes, the Stop hook's request, who is woken, the workspace of a project
   without repositories), `tests/mcp_cli.rs` (`chief mcp --routine` serves the two run tools over

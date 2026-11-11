@@ -539,16 +539,27 @@ read-only exploration is a thread's); chief's prompt said the same, and nothing 
 2. **Lookup threads**: the brief routes anything that takes finding out to a thread that
    changes nothing and reports the answer, on a small model; earlier conversations are found
    that way and saved to memory. A thread with such a task makes no branch.
-3. **A brief that went stale reaches the coordinator** (§8): `claude respawn` keeps the first
-   start's prompt, so chief keeps that brief and sends the current one at SessionStart when
-   they differ. Without it no prompt change ever reached a running project.
+3. **A brief that went stale reaches the coordinator** (§8, `src/brief.rs`): `claude respawn`
+   keeps the first start's prompt, so without this no prompt change ever reached a running
+   project. Sending the brief through a hook didn't work live: Claude Code cuts a hook's
+   context at about 10,000 characters and the brief with instructions is about 17,000, so
+   the coordinator got a preview and read the rest only sometimes. chief now writes the brief
+   to a file and tells the coordinator to read it, at SessionStart and with every prompt
+   until it has. It also says when the coordinator's tools are older than the installed
+   chief (`/clear` keeps the process) and what restarts it.
 4. **No cloud scheduling**: every chief session is denied `RemoteTrigger` and `/schedule`;
    routines are the project's repeating work and run on this machine.
 
-Tested through the hook command (`tests/hook_cli.rs`) and `lookups::`. Not verified live yet:
-the denial's wording steering a real coordinator to a lookup thread; the SessionStart context
-on a real respawn; that `Skill(schedule)` in `permissions.deny` stops the skill (from Claude
-Code's docs).
+Tested through the hook command (`tests/hook_cli.rs`), `lookups::` and `brief::`. Seen live
+on 2026-11-11: the coordinator kept to a few lookups and answered in place. Not verified live
+yet: the read-this notice making a real coordinator read its brief; a lookup thread started
+for an earlier conversation; the denials' wording; that `Skill(schedule)` in
+`permissions.deny` stops the skill (from Claude Code's docs).
+
+Open: the brief is long for a router (13,600 characters, about 17,000 with a project's
+instructions). It is cached, so it costs little per turn, but at low effort a long brief is
+skimmed. Cut it to the routing rules and move what most turns don't need (accounts and
+moves, limits, routines) to where it is used: tool descriptions, or files read on demand.
 
 ## Review, 2026-11-09: what would make chief better
 

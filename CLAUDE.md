@@ -9,7 +9,7 @@ the milestones.
 - `docs/ARCHITECTURE.md` wins over code. If the code must differ, update the doc in the same commit.
 - Hook commands (`chief hook …`) must never block or fail a Claude session: exit 0, keep stdout empty
   except the guard decision, the coordinator's context (each turn's board and memory, and at
-  SessionStart its brief when that went stale, §8), the denial of a coordinator's look outside
+  SessionStart the notice to read its brief when that went stale, §8), the denial of a coordinator's look outside
   the project or past its turn's count (§6), the two background-work outputs
   (ARCHITECTURE §5): the denial of a subagent's background command and the Stop decision that asks
   a thread for its final report, and the Stop decision that asks a routine's run for its outcome

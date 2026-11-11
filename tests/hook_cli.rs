@@ -1341,36 +1341,37 @@ fn the_coordinator_looks_only_so_far_and_so_much() {
     );
 }
 
-/// `claude respawn` starts the coordinator again with the brief of its first start, so a
-/// brief that changed since is sent again when its process starts (§8 "A brief that went
-/// stale").
+/// `claude respawn` starts the coordinator again with the brief of its first start, and its
+/// tools are the chief its process started with. A brief that changed since is too long for a
+/// hook to carry, so chief tells the coordinator to read it, until it has; and says when its
+/// tools are the old ones (§8 "A brief that went stale").
 #[test]
-fn a_coordinator_with_a_stale_brief_gets_the_new_one() {
+fn a_coordinator_with_a_stale_brief_is_told_to_read_the_new_one() {
     use chief::config::ProjectConfig;
     let home = guarded_home();
     let dir = home.path().join("projects/demo");
     std::fs::create_dir_all(dir.join("generated")).unwrap();
     let mut config = ProjectConfig::new("Demo", "demo", Some("Ship it"), vec![]);
     config.save(&dir.join("project.toml")).unwrap();
-    let start = |source: &str| {
-        coordinator_hook(
-            &home,
-            "SessionStart",
-            &serde_json::json!({
-                "session_id": "coord-sid",
-                "hook_event_name": "SessionStart",
-                "source": source,
-                "cwd": dir,
-            }),
-        )
+    let event = |name: &str, extra: Value| {
+        let mut payload = serde_json::json!({
+            "session_id": "coord-sid",
+            "hook_event_name": name,
+            "cwd": dir,
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        coordinator_hook(&home, name, &payload)
     };
-    let brief = |out: &Output| -> Option<String> {
+    let context = |out: &Output, hook: &str| -> Option<String> {
         assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
         if out.stdout.is_empty() {
             return None;
         }
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], hook);
         Some(
             v["hookSpecificOutput"]["additionalContext"]
                 .as_str()
@@ -1378,26 +1379,77 @@ fn a_coordinator_with_a_stale_brief_gets_the_new_one() {
                 .to_string(),
         )
     };
-    // A session from before chief kept its first brief: it may be anything, so it is sent.
-    let sent = brief(&start("resume")).expect("the brief");
-    assert!(sent.starts_with("chief was updated"), "{sent}");
-    assert!(sent.contains("You are the coordinator of the chief project \"Demo\". Goal: Ship it"));
-    assert!(sent.contains("start a lookup thread"), "{sent}");
+    let start = |source: &str| {
+        context(
+            &event("SessionStart", serde_json::json!({"source": source})),
+            "SessionStart",
+        )
+    };
+    let prompt = || {
+        context(
+            &event("UserPromptSubmit", serde_json::json!({"prompt": "status?"})),
+            "UserPromptSubmit",
+        )
+        .expect("the board")
+    };
+    let brief = dir.join("generated/coordinator-brief.md");
+    let read_brief = || {
+        let read = serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": brief},
+        });
+        assert_silent_success(&event("PostToolUse", read));
+    };
+
+    // A session from before chief kept its first brief: told to read the current one, in a
+    // line short enough to arrive whole. The brief itself is in the file.
+    let said = start("resume").expect("the notice");
+    assert!(said.starts_with("<chief-brief>"), "{said}");
+    assert!(said.contains(&brief.display().to_string()), "{said}");
+    assert!(said.len() < 1_000);
+    let text = std::fs::read_to_string(&brief).unwrap();
+    assert!(text.contains("You are the coordinator of the chief project \"Demo\". Goal: Ship it"));
+    assert!(text.contains("start a lookup thread"), "{text}");
+    // Said again with every prompt until it has read it, then no more.
+    assert!(prompt().starts_with("<chief-brief>"));
+    assert!(prompt().starts_with("<chief-brief>"));
+    read_brief();
+    assert!(prompt().starts_with("<chief-board as-of=\""));
+    assert_eq!(start("resume"), None);
+    // `/clear` and a compaction empty its context: it reads it again.
+    assert_silent_success(&event("SessionEnd", serde_json::json!({"reason": "clear"})));
+    assert!(prompt().starts_with("<chief-brief>"));
+    read_brief();
+    assert!(start("compact").is_some());
+    read_brief();
+    // The project changed since: there is a new brief to read.
+    config.goal = Some("Ship it by Friday".into());
+    config.save(&dir.join("project.toml")).unwrap();
+    assert!(prompt().starts_with("<chief-brief>"));
+    assert!(
+        std::fs::read_to_string(&brief)
+            .unwrap()
+            .contains("by Friday")
+    );
 
     // The brief it was created with is the one it has: nothing to say.
     let first = chief::prompts::coordinator(&config, &dir, "");
     chief::generated::save_coordinator_prompt(&dir, &first).unwrap();
-    assert_eq!(brief(&start("resume")), None);
-    assert_eq!(brief(&start("startup")), None);
+    assert_eq!(start("startup"), None);
+    assert!(prompt().starts_with("<chief-board as-of=\""));
 
-    // The project changed since: sent again at every start of its process, and after a
-    // compaction dropped it.
-    config.goal = Some("Ship it by Friday".into());
-    config.save(&dir.join("project.toml")).unwrap();
-    for source in ["resume", "compact"] {
-        let sent = brief(&start(source)).expect("the new brief");
-        assert!(sent.contains("Goal: Ship it by Friday"), "{source}: {sent}");
-    }
+    // Its process started before this chief was installed: its tools are the old ones, and
+    // it is told so with what restarts it. (The startup above is newer than the binary.)
+    home.db()
+        .execute("UPDATE events SET ts = 1 WHERE hook = 'SessionStart'", [])
+        .unwrap();
+    let ctx = prompt();
+    assert!(ctx.starts_with("<chief-update>"), "{ctx}");
+    assert!(ctx.contains("chief down demo && chief up demo"), "{ctx}");
+    assert!(ctx.contains("<chief-board as-of=\""), "{ctx}");
+    // Everything a prompt carries stays under what Claude Code lets a hook add.
+    assert!(ctx.len() < 10_000, "{}", ctx.len());
+
     // A thread's start says nothing.
     let out = home.run(
         &[
@@ -1417,4 +1469,9 @@ fn a_coordinator_with_a_stale_brief_gets_the_new_one() {
         .to_string(),
     );
     assert!(out.status.success() && out.stdout.is_empty(), "{out:?}");
+    assert!(
+        error_log(home.path()).is_empty(),
+        "{}",
+        error_log(home.path())
+    );
 }
