@@ -551,15 +551,37 @@ read-only exploration is a thread's); chief's prompt said the same, and nothing 
    routines are the project's repeating work and run on this machine.
 
 Tested through the hook command (`tests/hook_cli.rs`), `lookups::` and `brief::`. Seen live
-on 2026-11-11: the coordinator kept to a few lookups and answered in place. Not verified live
-yet: the read-this notice making a real coordinator read its brief; a lookup thread started
-for an earlier conversation; the denials' wording; that `Skill(schedule)` in
-`permissions.deny` stops the skill (from Claude Code's docs).
+on 2026-11-11, on a project's coordinator after `/clear`, asked about an earlier
+conversation: it read its brief first (one Read, before anything else), answered what it
+could from the board and memory with no lookups of its own, started a lookup thread on a
+small model for the conversation in the same turn, and when that reported answered from the
+report, saved it to memory and resolved the thread; it knew commands, checks and approval.
+Not verified live yet: the denials' wording; that `Skill(schedule)` in `permissions.deny`
+stops the skill (from Claude Code's docs).
 
-Open: the brief is long for a router (13,600 characters, about 17,000 with a project's
-instructions). It is cached, so it costs little per turn, but at low effort a long brief is
-skimmed. Cut it to the routing rules and move what most turns don't need (accounts and
-moves, limits, routines) to where it is used: tool descriptions, or files read on demand.
+Found in that run and fixed: after a `/clear`, the restart's SessionStart came under a
+session id no row had, so its event matched nobody and the coordinator went on being told
+its tools were old. Its SessionStart hook now notes the start itself
+(`generated/coordinator-started`), whatever the event matched.
+
+## A brief the coordinator reads (built, 2026-11-11)
+
+Problem: the brief was 14,000 characters (about 18,000 with a project's instructions), and
+a coordinator at low effort skims that. Most of it was for the few turns that create a
+routine, move a thread or hear of a limit.
+
+1. **The brief is the routing rules** (ARCHITECTURE §8, `src/prompts/coordinator.md`): about
+   6,200 characters, kept under 7,000 by a test. Role, the seven routes, how threads are
+   started, followed and resolved, what a routine is and that a command needs approval, how
+   far it may look, memory.
+2. **The rest is said where it is used**: in the chief tools' descriptions and their
+   parameters' (Claude Code loads them on demand through its tool search, so they cost
+   nothing until a turn needs them), in a tool's answer (`next`, `approval`, `scheduler`)
+   and in chief's notices, which each say what to do. Nothing went to a new file.
+
+Seen live on 2026-11-11 with the same question. Not verified live yet: a coordinator
+writing a routine from the tool descriptions alone; a limit or a move told with the new
+notices.
 
 ## Review, 2026-11-09: what would make chief better
 

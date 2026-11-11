@@ -261,15 +261,26 @@ pub struct Draft {
     /// A few words for the board, e.g. "Triage new issues". Each run's thread carries it.
     pub title: String,
     /// What a session does: the thread's whole brief, since it sees neither your conversation
-    /// nor earlier runs. Objective, what done means, what to report. Leave it out for a routine
-    /// that only runs a command. With a command too, the session starts only when the command
-    /// has news (it failed, or reported an outcome), and is handed its output.
+    /// nor earlier runs, and can't ask anyone. What to check and where, what counts as news,
+    /// which numbers to record, what to do when something is missing, and when the user wants
+    /// to be interrupted ("attention only if a fare is under 700 EUR") rather than merely
+    /// told. chief already tells every run how runs work (it reads and rewrites the routine's
+    /// notes file, records the values it tracks and ends with an outcome), so don't repeat
+    /// that. Leave it out for a routine that only runs a command. With a command too, the
+    /// session starts only when the command has news (it failed, or reported an outcome), and
+    /// is handed its output.
     #[serde(default)]
     pub prompt: String,
     /// A shell command (`sh -c`) chief runs itself instead of a session: a check, a script, a
     /// cron job. It costs no tokens, so use it for whatever needs no judgement. Exit status 0
-    /// means all is well; anything else is a failure the user hears of once. It runs in the
-    /// routine's repository. The user must approve a command you write before it runs.
+    /// means all is well; anything else is a failure. It repeats, so people hear only what
+    /// changed: its first failure and its first pass afterwards, not the same result every
+    /// run. It can say more than its exit status: `chief routine value <series> <number>
+    /// [--unit U]` records a number it tracks, and `chief routine outcome
+    /// nothing|update|attention "<headline>"` says what the run came to (the same words twice
+    /// in a row are said once). It runs in the routine's repository, with `CHIEF_ROUTINE_DIR`
+    /// (the routine's folder, for what it keeps between runs) in its environment. The user
+    /// must approve a command you write before it runs.
     #[serde(default)]
     pub command: Option<String>,
     /// How long the command may run, in seconds. Default 300, at most 86400.
@@ -278,15 +289,19 @@ pub struct Draft {
     /// When it runs, in the user's local time: five cron fields (`0 9 * * 1-5` = weekdays at
     /// 09:00), `@hourly`, `@daily`, `@weekly`, `@monthly`, or `every 30m` / `every 2h`. At most
     /// every 5 minutes for a prompt alone; a routine with a command may run every minute.
+    /// Not more often than the thing it follows changes.
     pub schedule: String,
     /// A repository name from the project's settings. Default: the project's default
     /// repository.
     #[serde(default)]
     pub repo: Option<String>,
-    /// Model override, e.g. "haiku" for a cheap check. Default: the project's thread model.
+    /// Model override for a session's runs. Runs repeat, so keep them cheap: "haiku" or
+    /// "sonnet" for a lookup or a comparison. Default: the project's thread model, for real
+    /// analysis or code.
     #[serde(default)]
     pub model: Option<String>,
-    /// Effort override: low, medium, high, xhigh or max. Default: the project's thread effort.
+    /// Effort override: low, medium, high, xhigh or max; low for a lookup or a comparison.
+    /// Default: the project's thread effort.
     #[serde(default)]
     pub effort: Option<String>,
     /// Whether you are told when a run finishes. Default true; false for runs nobody needs to
@@ -1627,8 +1642,8 @@ pub struct UpdateRoutineArgs {
 fn scheduler_note(ctx: &ToolCtx, out: &mut Value) {
     if !crate::serve::running_in(&crate::serve::home_of(ctx.project_dir)) {
         out["scheduler"] = json!(
-            "chief serve isn't running, so no routine fires on its schedule. The user starts \
-             it with `chief serve start` (and `chief serve install` keeps it running after a \
+            "chief serve isn't running, so no routine fires on its schedule. Tell the user: \
+             they start it with `chief serve start` (and `chief serve install` keeps it running after a \
              restart). run_routine still works."
         );
     }

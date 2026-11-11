@@ -240,6 +240,7 @@ fn keep_current(event: &str, project: &str, payload: &Value) -> Option<String> {
             None
         }
         "SessionStart" => {
+            crate::brief::note_start(&dir, field("source"), db::now_ms());
             // A resumed process still has what it read; anything else starts empty.
             if field("source") != Some("resume") {
                 crate::brief::forget_read(&dir);
@@ -863,7 +864,12 @@ fn coordinator_context(conn: &Connection, project: &str) -> Result<String> {
             &paths::project_dir(project),
             project_config(project).as_ref(),
         ),
-        crate::brief::stale_tools(conn, project, crate::brief::installed_ms())?,
+        crate::brief::stale_tools(
+            conn,
+            project,
+            &paths::project_dir(project),
+            crate::brief::installed_ms(),
+        )?,
     ];
     for notice in notices.into_iter().flatten().rev() {
         text = format!("{notice}\n{text}");

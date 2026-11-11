@@ -1443,12 +1443,33 @@ fn a_coordinator_with_a_stale_brief_is_told_to_read_the_new_one() {
     home.db()
         .execute("UPDATE events SET ts = 1 WHERE hook = 'SessionStart'", [])
         .unwrap();
+    let started = dir.join("generated/coordinator-started");
+    assert!(
+        std::fs::read_to_string(&started)
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            > 1
+    );
+    std::fs::write(&started, "1").unwrap();
     let ctx = prompt();
     assert!(ctx.starts_with("<chief-update>"), "{ctx}");
     assert!(ctx.contains("chief down demo && chief up demo"), "{ctx}");
     assert!(ctx.contains("<chief-board as-of=\""), "{ctx}");
     // Everything a prompt carries stays under what Claude Code lets a hook add.
     assert!(ctx.len() < 10_000, "{}", ctx.len());
+    // `/clear` keeps the process. The restart then comes under a session id no row has, so
+    // its event is nobody's (§4), and it is still what brings the new tools.
+    assert_eq!(start("clear"), None);
+    assert!(prompt().starts_with("<chief-update>"));
+    let restart = serde_json::json!({
+        "session_id": "after-clear-sid",
+        "hook_event_name": "SessionStart",
+        "source": "resume",
+        "cwd": dir,
+    });
+    assert_silent_success(&coordinator_hook(&home, "SessionStart", &restart));
+    assert!(prompt().starts_with("<chief-board as-of=\""));
 
     // A thread's start says nothing.
     let out = home.run(

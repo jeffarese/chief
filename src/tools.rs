@@ -564,7 +564,9 @@ fn subscribe(lead: &str, row: &SessionRow, address: Option<&str>) -> String {
     let account = row.account_shown().unwrap_or("another account");
     format!(
         "{line} {} runs in another Claude account ({account}), where names don't reach: \
-         message it at this address, not by name. The address changes when it is woken.",
+         message it at this address, not by name. The address changes when it is woken. \
+         Idle notices do work at such an address, whatever Claude Code says about not \
+         knowing. From there it can't message you first, only reply to a message of yours.",
         row.name
     )
 }

@@ -361,6 +361,7 @@ An empty variable counts as unset (made absolute, it would be the current folder
   generated/coordinator-prompt.md    the brief the coordinator's session was created with (§8 "A brief that went stale")
   generated/coordinator-brief.md     its brief as it reads now, written when that one went stale, for it to read
   generated/coordinator-brief.read   what it last read of it, while that is still in its context
+  generated/coordinator-started      when the coordinator's process last started (unix ms), noted by its SessionStart hook
   generated/thread-settings.json
   generated/run-settings.json        a routine run's: a thread's hooks, and `mcp__chief` allowed (§13)
   generated/mcp.json
@@ -1110,7 +1111,11 @@ background (`asyncRewake`, §1, §3) at each SessionStart and Stop of the coordi
   subscribe again. `<chief-limited>`: `- <name> "<title>" · limited since HH:MM · <the limit> ·
   <what happens next>` (agp found no account with room and resumes it at the reset; agp is still
   moving it; agp isn't watching it, or it doesn't run through agp, so it waits until messaged),
-  then: tell the user, offer `move_thread`. The coordinator prompt (§8) says what to do with each.
+  then: tell the user in a line each (the limit, when it resets, what happens next), offer
+  `move_thread`, and message a thread agp doesn't resume after the reset. Each section says
+  what to do with it, since the coordinator's brief (§8) only says to do what a notice says;
+  the waiting one adds that a waiting thread can't hear a message, the routine one that
+  runs that found nothing aren't listed and that a run isn't subscribed to.
 - It ends (exit 0, nothing told) when its parent, the coordinator's process, is gone, or a minute
   before its hook `timeout` (a day). A coordinator idle longer than that hears of the next stuck
   thread at its next SessionStart or Stop.
@@ -1316,12 +1321,12 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `read_report` | `name`, `history?` (int, default 1, max 20) | `{name, title, group, reports: [{at, text}]}`, newest first, full text; with background work (§5) also `running` and a `note` that the thread isn't finished and reports when it is |
 | `wake_thread` | `name` | Refreshes from its own account; if no live pid, settles a thread agp watches (§5 "Limits and moves": waits while agp moves it, then follows the move) and, when it moved and runs already, returns it without a respawn; else `agp bg watch` for an agp thread, then `claude respawn <short_id>` in its account, poll its account's `claude agents` up to 20 s for a pid (each poll bounded by the time left, so a hanging listing ends the wait at 20 s; database busy waits are bounded only per statement, §4). Returns `{name, alive, respawned}`, plus `address` once alive and, after a respawn that gave a thread in another account a new address, `next` (subscribe again there); a thread that moved also gets `moved` (its note), `account` and `next`. A cleaned thread is a tool error: "<name> was cleaned up; start a new thread (its reports are still readable with read_report)"; so is one still removed outside chief after the refresh, with §6's removed message |
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
-| `move_thread` | `name`, `account?` (an agp id or label from the pool) | Needs an agp with `bg`. Settles the thread (§5 "Limits and moves"); a named account must be in the pool, trust its repo (placement's pinned rules, §7 "Thread account") and not be the one it runs in. Then `agp bg move <session id> [--to <id>] --json` (bounded, 120 s): agp stops it and resumes it there (or in the other pool account with the most room). chief follows the move from `agp bg --json`, else from the move's answer, asks agp to watch it (`runner = "agp"`), refreshes its new account and returns `{name, alive, address, moved, account, next}` (subscribe again). The prompt (§8) says agp moves limited threads itself: only when the user asks, or for a limited thread agp didn't move |
-| `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. The prompt (§8) says to use it only when the user asks or a thread is off track and a message didn't help |
+| `move_thread` | `name`, `account?` (an agp id or label from the pool) | Needs an agp with `bg`. Settles the thread (§5 "Limits and moves"); a named account must be in the pool, trust its repo (placement's pinned rules, §7 "Thread account") and not be the one it runs in. Then `agp bg move <session id> [--to <id>] --json` (bounded, 120 s): agp stops it and resumes it there (or in the other pool account with the most room). chief follows the move from `agp bg --json`, else from the move's answer, asks agp to watch it (`runner = "agp"`), refreshes its new account and returns `{name, alive, address, moved, account, next}` (subscribe again). Its description says agp moves limited threads itself: only when the user asks, or for a limited thread agp didn't move (§8) |
+| `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. Its description says to use it only when the user asks or a thread is off track and a message didn't help (§8) |
 | `list_routines` | none | `{routines: [...]}`, each a routine's row (§4) plus `schedule_text` ("Weekdays at 09:00"), `next_run` and `last_run` (local `YYYY-MM-DD HH:MM`, null when none), `kind` (`session`, `command` or `check`), `needs_approval`, `state` (§13 "State": `key`, `label`, `line`, `at`, `needs_user`), `last_exec` (its command's latest run: `id`, `status`, `exit_code`, `fired_by`, `started_at`, `started`, `finished_at`, `duration_ms`, `line`, `outcome`, `headline`, `details`, `thread`; null before any), `last_finding` (what its last run said: `outcome`, `headline`, `details`, `at`, `when`, `thread`, `run`; null before any) and `series` (up to 4 of what it tracks, most recently recorded first: `name`, `unit`, `latest`, `previous`, `at`, and its 30 latest `points`); and `scheduler`, a line saying `chief serve` isn't running and how the user starts it, whenever it isn't (on every routine tool's answer but `delete_routine`'s and `run_routine`'s) |
 | `create_routine` | `title`, `schedule`, `prompt?`, `command?` (one of the two at least), `timeout_secs?`, `repo?`, `model?`, `effort?`, `notify?` (default true), `enabled?` (default true), `name?` (default: made from the title) | Validates (§13 "A routine") and stores it with its next run. Returns the routine as `list_routines` shows it, with `notes` (its notes file) and, for one with a command, `approval`: the command doesn't run until the user approves it, which the coordinator can't, and where they do (§13 "Approval") |
 | `update_routine` | `name`, and any of `title`, `prompt`, `command` (an empty string removes either; one must remain), `timeout_secs` (0 = the default), `schedule`, `repo`, `model`, `effort` (an empty string goes back to the project's default), `notify`, `enabled` | Changes only what is given; `enabled: false` pauses, `true` resumes from now. A changed command waits for approval again (`approval`). Returns the routine |
-| `delete_routine` | `name` | Removes the routine; its runs' threads and reports stay. `{name, deleted: true, note}`. The prompt keeps it for when the user asks |
+| `delete_routine` | `name` | Removes the routine; its runs' threads and reports stay. `{name, deleted: true, note}`. Its description keeps it for when the user asks |
 | `run_routine` | `name` | A run now, outside the schedule, which doesn't move (§13 "A run"). A session: `{routine, started: true, thread, next}`. A command, which runs detached: `{routine, started: true, run, note, next}`. `{routine, started: false, note}` while its last run still works or its command waits for approval |
 | `read_routine` | `name` | One routine in full, without a thread: what `list_routines` shows, plus `notes` (its `NOTES.md`, the first 8 KB, with `notes_file` and `notes_cut` when it goes on), `findings` (its 10 latest: `outcome`, `headline`, `details`, `at`, `when`, `thread`, `run`), `series` with each one's 60 latest `points` (`[at, value]`), `runs` (its command's 5 latest, as `last_exec`, each with `output` and `output_cut`: the latest run's whole 16 KB, 2 KB of the earlier ones) and, with a command, `log_file` |
 
@@ -1365,8 +1370,10 @@ a literal SendMessage input with no `message` key, `{"to": "<address>", "notify_
 (verified: omitting `message` is a valid pure subscription): the coordinator subscribes right after
 starting a thread, which is how it hears the thread finished. (M5 live run: told "with no message",
 and again told to pass `""`, Haiku emitted `"message": ,`, which is invalid JSON.) For a thread in
-another account `next` adds that names don't reach it there and the address changes when it is
-woken; when its process isn't listed yet, `next` says to get the address from `list_threads`.
+another account `next` adds that names don't reach it there, that the address changes when it is
+woken, that idle notices do work at such an address (Claude Code says it doesn't know whether
+they are supported) and that the thread can only reply to a message from there, not send one
+first; when its process isn't listed yet, `next` says to get the address from `list_threads`.
 
 A thread's `address` (`tools::address`) is where the coordinator's `SendMessage` reaches it:
 its name when it runs in the project's account; otherwise, since names don't reach across
@@ -1512,59 +1519,74 @@ at the reset, never moved.
 
 ## 8. Prompts (files in `src/prompts/`, included with `include_str!`)
 
-- `coordinator.md`: role (route, never do the work), its tools (§7: a quick look in its own
-  folder and the repositories, which chief keeps quick, §6 "The coordinator's own looking";
-  edit only memory and instructions, no shell), routing rules (quick question, from the board,
-  the reports, memory or one or two reads → answer; a question that takes finding out → a
-  lookup thread, never itself and never a subagent of its own, since the user can't talk to it
-  while it looks and what it reads fills the conversation: the task says what to find and
-  where, that it changes nothing and that its report is the answer, with `haiku` or `sonnet`
-  at `low`; it answers from the report, saves what is worth keeping to memory and resolves the
-  thread without asking; what was said before → memory first, else it answers what it can
-  and starts a lookup thread over Claude Code's transcripts in the same turn, rather than
-  saying it doesn't have the conversation or asking the user to repeat it; the thread saves
-  what it finds to memory;
-  new work → `start_thread`, with `account` only when the user names one; follow-up →
-  `SendMessage` to the matching thread with `notify_when_idle`, waking it first if asleep, at its
-  exact address with no `[ref]` (its name, or the `uds:…` address of a thread in another account,
-  which changes when it is woken: subscribe again then); several tasks →
-  several threads), say which thread got what, keep `max_parallel`, save preferences and decisions
-  to `memory/` and update `memory/MEMORY.md`, read full reports with `read_report` when an idle
-  notice arrives; when `read_report` says the thread still runs subagents or background
-  commands, the notice isn't a finish: say nothing yet and don't subscribe again (the notice
-  would come straight back, §1), as the thread reports when they finish (§5 "Background
-  work"). Removing worktrees and branches is the user's call (board `x`, `chief clean`,
-  `chief gc`), so it never offers to; it names no branch in a thread's brief unless the user did
-  (threads create their own). One line says it can message its own subagents by the name or agent
-  id the Agent tool gave them, and that they report to it (§6 "Subagents"). A `<chief-waiting>`
-  message from its watcher (§5 "Telling the coordinator") means to tell the user at once, a line
-  per thread, which thread and what it wants, and that they answer it by opening the thread on the
-  board; it can't answer for them and doesn't message the thread. A `<chief-moved>` message means
-  agp moved those threads to another account: call `list_threads` for their new addresses and
-  subscribe again, mentioning it to the user in passing at most. A `<chief-limited>` message means
-  those threads stopped on a usage limit and agp didn't move them: tell the user in a line each
-  (the limit, when it resets, what happens next), offer `move_thread` when the pool may have room,
-  and message a thread agp doesn't resume after the reset. `move_thread` only when the user asks,
-  or for such a thread (agp moves limited threads itself). A "Routines" section: work the user
-  wants repeated becomes a routine (`create_routine`), not a thread; routines run on this
-  machine, and Claude Code's own scheduling (the `schedule` skill, remote triggers) is never
-  used for it, being cloud and blocked (§3); a routine is a prompt
-  (judgement each run), a command (whatever a script can decide: no session, as often as every
-  minute, exit 0 means well) or both (a check that gets a session only for news), chosen by
-  what the work needs; a command the coordinator writes or changes waits for the user's
-  approval, so it shows them the command and where to approve, and doesn't run it before; chief
-  tells people only what changed in a command's runs, and a command can say more with `chief
-  routine value` and `chief routine outcome`; a prompt must stand on its
-  own, since a run sees neither the conversation nor earlier runs and can't ask anyone; schedules
-  are in the user's local time; when a tool says `chief serve` isn't running, tell the user. A
-  `<chief-routine>` message means those runs finished, each line with its outcome and
-  headline: tell the user in a line each, attention first, looking closer with `read_routine` or
-  `read_report` for those; don't subscribe to a run, resolve one that leaves nothing to do
-  without asking. The section also says: a routine is how the project follows things over time;
-  chief tells every run how runs work (notes, values, outcome), so the prompt says only the
-  task, what counts as news and when the user wants interrupting; keep runs cheap (`haiku` or
-  `sonnet` at `low` for a lookup, no more often than the thing changes); `read_routine` answers a
-  question about something followed without starting anything; it may edit a routine's notes.
+- `coordinator.md`: the routing rules and little else, under 7,000 characters. The
+  coordinator runs at low effort and skims a long brief (at 14,000 characters it did), so the
+  brief holds what every turn needs, and what only some turns need is said where it is used:
+  in a tool's description and its parameters' (Claude Code loads the chief tools' on demand,
+  through its tool search, seen live), in a tool's answer (`next`, `approval`, `scheduler`),
+  in a refusal (the guard's, §6; the lookup limit's), and in chief's own notices (§5 "Telling
+  the coordinator"), each of which says what to do with it. The brief has:
+  - Its role: it talks with the user and routes, tracks and reports; it never does the work,
+    so the user can always reach it.
+  - "Route every message": a quick question, from the board, the reports, memory or one or
+    two reads → answer; a question that takes finding out → a lookup thread, never itself and
+    never a subagent of its own, since the user can't talk to it while it looks and what it
+    reads fills the conversation: the task says what to find and where, that it changes
+    nothing and that its report is the answer, with `haiku` or `sonnet` at `low`; it answers
+    from the report, saves what is worth keeping to memory and resolves the thread without
+    asking; something said earlier that memory doesn't have → it answers what it can and
+    starts a lookup thread over Claude Code's transcripts in the same turn, rather than
+    saying it doesn't have the conversation or asking the user to repeat it, and the thread
+    saves what it finds to memory; new work → a thread, one per unrelated task; a follow-up
+    → the matching thread; work to repeat or something to watch → a routine; how the user
+    wants the project run → follow it and save it to memory. Then: say which thread got
+    what, keep `max_parallel`.
+  - "Threads": `task` is a thread's whole brief, and `next` in `start_thread`'s answer is
+    how it hears the thread finished; a follow-up goes with `SendMessage` to the thread's
+    exact `address` with `notify_when_idle`, waking it first if asleep; one line says it can
+    message its own subagents by the name or agent id the Agent tool gave them, and that
+    they report to it (§6 "Subagents"); at an idle notice it reads the whole report with
+    `read_report`, and when that says the thread still runs subagents or background commands
+    the notice isn't a finish: it says nothing yet and doesn't subscribe again (the notice
+    would come straight back, §1), as the thread reports when they finish (§5 "Background
+    work"); it resolves a thread when the user agrees or its pull request merged, a lookup
+    thread once it passed on what it found; removing worktrees and branches is the user's
+    call (board `x`, `chief clean`, `chief gc`), so it never offers to; a `<chief-…>`
+    message from chief says what happened and what to do, and it does that.
+  - "Routines": work chief repeats on a schedule on this machine (`create_routine`); a
+    prompt (judgement each run), a command (whatever a script can decide: no session, as
+    often as every minute) or both (a check that gets a session only for news), chosen by
+    what the work needs; a command it writes or changes waits for the user's approval, so
+    it shows them the command and where to approve; `read_routine` answers a question
+    about something followed without starting anything; Claude Code's own scheduling (the
+    `schedule` skill, remote triggers) is never used, being cloud and blocked (§3); the
+    routine tools' descriptions say the rest, to be read before writing one.
+  - "Looking and memory": a quick look in its own folder and the repositories, which chief
+    keeps quick (§6 "The coordinator's own looking"), no shell; memory in `memory/` with
+    `MEMORY.md` as the index, saved when the user asks and on its own; it edits only
+    `memory/` and `instructions.md`.
+  - "Style": brief, what happened first.
+
+  What left the brief, and where it is said now. `start_thread`'s description: threads
+  create their own branch, so the task names one only when the user did; its `account`
+  parameter: only when the user names one. `next` (§7): the literal subscription, and for
+  a thread in another account that names don't reach it, that its address changes when it
+  is woken, that idle notices do work at a `uds:…` address whatever Claude Code says, and
+  that it can only reply to a message, not send one first. `move_thread`'s and
+  `stop_thread`'s descriptions: only when the user asks, or for a limited thread agp didn't
+  move, or one off track that a message didn't bring back. The notices (§5): what to do
+  about threads waiting on the user, moved or limited, and routine runs that finished.
+  `create_routine`'s description and parameters: what the user's words for a routine sound
+  like, to prefer a check to a prompt that would find nothing most times, to show a command
+  and where it is approved and not run it before, to say the schedule in words and when it
+  first runs; how to write a prompt that stands on its own (a run sees neither the
+  conversation nor earlier runs and can't ask anyone; chief tells every run how runs work,
+  so the prompt says the task, what counts as news and when the user wants interrupting);
+  how a command speaks (`chief routine value`, `chief routine outcome`,
+  `CHIEF_ROUTINE_DIR`, only what changed is told); cheap runs (`haiku` or `sonnet` at `low`
+  for a lookup, no more often than the thing changes). `read_routine`'s description: it may
+  edit a routine's notes. `scheduler` in a routine tool's answer: `chief serve` isn't
+  running, tell the user.
 - `thread.md`: you are one thread of project <name>; read `<dir>/memory/MEMORY.md` first; project
   instructions follow; work on your own branch, except for a task that only asks to find
   something out, which changes nothing and whose report is the answer; of other sessions message only the coordinator,
@@ -1633,12 +1655,16 @@ since its MCP server starts with it (`src/brief.rs`).
   `resume`, and a SessionEnd whose reason is `clear`. A session created with the current
   brief is never told.
 - **Old tools.** A coordinator's `chief mcp` is the chief that was installed when its process
-  started, and `/clear` keeps the process. When the chief binary is newer than the
-  coordinator's last SessionStart with source `startup` or `resume` (`brief::stale_tools`,
-  from the events, §4, and the binary's modification time), every UserPromptSubmit context
-  starts with `<chief-update>`: that its tools are the old version, and to tell the user once
-  that `chief down <slug> && chief up <slug>` restarts it with the new ones and keeps the
-  conversation.
+  started, and `/clear` keeps the process. Its process's start is its last SessionStart with
+  source `startup` or `resume`. Its own hook notes each in `generated/coordinator-started`
+  (`brief::note_start`), whatever row the event matched: after a `/clear` a restart's
+  SessionStart can carry a session id no row has yet and be recorded unmatched (§4; seen
+  live, where a restarted coordinator went on being told its tools were old). For a process
+  that started under a chief that noted nothing, its events say (§4). When the chief
+  binary's modification time is later than the later of the two (`brief::stale_tools`),
+  every UserPromptSubmit context starts with `<chief-update>`: that its tools are the old
+  version, and to tell the user once that `chief down <slug> && chief up <slug>` restarts
+  it with the new ones and keeps the conversation.
 
 ## 9. Layout (`chief up`: Rex, tmux, chief's own, or the user's own)
 

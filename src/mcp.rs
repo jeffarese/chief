@@ -67,7 +67,7 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "Start a thread: a background Claude Code session that owns one task on its own branch, in the Claude account with the most room. Returns its name and address; then subscribe with SendMessage(to=address, notify_when_idle=true) and no message, as `next` says."
+        description = "Start a thread: a background Claude Code session that owns one task on its own branch, in the Claude account with the most room. It creates its branch itself: name one in the task only when the user named it. Returns its name and address; then subscribe with SendMessage(to=address, notify_when_idle=true) and no message, as `next` says."
     )]
     async fn start_thread(
         &self,
@@ -135,14 +135,14 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "Read one routine in full without opening a thread: its notes (what its runs remember), what its latest runs found (outcome and headline each), the values it tracks over time, and its command's latest runs with what they printed. Use it to answer a question about something a routine follows, or before you tell the user what a run found."
+        description = "Read one routine in full without opening a thread: its notes (what its runs remember), what its latest runs found (outcome and headline each), the values it tracks over time, and its command's latest runs with what they printed. Use it to answer a question about something a routine follows, or before you tell the user what a run found. You may edit its notes file (`notes_file`) when the user tells you something its runs should know."
     )]
     async fn read_routine(&self, Parameters(args): Parameters<RoutineNameArgs>) -> CallToolResult {
         self.call(move |ctx| routines::read_tool(ctx, &args)).await
     }
 
     #[tool(
-        description = "Create a routine: work chief runs on a schedule with nobody watching. Give a prompt for work that needs judgement (each run a fresh thread; the prompt is its whole brief), a command for what a script can do (a check, a sync, a cron job: no session, no tokens, as often as every minute), or both for a check that costs nothing while all is well and gets a session only when it fails or has news. Use it when the user wants something done or watched regularly. A command you write runs only after the user approves it: the answer says where. Returns the routine with its next run."
+        description = "Create a routine: work chief runs on a schedule with nobody watching. Give a prompt for work that needs judgement (each run a fresh thread; the prompt is its whole brief), a command for what a script can do (a check, a sync, a cron job: no session, no tokens, as often as every minute), or both for a check that costs nothing while all is well and gets a session only when it fails or has news. Use it when the user wants something done or watched regularly (\"every weekday at 9, triage new issues\", \"tell me when flights to Tokyo drop under 700\", \"check staging every minute\"), and prefer a check to a prompt that would find nothing most times. A command you write runs only after the user approves it: show them the command in full and where to approve it, as `approval` in the answer says, and don't call run_routine for it before. Returns the routine with its next run: tell the user its schedule in words and when it first runs."
     )]
     async fn create_routine(&self, Parameters(args): Parameters<Draft>) -> CallToolResult {
         self.call(move |ctx| routines::create_tool(ctx, &args))

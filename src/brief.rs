@@ -27,6 +27,21 @@ fn read_path(dir: &Path) -> PathBuf {
     dir.join("generated/coordinator-brief.read")
 }
 
+/// When the coordinator's process last started (unix ms), as its own SessionStart hook noted
+/// it. The events table can't always say: after `/clear` a restart's SessionStart may carry a
+/// session id no row has yet, and is recorded unmatched (§4).
+fn started_path(dir: &Path) -> PathBuf {
+    dir.join("generated/coordinator-started")
+}
+
+/// Notes that the coordinator's process started now: a SessionStart with source `startup` or
+/// `resume`. `/clear` and a compaction keep the process, and its tools.
+pub fn note_start(dir: &Path, source: Option<&str>, now_ms: i64) {
+    if matches!(source, Some("startup" | "resume")) {
+        let _ = crate::config::replace_file(&started_path(dir), &now_ms.to_string());
+    }
+}
+
 /// The line that tells the coordinator to read its brief, when the one in its context isn't
 /// the one chief would give it now: neither the brief its session was created with, nor the
 /// one it last read. Writes the brief to `path` first. None when it is current, or the
@@ -82,16 +97,22 @@ pub fn note_read(dir: &Path, payload: &Value) {
 /// The line that says the coordinator's tools are the old ones: its process (and the `chief
 /// mcp` inside it) started before the chief binary on disk was installed, at `installed_ms`.
 /// Its process's start is its last SessionStart that wasn't a `/clear` or a compaction, which
-/// keep the process. None when the tools are current, or nothing says when it started.
+/// keep the process: the later of what its hook noted (`note_start`) and its events, which
+/// are all there is for a process that started under a chief that noted nothing. None when
+/// the tools are current, or nothing says when it started.
 pub fn stale_tools(
     conn: &Connection,
     slug: &str,
+    dir: &Path,
     installed_ms: Option<i64>,
 ) -> Result<Option<String>> {
     let Some(installed) = installed_ms else {
         return Ok(None);
     };
-    let started: Option<i64> = conn
+    let noted: Option<i64> = std::fs::read_to_string(started_path(dir))
+        .ok()
+        .and_then(|at| at.trim().parse().ok());
+    let recorded: Option<i64> = conn
         .query_row(
             "SELECT ts FROM events
              WHERE session_name = ?1 AND hook = 'SessionStart' AND summary IN ('startup', 'resume')
@@ -100,7 +121,8 @@ pub fn stale_tools(
             |r| r.get(0),
         )
         .optional()?;
-    Ok(started
+    Ok(noted
+        .max(recorded)
         .filter(|started| *started < installed)
         .map(|started| {
             format!(
@@ -220,7 +242,7 @@ mod tests {
             )
             .unwrap();
         };
-        let stale = |installed| stale_tools(&conn, "demo", installed).unwrap();
+        let stale = |installed| stale_tools(&conn, "demo", dir.path(), installed).unwrap();
         // Nothing says when its process started, or when chief was installed.
         assert_eq!(stale(Some(5_000)), None);
         event("SessionStart", "startup", 1_000, "chief-demo");
@@ -236,5 +258,16 @@ mod tests {
         // A restart brings the new tools.
         event("SessionStart", "resume", 7_000, "chief-demo");
         assert_eq!(stale(Some(5_000)), None);
+
+        // A restart whose SessionStart matched no row (its id changed with a `/clear`) is in
+        // no event of the coordinator's: its hook noted it. `/clear` itself notes nothing.
+        assert!(stale(Some(9_000)).is_some());
+        std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+        note_start(dir.path(), Some("clear"), 9_500);
+        note_start(dir.path(), None, 9_500);
+        assert!(stale(Some(9_000)).is_some());
+        note_start(dir.path(), Some("resume"), 9_500);
+        assert_eq!(stale(Some(9_000)), None);
+        assert!(stale(Some(9_600)).is_some());
     }
 }

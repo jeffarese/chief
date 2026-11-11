@@ -222,8 +222,9 @@ pub fn routine_notice(lines: &[String]) -> String {
          nobody watching. Each line carries what the run found. Tell the user in a line each, \
          the ones marked attention first; for those, and for a run that gave no outcome, read \
          more with read_routine (its notes, findings and values) or read_report before you \
-         speak. Resolve a run that leaves nothing to do; a follow-up goes to its thread like \
-         any other. A line that says command has no thread: chief ran the routine's command \
+         speak. Runs that found nothing aren't listed. Don't subscribe to a run. Resolve one \
+         that leaves nothing to do without asking; one that opened a pull request or needs a \
+         decision stays open, and a follow-up goes to its thread like any other. A line that says command has no thread: chief ran the routine's command \
          itself, and read_routine shows that run and what it printed.",
         lines.join("\n")
     )
@@ -298,7 +299,7 @@ pub fn notice(lines: &[String]) -> String {
         "<chief-waiting>\n{}\n</chief-waiting>\nThese threads are stuck until the user answers \
          them, in the thread itself. Tell the user now, a line each: which thread, what it \
          wants, and that they answer it by opening the thread on the board. You can't answer \
-         it for them.",
+         it for them, and a waiting thread can't hear you, so don't message it.",
         lines.join("\n")
     )
 }
@@ -320,8 +321,10 @@ pub fn moved_notice(lines: &[String]) -> String {
 pub fn limited_notice(lines: &[String]) -> String {
     format!(
         "<chief-limited>\n{}\n</chief-limited>\nThese threads stopped on a Claude usage limit \
-         and wait. Tell the user in a line each. move_thread moves one to a pool account with \
-         room now; a thread agp doesn't resume goes on only when messaged after the reset.",
+         and agp didn't move them. Tell the user in a line each: which thread, the limit and \
+         when it resets, and what happens next (agp resumes it at the reset, or it waits \
+         until messaged). Offer move_thread, which moves one to a pool account with room now; \
+         after the reset, message a thread agp doesn't resume to go on.",
         lines.join("\n")
     )
 }

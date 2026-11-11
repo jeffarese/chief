@@ -144,7 +144,13 @@ mod tests {
         assert!(p.contains("at most 3 threads"));
         assert!(!p.contains("## Project instructions"));
         // §6 "Subagents".
-        assert!(p.contains("Of other sessions, you can only message this\n  project's threads"));
+        assert!(p.contains("Of other sessions,\n  you can only message this project's threads"));
+        // The routing rules, and nothing a tool's description or a notice of chief's says
+        // where it is used (§8): short enough to be read, not skimmed.
+        for rule in ["start a lookup thread", "a routine (below), not a thread"] {
+            assert!(p.contains(rule), "{rule}");
+        }
+        assert!(p.len() < 7_000, "{}", p.len());
         assert!(
             p.contains(
                 "- You can message your own subagents by the name or agent id the Agent tool \
