@@ -579,9 +579,16 @@ routine, move a thread or hear of a limit.
    nothing until a turn needs them), in a tool's answer (`next`, `approval`, `scheduler`)
    and in chief's notices, which each say what to do. Nothing went to a new file.
 
-Seen live on 2026-11-11 with the same question. Not verified live yet: a coordinator
-writing a routine from the tool descriptions alone; a limit or a move told with the new
-notices.
+Seen live on 2026-11-11, on the same coordinator after a restart and `/clear` (its brief
+with the project's instructions: 9,850 characters, from 17,910): it read the brief first
+and answered the same question from memory in one more read; asked about another earlier
+conversation that memory didn't have, it said what its notes held, started a lookup thread
+in the same turn, and answered from its report; asked how it would set up a check that
+records a value, it gave the command with `chief routine value`, the prompt for a failure,
+a small model, that only the first failure and first pass are told, and that the command
+waits for approval and `chief serve`, all of which is now only in the tool descriptions.
+It no longer said its tools were old. Not verified live yet: a routine actually created
+and approved this way; a limit or a move told with the new notices.
 
 ## Review, 2026-11-09: what would make chief better
 
