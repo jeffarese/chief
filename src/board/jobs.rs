@@ -13,6 +13,7 @@ use crate::claude::{Claude, RESOLVE_TIMEOUT};
 use crate::cleanup::{self, Ctx, Inspection, Mode, Outcome, Verdict};
 use crate::config::ProjectConfig;
 use crate::pr::Gh;
+use crate::routines::{self, Author, Patch, Trigger};
 use crate::tools::{self, NameArgs, ToolCtx};
 use crate::{db, generated, pane, placement, registry, trust, tui};
 
@@ -88,6 +89,12 @@ impl Failure {
             Action::SetResolved { name, .. } => (FailureKind::Notice, format!("Resolving {name}")),
             Action::OpenUrl(_) => (FailureKind::Notice, "Opening the PR".to_string()),
             Action::Reports(name) => (FailureKind::Notice, format!("Reading {name}'s reports")),
+            Action::RunRoutine(name) => (FailureKind::Busy, format!("Running {name}")),
+            Action::Approve { name, .. } => (FailureKind::Notice, format!("Approving {name}")),
+            Action::SetEnabled { name, enabled } => (
+                FailureKind::Notice,
+                format!("{} {name}", if *enabled { "Resuming" } else { "Pausing" }),
+            ),
             Action::Quit | Action::QuitAll | Action::Edit(_) => {
                 (FailureKind::Notice, "The action".to_string())
             }
@@ -179,6 +186,9 @@ fn try_run(src: &Sources, action: Action) -> Result<Msg> {
             let check = pool_trust(src, &config).map_err(|e| format!("{e:#}"));
             Ok(Msg::Trusted { text, check })
         }
+        Action::RunRoutine(name) => run_routine(src, &name),
+        Action::Approve { name, command } => approve(src, &name, &command),
+        Action::SetEnabled { name, enabled } => set_enabled(src, &name, enabled),
         // The runner handles these itself: they need the terminal.
         Action::Quit | Action::QuitAll | Action::Edit(_) => Ok(Msg::Notice(String::new())),
     }
@@ -195,6 +205,18 @@ fn thread_tool(
     name: &str,
     tool: fn(&ToolCtx, &NameArgs) -> Result<serde_json::Value>,
 ) -> Result<serde_json::Value> {
+    with_ctx(src, |ctx| {
+        tool(
+            ctx,
+            &NameArgs {
+                name: name.to_string(),
+            },
+        )
+    })
+}
+
+/// The context `chief mcp` would give a tool, from the board's sources.
+fn with_ctx<T>(src: &Sources, f: impl FnOnce(&ToolCtx) -> Result<T>) -> Result<T> {
     let conn = db::open(&src.db)?;
     let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
     let claude = src.claude();
@@ -213,12 +235,62 @@ fn thread_tool(
         wake_timeout: WAKE_TIMEOUT,
         poll_interval: POLL_INTERVAL,
     };
-    tool(
-        &ctx,
-        &NameArgs {
-            name: name.to_string(),
-        },
-    )
+    f(&ctx)
+}
+
+/// Runs a routine now, as `chief routine run` and the dashboard do, without waiting for its
+/// command: that runs detached and the refresh shows how it ends.
+fn run_routine(src: &Sources, name: &str) -> Result<Msg> {
+    with_ctx(src, |ctx| {
+        // The rows as they are now decide whether its last run still works.
+        let _ = tools::refresh(ctx);
+        Ok(Msg::Done(
+            match routines::run(ctx, name, Trigger::Manual)? {
+                routines::Outcome::Started { thread, warning } => match warning {
+                    Some(w) => format!("Started {thread}. Warning: {w}"),
+                    None => format!("Started {thread}."),
+                },
+                routines::Outcome::Running { .. } => {
+                    format!("{name}: its command runs; the detail shows how it ends.")
+                }
+                routines::Outcome::Ran(done) => format!("{name}: {}.", done.run.line()),
+                routines::Outcome::Skipped(why) => format!("Nothing started: {why}."),
+            },
+        ))
+    })
+}
+
+/// Approves the command only while it reads as the modal showed it: the coordinator may have
+/// changed it while the user read.
+fn approve(src: &Sources, name: &str, shown: &str) -> Result<Msg> {
+    let conn = db::open(&src.db)?;
+    let routine = routines::get(&conn, &src.slug, name)?
+        .with_context(|| format!("routine {name} is gone"))?;
+    if routine.command.as_deref() != Some(shown) {
+        return Ok(Msg::Notice(format!(
+            "Not approved: {name}'s command changed since it was shown. a shows it again."
+        )));
+    }
+    // The words go along, so a change between this look and the approval is refused too.
+    routines::approve(&conn, &src.slug, name, Some(shown), db::now_ms())?;
+    Ok(Msg::Notice(format!(
+        "Approved {name}'s command: it runs on its schedule now."
+    )))
+}
+
+fn set_enabled(src: &Sources, name: &str, enabled: bool) -> Result<Msg> {
+    let conn = db::open(&src.db)?;
+    let config = ProjectConfig::load(&src.dir.join("project.toml"))?;
+    let patch = Patch {
+        enabled: Some(enabled),
+        ..Default::default()
+    };
+    let routine = routines::update(&conn, &config, name, &patch, Author::User, db::now_ms())?;
+    Ok(Msg::Notice(match (enabled, routine.next_run_at) {
+        (false, _) => format!("Paused {name}: nothing fires on schedule until p resumes it."),
+        (true, Some(at)) => format!("Resumed {name}: next run {}.", crate::text::local_stamp(at)),
+        (true, None) => format!("Resumed {name}, but its schedule never comes due."),
+    }))
 }
 
 fn wake(src: &Sources, name: &str) -> Result<Msg> {

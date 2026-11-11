@@ -14,11 +14,13 @@ use crate::accounts;
 use crate::claude::{AGENTS_TIMEOUT, Claude};
 use crate::cleanup::Ctx;
 use crate::config::ProjectConfig;
+use crate::cron::Schedule;
 use crate::pr::{self, Gh};
 use crate::state::{Group, Role};
-use crate::{db, tui};
+use crate::{command, db, routines, tui};
 
-use super::app::{Msg, PrSummary, Snapshot, group_of};
+use super::app::{Msg, PrSummary, RoutineRow, Snapshot, group_of};
+use super::ui::OUTPUT_LINES;
 
 pub const AGENTS_EVERY: Duration = Duration::from_secs(2);
 pub const PR_EVERY: Duration = Duration::from_secs(30);
@@ -211,7 +213,50 @@ fn read(conn: &Connection, slug: &str, error: Option<String>) -> Result<Msg> {
         denials: db::count_guard_denials(conn, slug)?,
         pane_target: db::get_pane_target(conn, slug)?,
         error: error.map(|e| e.split_whitespace().collect::<Vec<_>>().join(" ")),
+        routines: read_routines(conn, slug)?,
     }))
+}
+
+/// The project's routines with how each stands, its command's latest run and its latest
+/// finding: a few small reads per routine, from the database only.
+fn read_routines(conn: &Connection, slug: &str) -> Result<Vec<RoutineRow>> {
+    let now = db::now_ms();
+    routines::list(conn, slug)?
+        .into_iter()
+        .map(|routine| {
+            let state = routines::state(conn, &routine, now)?;
+            let schedule = Schedule::parse(&routine.schedule)
+                .map(|s| s.describe())
+                .unwrap_or_else(|_| routine.schedule.clone());
+            let last_exec = match routine.command {
+                Some(_) => command::latest(conn, slug, &routine.name, 1)?
+                    .into_iter()
+                    .next()
+                    .map(|mut run| {
+                        // The detail shows its last lines; the rest stays in the database.
+                        run.output = run.output.map(|o| last_lines(&o, OUTPUT_LINES));
+                        run
+                    }),
+                None => None,
+            };
+            let finding = routines::findings(conn, slug, &routine.name, 1)?
+                .into_iter()
+                .next();
+            Ok(RoutineRow {
+                routine,
+                state,
+                schedule,
+                last_exec,
+                finding,
+            })
+        })
+        .collect()
+}
+
+/// The last `n` lines of `text`, trailing blank ones left out.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 /// One 30 s PR refresh. Settings are re-read each time: the cleanup mode may have changed.

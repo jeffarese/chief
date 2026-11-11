@@ -570,6 +570,22 @@ kbd {
 .history a, .history li > span:last-child { color: var(--text); overflow-wrap: anywhere; }
 .notes { padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--raised); margin-bottom: 8px; }
 
+/* ---- A routine's command and what it printed ---- */
+
+pre.cmd, pre.output { margin: 0; padding: 9px 12px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
+pre.cmd { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+pre.cmd::before { content: "$ "; color: var(--faint); user-select: none; }
+pre.output { background: var(--screen); color: #d8dbe2; max-height: 340px; overflow-y: auto; }
+.callout pre.cmd { margin-top: 8px; }
+.field textarea.mono { font-family: var(--mono); font-size: 12.5px; min-height: 84px; }
+.field[hidden] { display: none; }
+.runs-list li { align-items: start; }
+.runs-list details { min-width: 0; }
+.runs-list summary { cursor: pointer; color: var(--text); overflow-wrap: anywhere; }
+.runs-list summary .chip { margin-left: 8px; }
+.runs-list details[open] > summary { margin-bottom: 8px; }
+.runs-list details > a { display: inline-block; margin-top: 6px; }
+
 /* ---- Project list ---- */
 
 .projects { max-width: 760px; margin: 0 auto; padding: 40px 20px; overflow-y: auto; width: 100%; }

@@ -97,7 +97,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Routines: prompts a project runs on a schedule, each run a fresh thread
+    /// Routines: work a project runs on a schedule, a Claude session or a plain command
     Routine {
         #[command(subcommand)]
         action: RoutineAction,
@@ -151,9 +151,16 @@ enum RoutineAction {
         /// @weekly, @monthly, or "every 30m" / "every 2h"
         #[arg(long)]
         schedule: String,
-        /// What every run does: the thread's whole brief
+        /// What a session does: the thread's whole brief. With --command too, the session
+        /// starts only when the command has news
         #[arg(long)]
-        prompt: String,
+        prompt: Option<String>,
+        /// A shell command chief runs itself, with no session: exit 0 means all is well
+        #[arg(long)]
+        command: Option<String>,
+        /// Seconds the command may run (default 300)
+        #[arg(long)]
+        timeout: Option<i64>,
         /// A repository of the project (default: its default repository)
         #[arg(long)]
         repo: Option<String>,
@@ -171,8 +178,35 @@ enum RoutineAction {
         #[arg(long)]
         paused: bool,
     },
-    /// Run a routine now, outside its schedule
+    /// Run a routine now, outside its schedule; a command is waited for and its output shown
     Run { slug: String, name: String },
+    /// Show one routine: how it stands, what it found, its command's last runs and output
+    Show { slug: String, name: String },
+    /// Let a routine's command run: your yes to a command the coordinator wrote or changed
+    Approve { slug: String, name: String },
+    /// From a routine's command: record a number it tracks over time
+    Value {
+        /// What the number is; the same name every run
+        series: String,
+        #[arg(allow_negative_numbers = true)]
+        value: f64,
+        #[arg(long)]
+        unit: Option<String>,
+        /// A few words about this point
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// From a routine's command: say what this run came to (nothing, update or attention)
+    Outcome {
+        outcome: String,
+        /// One line the user reads on their phone
+        headline: String,
+        #[arg(long)]
+        details: Option<String>,
+    },
+    /// Run one run of a routine's command (chief starts this itself)
+    #[command(hide = true)]
+    Exec { slug: String, run: i64 },
     /// Stop a routine from firing until it is resumed
     Pause { slug: String, name: String },
     /// Let a paused routine fire again, from now
@@ -378,6 +412,8 @@ fn routine(action: RoutineAction) -> Result<()> {
             title,
             schedule,
             prompt,
+            command,
+            timeout,
             repo,
             model,
             effort,
@@ -388,7 +424,9 @@ fn routine(action: RoutineAction) -> Result<()> {
             &slug,
             &Draft {
                 title,
-                prompt,
+                prompt: prompt.unwrap_or_default(),
+                command,
+                timeout_secs: timeout,
                 schedule,
                 repo,
                 model,
@@ -399,6 +437,20 @@ fn routine(action: RoutineAction) -> Result<()> {
             },
         ),
         RoutineAction::Run { slug, name } => routines::cli_run(&slug, &name),
+        RoutineAction::Show { slug, name } => routines::cli_show(&slug, &name),
+        RoutineAction::Approve { slug, name } => routines::cli_approve(&slug, &name),
+        RoutineAction::Value {
+            series,
+            value,
+            unit,
+            note,
+        } => chief::command::cli_value(&series, value, unit, note),
+        RoutineAction::Outcome {
+            outcome,
+            headline,
+            details,
+        } => chief::command::cli_outcome(&outcome, &headline, details.as_deref()),
+        RoutineAction::Exec { slug, run } => chief::command::cli_exec(&slug, run),
         RoutineAction::Pause { slug, name } => routines::cli_update(
             &slug,
             &name,

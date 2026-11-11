@@ -492,6 +492,39 @@ Found on the way: `hooks_against_a_locked_database_log_and_exit_zero` fails abou
 four on the commit before this work too. A hook can wait about 10 s on a locked database, not
 the 5 s §4 says: the busy handler's clock starts again for each lock a statement waits on.
 
+## Routines that are commands (built, 2026-11-11)
+
+Problem (user request): every routine run was a whole Claude session, which is too much for a
+check ("is staging up", "did the build pass") and rules out what a cron job does. This closes
+the open item above (nothing gated a run on a cheap check).
+
+1. **Kinds** (ARCHITECTURE §13; `src/command.rs`, migration 21): a routine is a prompt (a
+   session each run, as before), a command chief runs itself with no session, or both: the
+   command first, and a session only when the command has news, with its output in the brief.
+   A routine with a command may fire every minute; a prompt alone stays at 5.
+2. **A command's run** is a `routine_runs` row and a detached `chief routine exec`: `sh -c` in
+   the routine's repository with a time limit, its output kept (the last 16 KB on the row, all
+   of the latest in `last-run.log`). It speaks through its exit status, and when it knows more
+   through `chief routine value` and `chief routine outcome`.
+3. **News**: a command repeats itself, so only a change reaches anyone: the first failure, the
+   first pass after it, an outcome it didn't say the run before.
+4. **Approval**: the coordinator has no Bash, so a command it writes or changes waits for the
+   user's yes (the board, the dashboard, `chief routine approve`); the user's own is approved.
+5. **State**: one word and one line for how a routine stands (`routines::state`), shown the
+   same by `chief routine list|show`, the board and the dashboard.
+6. **Board**: a Routines section with each routine's state, a detail panel, and keys to
+   approve, run and pause. **Dashboard**: the kind in the form, state on tiles and rows, the
+   command's runs and output on its page, Approve.
+
+Tested with real `sh` commands in-process (`tests/routines.rs`, `command::`) and through the
+binary (`tests/serve_cli.rs`: the server running a due command detached, the command speaking
+through the CLI, the dashboard's API), the board's section without a terminal (`board::`,
+`tests/board.rs`), and by hand against a seeded project: the page in Chrome with the server
+firing a command every minute, and the board in tmux.
+
+Not verified live yet: a check's session started by real news; the coordinator writing a
+command and the user approving it from the board; a command under launchd's environment.
+
 ## Review, 2026-11-09: what would make chief better
 
 From a read-only pass over the docs and code. Not built; ranked by value.

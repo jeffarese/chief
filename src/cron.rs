@@ -4,9 +4,12 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone};
 
-/// The shortest time between two runs. Each run is a whole Claude session, so a schedule that
-/// fires more often is a typo (`* * * * *`), not a wish.
+/// The shortest time between two runs that start a Claude session. Each is a whole session, so
+/// a schedule that fires more often is a typo (`* * * * *`), not a wish.
 pub const MIN_GAP_MINUTES: u32 = 5;
+
+/// The shortest time between two runs of a command (§13 "A command"): cron's own grain.
+pub const MIN_GAP_COMMAND_MINUTES: u32 = 1;
 
 /// How far `next_after` looks for a day that matches: `0 0 29 2 *` comes once in four years, and
 /// `0 0 29 2 1` (a Monday) rarely enough that eight years finds one.
@@ -65,6 +68,23 @@ impl Schedule {
         Ok(Schedule::Cron(cron))
     }
 
+    /// Refuses a schedule that would fire less than `minutes` apart: what a run costs decides
+    /// how often it may run, so the routine says which gap applies.
+    pub fn check_gap(&self, minutes: u32, why: &str) -> Result<()> {
+        let gap = match self {
+            Schedule::Every(m) => *m,
+            Schedule::Cron(cron) => cron.min_gap(),
+        };
+        if gap < minutes {
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            bail!(
+                "the schedule would run less than {minutes} {unit} apart; {why}, so space \
+                 them out (e.g. `*/15 * * * *`, `every 30m`)"
+            );
+        }
+        Ok(())
+    }
+
     /// The first run strictly after `after`. None for a cron line no day ever matches
     /// (`0 0 31 2 *`).
     pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
@@ -118,8 +138,8 @@ fn every(rest: &str) -> Result<Schedule> {
         _ => bail!("`every` takes minutes, hours or days (30m, 2h, 1d), not {unit:?}"),
     };
     let minutes = minutes.context("that interval is too long")?;
-    if minutes < MIN_GAP_MINUTES {
-        bail!("a routine can run at most every {MIN_GAP_MINUTES} minutes: each run is a thread");
+    if minutes == 0 {
+        bail!("`every` needs at least a minute");
     }
     Ok(Schedule::Every(minutes))
 }
@@ -146,12 +166,6 @@ impl Cron {
             days_given: !day.starts_with('*'),
             weekdays_given: !weekday.starts_with('*'),
         };
-        if cron.min_gap() < MIN_GAP_MINUTES {
-            bail!(
-                "would run less than {MIN_GAP_MINUTES} minutes apart; each run is a thread, so \
-                 space them out (e.g. `*/15 * * * *`)"
-            );
-        }
         Ok(cron)
     }
 
@@ -472,22 +486,48 @@ mod tests {
             ("0 9 * * funday", "a name it doesn't know"),
             ("*/0 9 * * *", "a zero step"),
             ("5-1 9 * * *", "a backwards range"),
-            ("* * * * *", "every minute"),
-            ("*/2 * * * *", "every two minutes"),
-            ("58,1 * * * *", "three minutes across the hour"),
-            ("every 2m", "under the minimum"),
+            ("every 0m", "no time at all"),
             ("every 10 fortnights", "an unknown unit"),
             ("every", "no number"),
             ("@yearlyish", "an unknown shorthand"),
         ] {
             assert!(Schedule::parse(schedule).is_err(), "{why}: {schedule:?}");
         }
-        // Minutes that are close only across an hour's edge are fine when the hours aren't back
-        // to back.
-        assert!(Schedule::parse("58,1 9 * * *").is_ok());
-        assert!(Schedule::parse("58,1 9,10 * * *").is_err());
-        assert!(Schedule::parse("55,0 9,12 * * *").is_ok());
-        assert!(Schedule::parse("*/5 * * * *").is_ok());
+    }
+
+    #[test]
+    fn a_schedule_keeps_the_gap_its_runs_need() {
+        let spaced = |schedule: &str, minutes: u32| {
+            Schedule::parse(schedule)
+                .unwrap()
+                .check_gap(minutes, "each run is a session")
+        };
+        for (schedule, why) in [
+            ("* * * * *", "every minute"),
+            ("*/2 * * * *", "every two minutes"),
+            ("58,1 * * * *", "three minutes across the hour"),
+            ("every 2m", "under the minimum"),
+            // Close only across an hour's edge, with hours back to back.
+            ("58,1 9,10 * * *", "three minutes across 09:58 and 10:01"),
+        ] {
+            let err = spaced(schedule, MIN_GAP_MINUTES).unwrap_err().to_string();
+            assert!(err.contains("less than 5 minutes apart"), "{why}: {err}");
+            assert!(err.contains("each run is a session"), "{err}");
+        }
+        for schedule in ["58,1 9 * * *", "55,0 9,12 * * *", "*/5 * * * *", "every 5m"] {
+            assert!(spaced(schedule, MIN_GAP_MINUTES).is_ok(), "{schedule}");
+        }
+        // A command may run as often as cron's grain.
+        for schedule in ["* * * * *", "every 1m", "*/2 * * * *"] {
+            assert!(
+                spaced(schedule, MIN_GAP_COMMAND_MINUTES).is_ok(),
+                "{schedule}"
+            );
+        }
+        assert_eq!(
+            Schedule::parse("* * * * *").unwrap().describe(),
+            "Every minute"
+        );
     }
 
     #[test]

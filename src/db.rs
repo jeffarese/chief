@@ -240,6 +240,33 @@ CREATE TABLE ui_state (
        note         TEXT
      );
      CREATE INDEX routine_points_by_series ON routine_points(project_slug, routine, series, id);",
+    // Routines that run a command instead of a session, or before one (§13 "A command"): the
+    // command, the words of it the user approved, and its time limit; one row per run of it;
+    // and, for what such a run found, which run it was and when the coordinator was told.
+    // Findings without a thread that were there before are nothing to tell anyone now.
+    "ALTER TABLE routines ADD COLUMN command TEXT;
+     ALTER TABLE routines ADD COLUMN approved_command TEXT;
+     ALTER TABLE routines ADD COLUMN timeout_secs INTEGER;
+     CREATE TABLE routine_runs (
+       id           INTEGER PRIMARY KEY,
+       project_slug TEXT NOT NULL,
+       routine      TEXT NOT NULL,
+       fired_by     TEXT NOT NULL CHECK (fired_by IN ('schedule','manual')),
+       started_at   INTEGER NOT NULL,
+       finished_at  INTEGER,
+       pid          INTEGER,
+       status       TEXT NOT NULL CHECK (status IN ('running','ok','failed','timeout','lost')),
+       exit_code    INTEGER,
+       output       TEXT,
+       outcome      TEXT CHECK (outcome IN ('nothing','update','attention')),
+       headline     TEXT,
+       details      TEXT,
+       thread       TEXT
+     );
+     CREATE INDEX routine_runs_by_routine ON routine_runs(project_slug, routine, id);
+     ALTER TABLE routine_outcomes ADD COLUMN run INTEGER;
+     ALTER TABLE routine_outcomes ADD COLUMN told_at INTEGER;
+     UPDATE routine_outcomes SET told_at = ts WHERE thread IS NULL;",
 ];
 
 /// A cleanup claim older than this was left by a process that died mid-cleanup.
@@ -1453,13 +1480,14 @@ mod tests {
                 "reports",
                 "routine_outcomes",
                 "routine_points",
+                "routine_runs",
                 "routines",
                 "sessions",
                 "teammates",
                 "ui_state"
             ]
         );
-        assert_eq!(MIGRATIONS.len(), 20);
+        assert_eq!(MIGRATIONS.len(), 21);
         drop(conn);
         // Reopening is a no-op migration.
         let conn = open(&dir.path().join("nested/chief.db")).unwrap();

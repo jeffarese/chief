@@ -325,6 +325,9 @@ impl Home {
             .env("CHIEF_NO_NOTIFY", "1")
             // A developer's own account folder must not leak into the generated files.
             .env_remove("CLAUDE_CONFIG_DIR")
+            // Tests run as the user would, even when a Claude session runs cargo (§13
+            // "Approval").
+            .env_remove("CLAUDECODE")
             // Tests run outside tmux unless they say otherwise, even when cargo runs inside it.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")

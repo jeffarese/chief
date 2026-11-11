@@ -1182,6 +1182,7 @@ pub fn status(slug: Option<&str>) -> Result<()> {
         let prefix = claude::shell_prefix(account.flatten().as_deref());
         let archived = db::archived_at(&conn, slug)?.is_some();
         out.push_str(&render_status(slug, archived, &rows, &prefix, db::now_ms()));
+        out.push_str(&crate::routines::render_status(&conn, slug, db::now_ms())?);
     }
     if hidden > 0 {
         out.push_str(&format!(

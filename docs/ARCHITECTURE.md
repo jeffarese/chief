@@ -229,7 +229,9 @@ coordinator's tools work the same with it stopped. One binary:
 | `chief status [<slug>]` | you | Print the board as text (debugging, scripting) |
 | `chief gc [<slug>] [--dry-run]` | you | Refresh PRs, then clean up every resolved thread that loses nothing (§12) |
 | `chief clean <slug> <thread> [--discard] [--yes]` | you | Clean up one resolved thread; `--discard` throws away unsaved work after confirming (§12) |
-| `chief routine list\|add\|run\|pause\|resume\|rm <slug> …` | you | A project's routines (§13) |
+| `chief routine list\|add\|show\|run\|approve\|pause\|resume\|rm <slug> …` | you | A project's routines (§13). `add` takes `--prompt`, `--command` (with `--timeout`) or both; `show` prints one with how it stands, what it found, its command's 10 latest runs and what the last printed; `run` waits for a command and prints its output; `approve` is the user's yes to a command the coordinator wrote (§13 "Approval") |
+| `chief routine value <series> <number> [--unit U] [--note N]`, `chief routine outcome <nothing\|update\|attention> <headline> [--details D]` | a routine's command | What the command's run tracks and came to (§13 "A command"); they read `CHIEF_PROJECT`, `CHIEF_ROUTINE` and `CHIEF_RUN` |
+| `chief routine exec <slug> <run>` (hidden) | chief, detached (`command::spawn`) | Runs one run of a routine's command to its end and records it (§13 "A command") |
 | `chief serve [--bind ADDR] [--port N]` | you, `chief serve start`, launchd | The background server, in the foreground: fires due routines and serves the dashboard (§14) |
 | `chief serve start\|stop\|status\|install\|uninstall` | you; `chief up` and `chief dashboard` run `start` | Start it detached, end it, say what it serves, keep it running across logins (§14) |
 | `chief dashboard <slug> [--off] [--no-open]` | you | Turn the project's dashboard on (or off), start the server, print the sign-in link (§14) |
@@ -327,7 +329,10 @@ each project's coordinator and threads grouped in board order. A thread's line j
 its name, `"<title>"`, waiting reason, `asleep`, `branch <b>`, `PR <url>`, `account <label>` (the
 agp account it runs in, §7 "Thread account"), `routine <name>` (a routine's run, §13) (each when there is
 one), then `cleaned up` or `cleanup blocked: <reason>` when §12 applies, and always ends with when
-it was last active (`5m ago`, `just now`). Without a slug it leaves archived projects out and ends
+it was last active (`5m ago`, `just now`). Under the threads of a project with routines,
+`Routines (N)` and a line each (`routines::render_status`): name, `"<title>"`, kind, schedule in
+words, how it stands (§13 "State": `Failing: exit 22: …`, `OK: passed in 0.3s`, `Needs
+approval: …`), and `next <when>`, `paused` or `never due`. Without a slug it leaves archived projects out and ends
 with `N archived project(s) not shown; chief status <slug> shows one.` when there are any; with
 the slug of an archived one, its first line is `<slug> (archived; chief unarchive <slug> brings it
 back)`.
@@ -341,6 +346,7 @@ An empty variable counts as unset (made absolute, it would be the current folder
 <root>/chief.db
 <root>/logs/hook-errors.log
 <root>/logs/serve.log   what a detached `chief serve` says (§14)
+<root>/logs/routine-runs.log   what the processes that run routines' commands say of themselves (§13)
 <root>/serve.toml       optional: where `chief serve` listens (`bind`, `port`)
 <root>/serve.lock       held by the running `chief serve`
 <root>/serve.json       the running server's pid, address and start time
@@ -355,6 +361,7 @@ An empty variable counts as unset (made absolute, it would be the current folder
   generated/mcp.json
   generated/run-mcp-<routine>.json   the run tools of one routine, written before each run
   routines/<routine>/NOTES.md        what that routine's runs remember; other files they keep beside it
+  routines/<routine>/last-run.log    everything its command's latest run printed (§13 "A command")
   workspace/                         where threads work when the project has no repositories
 ```
 
@@ -626,18 +633,41 @@ CREATE TABLE routines (                   -- §13 (migration 19)
   last_run_at  INTEGER,                   -- when its latest run started
   last_thread  TEXT,                      -- that run's sessions.name
   last_note    TEXT,                      -- why the last occurrence started no thread, or what the start warned of
+  command      TEXT,                      -- the shell line it runs instead of a session, or before one, §13 "A command" (migration 21)
+  approved_command TEXT,                  -- the words of `command` the user approved; it runs only while they are the same (migration 21)
+  timeout_secs INTEGER,                   -- how long the command may run; NULL = 300 (migration 21)
   UNIQUE (project_slug, name)
 );
+
+CREATE TABLE routine_runs (               -- one run of a routine's command, §13 "A command" (migration 21)
+  id           INTEGER PRIMARY KEY,
+  project_slug TEXT NOT NULL,
+  routine      TEXT NOT NULL,             -- routines.name; kept when the routine is deleted
+  fired_by     TEXT NOT NULL CHECK (fired_by IN ('schedule','manual')),
+  started_at   INTEGER NOT NULL,
+  finished_at  INTEGER,                   -- NULL while it runs
+  pid          INTEGER,                   -- the chief process that runs it
+  status       TEXT NOT NULL CHECK (status IN ('running','ok','failed','timeout','lost')),
+  exit_code    INTEGER,                   -- NULL while it runs, for a timeout, and for one that couldn't start; 128 + the signal for one a signal ended
+  output       TEXT,                      -- the last 16 KB of what it printed, stdout and stderr together
+  outcome      TEXT CHECK (outcome IN ('nothing','update','attention')),  -- what the command said with `chief routine outcome`
+  headline     TEXT,
+  details      TEXT,
+  thread       TEXT                       -- the session started for its news (a check)
+);
+CREATE INDEX routine_runs_by_routine ON routine_runs(project_slug, routine, id);
 
 CREATE TABLE routine_outcomes (           -- what a run said it came to, §13 (migration 20)
   id           INTEGER PRIMARY KEY,
   project_slug TEXT NOT NULL,
   routine      TEXT NOT NULL,             -- routines.name; kept when the routine is deleted
-  thread       TEXT,                      -- the run's sessions.name
+  thread       TEXT,                      -- the run's sessions.name; NULL for what a command's run found
   ts           INTEGER NOT NULL,
   outcome      TEXT NOT NULL CHECK (outcome IN ('nothing','update','attention')),
   headline     TEXT NOT NULL,             -- one line for the user, at most 200 chars
-  details      TEXT
+  details      TEXT,
+  run          INTEGER,                   -- routine_runs.id, for what a command's run found (migration 21)
+  told_at      INTEGER                    -- when the coordinator was told of a command's finding; set at once for one nobody is to hear of (migration 21)
 );
 CREATE INDEX routine_outcomes_by_routine ON routine_outcomes(project_slug, routine, id);
 CREATE INDEX routine_outcomes_by_thread ON routine_outcomes(thread, id);
@@ -1056,7 +1086,12 @@ background (`asyncRewake`, §1, §3) at each SessionStart and Stop of the coordi
   "<title>" · routine <routine> · finished at HH:MM · <outcome>: <headline>` (for a run without
   an outcome, `· gave no outcome` and a `report:` preview line, ≤200 chars), then: tell the user
   in a line each, attention first; look closer with `read_routine` or `read_report` for those and
-  for a run without an outcome; resolve a run that leaves nothing to do.
+  for a run without an outcome; resolve a run that leaves nothing to do. What a routine's
+  command found (§13 "News") has no thread, so it is due by itself (`routines::untold`: a
+  finding with a `run` and no `told_at`) and rides in the same section: `- routine <routine>
+  "<title>" · command · at HH:MM · <outcome>: <headline>`, the latest 10 spelled out under `-
+  (N earlier findings of commands: read_routine lists them)`, all marked told; the text adds
+  that such a line has no thread and that `read_routine` shows the run and what it printed.
 - The notice is a section per kind, separated by a blank line. `<chief-waiting>`, a line per
   thread, `</chief-waiting>`, and what to do: `- <name> "<title>" · <permission|question> since
   HH:MM · wants to run <command>` (or `wants to use <call>`, or `asks <question>`, read from its
@@ -1242,12 +1277,12 @@ All tools return JSON text content. Errors are tool errors with a plain message.
 | `resolve_thread` | `name`, `reopen?` (bool) | Sets or clears `resolved` (`coordinator`). Returns `{name, resolved, group}`. Reopening a cleaned thread, or one removed outside chief, is the same tool error as `wake_thread`'s (`registry::set_resolved` refuses it for every caller) |
 | `move_thread` | `name`, `account?` (an agp id or label from the pool) | Needs an agp with `bg`. Settles the thread (§5 "Limits and moves"); a named account must be in the pool, trust its repo (placement's pinned rules, §7 "Thread account") and not be the one it runs in. Then `agp bg move <session id> [--to <id>] --json` (bounded, 120 s): agp stops it and resumes it there (or in the other pool account with the most room). chief follows the move from `agp bg --json`, else from the move's answer, asks agp to watch it (`runner = "agp"`), refreshes its new account and returns `{name, alive, address, moved, account, next}` (subscribe again). The prompt (§8) says agp moves limited threads itself: only when the user asks, or for a limited thread agp didn't move |
 | `stop_thread` | `name` | Refreshes from its own account; with a live pid: when `ui_state.pane_target` is this thread, clears it and calls `pane::request_switch` (a pane showing it would respawn it), then `claude stop <short_id>` in its account. Returns `{name, stopped: true}`, or `{name, stopped: false, note}` for one with no process. The turn it was in ends without a report; its conversation, worktree and branch stay, and `wake_thread` brings it back. A cleaned thread or one removed outside chief is the same tool error as `wake_thread`'s. The prompt (§8) says to use it only when the user asks or a thread is off track and a message didn't help |
-| `list_routines` | none | `{routines: [...]}`, each a routine's row (§4) plus `schedule_text` ("Weekdays at 09:00"), `next_run` and `last_run` (local `YYYY-MM-DD HH:MM`, null when none), `last_finding` (what its last run said: `outcome`, `headline`, `details`, `at`, `when`, `thread`; null before any) and `series` (up to 4 of what it tracks, most recently recorded first: `name`, `unit`, `latest`, `previous`, `at`, and its 30 latest `points`); and `scheduler`, a line saying `chief serve` isn't running and how the user starts it, whenever it isn't (on every routine tool's answer but `delete_routine`'s and `run_routine`'s) |
-| `create_routine` | `title`, `prompt`, `schedule`, `repo?`, `model?`, `effort?`, `notify?` (default true), `enabled?` (default true), `name?` (default: made from the title) | Validates (§13 "A routine") and stores it with its next run. Returns the routine as `list_routines` shows it |
-| `update_routine` | `name`, and any of `title`, `prompt`, `schedule`, `repo`, `model`, `effort` (an empty string goes back to the project's default), `notify`, `enabled` | Changes only what is given; `enabled: false` pauses, `true` resumes from now. Returns the routine |
+| `list_routines` | none | `{routines: [...]}`, each a routine's row (§4) plus `schedule_text` ("Weekdays at 09:00"), `next_run` and `last_run` (local `YYYY-MM-DD HH:MM`, null when none), `kind` (`session`, `command` or `check`), `needs_approval`, `state` (§13 "State": `key`, `label`, `line`, `at`, `needs_user`), `last_exec` (its command's latest run: `id`, `status`, `exit_code`, `fired_by`, `started_at`, `started`, `finished_at`, `duration_ms`, `line`, `outcome`, `headline`, `details`, `thread`; null before any), `last_finding` (what its last run said: `outcome`, `headline`, `details`, `at`, `when`, `thread`, `run`; null before any) and `series` (up to 4 of what it tracks, most recently recorded first: `name`, `unit`, `latest`, `previous`, `at`, and its 30 latest `points`); and `scheduler`, a line saying `chief serve` isn't running and how the user starts it, whenever it isn't (on every routine tool's answer but `delete_routine`'s and `run_routine`'s) |
+| `create_routine` | `title`, `schedule`, `prompt?`, `command?` (one of the two at least), `timeout_secs?`, `repo?`, `model?`, `effort?`, `notify?` (default true), `enabled?` (default true), `name?` (default: made from the title) | Validates (§13 "A routine") and stores it with its next run. Returns the routine as `list_routines` shows it, with `notes` (its notes file) and, for one with a command, `approval`: the command doesn't run until the user approves it, which the coordinator can't, and where they do (§13 "Approval") |
+| `update_routine` | `name`, and any of `title`, `prompt`, `command` (an empty string removes either; one must remain), `timeout_secs` (0 = the default), `schedule`, `repo`, `model`, `effort` (an empty string goes back to the project's default), `notify`, `enabled` | Changes only what is given; `enabled: false` pauses, `true` resumes from now. A changed command waits for approval again (`approval`). Returns the routine |
 | `delete_routine` | `name` | Removes the routine; its runs' threads and reports stay. `{name, deleted: true, note}`. The prompt keeps it for when the user asks |
-| `run_routine` | `name` | A run now, outside the schedule, which doesn't move (§13 "A run"). `{routine, started: true, thread, next}`, or `{routine, started: false, note}` while its last run still works |
-| `read_routine` | `name` | One routine in full, without a thread: what `list_routines` shows, plus `notes` (its `NOTES.md`, the first 8 KB, with `notes_file` and `notes_cut` when it goes on), `findings` (its 10 latest: `outcome`, `headline`, `details`, `at`, `when`, `thread`) and `series` with each one's 60 latest `points` (`[at, value]`) |
+| `run_routine` | `name` | A run now, outside the schedule, which doesn't move (§13 "A run"). A session: `{routine, started: true, thread, next}`. A command, which runs detached: `{routine, started: true, run, note, next}`. `{routine, started: false, note}` while its last run still works or its command waits for approval |
+| `read_routine` | `name` | One routine in full, without a thread: what `list_routines` shows, plus `notes` (its `NOTES.md`, the first 8 KB, with `notes_file` and `notes_cut` when it goes on), `findings` (its 10 latest: `outcome`, `headline`, `details`, `at`, `when`, `thread`, `run`), `series` with each one's 60 latest `points` (`[at, value]`), `runs` (its command's 5 latest, as `last_exec`, each with `output` and `output_cut`: the latest run's whole 16 KB, 2 KB of the earlier ones) and, with a command, `log_file` |
 
 There is no cleanup tool: removing a worktree and branch is the user's call (§12).
 
@@ -1460,7 +1495,13 @@ at the reset, never moved.
   (the limit, when it resets, what happens next), offer `move_thread` when the pool may have room,
   and message a thread agp doesn't resume after the reset. `move_thread` only when the user asks,
   or for such a thread (agp moves limited threads itself). A "Routines" section: work the user
-  wants repeated becomes a routine (`create_routine`), not a thread; its prompt must stand on its
+  wants repeated becomes a routine (`create_routine`), not a thread; a routine is a prompt
+  (judgement each run), a command (whatever a script can decide: no session, as often as every
+  minute, exit 0 means well) or both (a check that gets a session only for news), chosen by
+  what the work needs; a command the coordinator writes or changes waits for the user's
+  approval, so it shows them the command and where to approve, and doesn't run it before; chief
+  tells people only what changed in a command's runs, and a command can say more with `chief
+  routine value` and `chief routine outcome`; a prompt must stand on its
   own, since a run sees neither the conversation nor earlier runs and can't ask anyone; schedules
   are in the user's local time; when a tool says `chief serve` isn't running, tell the user. A
   `<chief-routine>` message means those runs finished, each line with its outcome and
@@ -2040,6 +2081,47 @@ draws it in part of its frame (`ui::draw_in`). Logic and rendering are tested wi
 - A thread with `cleanup_blocked` shows a "cleanup blocked" tag (the reason in the detail); a
   cleaned thread shows "cleaned up" in Resolved. Wake and reopen are refused for a cleaned thread
   and for one removed outside chief.
+- **Routines** (§13). The refresh's database read also brings the project's routines
+  (`Snapshot.routines`, a `RoutineRow` each: the routine, its `routines::state`, its schedule in
+  words, its command's latest run with the last 5 lines it printed, its latest finding). They
+  are a section under the thread groups, after Resolved even when collapsed, hidden when the
+  project has none:
+  - Header `Routines · N`, bold; `Routines · N · 1 needs you` (`k need you`) in Waiting's bold
+    red when some do (`State::needs_user`).
+  - A row is ` <glyph> <title>  <tags>`, cut like a thread's, its title dim when paused, the
+    target mark's column blank (a routine is never what the main pane shows). The glyph is its
+    state: `!` bold red (`approval`, `attention`), `✗` bold red (`failing`), `●` green
+    (`running`), `✓` green (`ok`), `◆` blue (`update`), `○` (`nothing`; dim for `new`). Tags,
+    joined with ` · `: the state's word when it matters (`needs approval`, `failing`, `needs
+    you` in bold red, `running` in green, `update` in blue; none for ok, nothing new and no
+    run yet), `paused`, the kind when it isn't a plain session (`command`, `check`), and while
+    enabled when it next runs (`in 12m`, `due now`, `never due`).
+  - Routines come after the threads in the selection (keys, wheel, clicks; `↓ N more` counts
+    them). A selected routine stays selected while it exists; `n` goes to a thread.
+  - Detail, titled with its title: `<name> · <kind> · <schedule in words> · next HH:MM (in
+    12m)` (or `due now`, `never due`, `paused`); the state's word and line in the glyph's
+    colour, with ` · for 3h` while failing, else ` · 5m ago`; `$ <command>` on one line (200
+    chars) with `(at most Ns)`; while it waits, `Waits for your approval: a shows it whole, y
+    approves.`; `last run <ago> · <the run's line>` (` · started <thread>` for a check's
+    session) and the last 5 lines it printed (for a session routine, `last run <ago> ·
+    <thread>`); `outcome <verdict>: <headline> · <ago>` when it says more than the state line;
+    `note <last_note>`; `prompt …` on one line; `repo`, `model · effort` when set. What a
+    command printed is shown through `ui::printable`: escape sequences and control characters
+    out, the last redraw of a line that used `\r`.
+  - Keys on a routine, in the key bar in this order: `a` approve (offered while its command
+    waits, instead of `e`), `e` run now, `p` pause or resume. Thread keys on a routine, and
+    these on anything else, say what they act on; Enter on a routine shows nothing and says
+    where its runs are.
+  - `a` asks first (`Screen::Approve`, a red card titled `Approve the command of <title>?`):
+    that chief will run it with `sh -c`, as the user and with nobody watching, on its schedule
+    (in words) and whenever it is run, until its words change; then the whole command; `y
+    approves · any other key cancels`. A command too long to show whole can't be approved
+    there (`chief routine show` reads it). `y` sends the words that were shown, and the worker
+    approves only those (`routines::approve`, §13 "Approval").
+  - `e` runs on a worker as `wake` does (`tools::refresh`, then `routines::run(Manual)`):
+    `Started <thread>.`, `<name>: its command runs; the detail shows how it ends.`, or `Nothing
+    started: <why>.`; refused while its command waits for approval. `p` flips the row at once
+    and updates the routine as the user (`Paused <name>: …`, `Resumed <name>: next run …`).
 
 ## 10a. Launcher
 
@@ -2154,6 +2236,19 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
   routine kind (`waiting::`), and `tests/routines.rs` against the fake (validation, a due run
   starting a tagged thread, the claim, the skip while the last run works, older runs put away, a
   failed start noted and not retried).
+- The board's routines: `board::` (the section and its tags, selection into it, the detail of a
+  failing command and of one waiting for approval, the approval card, thread and routine keys
+  refusing each other, tiny terminals) and `tests/board.rs` (the refresh reading them, their
+  actions on workers). No test runs a command through the board's worker: it would start the
+  test binary as `chief routine exec`.
+- Commands (§13): `command::` (a run's line, what is news and what repeats, the tail),
+  `tests/routines.rs` running real `sh` commands in-process with `run_here` (no session and no
+  finding for a pass, the kinds and their gaps, a failure told once and its recovery once with
+  what is pushed and what the coordinator is due, approval of the coordinator's words, a check
+  starting a session only for news and falling back to a finding, the time limit, one run at a
+  time and a lost run), and `tests/serve_cli.rs` with the binary (the server running a due
+  command detached, the command speaking through `chief routine value` and `outcome`, the
+  dashboard's state, Run now and Approve, `chief routine run` and `show`).
 - A run's side: `tests/routines.rs` (the notes folder and brief, values joining one series, the
   outcome and what it pushes, the Stop hook's request, who is woken, the workspace of a project
   without repositories), `tests/mcp_cli.rs` (`chief mcp --routine` serves the two run tools over
@@ -2318,20 +2413,31 @@ A cleaned thread, or one removed outside chief, can't be woken, reopened or mess
 cleaned one is hidden from `list_threads` unless `include_resolved`. The coordinator has no cleanup tool; its prompt says cleanup is the
 user's call (§8).
 
-## 13. Routines (`src/routines.rs`, `src/cron.rs`)
+## 13. Routines (`src/routines.rs`, `src/command.rs`, `src/cron.rs`)
 
-A routine is work a project repeats on a schedule: a prompt chief runs by itself, each run a
-fresh thread that nobody watches. The coordinator makes and manages them with its tools (§7), so
-"every weekday at 9, triage new issues" is said in the conversation; `chief routine` (§2) and the
-dashboard (§14) do the same. They are rows (§4 `routines`), written through the same functions
-by all three.
+A routine is work a project repeats on a schedule, run by chief with nobody watching. It is one
+of three things (`Routine::kind`), by what it has:
+
+- a **session** (a `prompt`): each run is a fresh thread. For work that needs judgement;
+- a **command** (a `command`): a shell line chief runs itself, with no Claude session ("A
+  command", below). A check, a script, a cron job, at the cost of a process;
+- a **check** (both): the command runs first and a session starts only when the command has
+  news ("News"), so watching something costs nothing while all is well.
+
+The coordinator makes and manages them with its tools (§7), so "every weekday at 9, triage new
+issues" and "check staging every minute" are said in the conversation; `chief routine` (§2), the
+board (§10) and the dashboard (§14) do the same. They are rows (§4 `routines`), written through
+the same functions by all four.
 
 ### A routine
 
 - `name`: its handle, `[a-z0-9-]`, at most 32 characters, unique in the project and never
   changed. Made from the title when none is given (`-2`, `-3` … on a clash); an explicit name
   that is taken is refused.
-- `title` and `prompt`, neither empty. The prompt is each run's whole brief.
+- `title`, never empty, and a `prompt`, a `command`, or both. The prompt is a session's whole
+  brief; it is empty for a routine that is only a command. The command is one `sh -c` line (or
+  several), at most 16 KB: a longer script belongs in a file the command runs. `timeout_secs`
+  is how long it may run: 1 to 86400, default 300 (`command::DEFAULT_TIMEOUT_SECS`).
 - `schedule`, in the machine's local time, one of (`cron::Schedule::parse`):
   - five cron fields, `minute hour day-of-month month day-of-week`: `*`, numbers, ranges
     (`1-5`), lists (`0,30`), steps (`*/15`, `5/20`, `1-10/2`), month and weekday names (`jan`,
@@ -2339,13 +2445,16 @@ by all three.
     as in cron;
   - `@hourly`, `@daily` (`@midnight`), `@weekly`, `@monthly`, `@weekdays` (weekdays at 09:00);
   - `every <n>m|h|d` (also `minutes`, `hours`, `days`): that long after the last run.
-  Each run is a whole session, so a schedule that would fire less than 5 minutes apart is refused
-  (`cron::MIN_GAP_MINUTES`). A time the clocks skip doesn't run that day; one they repeat runs at
-  its first pass. `describe` words a schedule for people ("Weekdays at 09:00", "Every 30
+  What a run costs decides how often it may fire (`Schedule::check_gap`): a routine that is
+  only a session is refused a schedule that would fire less than 5 minutes apart
+  (`cron::MIN_GAP_MINUTES`), since each run is a whole session; one with a command may fire
+  every minute (`MIN_GAP_COMMAND_MINUTES`), cron's own grain, since its sessions start only for
+  news. A time the clocks skip doesn't run that day; one they repeat runs at its first pass. `describe` words a schedule for people ("Weekdays at 09:00", "Every 30
   minutes"), and shows one it has no words for as `cron <fields>`.
 - `repo`: a repository of the project by name (never a path: trust and the coordinator's deny
   rules are set up for the project's repositories), else the project's default repo; a routine
-  with neither is refused. `model` and `effort`: overrides of `[threads]`.
+  with neither is refused. A command runs in that repository's own folder, not a worktree.
+  `model` and `effort`: overrides of `[threads]`, for its sessions.
 - `enabled`: a paused routine keeps its row and fires nothing (`next_run_at` NULL). Resuming
   counts from that moment; nothing missed while paused is made up.
 - `notify` (default true): whether the coordinator is told when a run finishes (below).
@@ -2358,7 +2467,9 @@ away).
 
 Routines fire only while `chief serve` runs (§14): every 15 s (`serve::TICK`) it looks, in every
 project that isn't archived, for enabled routines whose `next_run_at` has passed, refreshes that
-project from `claude agents` (the rows decide whether a routine's last run still works), and
+project from `claude agents` when a due routine depends on what its sessions do
+(`routines::due_needs_rows`: a session to start, or a check whose last session the rows show
+at work; never for commands alone, so a command a minute doesn't cost a listing a minute), and
 runs each (`serve::Scheduler::tick`, `routines::run_due`). Without the server nothing fires; every listing
 (`list_routines`, `chief routine list`, a new routine's answer) says so and how to start it, and
 `chief up` starts it for a project that has an enabled routine (§2).
@@ -2370,17 +2481,25 @@ occurrences were missed, and its next run is counted from then.
 
 1. **Claim.** For a scheduled run, in one write transaction: when the routine is enabled and
    due, `next_run_at` moves to the next time after now. Two processes looking at once start one
-   thread, and a run that then fails or is skipped has still spent its occurrence: a broken
+   run, and a run that then fails or is skipped has still spent its occurrence: a broken
    routine doesn't start a session every tick. A manual run (`run_routine`, `chief routine run`,
-   the dashboard's Run now) claims nothing, leaves the schedule alone, and works on a paused
-   routine too.
-2. **One at a time.** When a thread of this routine is still working, waiting on the user or
+   the board's `r`, the dashboard's Run now) claims nothing, leaves the schedule alone, and
+   works on a paused routine too.
+2. **Approved.** A routine whose command waits for the user's yes ("Approval") starts nothing,
+   by schedule or by hand: `last_note` says `skipped at HH:MM: its command waits for the user's
+   approval`.
+3. **One at a time.** When a thread of this routine is still working, waiting on the user or
    limited (not resolved, cleaned or removed), nothing starts: `last_note` says `skipped at
-   HH:MM: its last run (<thread>) is still <group>`.
-3. **Put away.** Its earlier runs that sit idle are resolved (`resolved_reason = 'routine'`), so
+   HH:MM: its last run (<thread>) is still <group>`. Likewise while its command still runs
+   (`command::under_way`): `skipped at HH:MM: its command still runs (since HH:MM)`.
+
+A routine with a command then runs it ("A command"). A session, or the session a check's news
+starts (`routines::start_session`), goes on:
+
+4. **Put away.** Its earlier runs that sit idle are resolved (`resolved_reason = 'routine'`), so
    one finished run per routine stays on the board. A run with an open pull request (review,
    landing), a failed one, and anything of another routine stay.
-4. **Start.** `tools::start_thread_as` with the routine's title, repo (the project's workspace
+5. **Start.** `tools::start_thread_as` with the routine's title, repo (the project's workspace
    when it has no repositories, §3), model and effort and no account (placement picks, §7
    "Thread account"): a thread like any other, with the same guard, hooks, agp watching and
    cleanup, plus what makes it a run (`tools::RunOf`): its row carries `routine = <name>` from
@@ -2388,7 +2507,8 @@ occurrences were missed, and its next run is counted from then.
    thread's hooks, and `permissions.allow: ["mcp__chief"]`, since nobody watches a run for a
    prompt on the tools it must call); `--mcp-config generated/run-mcp-<name>.json`, written just
    before (`chief mcp --project <slug> --routine <name>` as its `chief` server). Its task is the
-   prompt under chief's own brief (`routines::brief`, below). The routine then gets
+   prompt under chief's own brief (`routines::brief`, below), and for a check, between the two,
+   why it started ("News"). The routine then gets
    `last_run_at`, `last_thread` and `last_note` (a start's `warning`, else NULL). A start that
    fails is the error, with `last_note` = `failed at HH:MM: <why>`.
 
@@ -2397,8 +2517,8 @@ threads it starts.
 
 ### What a run leaves
 
-Runs are separate sessions: fresh context every time, which is what keeps a routine that runs
-for months as cheap on its hundredth run as on its first. What carries over is what a run
+A session's runs are separate sessions: fresh context every time, which is what keeps a routine
+that runs for months as cheap on its hundredth run as on its first. What carries over is what a run
 leaves, and chief's brief tells every run to leave three things, so a routine's own prompt says
 only the task:
 
@@ -2429,6 +2549,101 @@ commands still running (that Stop isn't the end of the work), and the Stop isn't
 of a blocked turn (`stop_hook_active`): once per chain of Stops, after the final-report request
 (§5), which comes first. A failure to decide is logged and blocks nothing.
 
+### A command (`src/command.rs`)
+
+A command's run is a `routine_runs` row (§4) and a process, never a session:
+
+- **Who runs it.** `routines::run` writes the row (`command::begin`, `running`) and starts
+  `chief routine exec <slug> <run>` detached (`command::spawn`: its own session, its words in
+  `<root>/logs/routine-runs.log`), so the scheduler's next look, a tool's answer and a page's
+  request never wait for a command, and a run records itself even when what started it ends
+  first. `chief routine run` runs it in its own process instead and waits (`run_here`), since
+  whoever typed it watches. Either way `command::execute` does the rest.
+- **How.** `sh -c <command>` in the routine's repository (the project's workspace when it has
+  none, §3), stdin closed, stdout and stderr together into `<dir>/routines/<name>/last-run.log`
+  (the latest run's, whole). It leads its own process group. Its environment is the server's,
+  plus `CHIEF_HOME`, `CHIEF_PROJECT`, `CHIEF_ROUTINE`, `CHIEF_ROUTINE_DIR` (the routine's
+  folder, where it keeps what it likes between runs), `CHIEF_RUN` (the run's id), the folder of
+  this chief binary first on `PATH`, `CLAUDE_CONFIG_DIR` as the project's account (§3), and no
+  `GIT_*` of another repository.
+- **How it ends.** Exit status 0 is `ok`; any other status, a signal (kept as 128 + the
+  signal), or a command that couldn't start is `failed`; past `timeout_secs` its group gets
+  SIGTERM, 2 s, then SIGKILL, and it is `timeout`. The row keeps the last 16 KB of what it
+  printed. A run whose process is gone without a word (the machine restarted) is `lost` the
+  next time the routine is looked at; it says nothing about the command. The 200 latest runs
+  of a routine are kept.
+- **What it says.** Nothing is required: the exit status is the verdict. A command that knows
+  more says it with two commands it finds on its `PATH`, which are a session's two run tools:
+  `chief routine value <series> <number> [--unit U] [--note N]` (`record_value`) and `chief
+  routine outcome nothing|update|attention <headline> [--details D]`, which is kept on the run's
+  row until the run ends (a later word replaces an earlier one). Outside a run both say that
+  they are for a routine's command.
+
+### Approval
+
+The coordinator can't run commands (§3: no Bash), and a routine's command runs with the user's
+rights and nobody watching. So a command runs only in the words the user approved
+(`routines.approved_command`, `Routine::needs_approval`):
+
+- What the user writes is approved as they write it (`Author::User`): `chief routine add`, the
+  dashboard's form, whose every save carries the command.
+- `chief routine` run by a Claude session isn't the user's hand (Claude Code sets `CLAUDECODE`
+  for what its Bash tool runs): a thread has Bash, and the coordinator could ask one to approve
+  for it. There `add --command` writes as the coordinator does, and `approve` is refused with
+  where the user approves. A session that unsets the variable gets past this: it keeps a
+  helpful session from approving for the user, it is not a sandbox.
+- What the coordinator writes or changes (`Author::Coordinator`: `create_routine`,
+  `update_routine`) waits. The tool's answer carries `approval`, which tells it that it can't
+  approve, to show the user the command, and where they say yes: `a` on the board (§10),
+  Approve in the dashboard (§14), `chief routine approve <slug> <name>` (`routines::approve`).
+  The board and the dashboard send the words they showed, and a command that reads otherwise
+  by then is refused in the same transaction: the yes is to what was read.
+  A change of anything but the command leaves the approval; setting the command back to the
+  approved words needs none.
+- Until then nothing of the routine runs ("A run", step 2), and it stands as `approval`
+  ("State") wherever it is shown. `command::execute` checks again before it starts anything.
+
+### News
+
+A command runs often and repeats itself, so what a run came to reaches someone only when the
+run before it didn't say the same (`command::news_of`; the run before is the latest that
+ended, `lost` ones aside):
+
+| The run | Is news when | As |
+| --- | --- | --- |
+| said an outcome (`chief routine outcome`) | it isn't `nothing`, and the run before didn't say the same outcome and headline | its outcome, headline and details |
+| failed or timed out without saying one | the run before didn't also fail without saying one | `attention`, `Failed: exit 22: <the last line it printed>` (or `timed out after 5m 00s: …`, `didn't start: …`), details: the end of its output |
+| passed without saying one | the run before failed | `update`, `Passes again after N failed runs` (a recovery) |
+
+So a check that fails every minute through the night is one line in the morning, and its
+recovery another. News goes one of two ways (`command::deliver`):
+
+- **A command alone:** it is a finding (`routine_outcomes`, with the run's id and no thread)
+  and reaches people as any finding does ("Who hears of a run").
+- **A check:** it starts the routine's session ("A run", steps 4 and 5), which says the outcome
+  itself. Its brief gets, before the prompt, why it started: the command, how it ended and what
+  it said, and the last 4 KB of what it printed, with the path of the whole log. The run's row
+  names the thread. A recovery is never handed to a session; and when no session can take the
+  news (its last one still works, or the start fails), it is a finding after all, its details
+  ending with why no session looked into it.
+
+### State
+
+How a routine stands is one word and one line, computed in one place (`routines::state`) for
+`chief routine`, the board and the dashboard:
+
+| `key` | Word | When | Line |
+| --- | --- | --- | --- |
+| `approval` | Needs approval | its command waits for the user | |
+| `running` | Running | its command runs now | `since HH:MM` |
+| `failing` | Failing | its command's last run that ended failed | what a check's session found since the failures began, else the run's line (`exit 22: <the last line it printed>`); `at` is when the failures began |
+| `attention`, `update` | Needs you, Update | its command's last run passed and said so; or, for a session, its latest finding | the headline |
+| `ok` | OK | its command's last run passed | `passed in 0.3s` |
+| `nothing` | Nothing new | a session's latest finding | the headline |
+| `new` | No run yet | nothing ran | |
+
+`approval`, `failing` and `attention` need the user (`State::needs_user`).
+
 ### Who hears of a run
 
 A run's outcome decides it, so a routine costs a coordinator's turn only when there is news:
@@ -2440,12 +2655,20 @@ A run's outcome decides it, so a routine costs a coordinator's turn only when th
 | `attention` | told, and woken when it sleeps | pushed, and a desktop notification |
 | none (it crashed, or forgot despite being asked) | told on its next turn, with its report's first words | nothing |
 
+A command's run reaches this table only when it is news ("News"), with the outcome it said or
+the one chief gave it: a first failure is `attention`, a recovery `update`.
+
+- A command's finding has no thread to carry it, so it is told by itself: `routine_outcomes.
+  told_at` is empty until the coordinator's watcher tells it (`routines::untold`, §5), and it
+  wakes a sleeping coordinator as a thread's `attention` does. One that says `nothing`, or
+  whose routine tells nobody, is stored as told.
 - A routine with `notify = false` tells the coordinator of no run; its runs still push.
 - **Waking.** The watcher lives in the coordinator's process, which Claude Code ends after
   about an hour idle (§1). So `chief serve` wakes it for a run that needs the user
   (`Scheduler::tick`, `routines::unheard`, `wake_coordinator`): each look, a project with a run
-  that is due to be told, said `attention`, and reported at least 30 s ago (`WAKE_AFTER_MS`: a
-  turn the Stop hook kept going has moved on, and a coordinator that is awake has heard) gets
+  (or a command's finding) that is due to be told, said `attention`, and reported at least 30 s
+  ago (`WAKE_AFTER_MS`: a turn the Stop hook kept going has moved on, and a coordinator that is
+  awake has heard) gets
   its coordinator refreshed and, when it has no process, respawned (`project::respawn`, 5 s for
   a pid). Its SessionStart hook starts the watcher (§3), which finds the run due and wakes the
   coordinator with the notice. Each report gets one wake (kept in the server's memory, so a
@@ -2461,7 +2684,8 @@ The coordinator's words wait in its conversation; these reach the user when they
 looking, and never wait on anything (each is spawned and left):
 
 - **The desktop notification** (`push::desktop`, macOS `osascript`, `[ui] notify`): a thread's
-  permission prompt, a plain thread's finished turn (§5), and a run's `attention`.
+  permission prompt, a plain thread's finished turn (§5), and a run's `attention`, a command's
+  included.
 - **The push command** (`[push] command`, `push::send`): the user's own one-liner, run through
   `sh -c` with the message in its environment, never in its command line, so nothing in a
   headline is read as shell: `CHIEF_TITLE` (`<project name> · <routine title>`, or the
@@ -2544,8 +2768,9 @@ JSON; a failure is `{"error": "<plain message>"}` with 400 (what the tools refus
 | `GET /api/p/<slug>/stream` | The board as server-sent events: one `board` event with the board's JSON whenever it changed |
 | `GET /api/p/<slug>/sessions/<name>` | One session of the project in full: its board entry plus `task`, `reports` (newest first, 50), `events` (40) and `subagents` mid-turn |
 | `POST /api/p/<slug>/threads/<name>/<action>` | `wake` and `stop` (`tools::wake_thread`, `stop_thread`), `resolve` and `reopen` (`registry::set_resolved`, reason `user`), `clean` (`cleanup::clean(Safe)`). `{ok, message}`. A blocked cleanup is an error that names `x` on the board and `chief clean --discard`: discarding unsaved work needs the loss shown and the name typed (§12), which the dashboard doesn't do. Never the coordinator |
-| `POST /api/p/<slug>/routines`, `PATCH`/`DELETE …/routines/<name>`, `POST …/routines/<name>/run` | `routines::create`, `update`, `delete`, `run(Manual)` (§13) |
-| `GET /api/p/<slug>/routines/<name>` | The routine in full (`routines::read`): as `read_routine`, with all its notes (256 KB), 40 findings and 400 points a series |
+| `POST /api/p/<slug>/routines`, `PATCH`/`DELETE …/routines/<name>`, `POST …/routines/<name>/run` | `routines::create`, `update`, `delete`, `run(Manual)` (§13), as the user (`Author::User`): whoever holds the token is, so a command saved here is approved |
+| `POST /api/p/<slug>/routines/<name>/approve` | `routines::approve`: the user's yes to its command (§13 "Approval"). `{command}`, the words the page showed, is optional; a command that reads otherwise now is a 400. The routine |
+| `GET /api/p/<slug>/routines/<name>` | The routine in full (`routines::read`): as `read_routine`, with all its notes (256 KB), 40 findings, 400 points a series and its command's 30 latest runs |
 | `GET /api/p/<slug>/files` | `{instructions, memory}`: `instructions.md` and `memory/MEMORY.md`, to read |
 | `GET /api/p/<slug>/term?target=<thread>&cols=&rows=` | The terminal socket (below); no `target` is the coordinator |
 
@@ -2599,21 +2824,30 @@ permission prompts, questions and slash commands all work, for the coordinator a
   Overview when the project has routines, the
   coordinator, the threads by group as on the terminal board (same glyphs and colours, the same
   tags as chips, what a working thread does and a waiting one asks, Resolved folded), then the
-  routines with their schedule in words and next run, and `+ New`.
+  routines, each with a glyph for how it stands (`!` when it needs the user, `$` for one with a
+  command, `↻` for a session, `‖` paused), its state's line (else its schedule in words), its
+  next run, and chips for `approve`, `failing` and `running`; and `+ New`.
 - The selection on the right. A session: its state, the actions that apply (Open PR, Wake or
   Stop, Resolve; Reopen and Clean up when resolved; Stop, Clean up and deleting a routine ask
   once more), what it waits on as a callout, and tabs: Conversation (the terminal), Reports (its
   task and every report, as Markdown), and Activity (its latest calls and subagents) for a
   thread or Project (settings in brief, instructions and memory, to read) for the coordinator. A
-  routine has two tabs. Status: what its last run found (outcome, headline, details, a link to
-  the run's report), a line chart per series it tracks, the findings before, and its notes.
-  Settings: its form (title, prompt, a schedule builder that writes the cron line, repository,
-  model, effort, whether the coordinator is told), Run now, Pause or Resume, Delete, and its
-  runs.
+  routine has two tabs. Status: for a session, what its last run found (outcome, headline,
+  details, a link to the run's report); for one with a command, how it stands (§13 "State": the
+  word, the line, since when it fails), the command, what its last run printed and the session
+  that looked into it; then a line chart per series it tracks, the findings (for a command,
+  the times it had news), its command's runs (when, how each ended, by hand or not, each
+  opening to what it printed) with the path of the whole log, and its notes. Settings: its
+  form (title; what runs: a Claude session, a command, or a command then a session, which
+  shows the prompt, the command and its time limit as they apply; a schedule builder that
+  writes the cron line; repository, model, effort, whether the coordinator is told), Run now,
+  Pause or Resume, Delete, and its sessions. A routine whose command waits for approval says
+  so above both tabs, with the command in full and Approve (§13 "Approval").
 - **Overview**, where a project with routines lands: what needs the user (threads waiting, and
-  routines whose last run said `attention`), then a tile per routine with its outcome as an icon
-  and a word, its headline, the latest value of what it tracks with a sparkline, its schedule
-  and next run.
+  routines whose state does: a command to approve, a failing command, a run that said
+  `attention`), then a tile per routine with its state as an icon and a word, its line, the
+  latest value of what it tracks with a sparkline, whether it is a command, its schedule, next
+  run and last run.
 - Charts (drawn as SVG, no library): one series a chart, never two scales on one; a 2px line in
   one validated series colour per theme, round-number gridlines, a crosshair that reads the
   nearest run's value and time, and every value as a table under the chart. A change since the

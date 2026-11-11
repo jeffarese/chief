@@ -13,9 +13,10 @@ use chief::config::{ProjectConfig, Repo};
 use chief::db::{self, SessionRow};
 use chief::placement::{PoolTrust, Untrusted};
 use chief::pr::Gh;
+use chief::routines::{self, Author, Draft, Verdict};
 use chief::state::Role;
 use common::{Fake, GitRepo, agent};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 
 const SHORT: &str = "b65c3d73";
@@ -518,4 +519,143 @@ fn checks_which_repos_the_pool_trusts() {
         panic!("failed")
     };
     assert!(e.contains("`agp status --json` failed"), "{e}");
+}
+
+/// A routine that runs `command` every 30 minutes, written by `by`.
+fn command_routine(env: &Env, title: &str, command: &str, by: Author) -> routines::Routine {
+    let config = ProjectConfig::load(&env.src.dir.join("project.toml")).unwrap();
+    let draft = Draft {
+        title: title.into(),
+        command: Some(command.into()),
+        schedule: "every 30m".into(),
+        ..Default::default()
+    };
+    routines::create(&env.conn, &config, &draft, by, db::now_ms()).unwrap()
+}
+
+/// The refresh brings the project's routines, each with how it stands, its schedule in words,
+/// its command's latest run with only the last lines it printed, and its latest finding.
+#[test]
+fn the_refresh_reads_the_routines() {
+    let env = Env::new();
+    assert!(env.tick().routines.is_empty());
+    command_routine(&env, "Backup", "restic backup", Author::Coordinator);
+    command_routine(
+        &env,
+        "Uptime",
+        "curl -fsS https://example.com",
+        Author::User,
+    );
+    let now = db::now_ms();
+    let output = (1..=9).map(|i| format!("line {i}\n")).collect::<String>() + "curl: (22) 503\n\n";
+    env.conn
+        .execute(
+            "INSERT INTO routine_runs
+               (project_slug, routine, fired_by, started_at, finished_at, status, exit_code, output)
+             VALUES ('demo', 'uptime', 'schedule', ?1, ?2, 'failed', 22, ?3)",
+            params![now - 60_000, now - 59_000, output],
+        )
+        .unwrap();
+    env.conn
+        .execute(
+            "INSERT INTO routine_outcomes (project_slug, routine, ts, outcome, headline)
+             VALUES ('demo', 'uptime', ?1, 'attention', 'Site down')",
+            params![now - 30_000],
+        )
+        .unwrap();
+
+    let snap = env.tick();
+    let names: Vec<&str> = snap
+        .routines
+        .iter()
+        .map(|r| r.routine.name.as_str())
+        .collect();
+    assert_eq!(names, ["backup", "uptime"]);
+    let backup = &snap.routines[0];
+    assert_eq!(backup.state.key, "approval");
+    assert_eq!(backup.schedule, "Every 30 minutes");
+    assert_eq!((&backup.last_exec, &backup.finding), (&None, &None));
+    let uptime = &snap.routines[1];
+    assert_eq!(uptime.state.key, "failing");
+    let run = uptime.last_exec.as_ref().unwrap();
+    assert_eq!(
+        run.output.as_deref(),
+        Some("line 6\nline 7\nline 8\nline 9\ncurl: (22) 503")
+    );
+    assert_eq!(run.line(), "exit 22: curl: (22) 503");
+    let finding = uptime.finding.as_ref().unwrap();
+    assert_eq!(
+        (finding.verdict, finding.headline.as_str()),
+        (Verdict::Attention, "Site down")
+    );
+}
+
+/// The routine keys' workers: a run that can't start says why, approval holds only for the
+/// words the modal showed, and pausing and resuming are the user's own edits.
+#[test]
+fn routine_actions_run_on_workers() {
+    let env = Env::new();
+    command_routine(&env, "Backup", "restic backup", Author::Coordinator);
+    let get = || routines::get(&env.conn, "demo", "backup").unwrap().unwrap();
+
+    let Msg::Done(text) = jobs::run(&env.src, Action::RunRoutine("backup".into())) else {
+        panic!("a run ends busy")
+    };
+    assert!(text.starts_with("Nothing started: skipped at "), "{text}");
+    assert!(
+        text.ends_with("its command waits for the user's approval."),
+        "{text}"
+    );
+
+    let msg = jobs::run(
+        &env.src,
+        Action::Approve {
+            name: "backup".into(),
+            command: "restic backup --older".into(),
+        },
+    );
+    let Msg::Notice(text) = msg else {
+        panic!("{msg:?}")
+    };
+    assert!(text.contains("changed since it was shown"), "{text}");
+    assert!(get().needs_approval());
+    let msg = jobs::run(
+        &env.src,
+        Action::Approve {
+            name: "backup".into(),
+            command: "restic backup".into(),
+        },
+    );
+    assert_eq!(
+        msg,
+        Msg::Notice("Approved backup's command: it runs on its schedule now.".into())
+    );
+    assert!(!get().needs_approval());
+
+    let pause = |enabled| {
+        jobs::run(
+            &env.src,
+            Action::SetEnabled {
+                name: "backup".into(),
+                enabled,
+            },
+        )
+    };
+    assert_eq!(
+        pause(false),
+        Msg::Notice("Paused backup: nothing fires on schedule until p resumes it.".into())
+    );
+    let routine = get();
+    assert!(!routine.enabled);
+    assert_eq!(routine.next_run_at, None);
+    let Msg::Notice(text) = pause(true) else {
+        panic!("resumed")
+    };
+    assert!(text.starts_with("Resumed backup: next run "), "{text}");
+    assert!(get().enabled);
+
+    let Msg::Done(text) = jobs::run(&env.src, Action::RunRoutine("nope".into())) else {
+        panic!("a failed run ends busy too")
+    };
+    assert!(text.contains("no routine \"nope\""), "{text}");
 }

@@ -569,8 +569,9 @@ fn a_due_routine_fires_while_the_server_runs() {
     );
     assert!(added.status.success(), "{}", stderr(&added));
     assert!(
-        stdout(&added)
-            .contains("Added nightly-check  \"Nightly check\" · Every 30 minutes · next ")
+        stdout(&added).contains(
+            "Added nightly-check  \"Nightly check\" · session · Every 30 minutes · next "
+        )
     );
     assert!(stdout(&added).contains("chief serve isn't running"));
 
@@ -694,4 +695,230 @@ fn chief_dashboard_turns_it_on_and_prints_the_link() {
     let config = ProjectConfig::load(&home.path().join("projects/demo/project.toml")).unwrap();
     assert!(!config.dashboard.enabled);
     assert!(!home.run(&["dashboard", "nope"], "").status.success());
+}
+
+/// A routine that is a command (§13 "A command"): the server runs it in a process of its own
+/// with no session, it speaks through `chief routine value` and `outcome`, and the dashboard
+/// shows and approves it.
+#[test]
+fn a_command_routine_runs_without_a_session() {
+    let home = Home::new();
+    let repo = project(&home, "demo", true);
+    trust_file(&home.trust, &[&repo]);
+    home.fake.set("agents.stdout", "[]");
+    let conn = home.db();
+
+    // The user's own command, typed at the CLI: approved as given, and it may run every minute.
+    let added = home.run(
+        &[
+            "routine",
+            "add",
+            "demo",
+            "--title",
+            "Disk",
+            "--schedule",
+            "* * * * *",
+            "--command",
+            "chief routine value 'disk used' 91 --unit % && \
+             chief routine outcome attention 'Disk is at 91%' --details 'Mostly logs.'; pwd",
+        ],
+        "",
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    assert!(
+        stdout(&added).contains("Added disk  \"Disk\" · command · Every minute · next "),
+        "{}",
+        stdout(&added)
+    );
+    assert!(stdout(&added).contains("  $ chief routine value 'disk used' 91"));
+
+    // Its time comes while the server runs: the command runs, detached, and ends.
+    conn.execute("UPDATE routines SET next_run_at = 1", [])
+        .unwrap();
+    let server = serve(&home);
+    let run = wait_for("the command's run to end", || {
+        chief::command::latest(&conn, "demo", "disk", 1)
+            .ok()?
+            .into_iter()
+            .find(|run| run.status.ended())
+    });
+    assert_eq!(run.status, chief::command::Status::Ok);
+    assert_eq!(run.fired_by, "schedule");
+    assert_eq!(
+        run.output.as_deref(),
+        Some(format!("\"disk used\" = 91\n{}\n", repo.display()).as_str())
+    );
+    // What it said is what it found; no session was part of it.
+    assert_eq!(run.outcome, Some(chief::routines::Verdict::Attention));
+    let found = wait_for("its finding", || {
+        chief::routines::findings(&conn, "demo", "disk", 5)
+            .ok()?
+            .into_iter()
+            .next()
+    });
+    assert_eq!(found.headline, "Disk is at 91%");
+    assert_eq!(found.details.as_deref(), Some("Mostly logs."));
+    assert_eq!((found.run, found.thread.clone()), (Some(run.id), None));
+    assert!(home.fake.calls_of("--bg").is_empty());
+    // Nor a listing of sessions: a command a minute mustn't cost a `claude agents` a minute.
+    assert!(home.fake.calls_of("agents").is_empty());
+    let series = chief::routines::series(&conn, "demo", "disk", 5).unwrap();
+    assert_eq!(series[0].name, "disk used");
+    assert_eq!(series[0].points[0].1, 91.0);
+
+    // The dashboard shows it as it stands, with what the run printed.
+    let board = server.page("GET", "/api/p/demo/board", None).json();
+    let routine = &board["routines"][0];
+    assert_eq!(routine["kind"], "command");
+    assert_eq!(routine["state"]["key"], "attention");
+    assert_eq!(routine["state"]["line"], "Disk is at 91%");
+    assert_eq!(routine["state"]["needs_user"], true);
+    assert_eq!(routine["last_exec"]["status"], "ok");
+    let full = server.page("GET", "/api/p/demo/routines/disk", None).json();
+    assert!(
+        full["runs"][0]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("\"disk used\" = 91\n")
+    );
+    assert_eq!(full["runs"][0]["headline"], "Disk is at 91%");
+
+    // Run now from the dashboard answers at once; the run ends by itself. It says the same
+    // words as the run before, so nobody hears them twice.
+    let ran = server
+        .page("POST", "/api/p/demo/routines/disk/run", None)
+        .json();
+    assert_eq!(ran["started"], true);
+    let second = ran["run"].as_i64().unwrap();
+    wait_for("the second run to end", || {
+        chief::command::get(&conn, second)
+            .ok()??
+            .status
+            .ended()
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        chief::routines::findings(&conn, "demo", "disk", 5)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A command the coordinator wrote waits for the user: the dashboard is where they say yes,
+    // and a routine made in its form is the user's own.
+    let config = ProjectConfig::load(&home.path().join("projects/demo/project.toml")).unwrap();
+    chief::routines::create(
+        &conn,
+        &config,
+        &chief::routines::Draft {
+            title: "Sync".into(),
+            command: Some("echo synced".into()),
+            schedule: "@hourly".into(),
+            ..Default::default()
+        },
+        chief::routines::Author::Coordinator,
+        db::now_ms(),
+    )
+    .unwrap();
+    let pending = server.page("GET", "/api/p/demo/routines/sync", None).json();
+    assert_eq!(pending["needs_approval"], true);
+    assert_eq!(pending["state"]["key"], "approval");
+    let refused = server
+        .page("POST", "/api/p/demo/routines/sync/run", None)
+        .json();
+    assert_eq!(refused["started"], false);
+    assert!(
+        refused["note"]
+            .as_str()
+            .unwrap()
+            .contains("waits for the user's approval")
+    );
+    let stale = server.page(
+        "POST",
+        "/api/p/demo/routines/sync/approve",
+        Some(&json!({"command": "echo something else"})),
+    );
+    assert_eq!(stale.status, 400, "{}", stale.body);
+    let approved = server.page(
+        "POST",
+        "/api/p/demo/routines/sync/approve",
+        Some(&json!({"command": "echo synced"})),
+    );
+    assert_eq!(approved.status, 200, "{}", approved.body);
+    assert_eq!(approved.json()["needs_approval"], false);
+    let made = server.page(
+        "POST",
+        "/api/p/demo/routines",
+        Some(&json!({
+            "title": "Health",
+            "command": "curl -f https://example.test/health",
+            "prompt": "Find out why.",
+            "schedule": "*/2 * * * *",
+            "timeout_secs": 30,
+        })),
+    );
+    assert_eq!(made.status, 200, "{}", made.body);
+    assert_eq!(made.json()["kind"], "check");
+    assert_eq!(made.json()["needs_approval"], false);
+
+    // By hand at the CLI the command is waited for and its output shown; `show` reads it back.
+    let by_hand = home.run(&["routine", "run", "demo", "sync"], "");
+    assert!(by_hand.status.success(), "{}", stderr(&by_hand));
+    assert!(
+        stdout(&by_hand).starts_with("synced\npassed in "),
+        "{}",
+        stdout(&by_hand)
+    );
+    let shown = home.run(&["routine", "show", "demo", "disk"], "");
+    let shown = stdout(&shown);
+    assert!(shown.contains("  Needs you: Disk is at 91%"), "{shown}");
+    assert!(shown.contains("attention: Disk is at 91%"), "{shown}");
+    assert!(shown.contains("Runs of its command:"), "{shown}");
+    assert!(
+        shown.contains("The last run printed:\n\"disk used\" = 91"),
+        "{shown}"
+    );
+    // A Claude session isn't the user: what it adds waits, and it can't approve.
+    let from_session = home.run_env(
+        &[
+            "routine",
+            "add",
+            "demo",
+            "--title",
+            "Sneaky",
+            "--schedule",
+            "@daily",
+            "--command",
+            "true",
+        ],
+        &[("CLAUDECODE", "1")],
+        "",
+    );
+    assert!(
+        stdout(&from_session).contains("waits for your approval"),
+        "{}",
+        stdout(&from_session)
+    );
+    let refused = home.run_env(
+        &["routine", "approve", "demo", "sneaky"],
+        &[("CLAUDECODE", "1")],
+        "",
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("is the user's to do"),
+        "{}",
+        stderr(&refused)
+    );
+    let mine = home.run(&["routine", "approve", "demo", "sneaky"], "");
+    assert!(stdout(&mine).contains("Approved the command of sneaky"));
+    // Its two tools are for a command chief runs, and say so elsewhere.
+    let outside = home.run(&["routine", "outcome", "update", "x"], "");
+    assert!(!outside.status.success());
+    assert!(
+        stderr(&outside).contains("CHIEF_RUN isn't set"),
+        "{}",
+        stderr(&outside)
+    );
 }

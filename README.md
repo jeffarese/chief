@@ -101,6 +101,11 @@ then its task and its last report, which `v` shows in full. The bottom line alwa
 keys that work on the selection, and `?` explains every mark. The mouse works too: click to
 select, click again to show, scroll to move.
 
+A project with [routines](#routines) lists them under the threads, each with how it stands:
+`✓` passed, `✗` failing, `!` needs you (a command to approve, or a run that said so), `◆` has
+news, `●` running. The panel below shows a selected routine's schedule and next run, its
+command, and what its last run printed.
+
 | Key | Does |
 | --- | --- |
 | ↑ ↓ / j k, g G | Move; first (the coordinator) / last |
@@ -114,6 +119,9 @@ select, click again to show, scroll to move.
 | v | Read the thread's reports in full: ↑ ↓ scroll, ← → older and newer, Esc back |
 | x | Clean up a resolved thread (see below) |
 | X | Clean up every resolved thread that loses nothing (`chief gc` for this project) |
+| a | Approve a routine's command (shows it whole and asks first) |
+| e | Run a routine now |
+| p | Pause or resume a routine |
 | R | Show or hide resolved threads |
 | s | Settings |
 | ? | Help |
@@ -128,23 +136,48 @@ running in the background either way; `chief` or `chief up <slug>` opens the lay
 
 ## Routines
 
-A routine is something the project does or watches on a schedule: a prompt chief runs by
-itself, each run a fresh thread that nobody has to watch. It is how a project follows things
-over time: a fare, a mortgage rate, a nightly build, an inbox of issues. Ask the coordinator in
-plain words ("every morning, check flights to Tokyo for 10-24 April and tell me if one drops
-under 700") and it creates one; it can list, read, change, pause, run and delete them too. Or
+A routine is something the project does or watches on a schedule, run by chief with nobody
+watching. It is how a project follows things over time: a fare, a mortgage rate, a nightly
+build, an inbox of issues, whether staging is up. A routine is one of three things:
+
+- **A prompt**: each run is a fresh Claude session. For work that needs judgement.
+- **A command**: a shell line chief runs itself, like a cron job. No session and no tokens, as
+  often as every minute. For whatever a script can decide.
+- **Both**: the command is a cheap check and the prompt is what to do about it. A session
+  starts only when the check fails or says it has news, with the check's output in its brief.
+
+Ask the coordinator in plain words ("every morning, check flights to Tokyo for 10-24 April and
+tell me if one drops under 700", "check every minute that staging is up, and look into it when
+it isn't") and it creates one; it can list, read, change, pause, run and delete them too. Or
 from a shell:
 
 ```sh
 chief routine add home --title "Flights to Tokyo" --schedule "0 8 * * *" --model haiku \
   --prompt "Find the lowest return fare BCN-TYO for 10-24 April. Record it. Attention only under 700 EUR."
+chief routine add api --title "Staging health" --schedule "* * * * *" \
+  --command "curl -fsS https://staging.example.com/health" \
+  --prompt "Staging's health check fails. Find out why from the deploy log and say what to do."
 chief routine list home
 chief routine run home flights-to-tokyo    # now, outside its schedule
+chief routine show api staging-health      # how it stands, its last runs and output
 ```
 
 - **Schedules** are in your local time: five cron fields (`0 9 * * 1-5`), `@hourly`, `@daily`,
-  `@weekly`, `@monthly`, or `every 30m` / `every 2h`. At most every 5 minutes, since every run is
-  a whole session.
+  `@weekly`, `@monthly`, or `every 30m` / `every 2h`. A prompt alone runs at most every 5
+  minutes, since every run is a whole session; a routine with a command may run every minute.
+- **A command** runs with `sh -c` in the routine's repository, for at most 5 minutes unless
+  you give it `--timeout`. Exit status 0 means all is well; anything else is a failure. It
+  repeats itself, so you hear only what changes: the first failure, not the same one every
+  minute, and the first pass after it. A command that knows more can say it: `chief routine
+  value "<series>" <number>` records a number it tracks, and `chief routine outcome
+  update|attention "<headline>"` says what the run came to. `$CHIEF_ROUTINE_DIR` is a folder
+  of its own for what it keeps between runs, and what its last run printed is in
+  `last-run.log` there.
+- **Approval.** The coordinator can't run commands, so a command it writes or changes doesn't
+  run until you say yes: `a` on the board, Approve in the dashboard, or `chief routine approve
+  <slug> <name>`. A command you write yourself is approved as you write it. `chief routine`
+  run from inside a Claude session doesn't count as you: there `add --command` waits for
+  approval too, and `approve` is refused.
 - **Memory.** Runs are separate sessions, so the hundredth run costs what the first did. What
   carries over is the routine's notes file (`routines/<name>/NOTES.md` in the project folder):
   every run reads it first and rewrites it before it ends. You can edit it, and so can the
@@ -212,7 +245,9 @@ thread's report rendered on the right](docs/dashboard.png)
 - **Reports** as formatted text, a thread's **activity** (its latest calls and subagents), and
   the actions: wake, stop, resolve, reopen, clean up (only when nothing would be lost), open the
   pull request.
-- **Routines**: add and edit them with a schedule builder, run one now, pause it, see its runs.
+- **Routines**: add and edit them with a schedule builder (a session, a command, or both), run
+  one now, pause it, approve a command the coordinator wrote, see its runs and what a command
+  printed.
 - It works on a phone-sized screen, and follows your light or dark setting.
 
 It listens on `127.0.0.1:4747` and every request needs the secret token in that link, so keep the
@@ -313,7 +348,7 @@ readable.
 | `chief status [<slug>]` | The board as text |
 | `chief clean <slug> <thread> [--discard] [--yes]` | Clean up one resolved thread |
 | `chief gc [<slug>] [--dry-run]` | Clean up every resolved thread that loses nothing |
-| `chief routine list\|add\|run\|pause\|resume\|rm <slug> …` | The project's routines |
+| `chief routine list\|add\|show\|run\|approve\|pause\|resume\|rm <slug> …` | The project's routines |
 | `chief dashboard <slug> [--off] [--no-open]` | Turn the web dashboard on and print its link |
 | `chief serve [start\|stop\|status\|install\|uninstall]` | The background server: routines and the dashboard |
 

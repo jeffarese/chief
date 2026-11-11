@@ -318,7 +318,7 @@
       if (sel.kind === 'new-routine') return 'settings';
       if (sel.kind === 'routine') {
         const r = routine(sel.name);
-        return r && (r.last_run_at || r.last_finding) ? 'status' : 'settings';
+        return r && (r.last_run_at || r.last_finding || r.needs_approval) ? 'status' : 'settings';
       }
       if (sel.kind !== 'thread') return 'conversation';
       const t = thread(sel.name);
@@ -445,7 +445,7 @@
 
       if (b.routines.length) {
         const oSel = { kind: 'overview' };
-        const flagged = b.routines.filter((r) => r.last_finding && r.last_finding.outcome === 'attention').length;
+        const flagged = b.routines.filter((r) => r.state.needs_user).length;
         kids.push(
           h(
             'button',
@@ -522,7 +522,7 @@
         ),
       );
       if (!b.routines.length) {
-        kids.push(h('div', { class: 'empty' }, 'Work that repeats on a schedule. Ask the coordinator for one, or add it here.'));
+        kids.push(h('div', { class: 'empty' }, 'Work that repeats on a schedule: a Claude session, a plain command, or both. Ask the coordinator for one, or add it here.'));
       }
       for (const r of b.routines) {
         const sel = { kind: 'routine', name: r.name };
@@ -536,8 +536,8 @@
             },
             h(
               'span',
-              { class: 'glyph ' + (r.last_finding && r.last_finding.outcome === 'attention' ? 'g-waiting' : 'g-idle'), 'aria-hidden': 'true' },
-              !r.enabled ? '‖' : r.last_finding && r.last_finding.outcome === 'attention' ? '!' : '↻',
+              { class: 'glyph ' + (r.state.needs_user ? 'g-waiting' : r.state.key === 'running' ? 'g-working' : 'g-idle'), 'aria-hidden': 'true' },
+              !r.enabled ? '‖' : r.state.needs_user ? '!' : r.kind === 'session' ? '↻' : '$',
             ),
             h('span', { class: 'title' }, r.title),
             h(
@@ -548,8 +548,11 @@
             h(
               'span',
               { class: 'sub' },
-              h('span', { class: 'text' }, r.last_finding ? r.last_finding.headline : r.schedule_text),
-              r.last_note && h('span', { class: 'chip amber', title: r.last_note }, 'see note'),
+              h('span', { class: 'text' }, r.state.line || r.schedule_text),
+              r.state.key === 'approval' && h('span', { class: 'chip red', title: r.command }, 'approve'),
+              r.state.key === 'failing' && h('span', { class: 'chip red', title: r.state.line }, 'failing'),
+              r.state.key === 'running' && h('span', { class: 'chip green' }, 'running'),
+              r.last_note && r.state.key !== 'failing' && h('span', { class: 'chip amber', title: r.last_note }, 'see note'),
             ),
           ),
         );
@@ -678,11 +681,12 @@
             { class: 'meta' },
             r
               ? [
+                  h('span', null, KIND[r.kind] || r.kind),
                   h('span', null, r.schedule_text),
                   r.enabled && r.next_run_at && h('span', null, 'next ', h('b', { title: stamp(r.next_run_at) }, `${stamp(r.next_run_at)} (${until(r.next_run_at)})`)),
                   r.last_run_at && h('span', null, 'last run ', h('b', null, stamp(r.last_run_at))),
                 ]
-              : h('span', null, 'A prompt chief runs on a schedule. Each run is a fresh thread.'),
+              : h('span', null, 'Work chief runs on a schedule: a Claude session, a command of yours with no session, or a command that calls a session when it has news.'),
           ),
           r
             ? h(
@@ -694,9 +698,26 @@
               )
             : h('div', { style: 'height:12px' }),
         );
-        fill($.callouts, 
-          ...(r && r.last_note ? [h('div', { class: 'callout amber' }, h('div', { class: 'what' }, h('b', null, 'Last occurrence'), r.last_note))] : []),
-        );
+        const notes = [];
+        if (r && r.needs_approval) {
+          notes.push(
+            h(
+              'div',
+              { class: 'callout red' },
+              h(
+                'div',
+                { class: 'what' },
+                h('b', null, 'Its command waits for your approval'),
+                'The coordinator wrote it, and chief runs it on this machine with nobody watching. Read it first.',
+                h('pre', { class: 'cmd' }, r.command),
+              ),
+              h('button', { class: 'btn primary', onclick: (e) => approveRoutine(r, e.currentTarget) }, 'Approve'),
+            ),
+          );
+        } else if (r && r.last_note) {
+          notes.push(h('div', { class: 'callout amber' }, h('div', { class: 'what' }, h('b', null, 'Last occurrence'), r.last_note)));
+        }
+        fill($.callouts, ...notes);
         return;
       }
       const s = current();
@@ -1005,13 +1026,60 @@
         return;
       }
       const p = S.board.project;
-      const r = existing || { title: '', prompt: '', schedule: '0 9 * * 1-5', repo: null, model: null, effort: null, notify: true, enabled: true };
-      form = { key: existing ? existing.name : '+new', sched: parseSchedule(r.schedule) };
+      const r = existing || { kind: 'session', title: '', prompt: '', command: null, timeout_secs: null, schedule: '0 9 * * 1-5', repo: null, model: null, effort: null, notify: true, enabled: true };
+      form = { key: existing ? existing.name : '+new', sched: parseSchedule(r.schedule), kind: r.kind || 'session' };
       const f = form.sched;
 
       const title = h('input', { type: 'text', id: 'r-title', value: r.title, placeholder: 'Triage new issues', maxlength: 80 });
       const prompt = h('textarea', { id: 'r-prompt', placeholder: 'What every run does. A run sees neither the conversation nor earlier runs, and nobody is there to answer it: say what done means, what to report, and what to do when something is missing.' });
       prompt.value = r.prompt;
+      const command = h('textarea', { id: 'r-command', class: 'mono', spellcheck: 'false', placeholder: 'curl -fsS https://staging.example.com/health' });
+      command.value = r.command || '';
+      const timeout = h('input', { type: 'number', id: 'r-timeout', min: 1, max: 86400, value: r.timeout_secs || '', placeholder: '300' });
+
+      // What a run is: a session, a command, or a command that calls a session.
+      const kinds = [
+        ['session', 'Claude session', 'Every run is a fresh thread with this prompt.'],
+        ['command', 'Command', 'chief runs it itself: no session, no tokens. Exit status 0 means all is well.'],
+        ['check', 'Command, then session', 'The command runs first. A session starts only when it fails or says it has news.'],
+      ];
+      const kindSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'What runs' });
+      const kindHint = h('div', { class: 'hint' });
+      const commandField = h(
+        'div',
+        { class: 'field' },
+        h('label', { for: 'r-command' }, 'Command'),
+        command,
+        h(
+          'div',
+          { class: 'hint' },
+          'Run with ', h('code', null, 'sh -c'), ' in the repository. It is told only what changes: the first failure, and the first pass after it. Inside it, ',
+          h('code', null, 'chief routine value "<series>" <number>'), ' records a number and ',
+          h('code', null, 'chief routine outcome update|attention "<headline>"'), ' says what it found; ',
+          h('code', null, '$CHIEF_ROUTINE_DIR'), ' is its own folder.',
+        ),
+      );
+      const timeoutField = h('div', { class: 'field' }, h('label', { for: 'r-timeout' }, 'Time limit (seconds)'), timeout);
+      const promptLabel = h('label', { for: 'r-prompt' }, 'What each run does');
+      const promptField = h('div', { class: 'field' }, promptLabel, prompt);
+      const drawKind = () => {
+        fill(
+          kindSeg,
+          ...kinds.map(([key, label]) =>
+            h('button', { type: 'button', 'aria-pressed': String(form.kind === key), onclick: () => ((form.kind = key), drawKind()) }, label),
+          ),
+        );
+        kindHint.textContent = kinds.find(([key]) => key === form.kind)[2];
+        commandField.hidden = timeoutField.hidden = form.kind === 'session';
+        promptField.hidden = form.kind === 'command';
+        promptLabel.textContent = form.kind === 'check' ? 'What the session does about it' : 'What each run does';
+        prompt.placeholder =
+          form.kind === 'check'
+            ? 'What to do when the command fails or has news. The session is handed the command and what it printed: say what to find out, what to fix, and when to interrupt you.'
+            : 'What every run does. A run sees neither the conversation nor earlier runs, and nobody is there to answer it: say what done means, what to report, and what to do when something is missing.';
+        for (const el of sessionOnly) el.hidden = form.kind === 'command';
+        drawPreview();
+      };
 
       const extra = h('div', { class: 'sched-row' });
       const preview = h('div', { class: 'hint' });
@@ -1076,10 +1144,11 @@
         const text = buildSchedule(f);
         fill(preview, 
           f.mode === 'custom' ? 'Five cron fields: minute, hour, day of month, month, day of week. ' : ['Saved as ', h('code', null, text), '. '],
-          "Times are this machine's local time; a routine runs at most every 5 minutes.",
+          form.kind === 'session'
+            ? "Times are this machine's local time; a session runs at most every 5 minutes."
+            : "Times are this machine's local time; a command may run every minute.",
         );
       };
-      drawSchedule();
 
       const repo = h(
         'select',
@@ -1096,6 +1165,12 @@
       );
       const notify = h('input', { type: 'checkbox', id: 'r-notify', checked: r.notify });
       const error = h('div', { class: 'form-error', hidden: true });
+      const modelField = h('div', { class: 'field' }, h('label', { for: 'r-model' }, 'Model'), model);
+      const effortField = h('div', { class: 'field' }, h('label', { for: 'r-effort' }, 'Effort'), effort);
+      // What only a session has.
+      const sessionOnly = [modelField, effortField];
+      drawSchedule();
+      drawKind();
 
       const fail = (e) => {
         error.textContent = e.message;
@@ -1103,7 +1178,10 @@
       };
       const body = () => ({
         title: title.value,
-        prompt: prompt.value,
+        // The kind decides which of the two it keeps; saving the command here approves it.
+        prompt: form.kind === 'command' ? '' : prompt.value,
+        command: form.kind === 'session' ? '' : command.value,
+        timeout_secs: form.kind === 'session' ? 0 : Number(timeout.value) || 0,
         schedule: buildSchedule(f),
         repo: repo.value,
         model: model.value,
@@ -1133,9 +1211,12 @@
         btn.disabled = true;
         try {
           const ran = await api('POST', `${base}/routines/${encodeURIComponent(existing.name)}/run`);
-          if (ran.started) {
+          if (ran.started && ran.thread) {
             toast(`Started ${ran.thread}.`);
             select({ kind: 'thread', name: ran.thread });
+          } else if (ran.started) {
+            toast('Its command runs. Its result shows here when it ends.');
+            select(S.sel, 'status');
           } else {
             toast(`Nothing started: ${ran.note}.`, true);
           }
@@ -1179,21 +1260,24 @@
         h(
           'form',
           { class: 'form', onsubmit: (e) => e.preventDefault() },
-          h('div', { class: 'field' }, h('label', { for: 'r-title' }, 'Title'), title, h('div', { class: 'hint' }, "A few words; each run's thread carries it on the board.")),
-          h('div', { class: 'field' }, h('label', { for: 'r-prompt' }, 'What each run does'), prompt),
+          h('div', { class: 'field' }, h('label', { for: 'r-title' }, 'Title'), title, h('div', { class: 'hint' }, "A few words; a session's thread carries it on the board.")),
+          h('div', { class: 'field' }, h('div', { class: 'label' }, 'What runs'), kindSeg, kindHint),
+          commandField,
+          promptField,
           h('div', { class: 'field' }, h('div', { class: 'label' }, 'Schedule'), seg, extra, preview),
           h(
             'div',
             { class: 'cols' },
             h('div', { class: 'field' }, h('label', { for: 'r-repo' }, 'Repository'), repo),
-            h('div', { class: 'field' }, h('label', { for: 'r-model' }, 'Model'), model),
-            h('div', { class: 'field' }, h('label', { for: 'r-effort' }, 'Effort'), effort),
+            modelField,
+            effortField,
+            timeoutField,
           ),
           h(
             'div',
             { class: 'field check' },
             notify,
-            h('label', { for: 'r-notify' }, 'Tell the coordinator when a run finishes', h('div', { class: 'hint', style: 'font-weight:400' }, 'It reads the report and tells you what it found. Off: runs only show on the board.')),
+            h('label', { for: 'r-notify' }, 'Tell the coordinator when a run has news', h('div', { class: 'hint', style: 'font-weight:400' }, 'It reads what the run found and tells you. Off: runs only show here and on the board.')),
           ),
           error,
           h(
@@ -1216,9 +1300,21 @@
     function renderRuns() {
       if (!$.runs || S.sel.kind !== 'routine') return;
       const rows = S.board.threads.filter((t) => t.routine === S.sel.name).sort((a, b) => b.last_activity_at - a.last_activity_at);
+      const r = routine(S.sel.name);
+      const kind = r ? r.kind : 'session';
       fill($.runs, 
-        h('h2', null, 'Runs'),
-        rows.length ? rows.map(threadRow) : h('div', { class: 'empty' }, 'No run yet. It runs at its next time, or now with Run now.'),
+        h('h2', null, kind === 'session' ? 'Runs' : 'Sessions'),
+        rows.length
+          ? rows.map(threadRow)
+          : h(
+              'div',
+              { class: 'empty' },
+              kind === 'session'
+                ? 'No run yet. It runs at its next time, or now with Run now.'
+                : kind === 'command'
+                  ? 'A command starts no session. Its runs, with what they printed, are under Status.'
+                  : 'No session yet: one starts when the command fails or has news. The command’s runs are under Status.',
+            ),
       );
     }
 
@@ -1229,6 +1325,58 @@
       update: { label: 'Update', mark: '•', cls: 'v-update' },
       nothing: { label: 'Nothing new', mark: '✓', cls: 'v-nothing' },
     };
+
+    /** How a routine stands (`state` from the server): the same words as the terminal board. */
+    const STATE = {
+      approval: { mark: '?', cls: 'v-attention' },
+      failing: { mark: '✕', cls: 'v-attention' },
+      attention: { mark: '!', cls: 'v-attention' },
+      running: { mark: '▸', cls: 'v-update' },
+      update: { mark: '•', cls: 'v-update' },
+      ok: { mark: '✓', cls: 'v-nothing' },
+      nothing: { mark: '✓', cls: 'v-nothing' },
+      new: { mark: '–', cls: 'v-none' },
+    };
+    const KIND = { session: 'Session', command: 'Command', check: 'Command, then session' };
+
+    function stateBadge(state) {
+      const s = (state && STATE[state.key]) || STATE.new;
+      return h('span', { class: `verdict ${s.cls}` }, h('i', { 'aria-hidden': 'true' }, s.mark), state ? state.label : 'No run yet');
+    }
+
+    /** A command's run as an icon and a word. */
+    function runBadge(run) {
+      const how = {
+        ok: ['✓', 'v-nothing', 'Passed'],
+        failed: ['✕', 'v-attention', run.exit_code === null ? 'Didn’t start' : `Exit ${run.exit_code}`],
+        timeout: ['✕', 'v-attention', 'Timed out'],
+        running: ['▸', 'v-update', 'Running'],
+        lost: ['–', 'v-none', 'Interrupted'],
+      }[run.status] || ['–', 'v-none', run.status];
+      return h('span', { class: `verdict ${how[1]}` }, h('i', { 'aria-hidden': 'true' }, how[0]), how[2]);
+    }
+
+    /** 0.3s · 12s · 3m 05s */
+    function took(ms) {
+      if (ms === null || ms === undefined) return '';
+      const s = Math.floor(ms / 1000);
+      if (s < 10) return `${(ms / 1000).toFixed(1)}s`;
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+      return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+    }
+
+    async function approveRoutine(r, btn) {
+      btn.disabled = true;
+      try {
+        // The words shown go along: a command changed since isn't the one approved.
+        await api('POST', `${base}/routines/${encodeURIComponent(r.name)}/approve`, { command: r.command });
+        toast(`Approved the command of ${r.title}.`);
+      } catch (e) {
+        toast(e.message, true);
+        btn.disabled = false;
+      }
+    }
 
     /** A verdict as an icon and a word, never colour alone. */
     function verdictBadge(finding) {
@@ -1393,7 +1541,7 @@
       const b = S.board;
       const kids = [];
       const waiting = b.threads.filter((t) => t.group === 'waiting');
-      const flagged = b.routines.filter((r) => r.last_finding && r.last_finding.outcome === 'attention');
+      const flagged = b.routines.filter((r) => r.state.needs_user);
       if (waiting.length || flagged.length) {
         kids.push(
           h('h2', { class: 'ov-title' }, 'Needs you'),
@@ -1413,9 +1561,9 @@
               h(
                 'button',
                 { class: 'need', onclick: () => select({ kind: 'routine', name: r.name }, 'status') },
-                verdictBadge(r.last_finding),
+                stateBadge(r.state),
                 h('b', null, r.title),
-                h('span', null, r.last_finding.headline),
+                h('span', null, r.state.line),
               ),
             ),
           ),
@@ -1423,13 +1571,12 @@
       }
       kids.push(h('h2', { class: 'ov-title' }, 'Routines'));
       const tiles = b.routines.map((r) => {
-        const f = r.last_finding;
         const main = r.series[0];
         return h(
           'button',
           { class: 'tile' + (r.enabled ? '' : ' off'), onclick: () => select({ kind: 'routine', name: r.name }) },
-          h('div', { class: 'tile-head' }, h('b', null, r.title), verdictBadge(f)),
-          h('p', { class: 'tile-line' }, f ? f.headline : r.enabled ? 'It hasn’t run yet.' : 'Paused.'),
+          h('div', { class: 'tile-head' }, h('b', null, r.title), stateBadge(r.state)),
+          h('p', { class: 'tile-line' }, r.state.line || (r.state.key !== 'new' ? '' : r.enabled ? 'It hasn’t run yet.' : 'Paused.')),
           main &&
             h(
               'div',
@@ -1441,16 +1588,17 @@
           h(
             'div',
             { class: 'tile-foot' },
+            r.kind !== 'session' && h('span', { title: r.command }, r.kind === 'command' ? '$ command' : '$ command → session'),
             h('span', null, r.schedule_text),
             h('span', null, !r.enabled ? 'paused' : r.next_run_at ? `next ${until(r.next_run_at)}` : ''),
-            f && h('span', { title: stamp(f.at) }, `ran ${ago(f.at) === 'now' ? 'just now' : ago(f.at) + ' ago'}`),
+            r.last_run_at && h('span', { title: stamp(r.last_run_at) }, `ran ${ago(r.last_run_at) === 'now' ? 'just now' : ago(r.last_run_at) + ' ago'}`),
           ),
         );
       });
       kids.push(
         tiles.length
           ? h('div', { class: 'tiles' }, tiles)
-          : h('div', { class: 'blank' }, h('b', null, 'Nothing is followed yet'), 'Ask the coordinator to watch something on a schedule, or add a routine.'),
+          : h('div', { class: 'blank' }, h('b', null, 'Nothing is followed yet'), 'Ask the coordinator to watch something on a schedule, or add a routine: a session, or a plain command.'),
       );
       const working = b.threads.filter((t) => t.group === 'working').length;
       const open = b.threads.filter((t) => t.group !== 'resolved').length;
@@ -1472,7 +1620,8 @@
     async function loadRoutine(force) {
       const r = routine(S.sel.name);
       if (!r) return;
-      const key = `${r.name}|${r.last_run_at}|${r.last_finding ? r.last_finding.at : ''}|${r.series.map((s) => s.at).join(',')}`;
+      const exec = r.last_exec ? `${r.last_exec.id}:${r.last_exec.status}:${r.last_exec.thread || ''}` : '';
+      const key = `${r.name}|${r.last_run_at}|${r.last_finding ? r.last_finding.at : ''}|${r.series.map((s) => s.at).join(',')}|${exec}|${r.state.key}`;
       // Nothing it shows changed: leave the page, and whatever is hovered on it, alone.
       if (!force && key === S.routineKey && S.routineDetail) return false;
       S.routineKey = key;
@@ -1492,7 +1641,31 @@
       if (d.error) return fill($.pane, h('div', { class: 'blank' }, d.error));
       const kids = [];
       const f = d.last_finding;
-      if (f) {
+      const runs = d.runs || [];
+      const last = runs[0];
+      const hasCommand = d.kind !== 'session';
+      if (d.needs_approval) {
+        // The callout above says it, with the command and the button.
+      } else if (hasCommand) {
+        // How the command stands now, then what it last printed.
+        kids.push(
+          h(
+            'section',
+            { class: 'finding ' + (d.state.needs_user ? 'v-attention' : '') },
+            h(
+              'div',
+              { class: 'finding-head' },
+              stateBadge(d.state),
+              h('span', { class: 'dim' }, d.state.key === 'failing' && d.state.at ? `since ${stamp(d.state.at)}` : last ? `${last.started}${last.duration_ms !== null ? ' · ' + took(last.duration_ms) : ''}` : ''),
+            ),
+            h('p', { class: 'finding-line' }, d.state.line || (d.enabled ? `It runs ${d.next_run_at ? until(d.next_run_at) : 'at its next time'}, or now from Settings.` : 'It is paused.')),
+            h('pre', { class: 'cmd' }, d.command),
+            last && last.output && h('pre', { class: 'output' }, last.output_cut ? '…\n' + last.output : last.output),
+            last && !last.output && last.status !== 'running' && h('p', { class: 'dim small' }, 'Its last run printed nothing.'),
+            last && last.thread && h('a', { href: hashFor({ kind: 'thread', name: last.thread }) }, 'The session that looked into it →'),
+          ),
+        );
+      } else if (f) {
         kids.push(
           h(
             'section',
@@ -1507,9 +1680,10 @@
         kids.push(h('div', { class: 'blank' }, h('b', null, 'No run has reported yet'), d.enabled ? `It runs ${d.next_run_at ? until(d.next_run_at) : 'at its next time'}, or now from Settings.` : 'It is paused.'));
       }
       if (d.series.length) kids.push(h('div', { class: 'charts' }, d.series.map(lineChart)));
-      if (d.findings.length > 1) {
+      // A command's findings are the times it had news, so even one is history worth showing.
+      if (d.findings.length > (hasCommand ? 0 : 1)) {
         kids.push(
-          h('h2', { class: 'ov-title' }, 'What its runs found'),
+          h('h2', { class: 'ov-title' }, hasCommand ? 'What it told you' : 'What its runs found'),
           h(
             'ul',
             { class: 'history' },
@@ -1525,12 +1699,46 @@
           ),
         );
       }
+      if (runs.length) {
+        kids.push(
+          h('h2', { class: 'ov-title' }, 'Runs of its command'),
+          h(
+            'ul',
+            { class: 'history runs-list' },
+            runs.map((run) =>
+              h(
+                'li',
+                null,
+                h('time', { title: stamp(run.started_at) }, stamp(run.started_at)),
+                runBadge(run),
+                h(
+                  'details',
+                  null,
+                  h(
+                    'summary',
+                    null,
+                    run.headline ? `${run.outcome}: ${run.headline}` : run.line,
+                    run.fired_by === 'manual' && h('span', { class: 'chip' }, 'by hand'),
+                    run.thread && h('span', { class: 'chip blue' }, 'session'),
+                  ),
+                  run.output ? h('pre', { class: 'output' }, run.output_cut ? '…\n' + run.output : run.output) : h('p', { class: 'dim small' }, 'It printed nothing.'),
+                  run.thread && h('a', { href: hashFor({ kind: 'thread', name: run.thread }) }, `Session ${run.thread} →`),
+                ),
+              ),
+            ),
+          ),
+          d.log_file && h('p', { class: 'dim small' }, 'Everything the last run printed: ', h('code', null, d.log_file)),
+        );
+      }
       const notes = String(d.notes || '').replace(/<!--[\s\S]*?-->/g, '').trim();
-      kids.push(
-        h('h2', { class: 'ov-title' }, 'What it remembers'),
-        notes ? h('div', { class: 'notes md', html: md(notes) }) : h('p', { class: 'dim' }, 'Nothing yet: its runs keep their notes here.'),
-        h('p', { class: 'dim small' }, h('code', null, d.notes_file), ' · each run reads this first and rewrites it. You can edit it; so can the coordinator.'),
-      );
+      // A command keeps what it likes in its folder; the notes are a session's memory.
+      if (d.kind !== 'command') {
+        kids.push(
+          h('h2', { class: 'ov-title' }, 'What it remembers'),
+          notes ? h('div', { class: 'notes md', html: md(notes) }) : h('p', { class: 'dim' }, 'Nothing yet: its sessions keep their notes here.'),
+          h('p', { class: 'dim small' }, h('code', null, d.notes_file), ' · each session reads this first and rewrites it. You can edit it; so can the coordinator.'),
+        );
+      }
       fill($.pane, h('div', { class: 'inner wide' }, kids));
     }
 

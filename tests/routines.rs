@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chief::config::{ProjectConfig, Repo};
 use chief::db::{self, SessionRow};
-use chief::routines::{self, Draft, Outcome, Patch, Trigger};
+use chief::routines::{self, Author, Draft, Outcome, Patch, Trigger};
 use chief::state::Role;
 use chief::tools::ToolCtx;
 use common::{Fake, agent, trust_file};
@@ -51,6 +51,9 @@ impl Env {
         );
         let trust = root.path().join("claude.json");
         trust_file(&trust, &[&repo]);
+        // No desktop notification from a test, whatever a run says.
+        let mut config = config;
+        config.ui.notify = false;
         // Not installed: threads stay in the project's account.
         let agp = Fake::named("agp");
         std::fs::remove_file(agp.bin()).unwrap();
@@ -84,7 +87,7 @@ impl Env {
     }
 
     fn create(&self, draft: &Draft) -> anyhow::Result<routines::Routine> {
-        routines::create(&self.conn, &self.config, draft, NOW)
+        routines::create(&self.conn, &self.config, draft, Author::User, NOW)
     }
 
     /// Makes `name` due a minute ago.
@@ -212,7 +215,7 @@ fn update_changes_only_what_is_given() {
     })
     .unwrap();
     let update = |patch: Patch, at: i64| {
-        routines::update(&env.conn, &env.config, "nightly", &patch, at).unwrap()
+        routines::update(&env.conn, &env.config, "nightly", &patch, Author::User, at).unwrap()
     };
 
     // A new prompt leaves the next run where it was.
@@ -265,11 +268,19 @@ fn update_changes_only_what_is_given() {
             schedule: Some("nope".into()),
             ..Default::default()
         },
+        Author::User,
         NOW,
     );
     assert!(bad.is_err());
     assert_eq!(env.routine("nightly").schedule, "every 2h");
-    let missing = routines::update(&env.conn, &env.config, "nope", &Patch::default(), NOW);
+    let missing = routines::update(
+        &env.conn,
+        &env.config,
+        "nope",
+        &Patch::default(),
+        Author::User,
+        NOW,
+    );
     assert!(format!("{:#}", missing.unwrap_err()).contains("this project has nightly"));
 }
 
@@ -800,4 +811,632 @@ fn a_run_that_ends_without_a_verdict_is_asked_for_one() {
     })
     .unwrap();
     assert_eq!(ask(&stop).unwrap(), None);
+}
+
+// ---- Commands (§13 "A command") ------------------------------------------------------------------
+
+fn command_draft(title: &str, command: &str) -> Draft {
+    Draft {
+        title: title.into(),
+        command: Some(command.into()),
+        schedule: "* * * * *".into(),
+        ..Default::default()
+    }
+}
+
+/// Runs the routine now and waits for its command.
+fn ran(env: &Env, name: &str) -> chief::command::Finished {
+    match env
+        .with(|ctx| routines::run_here(ctx, name, Trigger::Manual))
+        .unwrap()
+    {
+        Outcome::Ran(done) => *done,
+        other => panic!("no command ran: {other:?}"),
+    }
+}
+
+fn state_key(env: &Env, name: &str) -> &'static str {
+    routines::state(&env.conn, &env.routine(name), NOW)
+        .unwrap()
+        .key
+}
+
+#[test]
+fn a_command_runs_with_no_session() {
+    let env = Env::new();
+    let r = env
+        .create(&command_draft(
+            "Disk space",
+            "echo \"$CHIEF_PROJECT/$CHIEF_ROUTINE run $CHIEF_RUN\"; pwd; \
+             echo kept > \"$CHIEF_ROUTINE_DIR/state\"; echo oops >&2",
+        ))
+        .unwrap();
+    // A command costs a process, so it may run every minute; it is the user's own, so it is
+    // approved as given.
+    assert_eq!(r.kind(), routines::Kind::Command);
+    assert!(!r.needs_approval());
+    assert_eq!(r.next_run_at, Some(NOW + 60_000 - NOW % 60_000));
+    assert_eq!(state_key(&env, "disk-space"), "new");
+
+    let done = ran(&env, "disk-space");
+    assert_eq!(done.run.status, chief::command::Status::Ok);
+    assert_eq!(done.run.exit_code, Some(0));
+    let repo = env.config.repos[0].path.display().to_string();
+    assert_eq!(
+        done.run.output.as_deref(),
+        Some(format!("demo/disk-space run {}\n{repo}\noops\n", done.run.id).as_str())
+    );
+    // Nothing new: nobody is told, and no session started.
+    assert_eq!((done.news, done.thread), (None, None));
+    assert!(env.fake.calls_of("--bg").is_empty());
+    assert!(
+        routines::findings(&env.conn, "demo", "disk-space", 5)
+            .unwrap()
+            .is_empty()
+    );
+    // What it kept and what it printed are in its folder.
+    let folder = env.dir.join("routines/disk-space");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("state")).unwrap(),
+        "kept\n"
+    );
+    assert!(
+        std::fs::read_to_string(folder.join("last-run.log"))
+            .unwrap()
+            .ends_with("oops\n")
+    );
+
+    let routine = env.routine("disk-space");
+    assert_eq!(routine.last_run_at, Some(NOW));
+    assert_eq!((&routine.last_thread, &routine.last_note), (&None, &None));
+    assert_eq!(state_key(&env, "disk-space"), "ok");
+    let view = routines::view(&env.conn, &routine).unwrap();
+    assert_eq!(view["kind"], "command");
+    assert_eq!(view["state"]["label"], "OK");
+    assert_eq!(view["last_exec"]["status"], "ok");
+    assert_eq!(view["last_exec"]["fired_by"], "manual");
+    assert_eq!(view["needs_approval"], false);
+    let read = env
+        .with(|ctx| {
+            routines::read_tool(
+                ctx,
+                &routines::RoutineNameArgs {
+                    name: "disk-space".into(),
+                },
+            )
+        })
+        .unwrap();
+    assert!(
+        read["runs"][0]["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("oops\n")
+    );
+    assert!(read["log_file"].as_str().unwrap().ends_with("last-run.log"));
+}
+
+#[test]
+fn a_routine_is_a_prompt_a_command_or_both() {
+    let env = Env::new();
+    for (bad, why) in [
+        (
+            Draft {
+                title: "X".into(),
+                schedule: "@daily".into(),
+                ..Default::default()
+            },
+            "give a prompt",
+        ),
+        (
+            Draft {
+                timeout_secs: Some(0),
+                ..command_draft("X", "true")
+            },
+            "timeout_secs must be between 1 and 86400",
+        ),
+        (
+            Draft {
+                timeout_secs: Some(100_000),
+                ..command_draft("X", "true")
+            },
+            "timeout_secs",
+        ),
+        // A session a minute is a typo; a command a minute isn't.
+        (draft("X", "* * * * *"), "less than 5 minutes apart"),
+        (
+            Draft {
+                schedule: "every 0m".into(),
+                ..command_draft("X", "true")
+            },
+            "at least a minute",
+        ),
+    ] {
+        let err = format!("{:#}", env.create(&bad).unwrap_err());
+        assert!(err.contains(why), "{why}: {err}");
+    }
+    let check = env
+        .create(&Draft {
+            prompt: "Find out why it fails.".into(),
+            timeout_secs: Some(20),
+            ..command_draft("Health", " curl -f https://example.test/health ")
+        })
+        .unwrap();
+    assert_eq!(check.kind(), routines::Kind::Check);
+    assert_eq!(
+        check.command.as_deref(),
+        Some("curl -f https://example.test/health")
+    );
+    assert_eq!(check.timeout(), Duration::from_secs(20));
+
+    let update = |patch: Patch| {
+        routines::update(&env.conn, &env.config, "health", &patch, Author::User, NOW)
+    };
+    // Without its command it is a session, which may not run every minute.
+    let err = update(Patch {
+        command: Some(String::new()),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("less than 5 minutes apart"));
+    let session = update(Patch {
+        command: Some(String::new()),
+        schedule: Some("@hourly".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(session.kind(), routines::Kind::Session);
+    assert_eq!((session.command, session.timeout_secs), (None, None));
+    // And without its prompt, only a command; with neither, nothing.
+    let command = update(Patch {
+        command: Some("true".into()),
+        prompt: Some(String::new()),
+        timeout_secs: Some(0),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(command.kind(), routines::Kind::Command);
+    assert_eq!(command.timeout(), Duration::from_secs(300));
+    assert!(
+        update(Patch {
+            command: Some(String::new()),
+            ..Default::default()
+        })
+        .is_err()
+    );
+}
+
+/// A command repeats itself, so only a change reaches anyone: the first failure, then the
+/// first pass after it.
+#[test]
+fn a_failing_command_is_told_once_and_so_is_its_recovery() {
+    let mut env = Env::new();
+    let pushed = env.dir.join("pushed");
+    env.config.push.command = Some(format!(
+        "printf '%s|%s|%s\\n' \"$CHIEF_KIND\" \"$CHIEF_TITLE\" \"$CHIEF_BODY\" >> '{}'",
+        pushed.display()
+    ));
+    env.config.push.on = chief::config::PushOn::Updates;
+    env.create(&command_draft(
+        "Staging health",
+        "test -f \"$CHIEF_ROUTINE_DIR/up\" || { echo checking; echo 'curl: (22) 503' >&2; exit 22; }",
+    ))
+    .unwrap();
+    let findings = || routines::findings(&env.conn, "demo", "staging-health", 10).unwrap();
+    let wait_pushed = |want: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&pushed).ok().as_deref() != Some(want) {
+            assert!(std::time::Instant::now() < deadline, "the push never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let first = ran(&env, "staging-health");
+    assert_eq!(first.run.status, chief::command::Status::Failed);
+    assert_eq!(first.run.exit_code, Some(22));
+    let news = first.news.unwrap();
+    assert_eq!(news.verdict, routines::Verdict::Attention);
+    assert_eq!(news.headline, "Failed: exit 22: curl: (22) 503");
+    let found = findings();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].run, Some(first.run.id));
+    assert_eq!(found[0].thread, None);
+    assert_eq!(
+        found[0].details.as_deref(),
+        Some("```\nchecking\ncurl: (22) 503\n```")
+    );
+    wait_pushed("attention|Demo · Staging health|Failed: exit 22: curl: (22) 503\n");
+    // How it stands is the run's own line: the finding only repeats it.
+    let state = routines::state(&env.conn, &env.routine("staging-health"), NOW).unwrap();
+    assert_eq!(
+        (state.key, state.line.as_str(), state.at),
+        ("failing", "exit 22: curl: (22) 503", Some(NOW))
+    );
+
+    // It fails again: its run is kept, and nobody hears it twice.
+    let second = ran(&env, "staging-health");
+    assert_eq!(second.run.status, chief::command::Status::Failed);
+    assert_eq!(second.news, None);
+    assert_eq!(findings().len(), 1);
+    let state = routines::state(&env.conn, &env.routine("staging-health"), NOW).unwrap();
+    assert_eq!((state.key, state.label), ("failing", "Failing"));
+    assert!(state.needs_user());
+
+    // The coordinator is told of what a command found, though no thread carries it; a
+    // sleeping one is woken for it once it has stood a moment.
+    let untold = routines::untold(&env.conn, "demo").unwrap();
+    assert_eq!(untold.len(), 1);
+    assert_eq!(
+        chief::waiting::finding_line(&untold[0], Some("Staging health")),
+        format!(
+            "- routine staging-health \"Staging health\" · command · at {} · attention: \
+             Failed: exit 22: curl: (22) 503",
+            chief::text::local_hhmm(NOW)
+        )
+    );
+    assert!(
+        routines::unheard(&env.conn, "demo", NOW)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        routines::unheard(&env.conn, "demo", NOW + routines::WAKE_AFTER_MS).unwrap(),
+        [(format!("finding {}", untold[0].id), NOW)]
+    );
+    routines::mark_told(&env.conn, &untold, NOW).unwrap();
+    assert!(routines::untold(&env.conn, "demo").unwrap().is_empty());
+    assert!(
+        routines::unheard(&env.conn, "demo", NOW + routines::WAKE_AFTER_MS)
+            .unwrap()
+            .is_empty()
+    );
+
+    // It passes again: said once, as news that can wait.
+    std::fs::write(env.dir.join("routines/staging-health/up"), "").unwrap();
+    let third = ran(&env, "staging-health");
+    assert_eq!(third.run.status, chief::command::Status::Ok);
+    let news = third.news.unwrap();
+    assert_eq!(news.verdict, routines::Verdict::Update);
+    assert_eq!(news.headline, "Passes again after 2 failed runs");
+    wait_pushed(
+        "attention|Demo · Staging health|Failed: exit 22: curl: (22) 503\n\
+         update|Demo · Staging health|Passes again after 2 failed runs\n",
+    );
+    assert_eq!(state_key(&env, "staging-health"), "ok");
+    assert_eq!(env.routine("staging-health").last_note, None);
+    assert_eq!(ran(&env, "staging-health").news, None);
+    assert_eq!(findings().len(), 2);
+    // No session was ever part of it.
+    assert!(env.fake.calls_of("--bg").is_empty());
+
+    // A routine that tells nobody keeps its findings to its own page.
+    routines::update(
+        &env.conn,
+        &env.config,
+        "staging-health",
+        &Patch {
+            notify: Some(false),
+            ..Default::default()
+        },
+        Author::User,
+        NOW,
+    )
+    .unwrap();
+    routines::mark_told(
+        &env.conn,
+        &routines::untold(&env.conn, "demo").unwrap(),
+        NOW,
+    )
+    .unwrap();
+    std::fs::remove_file(env.dir.join("routines/staging-health/up")).unwrap();
+    assert!(ran(&env, "staging-health").news.is_some());
+    assert_eq!(findings().len(), 3);
+    assert!(routines::untold(&env.conn, "demo").unwrap().is_empty());
+}
+
+/// The coordinator can't run commands itself, so one it writes waits for the user's yes, and
+/// waits again whenever it changes the words.
+#[test]
+fn a_command_the_coordinator_wrote_waits_for_approval() {
+    let env = Env::new();
+    let made = env
+        .with(|ctx| routines::create_tool(ctx, &command_draft("Backup", "echo backing up")))
+        .unwrap();
+    assert_eq!(made["needs_approval"], true);
+    assert_eq!(made["state"]["key"], "approval");
+    assert!(
+        made["approval"]
+            .as_str()
+            .unwrap()
+            .contains("chief routine approve demo backup")
+    );
+    // Its time comes and goes: the occurrence is spent, nothing ran.
+    env.make_due("backup");
+    let skipped = env
+        .with(|ctx| routines::run(ctx, "backup", Trigger::Schedule))
+        .unwrap();
+    let Outcome::Skipped(why) = skipped else {
+        panic!("it ran: {skipped:?}");
+    };
+    assert!(why.contains("waits for the user's approval"), "{why}");
+    assert!(env.routine("backup").next_run_at.unwrap() > NOW);
+    assert!(
+        chief::command::latest(&env.conn, "demo", "backup", 5)
+            .unwrap()
+            .is_empty()
+    );
+    // Asking for it by hand changes nothing: asking isn't approving.
+    assert!(matches!(
+        env.with(|ctx| routines::run_here(ctx, "backup", Trigger::Manual))
+            .unwrap(),
+        Outcome::Skipped(_)
+    ));
+
+    // The words shown must be the words approved.
+    let stale = routines::approve(&env.conn, "demo", "backup", Some("echo other"), NOW);
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains("changed since it was shown")
+    );
+    let approved =
+        routines::approve(&env.conn, "demo", "backup", Some("echo backing up"), NOW).unwrap();
+    assert!(!approved.needs_approval());
+    assert_eq!(approved.last_note, None);
+    assert_eq!(
+        ran(&env, "backup").run.output.as_deref(),
+        Some("backing up\n")
+    );
+
+    // What the coordinator changes besides the command leaves the approval; new words wait.
+    let update = |changes: Patch| {
+        env.with(|ctx| {
+            routines::update_tool(
+                ctx,
+                &routines::UpdateRoutineArgs {
+                    name: "backup".into(),
+                    changes,
+                },
+            )
+        })
+        .unwrap()
+    };
+    let retitled = update(Patch {
+        title: Some("Nightly backup".into()),
+        timeout_secs: Some(60),
+        ..Default::default()
+    });
+    assert_eq!(retitled["needs_approval"], false);
+    let changed = update(Patch {
+        command: Some("echo backing up; rm -rf /tmp/x".into()),
+        ..Default::default()
+    });
+    assert_eq!(changed["needs_approval"], true);
+    assert!(changed["approval"].is_string());
+    // Back to the words the user approved: nothing to ask.
+    let back = update(Patch {
+        command: Some("echo backing up".into()),
+        ..Default::default()
+    });
+    assert_eq!(back["needs_approval"], false);
+
+    // The user's own edit is their approval.
+    update(Patch {
+        command: Some("echo other".into()),
+        ..Default::default()
+    });
+    let mine = routines::update(
+        &env.conn,
+        &env.config,
+        "backup",
+        &Patch {
+            command: Some("echo other".into()),
+            ..Default::default()
+        },
+        Author::User,
+        NOW,
+    )
+    .unwrap();
+    assert!(!mine.needs_approval());
+    // A routine with no command has nothing to approve.
+    env.create(&draft("Plain", "@daily")).unwrap();
+    assert!(routines::approve(&env.conn, "demo", "plain", None, NOW).is_err());
+}
+
+/// A command with a prompt is a check: the session starts only when the check has news, and
+/// is handed what the check printed.
+#[test]
+fn a_check_starts_a_session_only_for_news() {
+    let env = Env::new();
+    env.create(&Draft {
+        prompt: "Find out why staging is down and say what to do.".into(),
+        model: Some("haiku".into()),
+        ..command_draft(
+            "Staging",
+            "test -f \"$CHIEF_ROUTINE_DIR/up\" || { echo 'curl: (22) 503'; exit 22; }",
+        )
+    })
+    .unwrap();
+    let up = env.dir.join("routines/staging/up");
+
+    // It passes: no session, nobody told.
+    std::fs::create_dir_all(up.parent().unwrap()).unwrap();
+    std::fs::write(&up, "").unwrap();
+    let done = ran(&env, "staging");
+    assert_eq!((done.news, done.thread), (None, None));
+    assert!(env.fake.calls_of("--bg").is_empty());
+
+    // It fails: a session looks into it, and says what it finds itself.
+    std::fs::remove_file(&up).unwrap();
+    env.will_start("r1");
+    let done = ran(&env, "staging");
+    let thread = done.thread.clone().expect("a session");
+    assert_eq!(done.run.thread.as_deref(), Some(thread.as_str()));
+    assert!(
+        routines::findings(&env.conn, "demo", "staging", 5)
+            .unwrap()
+            .is_empty()
+    );
+    let row = env.row(&thread);
+    assert_eq!(row.routine.as_deref(), Some("staging"));
+    let task = row.task.unwrap();
+    assert!(task.contains("Why this run started."), "{task}");
+    assert!(task.contains("came to this: exit 22."), "{task}");
+    assert!(task.contains("    curl: (22) 503"), "{task}");
+    assert!(
+        task.contains("    test -f \"$CHIEF_ROUTINE_DIR/up\""),
+        "{task}"
+    );
+    assert!(task.ends_with("Find out why staging is down and say what to do."));
+    assert!(env.fake.calls_of("--bg")[0].contains(&"haiku".to_string()));
+    let routine = env.routine("staging");
+    assert_eq!(routine.last_thread.as_deref(), Some(thread.as_str()));
+    assert_eq!(state_key(&env, "staging"), "failing");
+
+    // While that session works, the occurrence is skipped whole.
+    let skipped = env
+        .with(|ctx| routines::run_here(ctx, "staging", Trigger::Manual))
+        .unwrap();
+    assert!(matches!(skipped, Outcome::Skipped(_)), "{skipped:?}");
+
+    // It keeps failing after the session is done: the same failure starts no second one.
+    finish(&env, &thread, NOW);
+    let done = ran(&env, "staging");
+    assert_eq!((done.news, done.thread), (None, None));
+    assert_eq!(env.fake.calls_of("--bg").len(), 1);
+
+    // What the session said stands for the failure wherever the routine is shown.
+    env.with(|ctx| {
+        routines::report_outcome_tool(
+            ctx,
+            "staging",
+            &routines::ReportOutcomeArgs {
+                outcome: routines::Verdict::Attention,
+                headline: "Staging is down: the deploy at 09:12 ran out of disk".into(),
+                details: None,
+            },
+        )
+    })
+    .unwrap();
+    let state = routines::state(&env.conn, &env.routine("staging"), NOW).unwrap();
+    assert_eq!(
+        (state.key, state.line.as_str()),
+        (
+            "failing",
+            "Staging is down: the deploy at 09:12 ran out of disk"
+        )
+    );
+
+    // Passing again is said to people, not handed to a session.
+    std::fs::write(&up, "").unwrap();
+    let done = ran(&env, "staging");
+    assert!(done.news.unwrap().recovery);
+    assert_eq!(done.thread, None);
+    assert_eq!(env.fake.calls_of("--bg").len(), 1);
+    assert_eq!(state_key(&env, "staging"), "ok");
+
+    // News with no session to take it still reaches the user: here the start fails.
+    std::fs::remove_file(&up).unwrap();
+    env.fake
+        .unset("bg.stdout")
+        .set("bg.exit", "1")
+        .set("bg.stderr", "no such model\n");
+    let done = ran(&env, "staging");
+    assert_eq!(done.thread, None);
+    let found = routines::findings(&env.conn, "demo", "staging", 1).unwrap();
+    assert_eq!(found[0].verdict, routines::Verdict::Attention);
+    assert!(
+        found[0]
+            .details
+            .as_deref()
+            .unwrap()
+            .contains("No session looked into it: chief couldn't start a session for it"),
+        "{:?}",
+        found[0].details
+    );
+}
+
+#[test]
+fn a_command_gets_its_time_and_no_more() {
+    let env = Env::new();
+    env.create(&Draft {
+        timeout_secs: Some(1),
+        ..command_draft("Slow", "echo started; sleep 30; echo never")
+    })
+    .unwrap();
+    let began = std::time::Instant::now();
+    let done = ran(&env, "slow");
+    assert!(began.elapsed() < Duration::from_secs(10));
+    assert_eq!(done.run.status, chief::command::Status::Timeout);
+    assert_eq!(done.run.exit_code, None);
+    assert_eq!(done.run.output.as_deref(), Some("started\n"));
+    assert!(
+        done.news
+            .unwrap()
+            .headline
+            .starts_with("Failed: timed out after")
+    );
+    assert_eq!(state_key(&env, "slow"), "failing");
+}
+
+/// One run of a command at a time; a run whose process is gone doesn't hold the next one up.
+#[test]
+fn a_command_still_running_holds_the_next_run() {
+    let env = Env::new();
+    env.create(&command_draft("Sync", "echo synced")).unwrap();
+    let begin = |pid: Option<u32>| {
+        let id = chief::command::begin(&env.conn, "demo", "sync", Trigger::Schedule, NOW).unwrap();
+        env.conn
+            .execute(
+                "UPDATE routine_runs SET pid = ?2 WHERE id = ?1",
+                rusqlite::params![id, pid],
+            )
+            .unwrap();
+        id
+    };
+    // This test's own process stands in for a run under way.
+    let live = begin(Some(std::process::id()));
+    assert_eq!(state_key(&env, "sync"), "running");
+    let skipped = env
+        .with(|ctx| routines::run_here(ctx, "sync", Trigger::Manual))
+        .unwrap();
+    let Outcome::Skipped(why) = skipped else {
+        panic!("it ran: {skipped:?}");
+    };
+    assert!(why.contains("its command still runs"), "{why}");
+
+    // What a command says of itself is kept on its run while it runs, and only then.
+    chief::command::say(
+        &env.conn,
+        live,
+        routines::Verdict::Update,
+        " 3 files\nsynced ",
+        Some("a, b, c"),
+    )
+    .unwrap();
+    let said = chief::command::get(&env.conn, live).unwrap().unwrap();
+    assert_eq!(said.outcome, Some(routines::Verdict::Update));
+    assert_eq!(said.headline.as_deref(), Some("3 files synced"));
+    assert!(chief::command::say(&env.conn, live, routines::Verdict::Update, " ", None).is_err());
+    chief::command::abandon(&env.conn, live, "stopped", NOW).unwrap();
+    assert!(
+        chief::command::say(&env.conn, live, routines::Verdict::Update, "late", None)
+            .unwrap_err()
+            .to_string()
+            .contains("isn't running")
+    );
+
+    // A run whose process is gone was lost, and the routine runs again.
+    let gone = begin(Some(0x3fff_fff0));
+    let done = ran(&env, "sync");
+    assert_eq!(done.run.output.as_deref(), Some("synced\n"));
+    assert_eq!(
+        chief::command::get(&env.conn, gone)
+            .unwrap()
+            .unwrap()
+            .status,
+        chief::command::Status::Lost
+    );
+    // The failed and the lost run before it say nothing about a pass.
+    assert_eq!(done.news.map(|n| n.recovery), Some(true));
 }

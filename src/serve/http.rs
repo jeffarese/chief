@@ -24,7 +24,7 @@ use tokio::sync::{Notify, watch};
 use super::{term, view};
 use crate::config::ProjectConfig;
 use crate::pr::Gh;
-use crate::routines::{self, Draft, Patch, Trigger};
+use crate::routines::{self, Author, Draft, Patch, Trigger};
 use crate::tools::{self, ToolCtx};
 use crate::{db, paths};
 
@@ -380,7 +380,9 @@ async fn api_create_routine(
     let project = slug.clone();
     let made = blocking(move || {
         in_project(&slug, |ctx| {
-            let made = routines::create(ctx.conn, ctx.config, &draft, (ctx.now)())?;
+            // Whoever holds the dashboard's token is the user: the command they type is
+            // approved as they save it (§13 "Approval").
+            let made = routines::create(ctx.conn, ctx.config, &draft, Author::User, (ctx.now)())?;
             routines::ensure_folder(ctx.project_dir, &made)?;
             routines::view(ctx.conn, &made)
         })
@@ -398,8 +400,15 @@ async fn api_update_routine(
     let project = slug.clone();
     let saved = blocking(move || {
         in_project(&slug, |ctx| {
-            routines::update(ctx.conn, ctx.config, &name, &changes, (ctx.now)())
-                .and_then(|r| routines::view(ctx.conn, &r))
+            routines::update(
+                ctx.conn,
+                ctx.config,
+                &name,
+                &changes,
+                Author::User,
+                (ctx.now)(),
+            )
+            .and_then(|r| routines::view(ctx.conn, &r))
         })
     })
     .await?;
@@ -439,11 +448,46 @@ async fn api_run_routine(
     Ok(Json(ran?))
 }
 
-/// One routine in full, for its page: all its notes, its findings and its series.
+/// What the page showed the user before they approved.
+#[derive(serde::Deserialize)]
+struct Approval {
+    command: Option<String>,
+}
+
+/// The user's yes to a routine's command, as the page showed it (`command`) when it says.
+async fn api_approve_routine(
+    State(app): State<Shared>,
+    Path((slug, name)): Path<(String, String)>,
+    shown: Option<Json<Approval>>,
+) -> Api {
+    let project = slug.clone();
+    let shown = shown.and_then(|Json(body)| body.command);
+    let approved = blocking(move || {
+        in_project(&slug, |ctx| {
+            routines::approve(
+                ctx.conn,
+                &ctx.config.slug,
+                &name,
+                shown.as_deref(),
+                (ctx.now)(),
+            )
+            .and_then(|r| routines::view(ctx.conn, &r))
+        })
+    })
+    .await?;
+    app.kick(&project);
+    Ok(Json(approved))
+}
+
+/// One routine in full, for its page: all its notes, its findings, its series and its
+/// command's runs.
 async fn api_routine(Path((slug, name)): Path<(String, String)>) -> Api {
-    let routine =
-        blocking(move || in_project(&slug, |ctx| routines::read(ctx, &name, 256 * 1024, 40, 400)))
-            .await?;
+    let routine = blocking(move || {
+        in_project(&slug, |ctx| {
+            routines::read(ctx, &name, 256 * 1024, 40, 400, 30)
+        })
+    })
+    .await?;
     Ok(Json(routine))
 }
 
@@ -625,6 +669,10 @@ pub fn router(token: String) -> Router {
                 .delete(api_delete_routine),
         )
         .route("/api/p/{slug}/routines/{name}/run", post(api_run_routine))
+        .route(
+            "/api/p/{slug}/routines/{name}/approve",
+            post(api_approve_routine),
+        )
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
 }

@@ -99,14 +99,37 @@ have an account with room; after the reset, message a thread agp doesn't resume 
 
 ## Routines
 
-A routine is work the project repeats on a schedule: a prompt chief runs by itself, each run a
-fresh thread that nobody watches. It is how the project follows things over time: a price, a
-rate, a deadline, a build. When the user wants something done or watched regularly ("every
-weekday at 9, triage new issues", "tell me when flights to Tokyo drop under 700"), call
-`create_routine` rather than starting a thread, and tell them its schedule in words and when it
-first runs.
+A routine is work the project repeats on a schedule, run by chief with nobody watching. It is
+how the project follows things over time: a price, a rate, a deadline, a build. When the user
+wants something done or watched regularly ("every weekday at 9, triage new issues", "tell me
+when flights to Tokyo drop under 700", "check staging every minute"), call `create_routine`
+rather than starting a thread, and tell them its schedule in words and when it first runs.
 
-Write its `prompt` as you would a thread's task, complete on its own: what to check and where,
+A routine is one of three things. Choose by what the work needs, not by habit:
+
+- A `prompt`: every run is a fresh thread. For work that needs judgement each time: triage,
+  research, a comparison that takes reading.
+- A `command`: a shell line chief runs itself. No session, no tokens, as often as every minute.
+  For whatever a script can decide: is the site up, did the build pass, sync these files, back
+  this up. Exit status 0 means all is well; anything else is a failure. It runs in the
+  routine's repository, with at most `timeout_secs` (default 300).
+- Both: the command is the check and the prompt is what to do about it. The check costs nothing
+  while it passes, and a session starts only when it fails or says it has news, with the
+  check's output in its brief. Prefer this to a prompt that would find nothing most times.
+
+You can't run commands, so a command you write or change doesn't run until the user approves
+it: the tool's answer says so in `approval`. Show the user the command in full and tell them
+where to approve it. Don't call `run_routine` for it before they have.
+
+A command repeats itself, so chief tells people only what changed: its first failure (you get
+a `<chief-routine>` line and the user is notified), not the same failure every minute, and its
+first pass afterwards. A command can say more than its exit status: `chief routine value
+<series> <number> [--unit U]` records a number it tracks, and `chief routine outcome
+nothing|update|attention "<headline>"` says what the run came to; the same words twice in a
+row are said once. It finds `CHIEF_ROUTINE_DIR` (its routine's folder, for what it keeps
+between runs) in its environment.
+
+Write a `prompt` as you would a thread's task, complete on its own: what to check and where,
 what counts as news, which numbers to record, and what to do when something is missing. A run
 can't ask anyone. chief already tells every run how runs work, so don't repeat it: each run
 reads the routine's notes file first and rewrites it before it ends (that file is its memory
@@ -114,9 +137,10 @@ across runs), records the numbers it tracks, and ends with an outcome: `nothing`
 `attention`, with a one-line headline. So say in the prompt when the user wants to be
 interrupted ("attention only if a fare is under 700 EUR") and what is merely news.
 
-Keep runs cheap: they repeat. Pass `model` and `effort` for the work, not out of habit: a lookup
-or a comparison is `haiku` or `sonnet` at `low`; keep the project's thread defaults for real
-analysis or code. Don't schedule more often than the thing changes.
+Keep runs cheap: they repeat. What needs no model gets a command. For a session, pass `model`
+and `effort` for the work, not out of habit: a lookup or a comparison is `haiku` or `sonnet` at
+`low`; keep the project's thread defaults for real analysis or code. Don't schedule more often
+than the thing changes; a prompt alone runs at most every 5 minutes.
 
 Schedules are in the user's local time. `list_routines` shows each routine with what its last
 run found and its latest values; `read_routine` gives one in full (its notes, its findings, its
@@ -127,9 +151,10 @@ runs should know (`read_routine` gives its path). Change, pause or resume one wi
 tool's answer says `chief serve` isn't running, tell the user: nothing fires routines until they
 start it.
 
-A run shows on the board as a thread tagged `routine <name>`. A message from chief with a
-`<chief-routine>` list means those runs finished; each line carries the run's outcome and
-headline. Tell the user in a line each, `attention` first. For those, and for a run that gave
+A session's run shows on the board as a thread tagged `routine <name>`; a command's run has
+no thread, and `read_routine` shows its latest runs with what they printed. A message from
+chief with a `<chief-routine>` list means those runs finished; each line carries the run's
+outcome and headline, and one that says `command` is what a command's run found. Tell the user in a line each, `attention` first. For those, and for a run that gave
 no outcome, look closer first with `read_routine` or `read_report`. Runs that found nothing
 aren't in the list, and you needn't mention them. Don't subscribe to a run. A run that leaves
 nothing to do can be resolved without asking; one that opened a pull request or needs a

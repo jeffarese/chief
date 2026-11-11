@@ -177,6 +177,44 @@ pub fn routine_line(t: &SessionRow, finding: Option<&Finding>) -> String {
     line
 }
 
+/// How many of a project's untold command findings one notice spells out: the latest. A
+/// command that flapped all night is a line count, not a page.
+const FINDINGS_TOLD: usize = 10;
+
+/// `- routine <routine> "<title>" · command · at 09:04 · attention: <headline>`: what a
+/// routine's command found, which no thread carries.
+pub fn finding_line(f: &Finding, title: Option<&str>) -> String {
+    format!(
+        "- routine {} \"{}\" · command · at {} · {}: {}",
+        f.routine,
+        title.unwrap_or(&f.routine),
+        local_hhmm(f.at),
+        f.verdict.as_str(),
+        f.headline
+    )
+}
+
+/// The lines for the command findings due, oldest first: the latest `FINDINGS_TOLD`, under a
+/// count of the ones before them.
+fn finding_lines(conn: &Connection, project: &str, findings: &[Finding]) -> Result<Vec<String>> {
+    let titles: HashMap<String, String> = crate::routines::list(conn, project)?
+        .into_iter()
+        .map(|r| (r.name, r.title))
+        .collect();
+    let earlier = findings.len().saturating_sub(FINDINGS_TOLD);
+    let mut lines = Vec::new();
+    if earlier > 0 {
+        lines.push(format!(
+            "- ({earlier} earlier finding{} of commands: read_routine lists them)",
+            if earlier == 1 { "" } else { "s" }
+        ));
+    }
+    for f in &findings[earlier..] {
+        lines.push(finding_line(f, titles.get(&f.routine).map(String::as_str)));
+    }
+    Ok(lines)
+}
+
 /// The text for routine runs that finished.
 pub fn routine_notice(lines: &[String]) -> String {
     format!(
@@ -185,7 +223,8 @@ pub fn routine_notice(lines: &[String]) -> String {
          the ones marked attention first; for those, and for a run that gave no outcome, read \
          more with read_routine (its notes, findings and values) or read_report before you \
          speak. Resolve a run that leaves nothing to do; a follow-up goes to its thread like \
-         any other.",
+         any other. A line that says command has no thread: chief ran the routine's command \
+         itself, and read_routine shows that run and what it printed.",
         lines.join("\n")
     )
 }
@@ -314,7 +353,8 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
             || !limited_due(threads, now).is_empty()
             || !routine_due(threads, &quiet, &verdicts).is_empty()
     };
-    if !any(&threads) {
+    // What commands found has no thread to ride on (§13 "Who hears of a run").
+    if !any(&threads) && crate::routines::untold(conn, project)?.is_empty() {
         return Ok(Look::Nothing);
     }
     db::immediate(conn, |conn| {
@@ -322,7 +362,8 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
             return Ok(Look::Superseded);
         }
         let threads = db::list_sessions(conn, project, Some(Role::Thread))?;
-        if !any(&threads) {
+        let findings = crate::routines::untold(conn, project)?;
+        if !any(&threads) && findings.is_empty() {
             return Ok(Look::Nothing);
         }
         let mut told: Vec<SessionRow> = Vec::new();
@@ -370,6 +411,8 @@ fn look(conn: &Connection, project: &str, pid: u32, now: i64) -> Result<Look> {
             let i = row_of(t, &mut told);
             told[i].routine_told_at = Some(now);
         }
+        lines.extend(finding_lines(conn, project, &findings)?);
+        crate::routines::mark_told(conn, &findings, now)?;
         if !lines.is_empty() {
             sections.push(routine_notice(&lines));
         }
@@ -577,6 +620,8 @@ mod tests {
             removed, review,
         ];
         let finding = |verdict| Finding {
+            id: 1,
+            run: None,
             routine: "triage".into(),
             thread: None,
             at: 5_000,
@@ -612,6 +657,8 @@ mod tests {
         ));
         assert!(line.ends_with(" · gave no outcome\n  report: 3 new issues. #883 needs you."));
         let finding = Finding {
+            id: 1,
+            run: None,
             routine: "triage".into(),
             thread: Some("p-triage-1a2b".into()),
             at: 0,

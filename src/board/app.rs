@@ -10,9 +10,12 @@ use ratatui::crossterm::event::{
 };
 
 use crate::cleanup::{Inspection, Mode};
+use crate::command::CommandRun;
 use crate::config::ProjectConfig;
+use crate::cron::Schedule;
 use crate::db::{BusySubagent, Event, Report, SessionRow};
 use crate::placement::{PoolTrust, Untrusted};
+use crate::routines::{Finding, Kind, Routine, State};
 use crate::state::{Group, Role};
 use crate::tools;
 
@@ -52,6 +55,19 @@ pub enum Action {
     CheckTrust(Box<ProjectConfig>),
     /// Mark this pair trusted (the user pressed Enter on it), then check `config` again.
     Trust(Box<Untrusted>, Box<ProjectConfig>),
+    /// Run this routine now (`routines::run`, manual).
+    RunRoutine(String),
+    /// The user's yes to this routine's command, only while it still reads `command`: the words
+    /// the modal showed.
+    Approve {
+        name: String,
+        command: String,
+    },
+    /// Pause (false) or resume (true) this routine.
+    SetEnabled {
+        name: String,
+        enabled: bool,
+    },
 }
 
 /// What the refresher and the workers send back.
@@ -105,6 +121,22 @@ pub struct Snapshot {
     pub pane_target: Option<String>,
     /// `claude agents` failed; the rows are the stored ones.
     pub error: Option<String>,
+    /// The project's routines, by name.
+    pub routines: Vec<RoutineRow>,
+}
+
+/// A routine with what the board shows of it, read by the refresher.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutineRow {
+    pub routine: Routine,
+    /// How it stands (`routines::state`), as the dashboard and the CLI say it too.
+    pub state: State,
+    /// Its schedule in words.
+    pub schedule: String,
+    /// Its command's latest run, with only the last lines of what it printed.
+    pub last_exec: Option<CommandRun>,
+    /// What its latest run found.
+    pub finding: Option<Finding>,
 }
 
 /// One PR refresh, for the status line.
@@ -135,6 +167,14 @@ pub enum Screen {
         name: String,
         label: String,
     },
+    /// Approve this routine's command? It shows the whole command.
+    Approve {
+        name: String,
+        title: String,
+        command: String,
+        /// Its schedule in words: when the command will run.
+        schedule: String,
+    },
     Settings(Box<SettingsForm>),
     Report(Box<ReportView>),
 }
@@ -152,6 +192,13 @@ pub enum Item<'a> {
     Thread(&'a SessionRow),
     /// "No threads yet".
     Empty,
+    /// The routines' header, after the thread groups.
+    Routines {
+        count: usize,
+        /// How many need the user (`State::needs_user`).
+        need_you: usize,
+    },
+    Routine(&'a RoutineRow),
 }
 
 /// What a click on a screen line lands on, recorded by the last draw.
@@ -159,6 +206,7 @@ pub enum Item<'a> {
 pub enum Hit {
     Coordinator,
     Thread(String),
+    Routine(String),
     /// A collapsed or expanded Resolved header: a click toggles it.
     Resolved,
     /// A settings field, by index.
@@ -177,10 +225,14 @@ pub struct App {
     /// Their subagents mid-turn, each with its latest call.
     pub subagents: HashMap<String, Vec<BusySubagent>>,
     pub denials: i64,
+    /// The project's routines, by name.
+    pub routines: Vec<RoutineRow>,
     /// What the main pane shows; None is the coordinator.
     pub pane_target: Option<String>,
-    /// The selected thread; ignored while `on_coordinator`.
+    /// The selected thread; ignored while `on_coordinator` or a routine is selected.
     pub selected: Option<String>,
+    /// The selected routine, by name; ignored while `on_coordinator`.
+    pub selected_routine: Option<String>,
     /// The coordinator's row is selected.
     pub on_coordinator: bool,
     /// Selected only because no thread showed: the first thread to show takes the selection.
@@ -208,6 +260,8 @@ pub struct App {
     pub hits: RefCell<Vec<(u16, Hit)>>,
     /// Drawn beside its conversation in the built-in layout (§9), which takes Ctrl+\.
     pub embedded: bool,
+    /// The approve modal's whole command fit on the last frame: y approves only what was seen.
+    pub approve_shown: Cell<bool>,
 }
 
 impl App {
@@ -221,8 +275,10 @@ impl App {
             activity: HashMap::new(),
             subagents: HashMap::new(),
             denials: 0,
+            routines: Vec::new(),
             pane_target: None,
             selected: None,
+            selected_routine: None,
             on_coordinator: false,
             coordinator_by_default: false,
             show_resolved: false,
@@ -240,6 +296,7 @@ impl App {
             scroll: Cell::new(0),
             hits: RefCell::new(Vec::new()),
             embedded: false,
+            approve_shown: Cell::new(false),
         }
     }
 
@@ -256,6 +313,7 @@ impl App {
                 self.activity = s.activity;
                 self.subagents = s.subagents;
                 self.denials = s.denials;
+                self.routines = s.routines;
                 self.pane_target = s.pane_target;
                 self.refresh_error = s.error;
                 self.loaded = true;
@@ -345,7 +403,6 @@ impl App {
         let mut items = vec![Item::Coordinator];
         if self.threads.is_empty() {
             items.push(Item::Empty);
-            return items;
         }
         for group in Group::ORDER {
             let rows: Vec<_> = self
@@ -366,23 +423,50 @@ impl App {
                 items.extend(rows.into_iter().map(Item::Thread));
             }
         }
+        if !self.routines.is_empty() {
+            items.push(Item::Routines {
+                count: self.routines.len(),
+                need_you: self
+                    .routines
+                    .iter()
+                    .filter(|r| r.state.needs_user())
+                    .count(),
+            });
+            items.extend(self.routines.iter().map(Item::Routine));
+        }
         items
     }
 
-    /// The selected thread; None when the coordinator's row is selected.
+    /// The selected thread; None when the coordinator's row or a routine is selected.
     pub fn selected_row(&self) -> Option<&SessionRow> {
-        if self.on_coordinator {
+        if self.on_coordinator || self.selected_routine.is_some() {
             return None;
         }
         let name = self.selected.as_deref()?;
         self.visible().into_iter().find(|r| r.name == name)
     }
 
+    /// The selected routine, if a routine is selected.
+    pub fn routine_row(&self) -> Option<&RoutineRow> {
+        if self.on_coordinator {
+            return None;
+        }
+        let name = self.selected_routine.as_deref()?;
+        self.routines.iter().find(|r| r.routine.name == name)
+    }
+
     /// Keeps the selection on a visible thread: the same one if it still shows, else the first,
-    /// else the coordinator. A selected coordinator stays selected.
+    /// else the coordinator. A selected coordinator stays selected, and so does a selected
+    /// routine while it exists; routines never take the selection by themselves.
     fn fix_selection(&mut self) {
         if self.on_coordinator && !self.coordinator_by_default {
             return;
+        }
+        if let Some(name) = &self.selected_routine {
+            if self.routines.iter().any(|r| &r.routine.name == name) {
+                return;
+            }
+            self.selected_routine = None;
         }
         let visible = self.visible();
         let keep = self
@@ -396,25 +480,38 @@ impl App {
         }
     }
 
-    /// Moves over the coordinator (position 0) and the visible threads, stopping at the ends.
+    /// Moves over the coordinator (position 0), the visible threads, then the routines,
+    /// stopping at the ends.
     fn move_selection(&mut self, delta: isize) {
-        let visible = self.visible();
+        let threads: Vec<String> = self.visible().iter().map(|r| r.name.clone()).collect();
+        let routine_at = |name: &str| {
+            self.routines
+                .iter()
+                .position(|r| r.routine.name == name)
+                .map(|i| threads.len() + 1 + i)
+        };
         let current = if self.on_coordinator {
             0
+        } else if let Some(name) = &self.selected_routine {
+            routine_at(name).unwrap_or(0)
         } else {
             self.selected
                 .as_deref()
-                .and_then(|n| visible.iter().position(|r| r.name == n))
+                .and_then(|n| threads.iter().position(|r| r == n))
                 .map_or(0, |i| i + 1)
         };
+        let last = threads.len() + self.routines.len();
         let next = (current as isize)
             .saturating_add(delta)
-            .clamp(0, visible.len() as isize);
-        let thread = (next > 0).then(|| visible[next as usize - 1].name.clone());
-        self.on_coordinator = thread.is_none();
+            .clamp(0, last as isize) as usize;
+        self.on_coordinator = next == 0;
         self.coordinator_by_default = false;
-        if thread.is_some() {
-            self.selected = thread;
+        self.selected_routine = None;
+        if next > threads.len() {
+            self.selected_routine =
+                Some(self.routines[next - threads.len() - 1].routine.name.clone());
+        } else if next > 0 {
+            self.selected = Some(threads[next - 1].clone());
         }
     }
 
@@ -427,7 +524,13 @@ impl App {
             Hit::Thread(name) => {
                 self.on_coordinator = false;
                 self.coordinator_by_default = false;
+                self.selected_routine = None;
                 self.selected = Some(name.clone());
+            }
+            Hit::Routine(name) => {
+                self.on_coordinator = false;
+                self.coordinator_by_default = false;
+                self.selected_routine = Some(name.clone());
             }
             Hit::Resolved | Hit::Field(_) => {}
         }
@@ -487,7 +590,8 @@ impl App {
     fn is_selected(&self, hit: &Hit) -> bool {
         match hit {
             Hit::Coordinator => self.on_coordinator,
-            Hit::Thread(name) => !self.on_coordinator && self.selected.as_deref() == Some(name),
+            Hit::Thread(name) => self.selected_row().is_some_and(|r| &r.name == name),
+            Hit::Routine(name) => self.routine_row().is_some_and(|r| &r.routine.name == name),
             Hit::Resolved | Hit::Field(_) => false,
         }
     }
@@ -511,6 +615,7 @@ impl App {
             }
             Screen::Confirm(_) => self.confirm_key(key),
             Screen::Stop { .. } => self.stop_key(key),
+            Screen::Approve { .. } => self.approve_key(key),
             Screen::Report(view) => {
                 if let report::Outcome::Close = view.on_key(key) {
                     self.screen = Screen::Board;
@@ -548,6 +653,9 @@ impl App {
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Esc | KeyCode::Char('c') => return self.show_coordinator(),
             KeyCode::Enter if self.on_coordinator => return self.show_coordinator(),
+            KeyCode::Enter if self.routine_row().is_some() => {
+                return self.on_routine(|app, r| app.no_session(r));
+            }
             KeyCode::Enter => return self.on_thread(|app, row| app.show(row)),
             KeyCode::Char('n') => return self.next_waiting(),
             KeyCode::Char('w') => return self.on_thread(|app, row| app.wake(row)),
@@ -557,6 +665,9 @@ impl App {
             KeyCode::Char('o') => return self.on_thread(|app, row| app.open_pr(row)),
             KeyCode::Char('x') => return self.on_thread(|app, row| app.clean(row)),
             KeyCode::Char('v') => return self.on_thread(|app, row| app.read_reports(row)),
+            KeyCode::Char('a') => return self.on_routine(|app, r| app.ask_approve(r)),
+            KeyCode::Char('e') => return self.on_routine(|app, r| app.run_routine(r)),
+            KeyCode::Char('p') => return self.on_routine(|app, r| app.pause(r)),
             _ => {}
         }
         Vec::new()
@@ -586,15 +697,142 @@ impl App {
 
     /// Runs a thread key on the selection, or says there is none.
     fn on_thread(&mut self, f: impl FnOnce(&mut App, SessionRow) -> Vec<Action>) -> Vec<Action> {
-        match self.selected_row().cloned() {
-            Some(row) => f(self, row),
-            None if self.on_coordinator => self.refuse(
+        if let Some(row) = self.selected_row().cloned() {
+            return f(self, row);
+        }
+        if self.on_coordinator {
+            return self.refuse(
                 "That key acts on a thread: pick one with ↓. The coordinator is the conversation in \
                  the main pane."
                     .to_string(),
-            ),
-            None => self.refuse("No thread selected.".to_string()),
+            );
         }
+        if let Some(r) = self.routine_row() {
+            let why = format!(
+                "That key acts on a thread, and {} is a routine: its keys are on the bar below.",
+                r.routine.title
+            );
+            return self.refuse(why);
+        }
+        self.refuse("No thread selected.".to_string())
+    }
+
+    /// Runs a routine key on the selected routine, or says how to pick one.
+    fn on_routine(&mut self, f: impl FnOnce(&mut App, RoutineRow) -> Vec<Action>) -> Vec<Action> {
+        if let Some(r) = self.routine_row().cloned() {
+            return f(self, r);
+        }
+        self.refuse(if self.routines.is_empty() {
+            "That key acts on a routine, and this project has none: ask the coordinator for one."
+                .to_string()
+        } else {
+            "That key acts on a routine: pick one under Routines with ↓.".to_string()
+        })
+    }
+
+    /// Enter on a routine: it has no session of its own to show, so say where its runs are.
+    fn no_session(&mut self, r: RoutineRow) -> Vec<Action> {
+        let routine = &r.routine;
+        let then = if routine.needs_approval() {
+            "a approves its command"
+        } else {
+            "e runs it now"
+        };
+        self.refuse(match routine.kind() {
+            Kind::Command => format!(
+                "{} is a routine: chief runs its command with no session, so there is nothing \
+                 to show. {then}.",
+                routine.title
+            ),
+            Kind::Session | Kind::Check => format!(
+                "{} is a routine: its runs are threads tagged routine {}. {then}.",
+                routine.title, routine.name
+            ),
+        })
+    }
+
+    /// Asks before approving: approving lets a shell command run unattended, so the modal shows
+    /// it whole.
+    fn ask_approve(&mut self, r: RoutineRow) -> Vec<Action> {
+        let routine = r.routine;
+        let Some(command) = routine.command.clone() else {
+            return self.refuse(format!(
+                "{} runs no command: there is nothing to approve.",
+                routine.name
+            ));
+        };
+        if !routine.needs_approval() {
+            return self.refuse(format!("{}'s command is approved already.", routine.name));
+        }
+        self.approve_shown.set(false);
+        self.screen = Screen::Approve {
+            name: routine.name,
+            title: routine.title,
+            command,
+            schedule: r.schedule,
+        };
+        Vec::new()
+    }
+
+    /// y approves what the modal showed, and only when it showed all of it; any other key
+    /// leaves the command waiting.
+    fn approve_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let Screen::Approve { name, command, .. } =
+            std::mem::replace(&mut self.screen, Screen::Board)
+        else {
+            return Vec::new();
+        };
+        if key.code != KeyCode::Char('y') {
+            self.status = Some(format!("Not approved: {name}'s command still waits."));
+            return Vec::new();
+        }
+        if !self.approve_shown.get() {
+            self.status = Some(format!(
+                "Not approved: the whole command didn't fit on the screen. Make the board bigger, \
+                 or read it with chief routine show {} {name}.",
+                self.slug
+            ));
+            return Vec::new();
+        }
+        vec![Action::Approve { name, command }]
+    }
+
+    fn run_routine(&mut self, r: RoutineRow) -> Vec<Action> {
+        let name = r.routine.name.clone();
+        if r.routine.needs_approval() {
+            return self.refuse(format!(
+                "{name}'s command waits for your approval: a approves it, then e runs it."
+            ));
+        }
+        if let Some(busy) = &self.busy {
+            return self.refuse(format!("Wait: {busy}"));
+        }
+        self.busy = Some(format!("running {name}…"));
+        vec![Action::RunRoutine(name)]
+    }
+
+    /// Flipped here too, as resolving is, so a second p before the refresh undoes the first.
+    fn pause(&mut self, r: RoutineRow) -> Vec<Action> {
+        let enabled = !r.routine.enabled;
+        let now = self.now;
+        if let Some(row) = self
+            .routines
+            .iter_mut()
+            .find(|row| row.routine.name == r.routine.name)
+        {
+            row.routine.enabled = enabled;
+            row.routine.next_run_at = enabled
+                .then(|| {
+                    Schedule::parse(&row.routine.schedule)
+                        .ok()?
+                        .next_after_ms(now)
+                })
+                .flatten();
+        }
+        vec![Action::SetEnabled {
+            name: r.routine.name,
+            enabled,
+        }]
     }
 
     fn refuse(&mut self, why: String) -> Vec<Action> {
@@ -843,6 +1081,290 @@ pub(crate) mod tests {
         app
     }
 
+    /// A routine standing as `key` says (`routines::State`), due in 12 minutes. A key of
+    /// `approval` gives it a command the user hasn't approved.
+    pub fn routine(name: &str, key: &'static str) -> RoutineRow {
+        let label = match key {
+            "approval" => "Needs approval",
+            "running" => "Running",
+            "failing" => "Failing",
+            "ok" => "OK",
+            "attention" => "Needs you",
+            "update" => "Update",
+            "nothing" => "Nothing new",
+            _ => "No run yet",
+        };
+        let command = (key == "approval").then(|| "restic backup ~/work".to_string());
+        RoutineRow {
+            routine: Routine {
+                id: 1,
+                project_slug: "demo".into(),
+                name: name.into(),
+                title: name.into(),
+                prompt: String::new(),
+                schedule: "every 30m".into(),
+                repo: None,
+                model: None,
+                effort: None,
+                enabled: true,
+                notify: true,
+                created_at: 0,
+                updated_at: 0,
+                next_run_at: Some(NOW + 12 * 60_000),
+                last_run_at: None,
+                last_thread: None,
+                last_note: None,
+                command,
+                approved_command: None,
+                timeout_secs: None,
+            },
+            state: State {
+                key,
+                label,
+                line: String::new(),
+                at: None,
+            },
+            schedule: "Every 30 minutes".into(),
+            last_exec: None,
+            finding: None,
+        }
+    }
+
+    pub fn app_with_routines(rows: Vec<SessionRow>, routines: Vec<RoutineRow>) -> App {
+        let mut app = app_with(rows);
+        let mut sessions = app.threads.clone();
+        sessions.extend(app.coordinator.clone());
+        app.apply(Msg::Rows(Snapshot {
+            sessions,
+            routines,
+            ..Default::default()
+        }));
+        app
+    }
+
+    /// Routines come after every thread group, Resolved included, and the selection moves into
+    /// them past the last visible thread; they never take a default selection.
+    #[test]
+    fn selection_moves_into_the_routines() {
+        let mut app = app_with_routines(
+            vec![
+                thread("work-1", Group::Working, 3),
+                thread("done-1", Group::Resolved, 1),
+            ],
+            vec![routine("backup", "approval"), routine("triage", "ok")],
+        );
+        let tail: Vec<String> = app
+            .items()
+            .iter()
+            .skip(3)
+            .map(|i| match i {
+                Item::Header { group, .. } => format!("[{}]", group.as_str()),
+                Item::Routines { count, need_you } => format!("[routines {count} {need_you}]"),
+                Item::Routine(r) => r.routine.name.clone(),
+                _ => "?".into(),
+            })
+            .collect();
+        assert_eq!(tail, ["[resolved]", "[routines 2 1]", "backup", "triage"]);
+        assert_eq!(app.selected.as_deref(), Some("work-1"));
+        app.on_key(ch('j'));
+        assert_eq!(app.selected_routine.as_deref(), Some("backup"));
+        assert_eq!(
+            app.selected_row(),
+            None,
+            "no thread while a routine is selected"
+        );
+        assert_eq!(app.routine_row().unwrap().routine.name, "backup");
+        app.on_key(ch('j'));
+        app.on_key(ch('j'));
+        assert_eq!(
+            app.selected_routine.as_deref(),
+            Some("triage"),
+            "stops at the end"
+        );
+        app.on_key(ch('k'));
+        app.on_key(ch('k'));
+        assert_eq!(app.selected_routine, None);
+        assert_eq!(app.selected_row().unwrap().name, "work-1");
+        // Resolved threads, once shown, come before the routines.
+        app.on_key(ch('R'));
+        app.on_key(ch('j'));
+        assert_eq!(app.selected_row().unwrap().name, "done-1");
+        app.on_key(ch('G'));
+        assert_eq!(app.selected_routine.as_deref(), Some("triage"));
+        app.on_key(ch('g'));
+        assert!(app.on_coordinator);
+        assert_eq!(app.routine_row(), None);
+        app.on_key(ch('G'));
+
+        // A refresh keeps it; when it is deleted, a thread takes the selection.
+        let routines = app.routines.clone();
+        let mut sessions = app.threads.clone();
+        sessions.extend(app.coordinator.clone());
+        app.apply(Msg::Rows(Snapshot {
+            sessions: sessions.clone(),
+            routines: routines.clone(),
+            ..Default::default()
+        }));
+        assert_eq!(app.selected_routine.as_deref(), Some("triage"));
+        app.apply(Msg::Rows(Snapshot {
+            sessions,
+            routines: routines[..1].to_vec(),
+            ..Default::default()
+        }));
+        assert_eq!(app.selected_routine, None);
+        assert!(app.selected_row().is_some());
+
+        // With no threads the coordinator keeps the selection; ↓ reaches the routines.
+        let mut app = app_with_routines(vec![], vec![routine("backup", "ok")]);
+        assert!(app.on_coordinator);
+        assert_eq!(
+            app.items()[..3],
+            [
+                Item::Coordinator,
+                Item::Empty,
+                Item::Routines {
+                    count: 1,
+                    need_you: 0
+                }
+            ]
+        );
+        app.on_key(ch('j'));
+        assert_eq!(app.selected_routine.as_deref(), Some("backup"));
+        // n selects a waiting thread, off the routine.
+        let mut app = app_with_routines(
+            vec![thread("wait-1", Group::Waiting, 1)],
+            vec![routine("backup", "ok")],
+        );
+        app.on_key(ch('G'));
+        app.on_key(ch('n'));
+        assert_eq!(app.selected_routine, None);
+        assert_eq!(app.selected_row().unwrap().name, "wait-1");
+    }
+
+    /// A thread's keys say so on a routine, a routine's on a thread, and Enter on a routine shows
+    /// nothing: it has no session of its own.
+    #[test]
+    fn thread_and_routine_keys_refuse_each_other() {
+        let mut command = routine("disk", "ok");
+        command.routine.command = Some("df -h".into());
+        command.routine.approved_command = command.routine.command.clone();
+        let mut app = app_with_routines(
+            vec![thread("work-1", Group::Working, 3)],
+            vec![routine("triage", "ok"), command],
+        );
+        app.on_key(ch('G'));
+        app.on_key(ch('k'));
+        for c in ['w', 'S', 'r', 'o', 'x', 'v'] {
+            assert!(app.on_key(ch(c)).is_empty(), "{c}");
+            assert!(
+                app.status
+                    .as_deref()
+                    .unwrap()
+                    .contains("triage is a routine"),
+                "{c}: {:?}",
+                app.status
+            );
+        }
+        assert_eq!(app.screen, Screen::Board);
+        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("its runs are threads tagged routine triage"),
+            "{:?}",
+            app.status
+        );
+        assert_eq!(app.pane_target, None);
+        app.on_key(ch('j'));
+        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("no session"));
+
+        app.on_key(ch('g'));
+        app.on_key(ch('j'));
+        for c in ['a', 'e', 'p'] {
+            assert!(app.on_key(ch(c)).is_empty(), "{c}");
+            assert!(
+                app.status
+                    .as_deref()
+                    .unwrap()
+                    .contains("pick one under Routines"),
+                "{c}: {:?}",
+                app.status
+            );
+        }
+        let mut none = app_with(vec![thread("work-1", Group::Working, 3)]);
+        assert!(none.on_key(ch('e')).is_empty());
+        assert!(none.status.as_deref().unwrap().contains("has none"));
+    }
+
+    /// e runs a routine on a worker, p pauses and resumes it at once on the board, and a asks
+    /// before approving a command, and approves only what the modal showed whole.
+    #[test]
+    fn routine_keys_run_pause_and_approve() {
+        let mut app = app_with_routines(
+            vec![],
+            vec![routine("backup", "approval"), routine("triage", "ok")],
+        );
+        app.on_key(ch('G'));
+        assert_eq!(app.on_key(ch('e')), [Action::RunRoutine("triage".into())]);
+        assert_eq!(app.busy.as_deref(), Some("running triage…"));
+        assert!(app.on_key(ch('e')).is_empty(), "one worker at a time");
+        app.apply(Msg::Done("Started demo-triage-1a2b.".into()));
+        assert!(app.on_key(ch('a')).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("runs no command"));
+
+        assert_eq!(
+            app.on_key(ch('p')),
+            [Action::SetEnabled {
+                name: "triage".into(),
+                enabled: false
+            }]
+        );
+        let triage = &app.routines[1].routine;
+        assert!(!triage.enabled);
+        assert_eq!(triage.next_run_at, None);
+        // A second p before the refresh undoes the first.
+        assert_eq!(
+            app.on_key(ch('p')),
+            [Action::SetEnabled {
+                name: "triage".into(),
+                enabled: true
+            }]
+        );
+        let triage = &app.routines[1].routine;
+        assert!(triage.enabled);
+        assert!(triage.next_run_at.is_some_and(|at| at > NOW));
+
+        // A command waiting for approval doesn't run; a asks first.
+        app.on_key(ch('k'));
+        assert!(app.on_key(ch('e')).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("a approves it"));
+        assert!(app.on_key(ch('a')).is_empty());
+        assert!(matches!(app.screen, Screen::Approve { .. }));
+        assert!(app.on_key(ch('n')).is_empty(), "any other key cancels");
+        assert_eq!(app.screen, Screen::Board);
+        assert!(app.status.as_deref().unwrap().starts_with("Not approved"));
+        // y approves only a command the screen showed whole.
+        app.on_key(ch('a'));
+        assert!(app.on_key(ch('y')).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("didn't fit"));
+        app.on_key(ch('a'));
+        app.approve_shown.set(true);
+        assert_eq!(
+            app.on_key(ch('y')),
+            [Action::Approve {
+                name: "backup".into(),
+                command: "restic backup ~/work".into()
+            }]
+        );
+        assert_eq!(app.screen, Screen::Board);
+        // Approved already: nothing to ask.
+        app.routines[0].routine.approved_command = app.routines[0].routine.command.clone();
+        assert!(app.on_key(ch('a')).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("approved already"));
+    }
+
     fn sample() -> App {
         app_with(vec![
             thread("idle-1", Group::Idle, 5),
@@ -975,6 +1497,8 @@ pub(crate) mod tests {
                 Item::Thread(r) => r.name.clone(),
                 Item::Empty => "empty".into(),
                 Item::Coordinator => "coordinator".into(),
+                Item::Routines { count, need_you } => format!("[routines {count} {need_you}]"),
+                Item::Routine(r) => format!("routine {}", r.routine.name),
             })
             .collect();
         assert_eq!(

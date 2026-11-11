@@ -6,6 +6,7 @@ pub mod board;
 pub mod builtin;
 pub mod claude;
 pub mod cleanup;
+pub mod command;
 pub mod config;
 pub mod context;
 pub mod cron;

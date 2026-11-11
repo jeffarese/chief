@@ -128,21 +128,21 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "List this project's routines: prompts that run on a schedule, each run a fresh thread. Shows each one's schedule in words, whether it is paused, when it next runs, and the thread and outcome of its last run."
+        description = "List this project's routines: work that runs on a schedule, each a prompt (every run a fresh thread), a command chief runs itself with no session, or both. Shows each one's kind, schedule in words, whether it is paused, when it next runs, how it stands (state), what its last run found, and its command's last run."
     )]
     async fn list_routines(&self) -> CallToolResult {
         self.call(routines::list_tool).await
     }
 
     #[tool(
-        description = "Read one routine in full without opening a thread: its notes (what its runs remember), what its latest runs found (outcome and headline each), and the values it tracks over time. Use it to answer a question about something a routine follows, or before you tell the user what a run found."
+        description = "Read one routine in full without opening a thread: its notes (what its runs remember), what its latest runs found (outcome and headline each), the values it tracks over time, and its command's latest runs with what they printed. Use it to answer a question about something a routine follows, or before you tell the user what a run found."
     )]
     async fn read_routine(&self, Parameters(args): Parameters<RoutineNameArgs>) -> CallToolResult {
         self.call(move |ctx| routines::read_tool(ctx, &args)).await
     }
 
     #[tool(
-        description = "Create a routine: a prompt chief runs on a schedule, each run a fresh thread that works without anyone watching. Use it when the user wants something done regularly (\"every weekday at 9, triage new issues\"). The prompt is each run's whole brief. Returns the routine with its next run."
+        description = "Create a routine: work chief runs on a schedule with nobody watching. Give a prompt for work that needs judgement (each run a fresh thread; the prompt is its whole brief), a command for what a script can do (a check, a sync, a cron job: no session, no tokens, as often as every minute), or both for a check that costs nothing while all is well and gets a session only when it fails or has news. Use it when the user wants something done or watched regularly. A command you write runs only after the user approves it: the answer says where. Returns the routine with its next run."
     )]
     async fn create_routine(&self, Parameters(args): Parameters<Draft>) -> CallToolResult {
         self.call(move |ctx| routines::create_tool(ctx, &args))
@@ -150,7 +150,7 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "Change a routine: its title, prompt, schedule, repo, model or effort, whether you are told when a run finishes, or pause and resume it with enabled. Only the fields you pass change."
+        description = "Change a routine: its title, prompt, command, timeout, schedule, repo, model or effort, whether you are told when a run finishes, or pause and resume it with enabled. Only the fields you pass change. A command you change waits for the user's approval again."
     )]
     async fn update_routine(
         &self,
@@ -172,7 +172,7 @@ impl ChiefMcp {
     }
 
     #[tool(
-        description = "Run a routine now, outside its schedule: starts its thread and returns its name. Its schedule doesn't move. Nothing starts while its last run is still working."
+        description = "Run a routine now, outside its schedule. A prompt starts its thread and returns its name; a command starts in the background and returns its run (read_routine shows how it ended). Its schedule doesn't move. Nothing starts while its last run is still working, or while its command waits for the user's approval."
     )]
     async fn run_routine(&self, Parameters(args): Parameters<RoutineNameArgs>) -> CallToolResult {
         self.call(move |ctx| routines::run_tool(ctx, &args)).await
