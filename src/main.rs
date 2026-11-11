@@ -33,6 +33,9 @@ enum Command {
         /// Don't offer to open Claude in untrusted folders; print the commands instead
         #[arg(long)]
         no_trust_prompt: bool,
+        /// Keep threads in this account, started by plain claude, even with agp installed
+        #[arg(long)]
+        no_agp: bool,
     },
     /// Mark every folder the project's sessions need as trusted by Claude Code
     Trust { slug: String },
@@ -332,7 +335,8 @@ fn main() -> Result<()> {
             goal,
             repos,
             no_trust_prompt,
-        } => chief::project::init(&name, goal.as_deref(), &repos, !no_trust_prompt),
+            no_agp,
+        } => chief::project::init(&name, goal.as_deref(), &repos, !no_trust_prompt, !no_agp),
         Command::Trust { slug } => chief::project::trust(&slug),
         Command::Up { slug, layout } => chief::project::up(
             &slug,

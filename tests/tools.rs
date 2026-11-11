@@ -431,6 +431,20 @@ fn start_thread_falls_back_to_the_project_account() {
         "{note}"
     );
 
+    // The only pool account has no login in agp: a thread there would only ask to log in.
+    let env = Env::new();
+    let cpe = common::account(env.root.path(), "claude-cpe");
+    trust_file(&cpe.join(".claude.json"), &[&env.repo]);
+    let mut logged_out = common::agp_view("cpe", "PB3", true, 0.0);
+    logged_out["token"] = json!("Missing");
+    logged_out["score"] = Value::Null;
+    env.pool(&[logged_out], &[("cpe", Some(&cpe))]);
+    assert_eq!(
+        run(&env).unwrap(),
+        "Every pool account (cpe (PB3)) is limited or has no login right now; it runs in the \
+         project's account."
+    );
+
     // agp fails.
     let env = Env::new();
     pool(&env);
@@ -521,6 +535,17 @@ fn start_thread_runs_where_asked() {
         "{err}"
     );
     let _ = pool.cpe;
+
+    // An account agp has no login for takes no thread, asked for or not.
+    let env = Env::new();
+    let mut logged_out = common::agp_view("cpe", "PB3", true, 0.0);
+    logged_out["token"] = json!("Missing");
+    env.pool(&[logged_out], &[]);
+    let err = pinned(&env, "PB3").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "can't run it in PB3: agp has no login for it (run `agp add cpe` once)"
+    );
 
     // Without agp nothing can be pinned.
     let env = Env::new();

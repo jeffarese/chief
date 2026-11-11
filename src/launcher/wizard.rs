@@ -42,14 +42,17 @@ pub enum Setting {
     CoordinatorEffort,
     ThreadModel,
     ThreadEffort,
+    /// Whether threads run through agp. Only offered when agp is installed.
+    Runner,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 4] = [
+    pub const ALL: [Setting; 5] = [
         Setting::CoordinatorModel,
         Setting::CoordinatorEffort,
         Setting::ThreadModel,
         Setting::ThreadEffort,
+        Setting::Runner,
     ];
 
     pub fn label(self) -> &'static str {
@@ -58,17 +61,26 @@ impl Setting {
             Setting::CoordinatorEffort => "Coordinator effort",
             Setting::ThreadModel => "Thread model",
             Setting::ThreadEffort => "Thread effort",
+            Setting::Runner => "Threads run through",
         }
     }
+}
 
-    pub fn help(self) -> &'static str {
-        match self {
-            Setting::CoordinatorModel => "The session you talk to: it plans and delegates.",
-            Setting::CoordinatorEffort => "Low keeps the conversation quick.",
-            Setting::ThreadModel => "Each background thread that does the work.",
-            Setting::ThreadEffort => "How hard each thread thinks.",
-        }
-    }
+/// An agp pool account a new project's threads could run in (§7 "Thread account").
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolAccount {
+    /// What agp shows for it, e.g. `PB2`.
+    pub label: String,
+    /// The file that records which folders it trusts.
+    pub trust: PathBuf,
+}
+
+/// A repo an account doesn't trust yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Untrusted {
+    pub folder: PathBuf,
+    /// The pool account's label; None is the project's own account.
+    pub account: Option<String>,
 }
 
 /// What the wizard collected, for the launcher to create.
@@ -81,6 +93,9 @@ pub struct Draft {
     pub coordinator_effort: String,
     pub thread_model: String,
     pub thread_effort: String,
+    /// Threads run through agp when it is installed (the `[threads]` defaults); false keeps
+    /// them in the project's account, started by plain `claude`.
+    pub agp: bool,
     /// The user agreed to mark the untrusted repos trusted.
     pub trust: bool,
 }
@@ -89,8 +104,9 @@ pub struct Draft {
 pub trait Probe {
     /// Some(why) when a project can't take this slug (taken, or it can't be checked).
     fn slug_problem(&self, slug: &str) -> Option<String>;
-    /// Whether the project's account trusts `folder` already.
-    fn trusted(&self, folder: &Path) -> bool;
+    /// Whether an account trusts `folder` already: the pool account whose trust file is
+    /// `account`, or the project's own for None.
+    fn trusted(&self, account: Option<&Path>, folder: &Path) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,8 +134,14 @@ pub struct Wizard {
     pub coordinator_effort: String,
     pub thread_model: String,
     pub thread_effort: String,
-    /// Step 4: the repos the project's account doesn't trust yet.
-    pub untrusted: Vec<PathBuf>,
+    /// agp's pool accounts but the project's own, once the launcher has asked agp. None
+    /// without agp (or before it answered): step 3 then has nothing to ask about it.
+    pub agp: Option<Vec<PoolAccount>>,
+    /// Step 3: threads run through agp. Only shown, and only changed, with `agp`.
+    pub use_agp: bool,
+    /// Step 4: the repos not trusted yet, in the project's account and, with agp, in each
+    /// pool account.
+    pub untrusted: Vec<Untrusted>,
     pub trust: bool,
     /// An error or a hint for the current step.
     pub message: Option<String>,
@@ -143,6 +165,8 @@ impl Wizard {
             coordinator_effort: defaults.coordinator.effort,
             thread_model: defaults.threads.model,
             thread_effort: defaults.threads.effort,
+            agp: None,
+            use_agp: true,
             untrusted: Vec::new(),
             trust: true,
             message: None,
@@ -157,13 +181,94 @@ impl Wizard {
         self.step.index() + 1
     }
 
+    /// Step 3's rows: the last asks about agp, so it shows only once agp is found.
+    pub fn settings(&self) -> &'static [Setting] {
+        let all = &Setting::ALL;
+        match self.agp {
+            Some(_) => all,
+            None => &all[..all.len() - 1],
+        }
+    }
+
+    /// The selected row of step 3.
+    pub fn selected(&self) -> Setting {
+        let shown = self.settings();
+        shown[self.setting.min(shown.len() - 1)]
+    }
+
     pub fn value(&self, s: Setting) -> &str {
         match s {
             Setting::CoordinatorModel => &self.coordinator_model,
             Setting::CoordinatorEffort => &self.coordinator_effort,
             Setting::ThreadModel => &self.thread_model,
             Setting::ThreadEffort => &self.thread_effort,
+            Setting::Runner if self.use_agp => "agp",
+            Setting::Runner => "claude",
         }
+    }
+
+    /// The line under step 3's rows.
+    pub fn help(&self, s: Setting) -> String {
+        match s {
+            Setting::CoordinatorModel => "The session you talk to: it plans and delegates.".into(),
+            Setting::CoordinatorEffort => "Low keeps the conversation quick.".into(),
+            Setting::ThreadModel => "Each background thread that does the work.".into(),
+            Setting::ThreadEffort => "How hard each thread thinks.".into(),
+            Setting::Runner if !self.use_agp => {
+                "Plain claude in this account. Nothing watches threads for usage limits.".into()
+            }
+            Setting::Runner => match self.pool_labels() {
+                Some(labels) => format!(
+                    "agp starts each thread in the account with the most room and moves it at \
+                     a usage limit. Besides this account: {labels}."
+                ),
+                None => "agp watches each thread and resumes it once a usage limit resets.".into(),
+            },
+        }
+    }
+
+    /// The pool accounts threads would also run in, `PB2, PB3`; None without any.
+    pub fn pool_labels(&self) -> Option<String> {
+        let labels: Vec<&str> = self
+            .agp
+            .iter()
+            .flatten()
+            .map(|a| a.label.as_str())
+            .collect();
+        (!labels.is_empty()).then(|| labels.join(", "))
+    }
+
+    /// What the launcher learnt from agp (§10a): its pool, or None when it isn't installed.
+    pub fn set_agp(&mut self, agp: Option<Vec<PoolAccount>>, probe: &dyn Probe) {
+        self.agp = agp;
+        self.find_untrusted(probe);
+    }
+
+    /// Step 4's list: every repo in the project's account, then in each pool account threads
+    /// would run in.
+    fn find_untrusted(&mut self, probe: &dyn Probe) {
+        let mut found: Vec<Untrusted> = self
+            .repos
+            .iter()
+            .filter(|r| !probe.trusted(None, r))
+            .map(|r| Untrusted {
+                folder: r.clone(),
+                account: None,
+            })
+            .collect();
+        if self.use_agp {
+            for account in self.agp.iter().flatten() {
+                for repo in &self.repos {
+                    if !probe.trusted(Some(&account.trust), repo) {
+                        found.push(Untrusted {
+                            folder: repo.clone(),
+                            account: Some(account.label.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        self.untrusted = found;
     }
 
     pub fn on_key(&mut self, key: KeyEvent, probe: &dyn Probe) -> Outcome {
@@ -177,7 +282,7 @@ impl Wizard {
         match self.step {
             Step::About => self.about_key(key, ctrl, probe),
             Step::Code => self.code_key(key, ctrl, probe),
-            Step::Models => self.models_key(key),
+            Step::Models => self.models_key(key, probe),
             Step::Review => match key.code {
                 KeyCode::Char(' ') | KeyCode::Char('t') if !self.untrusted.is_empty() => {
                     self.trust = !self.trust;
@@ -300,31 +405,27 @@ impl Wizard {
     fn next_from_code(&mut self, probe: &dyn Probe) -> Outcome {
         self.message = None;
         self.step = Step::Models;
-        self.untrusted = self
-            .repos
-            .iter()
-            .filter(|r| !probe.trusted(r))
-            .cloned()
-            .collect();
+        self.find_untrusted(probe);
         Outcome::Stay
     }
 
-    fn models_key(&mut self, key: KeyEvent) -> Outcome {
-        let last = Setting::ALL.len() - 1;
+    fn models_key(&mut self, key: KeyEvent, probe: &dyn Probe) -> Outcome {
+        let last = self.settings().len() - 1;
+        self.setting = self.setting.min(last);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.setting = self.setting.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                 self.setting = (self.setting + 1).min(last)
             }
-            KeyCode::Left | KeyCode::Char('h') => self.cycle(-1),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => self.cycle(1),
+            KeyCode::Left | KeyCode::Char('h') => self.cycle(-1, probe),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => self.cycle(1, probe),
             KeyCode::Enter => self.step = Step::Review,
             _ => {}
         }
         Outcome::Stay
     }
 
-    fn cycle(&mut self, step: isize) {
+    fn cycle(&mut self, step: isize, probe: &dyn Probe) {
         let pick = |options: &[&str], current: &str| {
             let n = options.len() as isize;
             let i = options
@@ -333,7 +434,7 @@ impl Wizard {
                 .map_or(0, |i| (i as isize + step).rem_euclid(n) as usize);
             options[i].to_string()
         };
-        match Setting::ALL[self.setting] {
+        match self.selected() {
             Setting::CoordinatorModel => {
                 self.coordinator_model = pick(&MODELS, &self.coordinator_model)
             }
@@ -342,6 +443,11 @@ impl Wizard {
             }
             Setting::ThreadModel => self.thread_model = pick(&MODELS, &self.thread_model),
             Setting::ThreadEffort => self.thread_effort = pick(&EFFORTS, &self.thread_effort),
+            // Which accounts' trust the review lists depends on it.
+            Setting::Runner => {
+                self.use_agp = !self.use_agp;
+                self.find_untrusted(probe);
+            }
         }
     }
 
@@ -355,6 +461,7 @@ impl Wizard {
             coordinator_effort: self.coordinator_effort.clone(),
             thread_model: self.thread_model.clone(),
             thread_effort: self.thread_effort.clone(),
+            agp: self.use_agp,
             trust: self.trust && !self.untrusted.is_empty(),
         }
     }
@@ -449,8 +556,9 @@ mod tests {
                 .any(|t| t == slug)
                 .then(|| format!("A project called {slug} exists already."))
         }
-        fn trusted(&self, folder: &Path) -> bool {
-            self.trusted.iter().any(|t| t == folder)
+        fn trusted(&self, account: Option<&Path>, folder: &Path) -> bool {
+            // The pool accounts trust nothing yet.
+            account.is_none() && self.trusted.iter().any(|t| t == folder)
         }
     }
 
@@ -531,7 +639,11 @@ mod tests {
         assert_eq!(w.step, Step::Code);
         w.on_key(key(KeyCode::Enter), &probe);
         assert_eq!(w.step, Step::Models);
-        assert_eq!(w.untrusted, std::slice::from_ref(&other));
+        let own = |folder: &PathBuf| Untrusted {
+            folder: folder.clone(),
+            account: None,
+        };
+        assert_eq!(w.untrusted, [own(&other)]);
 
         // 3. ←→ cycle; ↓ moves.
         assert_eq!(w.coordinator_model, "opus");
@@ -563,6 +675,7 @@ mod tests {
                 coordinator_effort: "max".into(),
                 thread_model: "sonnet".into(),
                 thread_effort: "high".into(),
+                agp: true,
                 trust: true,
             }
         );
@@ -570,6 +683,80 @@ mod tests {
         let mut w = Wizard::new(None);
         assert!(w.repos.is_empty());
         assert_eq!(w.on_key(key(KeyCode::Esc), &probe), Outcome::Cancel);
+    }
+
+    /// Step 3 asks about agp only once agp is found; the review then lists the pool accounts'
+    /// untrusted repos too, and not when threads stay with plain claude.
+    #[test]
+    fn agp_is_a_choice_once_it_is_found() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("api");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let probe = Fake {
+            taken: Vec::new(),
+            trusted: vec![repo.clone()],
+        };
+        let mut w = Wizard::new(Some(&repo));
+        typed(&mut w, "Docs", &probe);
+        w.on_key(key(KeyCode::Enter), &probe);
+        w.on_key(key(KeyCode::Enter), &probe);
+        w.on_key(key(KeyCode::Enter), &probe);
+        assert_eq!(w.step, Step::Models);
+
+        // No agp (or no answer yet): four rows, nothing about it, and the defaults stay.
+        assert_eq!(w.settings().len(), 4);
+        for _ in 0..6 {
+            w.on_key(key(KeyCode::Down), &probe);
+        }
+        assert_eq!(w.selected(), Setting::ThreadEffort);
+        assert!(w.untrusted.is_empty());
+        assert!(w.draft().agp);
+
+        // agp answers while the step is open: a fifth row, and its accounts' trust.
+        let pb2 = PoolAccount {
+            label: "PB2".into(),
+            trust: PathBuf::from("/pb2/.claude.json"),
+        };
+        w.set_agp(Some(vec![pb2]), &probe);
+        assert_eq!(w.settings().len(), 5);
+        w.on_key(key(KeyCode::Down), &probe);
+        assert_eq!(w.selected(), Setting::Runner);
+        assert_eq!(w.value(Setting::Runner), "agp");
+        assert!(
+            w.help(Setting::Runner)
+                .ends_with("Besides this account: PB2.")
+        );
+        let in_pb2 = Untrusted {
+            folder: repo.clone(),
+            account: Some("PB2".into()),
+        };
+        assert_eq!(w.untrusted, std::slice::from_ref(&in_pb2));
+        assert!(w.draft().trust, "the box covers the pool accounts");
+
+        // ←/→ switch to plain claude and back: nothing of the pool's to trust then.
+        w.on_key(key(KeyCode::Right), &probe);
+        assert_eq!(w.value(Setting::Runner), "claude");
+        assert!(w.untrusted.is_empty());
+        let draft = w.draft();
+        assert!(!draft.agp && !draft.trust);
+        w.on_key(key(KeyCode::Left), &probe);
+        assert_eq!(w.untrusted, [in_pb2]);
+
+        // An agp with no other account still watches threads.
+        w.set_agp(Some(Vec::new()), &probe);
+        assert_eq!(w.pool_labels(), None);
+        assert!(
+            w.help(Setting::Runner)
+                .starts_with("agp watches each thread")
+        );
+        assert!(w.untrusted.is_empty());
+
+        // agp gone (a wizard reopened after a failure): the row goes, the cursor stays valid.
+        w.set_agp(None, &probe);
+        assert_eq!(w.selected(), Setting::ThreadEffort);
+        w.on_key(key(KeyCode::Right), &probe);
+        assert_eq!(w.step, Step::Models);
     }
 
     #[test]

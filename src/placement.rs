@@ -129,10 +129,13 @@ pub fn place(inputs: &Inputs, repo: &Path, pinned: Option<&str>) -> Result<Place
     let max = inputs.threads.max_usage;
     let usable = agp::usable(&pool, max);
     if usable.is_empty() {
-        let why = match max {
+        let mut why = match max {
             Some(max) => format!("limited or at {max}% usage or more"),
             None => "limited".to_string(),
         };
+        if pool.iter().any(|a| !a.logged_in) {
+            why.push_str(" or has no login");
+        }
         let note = format!(
             "Every pool account ({}) is {why} right now; it runs in the project's account.",
             agp::listed(&pool)
@@ -185,6 +188,13 @@ fn place_pinned(
             agp::listed(pool)
         );
     };
+    if !account.logged_in {
+        bail!(
+            "can't run it in {}: agp has no login for it (run `agp add {}` once)",
+            account.shown(),
+            account.id
+        );
+    }
     let dir = inputs.agp.config_dir(&account.id)?;
     if let Some(why) = inputs.untrusted(account, dir.as_deref(), repo) {
         bail!("can't run it in {}: {why}", account.shown());
@@ -246,40 +256,69 @@ pub struct PoolTrust {
     pub errors: Vec<String>,
 }
 
+/// A pool account and the folder agp runs it in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolAccount {
+    pub id: String,
+    pub label: String,
+    /// Its config folder; None is the default account.
+    pub dir: Option<PathBuf>,
+}
+
+/// The pool accounts `threads` allows, each with its folder, and the accounts agp can't name a
+/// folder for (with why). Ok(None) without agp; an error only when `agp status` fails.
+pub fn pool_accounts(
+    threads: &ThreadSettings,
+    agp: &Agp,
+) -> Result<Option<(Vec<PoolAccount>, Vec<String>)>> {
+    if threads.accounts.is_empty() {
+        return Ok(Some(Default::default()));
+    }
+    let Some(all) = agp.status()? else {
+        return Ok(None);
+    };
+    let (mut found, mut errors) = (Vec::new(), Vec::new());
+    for account in agp::pool(&all, &threads.accounts) {
+        let label = account.shown().to_string();
+        match agp.config_dir(&account.id) {
+            Ok(dir) => found.push(PoolAccount {
+                id: account.id.clone(),
+                label,
+                dir,
+            }),
+            Err(e) => errors.push(format!("{label}: {e:#}")),
+        }
+    }
+    Ok(Some((found, errors)))
+}
+
 /// Every pool account `threads` allows, against every repository: the (account, folder) pairs
 /// where `start_thread` would skip the account for want of trust. Limited accounts count: their
 /// limits reset. An error only when `agp status` fails.
 pub fn pool_trust(threads: &ThreadSettings, agp: &Agp, repos: &[PathBuf]) -> Result<PoolTrust> {
     let mut out = PoolTrust::default();
-    if threads.accounts.is_empty() || repos.is_empty() {
+    if repos.is_empty() {
         return Ok(out);
     }
-    let Some(all) = agp.status()? else {
+    let Some((accounts, errors)) = pool_accounts(threads, agp)? else {
         return Ok(out);
     };
-    for account in agp::pool(&all, &threads.accounts) {
-        let label = account.shown().to_string();
-        let dir = match agp.config_dir(&account.id) {
-            Ok(dir) => dir,
-            Err(e) => {
-                out.errors.push(format!("{label}: {e:#}"));
-                continue;
-            }
-        };
-        let trust = claude::claude_config_path(dir.as_deref());
+    out.errors = errors;
+    for account in accounts {
+        let trust = claude::claude_config_path(account.dir.as_deref());
         for folder in repos {
             match claude::is_trusted_in(&trust, folder) {
                 Ok(true) => {}
                 Ok(false) => out.untrusted.push(Untrusted {
                     id: account.id.clone(),
-                    label: label.clone(),
-                    dir: dir.clone(),
+                    label: account.label.clone(),
+                    dir: account.dir.clone(),
                     folder: folder.clone(),
                 }),
-                Err(e) => out.errors.push(format!("{label}: {e:#}")),
+                Err(e) => out.errors.push(format!("{}: {e:#}", account.label)),
             }
         }
-        out.checked.push(label);
+        out.checked.push(account.label);
     }
     Ok(out)
 }

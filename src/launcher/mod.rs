@@ -17,10 +17,10 @@ use crate::claude::{self, Claude};
 use crate::config::ProjectConfig;
 use crate::pane::OnQuit;
 use crate::project::{self, LayoutChoice, Note, Where};
-use crate::{db, generated, paths, trust, tui};
+use crate::{db, generated, paths, placement, trust, tui};
 
 use app::{Action, Entry, Launcher, Msg};
-use wizard::{Draft, Probe};
+use wizard::{Draft, PoolAccount, Probe};
 
 const POLL: Duration = Duration::from_millis(100);
 
@@ -66,9 +66,29 @@ impl Probe for Live {
         }
     }
 
-    fn trusted(&self, folder: &Path) -> bool {
-        claude::is_trusted_in(&self.trust, folder).unwrap_or(false)
+    fn trusted(&self, account: Option<&Path>, folder: &Path) -> bool {
+        claude::is_trusted_in(account.unwrap_or(&self.trust), folder).unwrap_or(false)
     }
+}
+
+/// What the wizard asks about agp (§10a): the pool accounts a new project's threads would run
+/// in under the `[threads]` defaults, without the account the project itself gets (this
+/// process's). None when agp isn't installed or doesn't answer: the wizard then asks nothing,
+/// and creating the project says what failed (`trust::check`).
+fn agp_pool() -> Option<Vec<PoolAccount>> {
+    let threads = ProjectConfig::new("", "", None, Vec::new()).threads;
+    let (accounts, _) = placement::pool_accounts(&threads, &crate::agp::Agp::from_env()).ok()??;
+    let project = Claude::from_env().account;
+    Some(
+        accounts
+            .into_iter()
+            .filter(|a| !claude::same_account(a.dir.as_deref(), project.as_deref()))
+            .map(|a| PoolAccount {
+                label: a.label,
+                trust: claude::claude_config_path(a.dir.as_deref()),
+            })
+            .collect(),
+    )
 }
 
 /// `chief` (`new`: `chief new`, straight to the wizard).
@@ -82,6 +102,11 @@ pub fn run(new: bool) -> Result<()> {
     let cwd = std::env::current_dir().ok();
     let mut app = Launcher::new(entries()?, cwd, new);
     let (tx, rx) = mpsc::channel();
+    // agp may take seconds to answer; the wizard shows its step about it once it has.
+    let found = tx.clone();
+    std::thread::spawn(move || {
+        let _ = found.send(Msg::Agp(agp_pool()));
+    });
 
     let mut terminal = tui::init()?;
     let exit = (|| -> Result<Option<Next>> {
@@ -117,6 +142,13 @@ pub fn run(new: bool) -> Result<()> {
             }
             let mut finished = None;
             while let Ok(msg) = rx.try_recv() {
+                let msg = match msg {
+                    Msg::Agp(agp) => {
+                        app.agp_found(agp, &probe);
+                        continue;
+                    }
+                    other => other,
+                };
                 if let Msg::Created(slug) = &msg {
                     finished = Some(slug.clone());
                 }
@@ -234,6 +266,9 @@ pub fn create(draft: &Draft, send: &mut dyn FnMut(Msg)) -> Result<Where> {
             c.coordinator.effort = draft.coordinator_effort.clone();
             c.threads.model = draft.thread_model.clone();
             c.threads.effort = draft.thread_effort.clone();
+            if !draft.agp {
+                c.threads.without_agp();
+            }
         },
     )?;
     send(Msg::Created(config.slug.clone()));
@@ -251,10 +286,9 @@ pub fn create(draft: &Draft, send: &mut dyn FnMut(Msg)) -> Result<Where> {
     if draft.trust {
         needs.extend(&check.repos);
     } else if !check.repos.is_empty() {
-        send(Msg::Note(Note::Warn(format!(
-            "{} folders aren't trusted, so threads there won't start: chief trust {}",
-            check.repos.len(),
-            config.slug
+        send(Msg::Note(Note::Warn(untrusted_warning(
+            &check.repos,
+            &config.slug,
         ))));
     }
     for line in trust::mark_all(needs) {
@@ -266,9 +300,48 @@ pub fn create(draft: &Draft, send: &mut dyn FnMut(Msg)) -> Result<Where> {
     open(&config.slug, send)
 }
 
+/// What repos left untrusted cost: in the project's account threads there don't start; in a
+/// pool account only, new threads skip that account.
+fn untrusted_warning(needs: &[trust::Need], slug: &str) -> String {
+    let count = |n: usize| match n {
+        1 => "1 folder isn't".to_string(),
+        n => format!("{n} folders aren't"),
+    };
+    let pool = needs.iter().filter(|n| n.account.is_some()).count();
+    match needs.len() - pool {
+        0 => format!(
+            "{} trusted in agp's other accounts, so threads there skip those accounts: chief \
+             trust {slug}",
+            count(pool)
+        ),
+        own => format!(
+            "{} trusted, so threads there won't start: chief trust {slug}",
+            count(own)
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_warning_tells_the_projects_account_from_the_pool() {
+        let need = |account: Option<&str>| trust::Need {
+            folder: PathBuf::from("/r/web"),
+            config: PathBuf::from("/h/.claude.json"),
+            account: account.map(str::to_string),
+        };
+        assert_eq!(
+            untrusted_warning(&[need(None), need(None), need(Some("PB2"))], "pay"),
+            "2 folders aren't trusted, so threads there won't start: chief trust pay"
+        );
+        assert_eq!(
+            untrusted_warning(&[need(Some("PB2"))], "pay"),
+            "1 folder isn't trusted in agp's other accounts, so threads there skip those \
+             accounts: chief trust pay"
+        );
+    }
 
     /// A worker that panics still sends Done, so the Starting card stops spinning and says why.
     #[test]

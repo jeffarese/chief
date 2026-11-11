@@ -63,6 +63,7 @@ fn the_wizard_creates_trusts_and_opens_the_project() {
         coordinator_effort: "medium".into(),
         thread_model: "haiku".into(),
         thread_effort: "low".into(),
+        agp: true,
         trust: true,
     };
     let mut msgs = Vec::new();
@@ -121,10 +122,29 @@ fn the_wizard_creates_trusts_and_opens_the_project() {
     assert_eq!(bg.len(), 1);
     let at = bg[0].iter().position(|a| a == "--model").unwrap();
     assert_eq!(bg[0][at + 1..at + 4], ["sonnet", "--effort", "medium"]);
+    // agp is the `[threads]` default, installed or not.
+    assert_eq!(config.threads.accounts, ["auto"]);
+    assert_eq!(config.threads.runner, chief::config::Runner::Agp);
 
     // The same name again is refused before anything is written.
     let mut msgs = Vec::new();
     let err = chief::launcher::create(&draft, &mut |m| msgs.push(m)).unwrap_err();
     assert!(format!("{err:#}").contains("already exists"), "{err:#}");
     assert!(msgs.is_empty(), "{msgs:?}");
+
+    // "Threads run through: claude" in the wizard: the project's threads never use agp.
+    let plain = Draft {
+        name: "Plain".into(),
+        repos: Vec::new(),
+        agp: false,
+        trust: false,
+        ..draft
+    };
+    let mut msgs = Vec::new();
+    // Whether its coordinator starts is the fake's business; the project exists by then.
+    let _ = chief::launcher::create(&plain, &mut |m| msgs.push(m));
+    assert_eq!(msgs[0], Msg::Created("plain".into()));
+    let config = ProjectConfig::load(&home.path().join("projects/plain/project.toml")).unwrap();
+    assert!(config.threads.accounts.is_empty());
+    assert_eq!(config.threads.runner, chief::config::Runner::Claude);
 }

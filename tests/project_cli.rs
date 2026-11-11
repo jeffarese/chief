@@ -187,6 +187,53 @@ fn init_creates_the_project() {
     );
 }
 
+/// `init --no-agp`: the project's threads stay in its account, started by plain `claude`, even
+/// with agp installed, so no pool account is checked or offered.
+#[test]
+fn init_without_agp_keeps_threads_in_the_projects_account() {
+    let home = Home::new();
+    version_ok(&home);
+    let (a, b) = repos(&home);
+    trust_file(&home.trust, &[&a, &b]);
+    let cpb = common::account(home.path(), "claude-cpb");
+    let agp = home.install_agp();
+    common::agp_accounts(
+        agp,
+        &[
+            common::agp_view("default", "Main", true, 0.9),
+            common::agp_view("cpb", "PB2", true, 0.8),
+        ],
+        &[("default", None), ("cpb", Some(&cpb))],
+    );
+    let out = home.run(
+        &[
+            "init",
+            "Payments Latency",
+            "--repo",
+            a.to_str().unwrap(),
+            "--repo",
+            b.to_str().unwrap(),
+            "--no-agp",
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Its threads stay in this account, started by claude: agp isn't used."),
+        "{text}"
+    );
+    assert!(!text.contains("agp accounts"), "{text}");
+    assert!(!text.contains("(in PB2)"), "{text}");
+    assert!(agp.calls().is_empty(), "agp isn't asked: {:?}", agp.calls());
+    let config = chief::config::ProjectConfig::load(
+        &home.path().join("projects").join(SLUG).join("project.toml"),
+    )
+    .unwrap();
+    assert!(config.threads.accounts.is_empty());
+    assert_eq!(config.threads.runner, chief::config::Runner::Claude);
+}
+
 /// With agp, threads may run in any pool account, each with its own trust (§3): `init` lists
 /// every (account, repo) pair that isn't trusted yet, leaving out the project's own account
 /// (listed as before) and accounts outside the pool; `chief trust` marks them.

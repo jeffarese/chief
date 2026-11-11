@@ -43,7 +43,9 @@ Verified against Claude Code 2.1.310 in a spike (payload samples in `tests/fixtu
   (idle notices are delivered between turns; a 30 s wait inside one turn saw nothing).
 - `agp status --json` → `views[]`: `profile_id`, `label`, `in_pool`, `limited` (null or an
   object), `score` (a float; null outside the pool), `usage.five_hour.utilization` and
-  `usage.seven_day.utilization` (percent; `seven_day` may be null), `projection`;
+  `usage.seven_day.utilization` (percent; `seven_day` may be null), `projection`, `token`
+  (`"Missing"` when agp has no login for the account, else `{"Valid": …}` or `{"Expired": …}`:
+  an expired token is refreshed by the account's next run);
   `identity.tool` is `claude` for Claude accounts. `agp pick --json` ignores `--accounts` and
   `--exclude` (it always returned the same account), so chief ranks accounts itself (§7).
   Sample in `tests/fixtures/agp/status.json`.
@@ -213,7 +215,7 @@ coordinator's tools work the same with it stopped. One binary:
 | --- | --- | --- |
 | `chief` | you | The launcher (§10a): pick a project or create one in a guided setup, then open it |
 | `chief new` | you | The launcher, straight to the new-project wizard |
-| `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt]` | you | Create project files, check trust, register the project |
+| `chief init <name> [--goal …] [--repo PATH…] [--no-trust-prompt] [--no-agp]` | you | Create project files, check trust, register the project |
 | `chief trust <slug>` | you | Mark every folder the project's sessions need as trusted (§3 "Trust") |
 | `chief up <slug> [--layout builtin]` | you | Unarchive the project if it is archived, start or revive the coordinator, open the layout (Rex, tmux, chief's own, or say how) |
 | `chief down <slug> [--stop-threads]` | you | End the pane, close the layout; threads keep running unless asked |
@@ -251,7 +253,12 @@ final report's Stop and a Stop chief can't match yet (§4 "Matching a hook to a 
 `chief init` validates first (Claude Code version, name → slug with ≥1 letter or digit, slug not
 taken, every `--repo` an existing folder, stored canonical and named after its folder with `-2`, `-3`
 … on a clash) and leaves nothing behind on failure. The project belongs to the account
-`CLAUDE_CONFIG_DIR` names when `init` runs (§3); `init` says so for a non-default one. It then
+`CLAUDE_CONFIG_DIR` names when `init` runs (§3); `init` says so for a non-default one. agp is
+optional, and a project uses it for its threads when it is installed (the `[threads]` defaults,
+§3). `--no-agp` creates the project with `accounts = []` and `runner = "claude"`
+(`ThreadSettings::without_agp`), so its threads stay in its account, started by plain `claude`,
+and agp is never asked; `init` says "Its threads stay in this account, started by claude: agp
+isn't used.". It then
 handles trust (§3 "Trust", `trust::check`): it marks the project folder trusted without asking
 (`Trusted <dir>.`), since chief made it. With agp (§7 "Thread account") it checks every repo in
 every account of the pool too (`placement::pool_trust`: the accounts `[threads] accounts` allows
@@ -1392,8 +1399,9 @@ every thread runs in the project's account, as before. Otherwise `start_thread` 
 `agp status --json` (bounded, 15 s) and takes the pool: the Claude accounts agp has `in_pool`
 that `accounts` allows (`"auto"`: all of them; else the listed profile ids). The coordinator's
 own account needn't be in it. No pool account allowed: the project's account, silently. Of the
-pool, the usable accounts are those not `limited` (an object, or `true`; `null` and `false` are
-not limits), with 5-hour and weekly utilization below
+pool, the usable accounts are those agp has a login for (`token` isn't `"Missing"`, §1: a
+thread there would only ask to log in), not `limited` (an object, or `true`; `null` and `false`
+are not limits), with 5-hour and weekly utilization below
 `max_usage` when it is set, best agp `score` first (`agp pick` ignores `--accounts`/`--exclude`,
 §1, so chief never asks it). For each in turn chief asks agp for its folder (`agp exec <id> --
 sh -c 'printf %s "${CLAUDE_CONFIG_DIR-}"'`; empty = the default account; every `agp exec` runs
@@ -1403,9 +1411,11 @@ trust in that account's `.claude.json`; the first that trusts it gets the thread
 skipped (untrusted, with the `cd <repo> && agp exec <id> -- claude` that fixes it; agp failing)
 are listed in `account_note`. When none is usable or none trusts the repo, or `agp status`
 fails, the thread runs in the project's account and `account_note` says why. `account?` pins
-one: it must be in the pool (by id, else label) and trust the repo, or the call fails; limited
-or over `max_usage` only adds a note (the thread waits for the reset). The account is chosen
-once: a thread whose account later hits a limit waits there and is never moved. `chief init`
+one: it must be in the pool (by id, else label), have a login ("can't run it in <label>: agp
+has no login for it (run `agp add <id>` once)") and trust the repo, or the call fails; limited
+or over `max_usage` only adds a note (the thread waits for the reset). chief chooses the
+account once, at the start; after that only agp moves a thread, at a limit or on `move_thread`
+(§5 "Limits and moves"). `chief init`
 (§2) and the board's settings screen (§10) check every pool account's trust of every repo ahead
 of time and offer the fix for each pair, so `start_thread` rarely has to skip one.
 
@@ -2290,14 +2300,30 @@ the board (§10 "Terminal"): a worker that panics ends the card with `Starting c
      removes one. Enter with nothing typed goes on; none is fine.
   3. Models: coordinator model and effort, thread model and effort (←/→ cycle `fable`, `opus`,
      `sonnet`, `haiku` and §3's efforts), defaults from `ProjectConfig::new`, a line on what each does, and
-     a note that the rest is on the board (s).
-  4. Review: name and slug, goal, code, models; when the project's account (this process's
-     `CLAUDE_CONFIG_DIR`, as for `init`) doesn't trust some repos, lists them with
-     `[x] Trust them, as accepting Claude's trust prompt would` (Space toggles). Enter creates.
+     a note that the rest is on the board (s). With agp installed (below) a fifth row, `Threads
+     run through`, ←/→ between `agp` (the default: the `[threads]` defaults) and `claude`
+     (`init --no-agp`, §2); its line names the pool accounts threads would also run in
+     (`Besides this account: PB2, PB3.`), or says that agp watches each thread when it has no
+     other account, or that nothing watches threads for usage limits with `claude`.
+  4. Review: name and slug, goal, code, models, and with agp installed an `agp` row (`threads
+     also run in PB2, PB3`, `watches threads for usage limits`, or `threads stay in this
+     account, without agp`); when some repos aren't trusted yet, in the project's account (this
+     process's `CLAUDE_CONFIG_DIR`, as for `init`) or, with `agp` chosen, in a pool account
+     (`<repo> (in <label>)`), lists them with `[x] Trust them, as accepting Claude's trust
+     prompt would` (Space toggles). Enter creates.
+- agp in the wizard: the launcher asks agp once, on a thread of its own when it starts
+  (`launcher::agp_pool`: `placement::pool_accounts` for the `[threads]` defaults, which is `agp
+  status --json` and an `agp exec` per pool account, without the account the project gets), so
+  a slow agp never holds the screen. The answer (`Msg::Agp`) reaches the open wizard and every
+  one opened after (`Launcher::agp_found`). Until it comes, and without agp or when agp fails,
+  the wizard shows nothing about agp and the project gets the `[threads]` defaults.
 - Creating (`launcher::create`, on a worker): `project::create_with` (`init`'s validation and
-  files, with the wizard's models and efforts), then `trust::check`: the project folder is
-  marked, and the repos in every account when the box was ticked (else a warning names
-  `chief trust <slug>`); then `project::up_with`. Opening a listed project runs `up_with` alone.
+  files, with the wizard's models and efforts, and `without_agp` when `claude` was chosen),
+  then `trust::check`: the project folder is marked, and the repos in every account when the
+  box was ticked. Else a warning names `chief trust <slug>`: "<n> folders aren't trusted, so
+  threads there won't start: …" when the project's account lacks some, and "<n> folders aren't
+  trusted in agp's other accounts, so threads there skip those accounts: …" when only pool
+  accounts do; then `project::up_with`. Opening a listed project runs `up_with` alone.
   The "Starting <name>" card shows each report as it comes (`✓` done, `!` warning) under a
   spinner, then where the conversation is: Rex (`Open in Rex session chief-<slug>: the
   conversation with the coordinator on the left, its threads on the right.`, or to switch to it in

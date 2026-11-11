@@ -12,7 +12,7 @@ use crate::project::{Note, Where};
 use crate::tui::{self, ACCENT, bold, cols, dim, key_bar, panel, tail, truncate};
 
 use super::app::{Archiving, Hit, Launcher, Screen, Starting};
-use super::wizard::{Setting, Step, Wizard};
+use super::wizard::{Step, Wizard};
 
 const CARD_WIDTH: u16 = 76;
 /// A pulsing dot. Not the quarter circles (◐◓◑◒): almost no monospace font has them, and a
@@ -495,8 +495,8 @@ fn wizard_card(w: &Wizard, width: usize) -> Card {
                 dim(),
             ));
             lines.push(Line::raw(""));
-            for (i, s) in Setting::ALL.iter().enumerate() {
-                let on = i == w.setting;
+            for s in w.settings() {
+                let on = *s == w.selected();
                 let value = format!("‹ {} ›", w.value(*s));
                 let mut line = Line::from(vec![
                     Span::styled(if on { "▌ " } else { "  " }, Style::new().fg(ACCENT)),
@@ -510,10 +510,7 @@ fn wizard_card(w: &Wizard, width: usize) -> Card {
                 lines.push(line);
             }
             lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                Setting::ALL[w.setting].help().to_string(),
-                dim(),
-            ));
+            lines.push(Line::styled(w.help(w.selected()), dim()));
         }
         Step::Review => {
             let d = w.draft();
@@ -540,14 +537,30 @@ fn wizard_card(w: &Wizard, width: usize) -> Card {
                     d.coordinator_model, d.coordinator_effort, d.thread_model, d.thread_effort
                 ),
             ));
+            // Only with agp installed: without it there is nothing to choose.
+            if w.agp.is_some() {
+                let threads = match (d.agp, w.pool_labels()) {
+                    (false, _) => "threads stay in this account, without agp".to_string(),
+                    (true, Some(labels)) => format!("threads also run in {labels}"),
+                    (true, None) => "watches threads for usage limits".to_string(),
+                };
+                lines.push(row("agp", threads));
+            }
             if !w.untrusted.is_empty() {
                 lines.push(Line::raw(""));
                 lines.push(Line::raw(
                     "Claude Code doesn't trust these yet, and background sessions refuse them:",
                 ));
-                for folder in &w.untrusted {
+                for need in &w.untrusted {
+                    // `/path/to/repo (in PB2)` for a pool account, as `chief init` lists it.
+                    let account = need
+                        .account
+                        .as_ref()
+                        .map(|a| format!(" (in {a})"))
+                        .unwrap_or_default();
+                    let room = width.saturating_sub(2 + account.chars().count());
                     lines.push(Line::styled(
-                        format!("  {}", tui::path(folder, width.saturating_sub(2))),
+                        format!("  {}{account}", tui::path(&need.folder, room)),
                         dim(),
                     ));
                 }
@@ -703,7 +716,7 @@ mod tests {
     use super::*;
     use crate::config::ProjectConfig;
     use crate::launcher::app::Entry;
-    use crate::launcher::wizard::Probe;
+    use crate::launcher::wizard::{PoolAccount, Probe};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -715,8 +728,9 @@ mod tests {
         fn slug_problem(&self, _: &str) -> Option<String> {
             None
         }
-        fn trusted(&self, folder: &Path) -> bool {
-            !folder.ends_with("web")
+        fn trusted(&self, account: Option<&Path>, folder: &Path) -> bool {
+            // PB2 (`/pb2/.claude.json`) trusts nothing yet.
+            account.is_none() && !folder.ends_with("web")
         }
     }
 
@@ -880,6 +894,38 @@ mod tests {
         for (w, h) in [(20, 5), (3, 2)] {
             render(&app, w, h);
         }
+
+        // agp answered: step 3 asks whether threads run through it, and the review lists its
+        // accounts' trust.
+        let pb2 = PoolAccount {
+            label: "PB2".into(),
+            trust: "/pb2/.claude.json".into(),
+        };
+        app.agp_found(Some(vec![pb2]), &Free);
+        let out = render(&app, 80, 24);
+        assert!(out.contains("agp     threads also run in PB2"), "{out}");
+        assert!(out.contains("web (in PB2)"), "{out}");
+        press(&mut app, KeyCode::Esc);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+        }
+        let out = render(&app, 80, 24);
+        assert!(out.contains("Threads run through ‹ agp ›"), "{out}");
+        assert!(out.contains("Besides this account: PB2."), "{out}");
+        press(&mut app, KeyCode::Right);
+        let out = render(&app, 80, 24);
+        assert!(out.contains("Threads run through ‹ claude ›"), "{out}");
+        assert!(
+            out.contains("Nothing watches threads for usage limits."),
+            "{out}"
+        );
+        press(&mut app, KeyCode::Enter);
+        let out = render(&app, 80, 24);
+        assert!(
+            out.contains("agp     threads stay in this account, without agp"),
+            "{out}"
+        );
+        assert!(!out.contains("(in PB2)"), "{out}");
     }
 
     /// On a 20-row terminal the Review card keeps the trust box, what Enter does and the last

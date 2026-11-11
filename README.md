@@ -21,6 +21,9 @@ the Claude sessions behind them a replay. <code>scripts/demo/demo.sh</code> reco
 - Any terminal. Rex or tmux are optional: they let `chief up` open the two-pane layout for you
   (see [The layout](#the-layout)).
 - `gh`, signed in, for pull request status on the board (optional).
+- [agp](https://github.com/jeffarese/agent-prism) (agent-prism), for threads that spread over
+  your other Claude accounts and move when one hits a usage limit (optional, and each project
+  chooses whether to use it: see [Accounts](#accounts)).
 
 ## Install
 
@@ -277,8 +280,11 @@ A project belongs to the Claude Code account you ran `chief init` from (its `CLA
 recorded as `claude_config_dir` in `project.toml`). The coordinator always runs there, and every
 chief command for the project uses that account, whatever terminal you type it in.
 
-With agp (agent-prism) installed, threads can spread over your other accounts: each new thread
-starts in the account of agp's pool with the most room (`agp status`), skipping limited ones.
+agp ([agent-prism](https://github.com/jeffarese/agent-prism)) is optional. Without it, threads
+run in the project's account, and one that hits a usage limit waits until you message it. With
+agp installed, threads can spread over your other accounts: each new thread
+starts in the account of agp's pool with the most room (`agp status`), skipping limited ones
+and any agp has no login for.
 `[threads] accounts` in `project.toml` narrows the pool (`["auto"]`, the default, is the whole
 pool; `[]` keeps threads on the project's account) and `max_usage` skips accounts at or over a
 5-hour or weekly percentage. Ask the coordinator for a specific account and it pins the thread
@@ -294,8 +300,13 @@ resets, never moved.
 
 Each account trusts folders separately, so `chief init`, the new-project wizard and the settings
 screen ("Account trust") check every repo in every pool account and offer to trust it there. A
-thread never starts in an account that doesn't trust its repo. Without agp, threads use the
-project's account.
+thread never starts in an account that doesn't trust its repo.
+
+A project needn't use agp even when it is installed. The new-project wizard asks, on its third
+step (`Threads run through`: `agp` or `claude`); `chief init --no-agp` is the same from a
+script. Later, `s` on the board has both halves: `Thread accounts` (empty keeps threads in the
+project's account) and `Threads run through` (`claude` starts them without agp, so nothing
+watches them for limits).
 
 ## Cleanup
 
@@ -342,7 +353,7 @@ readable.
 | --- | --- |
 | `chief` | Pick a project, or create one in a guided setup, and open it |
 | `chief new` | Straight to the guided setup |
-| `chief init <name> [--goal …] [--repo PATH…]` | Create a project from a script |
+| `chief init <name> [--goal …] [--repo PATH…] [--no-agp]` | Create a project from a script (`--no-agp`: its threads never use agp) |
 | `chief trust <slug>` | Trust every folder the project's sessions need |
 | `chief up <slug>` | Start or revive the coordinator and open the layout |
 | `chief down <slug> [--stop-threads]` | Close the layout and stop the coordinator |

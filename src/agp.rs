@@ -35,6 +35,9 @@ pub struct Account {
     pub in_pool: bool,
     /// agp counts it limited right now.
     pub limited: bool,
+    /// agp has a login for it (`token` isn't `Missing`; an expired token still counts, since
+    /// the next run refreshes it). A thread started without one would only ask to log in.
+    pub logged_in: bool,
     /// agp's ranking score; higher is better.
     pub score: Option<f64>,
     /// 5-hour and weekly utilization in percent; None when agp doesn't know.
@@ -84,6 +87,8 @@ struct View {
     #[serde(default)]
     limited: Value,
     #[serde(default)]
+    token: Value,
+    #[serde(default)]
     score: Option<f64>,
 }
 
@@ -111,6 +116,9 @@ pub fn parse_status(json: &str) -> Result<Vec<Account>> {
                 in_pool: v.in_pool,
                 // agp gives the limit as an object; `false` means none.
                 limited: matches!(v.limited, Value::Object(_) | Value::Bool(true)),
+                // `"Missing"`, next to `{"Valid": …}` and `{"Expired": …}`; an agp that
+                // doesn't say counts as logged in.
+                logged_in: v.token.as_str() != Some("Missing"),
                 score: v.score,
                 id: v.profile_id,
             }
@@ -128,13 +136,13 @@ pub fn pool<'a>(accounts: &'a [Account], allowed: &[String]) -> Vec<&'a Account>
         .collect()
 }
 
-/// The pool accounts that can take a thread now (not limited, under `max_usage`), best score
-/// first; accounts without a score come last, and ties keep agp's order.
+/// The pool accounts that can take a thread now (logged in, not limited, under `max_usage`),
+/// best score first; accounts without a score come last, and ties keep agp's order.
 pub fn usable<'a>(pool: &[&'a Account], max_usage: Option<u32>) -> Vec<&'a Account> {
     let mut usable: Vec<&Account> = pool
         .iter()
         .copied()
-        .filter(|a| !a.limited && !a.over(max_usage))
+        .filter(|a| a.logged_in && !a.limited && !a.over(max_usage))
         .collect();
     usable.sort_by(|a, b| {
         let score = |x: &Account| x.score.unwrap_or(f64::NEG_INFINITY);
@@ -602,16 +610,22 @@ mod tests {
              "limited": null, "score": 0.9},
             {"profile_id": "busy", "label": "B", "in_pool": true, "limited": {"until": 5},
              "score": 0.8, "usage": null},
-            {"profile_id": "bare", "in_pool": true}
+            {"profile_id": "bare", "in_pool": true},
+            {"profile_id": "out", "in_pool": true, "token": "Missing", "limited": null},
+            {"profile_id": "idle", "in_pool": true, "token": {"Expired": {"since": 5}}}
         ]}"#;
         let all = parse_status(json).unwrap();
         assert_eq!(
             all.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["busy", "bare"]
+            ["busy", "bare", "out", "idle"]
         );
         assert!(all[0].limited);
         assert_eq!((all[0].five_hour, all[1].limited), (None, false));
         assert_eq!(all[1].shown(), "bare");
+        // Only a missing token is no login: an agp that says nothing, and an expired token
+        // (the next run refreshes it), both count as one.
+        let logged_in: Vec<bool> = all.iter().map(|a| a.logged_in).collect();
+        assert_eq!(logged_in, [true, true, false, true]);
 
         // A limit is an object (or true); false and other values aren't one.
         let limited = |value: &str| {
@@ -663,6 +677,13 @@ mod tests {
             ids(&usable(&pool(&all, &auto), None)),
             ["cpb", "laura", "carlos", "cpe"]
         );
+        // agp has no login for laura.
+        all[4].logged_in = false;
+        assert_eq!(
+            ids(&usable(&pool(&all, &auto), None)),
+            ["cpb", "carlos", "cpe"]
+        );
+        all[4].logged_in = true;
         assert_eq!(find(&pool(&all, &auto), "PB2").unwrap().id, "cpb");
         assert_eq!(find(&pool(&all, &auto), "cpb").unwrap().id, "cpb");
         assert!(find(&pool(&all, &auto), "default").is_none());

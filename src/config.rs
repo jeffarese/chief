@@ -159,6 +159,15 @@ impl Runner {
     }
 }
 
+impl ThreadSettings {
+    /// Threads without agp, whether or not it is installed: in the project's account, started
+    /// by plain `claude` (`chief init --no-agp`, the wizard's "Threads run through").
+    pub fn without_agp(&mut self) {
+        self.accounts.clear();
+        self.runner = Runner::Claude;
+    }
+}
+
 fn auto_accounts() -> Vec<String> {
     vec![crate::agp::AUTO.to_string()]
 }

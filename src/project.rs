@@ -69,14 +69,25 @@ pub fn project_dir(slug: &str) -> PathBuf {
 /// Creates `<root>/projects/<slug>/` with project.toml, instructions.md, memory/MEMORY.md and
 /// generated/*, registers the project, and offers to trust (or explains how to trust) every
 /// folder Claude Code doesn't trust yet. The project belongs to the account `CLAUDE_CONFIG_DIR`
-/// names here (the default one when unset), for good.
-pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: bool) -> Result<()> {
+/// names here (the default one when unset), for good. `agp` false (`--no-agp`) keeps its
+/// threads there too, started by plain `claude`, whether or not agp is installed.
+pub fn init(
+    name: &str,
+    goal: Option<&str>,
+    repos: &[PathBuf],
+    trust_prompt: bool,
+    agp: bool,
+) -> Result<()> {
     let claude = Claude::from_env();
     claude.check_version()?;
     let exe = generated::chief_exe()?;
     let account = claude.account.clone();
     let env = generated::passthrough_env(account.as_deref());
-    let (config, dir) = create(name, goal, repos, account, &exe, &env)?;
+    let (config, dir) = create_with(name, goal, repos, account, &exe, &env, |c| {
+        if !agp {
+            c.threads.without_agp();
+        }
+    })?;
     println!(
         "Created project {:?} ({}) in {}",
         config.name,
@@ -89,6 +100,10 @@ pub fn init(name: &str, goal: Option<&str>, repos: &[PathBuf], trust_prompt: boo
              command uses that account for it.",
             account.display()
         );
+    }
+
+    if !agp {
+        println!("Its threads stay in this account, started by claude: agp isn't used.");
     }
 
     let interactive =
@@ -187,18 +202,6 @@ fn ask(question: &str) -> Result<bool> {
     ))
 }
 
-/// Writes the project files and registers the project; nothing is left behind on failure.
-pub fn create(
-    name: &str,
-    goal: Option<&str>,
-    repos: &[PathBuf],
-    account: Option<PathBuf>,
-    exe: &Path,
-    env: &[(String, String)],
-) -> Result<(ProjectConfig, PathBuf)> {
-    create_with(name, goal, repos, account, exe, env, |_| {})
-}
-
 /// The slug a project name gets: `[a-z0-9-]`, empty when the name has no letter or digit.
 pub fn slug_of(name: &str) -> String {
     names::slugify(name.trim(), SLUG_CHARS)
@@ -209,7 +212,8 @@ pub fn slug_taken(conn: &Connection, slug: &str) -> Result<bool> {
     Ok(paths::project_dir(slug).exists() || db::project_dir(conn, slug)?.is_some())
 }
 
-/// `create`, with `tune` changing the defaults (the launcher's quick settings) before anything
+/// Writes the project files and registers the project; nothing is left behind on failure.
+/// `tune` changes the defaults (`init --no-agp`, the launcher's quick settings) before anything
 /// is validated or written.
 pub fn create_with(
     name: &str,

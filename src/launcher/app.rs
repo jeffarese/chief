@@ -11,7 +11,7 @@ use crate::db::SessionRow;
 use crate::project::{Note, Where};
 use crate::state::{Group, Role};
 
-use super::wizard::{self, Draft, Probe, Wizard};
+use super::wizard::{self, Draft, PoolAccount, Probe, Wizard};
 
 /// A project in the list, from its project.toml and its stored rows (no `claude agents` call:
 /// the list opens at once).
@@ -114,6 +114,8 @@ pub enum Msg {
     Created(String),
     Done(Result<Where, String>),
     Archived(Result<(), String>),
+    /// agp's pool accounts but the one a new project gets; None without agp (`agp_found`).
+    Agp(Option<Vec<PoolAccount>>),
 }
 
 /// A project being created or opened.
@@ -169,6 +171,8 @@ pub struct Launcher {
     pub show_archived: bool,
     /// Where a new project's repo list starts (the launcher's own folder).
     pub cwd: Option<std::path::PathBuf>,
+    /// What agp answered (`agp_found`), for every wizard opened after.
+    pub agp: Option<Vec<PoolAccount>>,
     pub hits: RefCell<Vec<(u16, Hit)>>,
     /// The first frame's wizard, when there are no projects: Esc from it quits.
     first_run: bool,
@@ -191,6 +195,7 @@ impl Launcher {
             status: None,
             show_archived: false,
             cwd,
+            agp: None,
             hits: RefCell::new(Vec::new()),
             first_run,
         }
@@ -240,6 +245,27 @@ impl Launcher {
         } else {
             self.cursor.min(self.visible())
         };
+    }
+
+    /// agp answered: the open wizard, and each one opened later, asks whether threads run
+    /// through it and lists the pool accounts' trust.
+    pub fn agp_found(&mut self, agp: Option<Vec<PoolAccount>>, probe: &dyn Probe) {
+        self.agp = agp;
+        let wizard = match &mut self.screen {
+            Screen::Wizard(w) => Some(w),
+            Screen::Starting(s) => s.wizard.as_mut(),
+            _ => None,
+        };
+        if let Some(w) = wizard {
+            w.set_agp(self.agp.clone(), probe);
+        }
+    }
+
+    /// A wizard that knows what agp answered so far.
+    fn new_wizard(&self) -> Box<Wizard> {
+        let mut wizard = Wizard::new(self.cwd.as_deref());
+        wizard.agp = self.agp.clone();
+        Box::new(wizard)
     }
 
     pub fn apply(&mut self, msg: Msg) {
@@ -364,7 +390,7 @@ impl Launcher {
     }
 
     fn new_project(&mut self) {
-        self.screen = Screen::Wizard(Box::new(Wizard::new(self.cwd.as_deref())));
+        self.screen = Screen::Wizard(self.new_wizard());
     }
 
     /// `a`: a live project asks first (its sessions stop); an archived one comes back at once.
@@ -440,9 +466,32 @@ mod tests {
         fn slug_problem(&self, _: &str) -> Option<String> {
             None
         }
-        fn trusted(&self, _: &Path) -> bool {
+        fn trusted(&self, _: Option<&Path>, _: &Path) -> bool {
             true
         }
+    }
+
+    /// What agp answered reaches the wizard that is open and every one opened after.
+    #[test]
+    fn agp_reaches_open_and_later_wizards() {
+        let pool = Some(vec![PoolAccount {
+            label: "PB2".into(),
+            trust: "/pb2/.claude.json".into(),
+        }]);
+        // First run: the wizard is open before agp answers.
+        let mut app = Launcher::new(Vec::new(), None, false);
+        app.agp_found(pool.clone(), &Free);
+        let Screen::Wizard(w) = &app.screen else {
+            panic!("the wizard");
+        };
+        assert_eq!(w.agp, pool);
+        // Back to the list and in again.
+        app.screen = Screen::List;
+        app.on_key(key(KeyCode::Char('n')), &Free);
+        let Screen::Wizard(w) = &app.screen else {
+            panic!("the wizard");
+        };
+        assert_eq!(w.agp, pool);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
