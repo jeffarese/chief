@@ -1518,8 +1518,10 @@ at the reset, never moved.
   while it looks and what it reads fills the conversation: the task says what to find and
   where, that it changes nothing and that its report is the answer, with `haiku` or `sonnet`
   at `low`; it answers from the report, saves what is worth keeping to memory and resolves the
-  thread without asking; what was said before → memory first, else a lookup thread over
-  Claude Code's transcripts, which saves what it finds to memory;
+  thread without asking; what was said before → memory first, else it answers what it can
+  and starts a lookup thread over Claude Code's transcripts in the same turn, rather than
+  saying it doesn't have the conversation or asking the user to repeat it; the thread saves
+  what it finds to memory;
   new work → `start_thread`, with `account` only when the user names one; follow-up →
   `SendMessage` to the matching thread with `notify_when_idle`, waking it first if asleep, at its
   exact address with no `[ref]` (its name, or the `uds:…` address of a thread in another account,
